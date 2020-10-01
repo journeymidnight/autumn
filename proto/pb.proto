@@ -1,0 +1,74 @@
+ /*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless  by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+syntax = "proto3";
+
+
+package pb;
+
+enum Code {
+	OK = 0;
+	NOT_LEADER = 1;
+	NOT_PRIMARY = 2;
+}
+
+message Block {
+	uint32 checkSum = 1;
+	uint32 length = 2
+	string name  = 3;
+	bytes data = 4;
+}
+
+message AppendRequest {
+	uint64 extentID = 1;
+	repeated Block blocks = 2;
+}
+
+message AppendResponse {
+	Code code = 1;
+	uint64 offset = 2;
+}
+
+message CreateExtentRequest {
+	uint64 streamID = 1;
+}
+
+message CreateExtentResponse{
+	Code code = 1;
+	uint64 extentID = 2;
+}
+
+message ReadBlocksRequest {
+	uint64 offset = 1;
+	uint32 numOfBlock = 2;
+}
+
+message ReadBlocksResponse {
+	Code code = 1;
+	repeated Block blocks = 2;
+}
+
+
+service ExtentService {
+	rpc Append(AppendRequest) returns (AppendResponse){}
+	rpc ReadBlocks(ReadBlocksRequest) returns(ReadBlocksResponse){}
+	//rpc ReadBytes(offset, size) returns(){} //stream
+}
+
+
+service StreamManagerService {
+	rpc CreateExtent(CreateExtentRequest) returns (CreateExtentResponse) {}
+	//rpc ListStreams()
+	//rpc GetStreamInfo()
+}
