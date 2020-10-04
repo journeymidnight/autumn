@@ -17,50 +17,58 @@ package extent
 import (
 	"encoding/binary"
 	"io"
+	"sort"
 	"sync"
 
+	"github.com/journeymidnight/streamlayer/proto/pb"
 	"github.com/pkg/errors"
 )
 
 type Index interface {
-	Get(k uint64) (uint64, bool)
-	Put(k uint64, v uint64, name string)
+	Get(k uint32) (*pb.BlockMeta, bool)
+	Put(k uint32, v *pb.BlockMeta)
 	//if range is ordered by k, application can get better performance
-	Range(fn func(k, v uint64, name string))
-	Marshal(w io.Writer)
-	Unmarshal(r io.Reader)
-}
-
-type diValue struct {
-	v    uint64
-	name string
+	//Range(fn func(k, v pb.BlockMeta))
+	Marshal(w io.Writer) error
+	Unmarshal(r io.Reader) error
 }
 
 const (
-	indexMagicNumber = "Dyna InX"
+	indexMagicNumber = "EXT__IND"
 )
 
+//TODO: 修改成google/btree
 type DynamicIndex struct {
-	x *sync.Map
+	sync.RWMutex
+	x map[uint32]*pb.BlockMeta
 }
 
-func (di *DynamicIndex) Get(k uint64) (uint64, bool) {
-	v, ok := di.x.Load(k)
-	if !ok {
-		return 0, false
+func NewDynamicIndex() *DynamicIndex {
+	return &DynamicIndex{
+		x: make(map[uint32]*pb.BlockMeta),
 	}
-	r := v.(diValue)
-	return r.v, true
 }
 
-func (di *DynamicIndex) Put(k uint64, v uint64, name string) {
-	di.x.Store(k, diValue{
-		v:    v,
-		name: name,
-	})
+func (di *DynamicIndex) Get(k uint32) (*pb.BlockMeta, bool) {
+	di.RWMutex.RLock()
+	defer di.RWMutex.RUnlock()
+	v, ok := di.x[k]
+	if !ok {
+		return &pb.BlockMeta{}, false
+	}
+	return v, true
+
+}
+
+func (di *DynamicIndex) Put(k uint32, v *pb.BlockMeta) {
+	di.Lock()
+	defer di.Unlock()
+	di.x[k] = v
 }
 
 func (di *DynamicIndex) Unmarshal(r io.Reader) error {
+	di.Lock()
+	defer di.Unlock()
 	var buf [8]byte
 	_, err := io.ReadFull(r, buf[:])
 	if err != nil {
@@ -69,62 +77,61 @@ func (di *DynamicIndex) Unmarshal(r io.Reader) error {
 	if string(buf[:]) != indexMagicNumber {
 		return errors.Errorf("Unmarshal failed, magic number is %s", buf)
 	}
-	var k uint64
-	var v uint64
-	var nameBuf []byte
-	var nameLength uint32
-	for {
-		if err = binary.Read(r, binary.BigEndian, &k); err != nil {
-			return err
-		}
 
-		if err = binary.Read(r, binary.BigEndian, &v); err != nil {
-			return err
-		}
-
-		if err = binary.Read(r, binary.BigEndian, &nameLength); err != nil {
-			return err
-		}
-		nameBuf = make([]byte, nameLength, nameLength)
-		if _, err = io.ReadFull(r, nameBuf); err != nil {
-			return err
-		}
-		di.x.Store(k, diValue{
-			v:    v,
-			name: string(nameBuf),
-		})
-
+	var numberOfBlocks uint32
+	if err = binary.Read(r, binary.BigEndian, &numberOfBlocks); err != nil {
+		return err
 	}
+
+	var len uint32
+	var meta pb.BlockMeta
+	for i := uint32(0); i < numberOfBlocks; i++ {
+		err = binary.Read(r, binary.BigEndian, &len) //read len
+		if err != nil {
+			return err
+		}
+
+		buf := make([]byte, len)
+		if _, err = io.ReadFull(r, buf); err != nil {
+			return err
+		}
+		meta.Unmarshal(buf)
+		di.x[meta.Offset] = &meta
+	}
+	return nil
 
 }
 
 func (di *DynamicIndex) Marshal(w io.Writer) error {
+	di.Lock()
+	defer di.Unlock()
+
 	//magic number is 8 bytes
 	_, err := w.Write([]byte(indexMagicNumber))
 	if err != nil {
 		return err
 	}
-	di.x.Range(func(key interface{}, value interface{}) bool {
-		k := key.(uint64)
-		v := value.(diValue)
+	binary.Write(w, binary.BigEndian, uint32(len(di.x)))
 
-		if err = binary.Write(w, binary.BigEndian, k); err != nil {
-			return false
-		}
+	var offsets []uint32
 
-		if err = binary.Write(w, binary.BigEndian, v); err != nil {
-			return false
+	//sort pb.BlockMeta by offset
+	for k := range di.x {
+		offsets = append(offsets, k)
+	}
 
-		}
-
-		if err = binary.Write(w, binary.BigEndian, uint32(len(v.name))); err != nil {
-			return false
-		}
-
-		if _, err = w.Write([]byte(v.name)); err != nil {
-			return false
-		}
-		return true
+	sort.Slice(offsets, func(i, j int) bool {
+		return offsets[i] < offsets[j]
 	})
+
+	for _, offset := range offsets {
+		v := di.x[offset]
+		data, err := v.Marshal()
+		binary.Write(w, binary.BigEndian, uint32(v.Size()))
+		_, err = w.Write(data)
+		if err != nil {
+			return err
+		}
+	}
 	return err
 }
