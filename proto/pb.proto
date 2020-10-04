@@ -25,7 +25,7 @@ enum Code {
 
 message Block {
 	uint32 checkSum = 1;
-	uint32 length = 2
+	uint32 blockLength = 2;
 	string name  = 3;
 	bytes data = 4;
 }
@@ -71,4 +71,14 @@ service StreamManagerService {
 	rpc CreateExtent(CreateExtentRequest) returns (CreateExtentResponse) {}
 	//rpc ListStreams()
 	//rpc GetStreamInfo()
+}
+
+
+//used in extent index internally
+message BlockMeta {
+	uint32 checkSum = 1;
+	uint32 blockLength = 2;
+	string name  = 3;
+	uint32 blockOffset = 4;
+	uint32 offset = 5;
 }
