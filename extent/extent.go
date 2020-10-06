@@ -13,10 +13,11 @@
  */
 package extent
 
-//FIXME: metaBlock自己也需要checksum
 import (
 	"encoding/binary"
 	"fmt"
+	"hash"
+	"hash/adler32"
 	"math"
 	"os"
 	"sync"
@@ -28,6 +29,8 @@ import (
 
 	"github.com/journeymidnight/streamlayer/proto/pb"
 )
+
+//TODO: block的元数据, 和持久化的index都需要做checksum
 
 //FIXME: put all errors into errors directory
 func align(n uint64) bool {
@@ -49,6 +52,7 @@ type Extent struct {
 	commitLength  uint32 //atomic
 	fileName      string
 	indexFileName string
+	ID            uint64
 
 	file  *os.File
 	index Index
@@ -65,8 +69,44 @@ type extentHeader struct {
 	ID          uint64
 }
 
-func (eh extentHeader) size() uint32 {
+func newExtentHeader(ID uint64) *extentHeader {
+	eh := extentHeader{
+		ID: ID,
+	}
+	copy(eh.magicNumber[:], extentMagicNumber)
+	return &eh
+}
+
+func (eh *extentHeader) Size() uint32 {
 	return 16
+}
+
+func (eh extentHeader) Marshal(w io.Writer) error {
+	var buf [512]byte
+	copy(buf[:], eh.magicNumber[:])
+	binary.BigEndian.PutUint64(buf[:8], eh.ID)
+
+	n, err := w.Write(buf[:])
+	if n != 512 || err != nil {
+		return errors.Errorf("failed to create extent file")
+	}
+	return nil
+}
+
+func (eh extentHeader) Unmarshal(r io.Reader) error {
+	var buf [512]byte
+	_, err := io.ReadFull(r, buf[:])
+	if err != nil {
+		return err
+	}
+
+	copy(eh.magicNumber[:], buf[:8])
+	eh.ID = binary.BigEndian.Uint64(buf[8:16])
+
+	if string(eh.magicNumber[:]) != extentMagicNumber {
+		errors.Errorf("extent magic number failed")
+	}
+	return nil
 }
 
 func CreateExtent(fileName string, ID uint64) (*Extent, error) {
@@ -74,16 +114,11 @@ func CreateExtent(fileName string, ID uint64) (*Extent, error) {
 	if err != nil {
 		return nil, err
 	}
-	//write header of Extent
-	var buf [512]byte
-	copy(buf[:], extentMagicNumber)
-	binary.BigEndian.PutUint64(buf[:8], ID)
-
-	n, err := f.Write(buf[:])
-	if n != 512 || err != nil {
-		return nil, errors.Errorf("failed to create extent file")
+	extentHeader := newExtentHeader(ID)
+	if err = extentHeader.Marshal(f); err != nil {
+		return nil, err
 	}
-
+	//write header of Extent
 	return &Extent{
 		isSeal:       0,
 		commitLength: 512,
@@ -101,7 +136,7 @@ func OpenExtent(fileName string, indexFileName string) (*Extent, error) {
 		if err != nil {
 			return nil, err
 		}
-		index := NewDynamicIndex()
+		index := NewStaticIndex()
 		if err = index.Unmarshal(indexFile); err != nil {
 			return nil, err
 		}
@@ -114,6 +149,13 @@ func OpenExtent(fileName string, indexFileName string) (*Extent, error) {
 		if info.Size() > math.MaxUint32 {
 			return nil, errors.Errorf("check extent file, the extent file is too big")
 		}
+		//check extent header
+
+		eh := newExtentHeader(0)
+		if err = eh.Unmarshal(file); err != nil {
+			return nil, err
+		}
+
 		return &Extent{
 			isSeal:        1,
 			commitLength:  uint32(info.Size()),
@@ -121,6 +163,7 @@ func OpenExtent(fileName string, indexFileName string) (*Extent, error) {
 			indexFileName: indexFileName,
 			file:          file,
 			index:         index,
+			ID:            eh.ID,
 		}, nil
 	}
 
@@ -134,7 +177,52 @@ func OpenExtent(fileName string, indexFileName string) (*Extent, error) {
 		   原子性
 	*/
 
-	return nil
+	//replay the extent file, 这里的replay重新读了所有文件内容, 也许不需要,
+	//前面可以只读block的meta, 直到最后一个block再读文件数据, 检查checksum
+	f, err := os.Open(fileName)
+	if err != nil {
+		return nil, err
+	}
+	info, _ := f.Stat()
+	currentSize := uint32(info.Size())
+	index := NewDynamicIndex()
+
+	eh := newExtentHeader(0)
+	err = eh.Unmarshal(f)
+	if err != nil {
+		return nil, err
+	}
+	offset := uint32(512)
+	for offset < currentSize {
+		b, err := readBlock(f)
+		if err != nil {
+			//this block is corrupt, so, truncate extent to current offset
+			if err = f.Truncate(int64(offset)); err != nil {
+				return nil, err
+			}
+			if err = f.Sync(); err != nil {
+				return nil, err
+			}
+			break
+		}
+		//BlockOffset and Offset should be the same
+		index.Put(offset, &pb.BlockMeta{
+			BlockLength: b.BlockLength,
+			BlockOffset: offset,
+			Offset:      offset,
+		})
+		offset += b.BlockLength + 512
+	}
+
+	return &Extent{
+		isSeal:        0,
+		commitLength:  offset,
+		fileName:      fileName,
+		indexFileName: indexFileName,
+		file:          f,
+		index:         index,
+		ID:            eh.ID,
+	}, nil
 }
 
 //support multple threads
@@ -145,7 +233,7 @@ type extentBlockReader struct {
 	n        uint32 // max bytes remaining
 }
 
-func (r extentBlockReader) Read(p []byte) (n int, err error) {
+func (r *extentBlockReader) Read(p []byte) (n int, err error) {
 	if r.n <= 0 {
 		return 0, io.EOF
 	}
@@ -163,17 +251,60 @@ func (r extentBlockReader) Read(p []byte) (n int, err error) {
 	return n, nil
 }
 
+func (ex *Extent) Seal(commit uint32, indexFileName string) error {
+	if indexFileName == "" {
+		return errors.Errorf("index file is empty")
+	}
+	ex.Lock()
+	defer ex.Unlock()
+	atomic.StoreInt32(&ex.isSeal, 1)
+
+	currentLength := ex.commitLength
+	if currentLength < commit {
+		return errors.Errorf("commit is less than current commit length")
+	} else if currentLength > commit {
+		ex.file.Truncate(int64(commit))
+	}
+	//write index file
+	//TODO: cleanup index:如果有任何大于commit的entry, 也要删除, 保证数据完整
+	ex.indexFileName = indexFileName
+	f, err := os.OpenFile(ex.indexFileName, os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	if err = ex.index.Marshal(f); err != nil {
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		return err
+	}
+	//TODO : convert dynamic index into static index to save memory when sealing,
+	//request a atomic swap to implement this operation
+	return nil
+}
+
+func (ex *Extent) IsSeal() bool {
+	return atomic.LoadInt32(&ex.isSeal) == 1
+}
 func (ex *Extent) GetReader(offset uint32) (io.Reader, error) {
 	meta, ok := ex.index.Get(offset)
 	if !ok {
 		return nil, errors.Errorf("can not find offset %d", offset)
 	}
-	return extentBlockReader{
+	return &extentBlockReader{
 		extent:   ex,
 		position: meta.BlockOffset,
-		n:        meta.BlockLength,
+		n:        meta.BlockLength + 512,
 	}, nil
 
+}
+
+//Close function is not thread-safe
+func (ex *Extent) Close() {
+	ex.Lock() //stop any append, may cause read failed
+	defer ex.Unlock()
+	ex.file.Close()
+	ex.index = nil
 }
 
 func (ex *Extent) ReadBlocks(offsets []uint32) ([]pb.Block, error) {
@@ -198,6 +329,10 @@ func (ex *Extent) ReadBlocks(offsets []uint32) ([]pb.Block, error) {
 	return ret, nil
 }
 
+func (ex *Extent) CommitLength() uint32 {
+	return atomic.LoadUint32(&ex.commitLength)
+}
+
 func (ex *Extent) AppendBlocks(blocks []pb.Block) (ret []uint32, err error) {
 	ex.Lock()
 	defer ex.Unlock()
@@ -214,15 +349,14 @@ func (ex *Extent) AppendBlocks(blocks []pb.Block) (ret []uint32, err error) {
 			return nil, err
 		}
 		//if we have ssd journal, do not have to sync every time.
-		//TODO: wait ssd channel
+		//TODO: wait ssd channel,  这里分情况, 如果有SSD journal, 就不需要调用sync
+		//如果没有SSD journal,就需要调用sync
 		ex.file.Sync()
 
 		currentLength := atomic.LoadUint32(&ex.commitLength)
 		ret = append(ret, currentLength)
 		ex.index.Put(currentLength, &pb.BlockMeta{
-			CheckSum:    block.CheckSum,
 			BlockLength: block.BlockLength,
-			Name:        block.Name,
 			BlockOffset: ex.commitLength,
 			Offset:      ex.commitLength,
 		})
@@ -239,6 +373,11 @@ func writeBlock(w io.Writer, block pb.Block) (err error) {
 	if !align(uint64(block.BlockLength)) {
 		return errors.Errorf("block is not  aligned %d", block.BlockLength)
 	}
+	//checkSum
+
+	if block.CheckSum != AdlerCheckSum(block.Data) {
+		return errors.Errorf("alder32 checksum not match")
+	}
 	padding := 512 - (4 + 4 + 4 + len(block.Name))
 
 	//write block metadata
@@ -249,6 +388,7 @@ func writeBlock(w io.Writer, block pb.Block) (err error) {
 	if err != nil {
 		return err
 	}
+
 	_, err = w.Write(make([]byte, padding))
 	if err != nil {
 		return err
@@ -259,7 +399,24 @@ func writeBlock(w io.Writer, block pb.Block) (err error) {
 	return err
 }
 
+var (
+	hashPool = sync.Pool{
+		New: func() interface{} {
+			return adler32.New()
+		},
+	}
+)
+
+func AdlerCheckSum(data []byte) uint32 {
+	hash := hashPool.Get().(hash.Hash32)
+	defer hashPool.Put(hash)
+	hash.Reset()
+	hash.Write(data)
+	return hash.Sum32()
+}
+
 func readBlock(reader io.Reader) (pb.Block, error) {
+
 	var buf [512]byte
 
 	_, err := io.ReadFull(reader, buf[:])
@@ -281,10 +438,16 @@ func readBlock(reader io.Reader) (pb.Block, error) {
 
 	data := make([]byte, blockLength, blockLength)
 	_, err = io.ReadFull(reader, data)
+
 	if err != nil && err != io.EOF {
 		return pb.Block{}, err
 	}
-	//TODO, CRC check
+
+	//checkSum
+	if AdlerCheckSum(data) != checkSum {
+		return pb.Block{}, errors.Errorf("alder32 checksum not match")
+	}
+
 	return pb.Block{
 		CheckSum:    checkSum,
 		BlockLength: blockLength,

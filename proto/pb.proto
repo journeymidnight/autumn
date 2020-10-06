@@ -76,9 +76,7 @@ service StreamManagerService {
 
 //used in extent index internally
 message BlockMeta {
-	uint32 checkSum = 1;
-	uint32 blockLength = 2;
-	string name  = 3;
-	uint32 blockOffset = 4;
-	uint32 offset = 5;
+	uint32 blockLength = 1;
+	uint32 blockOffset = 2;
+	uint32 offset = 3;
 }
