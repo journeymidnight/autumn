@@ -11,6 +11,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package extent
 
 import (
@@ -28,6 +29,7 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/journeymidnight/streamlayer/proto/pb"
+	"github.com/journeymidnight/streamlayer/utils"
 )
 
 //TODO: block的元数据, 和持久化的index都需要做checksum
@@ -47,7 +49,8 @@ func formatExtentIndexName(id uint64) string {
 }
 
 type Extent struct {
-	sync.Mutex           //only one AppendBlocks could be called at a time
+	//sync.Mutex //only one AppendBlocks could be called at a time
+	utils.SafeMutex
 	isSeal        int32  //atomic
 	commitLength  uint32 //atomic
 	fileName      string
@@ -179,7 +182,7 @@ func OpenExtent(fileName string, indexFileName string) (*Extent, error) {
 
 	//replay the extent file, 这里的replay重新读了所有文件内容, 也许不需要,
 	//前面可以只读block的meta, 直到最后一个block再读文件数据, 检查checksum
-	f, err := os.Open(fileName)
+	f, err := os.OpenFile(fileName, os.O_APPEND|os.O_RDWR, 0644)
 	if err != nil {
 		return nil, err
 	}
@@ -301,7 +304,7 @@ func (ex *Extent) GetReader(offset uint32) (io.Reader, error) {
 
 //Close function is not thread-safe
 func (ex *Extent) Close() {
-	ex.Lock() //stop any append, may cause read failed
+	ex.Lock()
 	defer ex.Unlock()
 	ex.file.Close()
 	ex.index = nil
@@ -333,12 +336,16 @@ func (ex *Extent) CommitLength() uint32 {
 	return atomic.LoadUint32(&ex.commitLength)
 }
 
-func (ex *Extent) AppendBlocks(blocks []pb.Block) (ret []uint32, err error) {
-	ex.Lock()
-	defer ex.Unlock()
+func (ex *Extent) AppendBlocks(blocks []pb.Block, lastCommit uint32) (ret []uint32, err error) {
+	ex.AssertLock()
 
 	if atomic.LoadInt32(&ex.isSeal) == 1 {
 		return nil, errors.Errorf("immuatble")
+	}
+
+	//for secondary extents, it must check lastCommit.
+	if lastCommit != 0 && lastCommit != ex.CommitLength() {
+		return nil, errors.Errorf("offset not match...")
 	}
 	/*
 		wrap <offset + blocks>

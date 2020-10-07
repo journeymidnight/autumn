@@ -21,6 +21,7 @@ enum Code {
 	OK = 0;
 	NOT_LEADER = 1;
 	NOT_PRIMARY = 2;
+	ERROR = 3;
 }
 
 message Block {
@@ -60,10 +61,29 @@ message ReadBlocksResponse {
 }
 
 
+message Payload {
+        bytes Data = 1;
+}
+
 service ExtentService {
 	rpc Append(AppendRequest) returns (AppendResponse){}
 	rpc ReadBlocks(ReadBlocksRequest) returns(ReadBlocksResponse){}
 	//rpc ReadBytes(offset, size) returns(){} //stream
+}
+
+message ReplicateBlocksRequest {
+	uint64 extentID = 1;
+	uint32 commit = 2;
+	repeated Block blocks = 3;
+}
+
+message ReplicateBlocksResponse {
+	Code code = 1;
+}
+
+service InternalExtentService {
+	rpc Heartbeat (Payload)        returns (stream Payload) {}
+	rpc ReplicateBlocks(ReplicateBlocksRequest) returns (ReplicateBlocksResponse) {}
 }
 
 
@@ -74,9 +94,10 @@ service StreamManagerService {
 }
 
 
-//used in extent index internally
+//used in extent index internally, maybe remove in the futhure
 message BlockMeta {
-	uint32 blockLength = 1;
-	uint32 blockOffset = 2;
-	uint32 offset = 3;
+	uint32 blockOffset = 1;
+	uint32 offset = 2;
 }
+
+
