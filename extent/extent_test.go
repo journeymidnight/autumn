@@ -107,7 +107,9 @@ func TestAppendReadFile(t *testing.T) {
 	extent, err := CreateExtent("localtest.ext", 100)
 	defer os.Remove("localtest.ext")
 	assert.Nil(t, err)
-	ret, err := extent.AppendBlocks(cases)
+	extent.Lock()
+	ret, err := extent.AppendBlocks(cases, 0)
+	extent.Unlock()
 	assert.Nil(t, err)
 
 	//single thread read
@@ -160,7 +162,9 @@ func TestReplayExtent(t *testing.T) {
 	extent, err := CreateExtent(extentName, 100)
 	defer os.Remove(extentName)
 	assert.Nil(t, err)
-	_, err = extent.AppendBlocks(cases)
+	extent.Lock()
+	_, err = extent.AppendBlocks(cases, 0)
+	extent.Unlock()
 	assert.Nil(t, err)
 
 	extent.Close()
@@ -171,6 +175,13 @@ func TestReplayExtent(t *testing.T) {
 	assert.False(t, ex.IsSeal())
 	assert.Equal(t, uint32(512*5+4096*3+8192), ex.CommitLength())
 
+	//write new cases
+	ex.Lock()
+	_, err = ex.AppendBlocks(cases, 0)
+	ex.Unlock()
+	assert.Nil(t, err)
+	commit := ex.CommitLength()
+
 	err = ex.Seal(ex.commitLength, "localtest.idx")
 	assert.Nil(t, err)
 	defer os.Remove("localtest.idx")
@@ -180,7 +191,7 @@ func TestReplayExtent(t *testing.T) {
 	ex, err = OpenExtent(extentName, "localtest.idx")
 	assert.Nil(t, err)
 	assert.True(t, ex.IsSeal())
-	assert.Equal(t, uint32(512*5+4096*3+8192), ex.CommitLength())
+	assert.Equal(t, commit, ex.CommitLength())
 
 	//read test
 	blocks, err := ex.ReadBlocks([]uint32{512}) //read object1

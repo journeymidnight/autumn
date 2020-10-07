@@ -24,6 +24,7 @@ import (
 	"github.com/pkg/errors"
 )
 
+//FIXME: add dump index
 type Index interface {
 	Get(k uint32) (*pb.BlockMeta, bool)
 	Put(k uint32, v *pb.BlockMeta)
@@ -204,3 +205,5 @@ func (si *StaticIndex) Unmarshal(r io.Reader) error {
 func (si *StaticIndex) Marshal(w io.Writer) error {
 	panic("not implemented: you should never call Marshal for static Index")
 }
+
+type DummyIndex struct{}

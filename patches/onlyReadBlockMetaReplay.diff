@@ -1,0 +1,79 @@
+diff --git a/extent/extent.go b/extent/extent.go
+index a168236..a13214a 100644
+--- a/extent/extent.go
++++ b/extent/extent.go
+@@ -110,7 +110,7 @@ func (eh extentHeader) Unmarshal(r io.Reader) error {
+ }
+ 
+ func CreateExtent(fileName string, ID uint64) (*Extent, error) {
+-	f, err := os.OpenFile(fileName, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
++	f, err := os.OpenFile(fileName, os.O_CREATE|os.O_RDWR, 0644)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -179,7 +179,7 @@ func OpenExtent(fileName string, indexFileName string) (*Extent, error) {
+ 
+ 	//replay the extent file, 这里的replay重新读了所有文件内容, 也许不需要,
+ 	//前面可以只读block的meta, 直到最后一个block再读文件数据, 检查checksum
+-	f, err := os.Open(fileName)
++	f, err := os.OpenFile(fileName, os.O_RDWR, 0644)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -194,7 +194,8 @@ func OpenExtent(fileName string, indexFileName string) (*Extent, error) {
+ 	}
+ 	offset := uint32(512)
+ 	for offset < currentSize {
+-		b, err := readBlock(f)
++		//b, err := readBlock(f)
++		blockLength, err := readBlockLength(f)
+ 		if err != nil {
+ 			//this block is corrupt, so, truncate extent to current offset
+ 			if err = f.Truncate(int64(offset)); err != nil {
+@@ -207,13 +208,15 @@ func OpenExtent(fileName string, indexFileName string) (*Extent, error) {
+ 		}
+ 		//BlockOffset and Offset should be the same
+ 		index.Put(offset, &pb.BlockMeta{
+-			BlockLength: b.BlockLength,
++			BlockLength: blockLength,
+ 			BlockOffset: offset,
+ 			Offset:      offset,
+ 		})
+-		offset += b.BlockLength + 512
++		f.Seek(int64(blockLength), os.SEEK_CUR)
++		offset += blockLength + 512
+ 	}
+ 
++	f.Seek(0, os.SEEK_END)
+ 	return &Extent{
+ 		isSeal:        0,
+ 		commitLength:  offset,
+@@ -415,6 +418,28 @@ func AdlerCheckSum(data []byte) uint32 {
+ 	return hash.Sum32()
+ }
+ 
++func readBlockLength(reader io.Reader) (uint32, error) {
++	var buf [512]byte
++
++	_, err := io.ReadFull(reader, buf[:])
++
++	if err != nil {
++		return 0, err
++	}
++
++	//checkSum := binary.BigEndian.Uint32(buf[:4])
++	blockLength := binary.BigEndian.Uint32(buf[4:8])
++	nameLength := binary.BigEndian.Uint32(buf[8:12])
++	if nameLength > 256 {
++		return 0, errors.Errorf("block name is too long :%d", nameLength)
++	}
++	if !align(uint64(blockLength)) {
++		return 0, errors.Errorf("block is not aligned %d", blockLength)
++	}
++
++	return blockLength, nil
++}
++
+ func readBlock(reader io.Reader) (pb.Block, error) {
+ 
+ 	var buf [512]byte
