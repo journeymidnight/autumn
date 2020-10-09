@@ -185,7 +185,7 @@ func (m *AppendRequest) GetBlocks() []*Block {
 
 type AppendResponse struct {
 	Code                 Code     `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
-	Offset               uint64   `protobuf:"varint,2,opt,name=offset,proto3" json:"offset,omitempty"`
+	Offsets              []uint32 `protobuf:"varint,2,rep,packed,name=offsets,proto3" json:"offsets,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -231,11 +231,11 @@ func (m *AppendResponse) GetCode() Code {
 	return Code_OK
 }
 
-func (m *AppendResponse) GetOffset() uint64 {
+func (m *AppendResponse) GetOffsets() []uint32 {
 	if m != nil {
-		return m.Offset
+		return m.Offsets
 	}
-	return 0
+	return nil
 }
 
 type CreateExtentRequest struct {
@@ -341,8 +341,8 @@ func (m *CreateExtentResponse) GetExtentID() uint64 {
 }
 
 type ReadBlocksRequest struct {
-	Offset               uint64   `protobuf:"varint,1,opt,name=offset,proto3" json:"offset,omitempty"`
-	NumOfBlock           uint32   `protobuf:"varint,2,opt,name=numOfBlock,proto3" json:"numOfBlock,omitempty"`
+	ExtentID             uint64   `protobuf:"varint,1,opt,name=extentID,proto3" json:"extentID,omitempty"`
+	Offsets              []uint32 `protobuf:"varint,2,rep,packed,name=offsets,proto3" json:"offsets,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -381,18 +381,18 @@ func (m *ReadBlocksRequest) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_ReadBlocksRequest proto.InternalMessageInfo
 
-func (m *ReadBlocksRequest) GetOffset() uint64 {
+func (m *ReadBlocksRequest) GetExtentID() uint64 {
 	if m != nil {
-		return m.Offset
+		return m.ExtentID
 	}
 	return 0
 }
 
-func (m *ReadBlocksRequest) GetNumOfBlock() uint32 {
+func (m *ReadBlocksRequest) GetOffsets() []uint32 {
 	if m != nil {
-		return m.NumOfBlock
+		return m.Offsets
 	}
-	return 0
+	return nil
 }
 
 type ReadBlocksResponse struct {
@@ -562,6 +562,7 @@ func (m *ReplicateBlocksRequest) GetBlocks() []*Block {
 
 type ReplicateBlocksResponse struct {
 	Code                 Code     `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
+	Offsets              []uint32 `protobuf:"varint,2,rep,packed,name=offsets,proto3" json:"offsets,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -607,28 +608,32 @@ func (m *ReplicateBlocksResponse) GetCode() Code {
 	return Code_OK
 }
 
-//used in extent index internally, maybe remove in the futhure
-type BlockMeta struct {
-	BlockLength          uint32   `protobuf:"varint,1,opt,name=blockLength,proto3" json:"blockLength,omitempty"`
-	BlockOffset          uint32   `protobuf:"varint,2,opt,name=blockOffset,proto3" json:"blockOffset,omitempty"`
-	Offset               uint32   `protobuf:"varint,3,opt,name=offset,proto3" json:"offset,omitempty"`
+func (m *ReplicateBlocksResponse) GetOffsets() []uint32 {
+	if m != nil {
+		return m.Offsets
+	}
+	return nil
+}
+
+type AllocExtentRequest struct {
+	ExtentID             uint64   `protobuf:"varint,1,opt,name=extentID,proto3" json:"extentID,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
 }
 
-func (m *BlockMeta) Reset()         { *m = BlockMeta{} }
-func (m *BlockMeta) String() string { return proto.CompactTextString(m) }
-func (*BlockMeta) ProtoMessage()    {}
-func (*BlockMeta) Descriptor() ([]byte, []int) {
+func (m *AllocExtentRequest) Reset()         { *m = AllocExtentRequest{} }
+func (m *AllocExtentRequest) String() string { return proto.CompactTextString(m) }
+func (*AllocExtentRequest) ProtoMessage()    {}
+func (*AllocExtentRequest) Descriptor() ([]byte, []int) {
 	return fileDescriptor_f80abaa17e25ccc8, []int{10}
 }
-func (m *BlockMeta) XXX_Unmarshal(b []byte) error {
+func (m *AllocExtentRequest) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
 }
-func (m *BlockMeta) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+func (m *AllocExtentRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
 	if deterministic {
-		return xxx_messageInfo_BlockMeta.Marshal(b, m, deterministic)
+		return xxx_messageInfo_AllocExtentRequest.Marshal(b, m, deterministic)
 	} else {
 		b = b[:cap(b)]
 		n, err := m.MarshalToSizedBuffer(b)
@@ -638,37 +643,70 @@ func (m *BlockMeta) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
 		return b[:n], nil
 	}
 }
-func (m *BlockMeta) XXX_Merge(src proto.Message) {
-	xxx_messageInfo_BlockMeta.Merge(m, src)
+func (m *AllocExtentRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_AllocExtentRequest.Merge(m, src)
 }
-func (m *BlockMeta) XXX_Size() int {
+func (m *AllocExtentRequest) XXX_Size() int {
 	return m.Size()
 }
-func (m *BlockMeta) XXX_DiscardUnknown() {
-	xxx_messageInfo_BlockMeta.DiscardUnknown(m)
+func (m *AllocExtentRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_AllocExtentRequest.DiscardUnknown(m)
 }
 
-var xxx_messageInfo_BlockMeta proto.InternalMessageInfo
+var xxx_messageInfo_AllocExtentRequest proto.InternalMessageInfo
 
-func (m *BlockMeta) GetBlockLength() uint32 {
+func (m *AllocExtentRequest) GetExtentID() uint64 {
 	if m != nil {
-		return m.BlockLength
+		return m.ExtentID
 	}
 	return 0
 }
 
-func (m *BlockMeta) GetBlockOffset() uint32 {
-	if m != nil {
-		return m.BlockOffset
-	}
-	return 0
+type AllocExtentResponse struct {
+	Code                 Code     `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
 }
 
-func (m *BlockMeta) GetOffset() uint32 {
-	if m != nil {
-		return m.Offset
+func (m *AllocExtentResponse) Reset()         { *m = AllocExtentResponse{} }
+func (m *AllocExtentResponse) String() string { return proto.CompactTextString(m) }
+func (*AllocExtentResponse) ProtoMessage()    {}
+func (*AllocExtentResponse) Descriptor() ([]byte, []int) {
+	return fileDescriptor_f80abaa17e25ccc8, []int{11}
+}
+func (m *AllocExtentResponse) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *AllocExtentResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_AllocExtentResponse.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
 	}
-	return 0
+}
+func (m *AllocExtentResponse) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_AllocExtentResponse.Merge(m, src)
+}
+func (m *AllocExtentResponse) XXX_Size() int {
+	return m.Size()
+}
+func (m *AllocExtentResponse) XXX_DiscardUnknown() {
+	xxx_messageInfo_AllocExtentResponse.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_AllocExtentResponse proto.InternalMessageInfo
+
+func (m *AllocExtentResponse) GetCode() Code {
+	if m != nil {
+		return m.Code
+	}
+	return Code_OK
 }
 
 func init() {
@@ -683,51 +721,50 @@ func init() {
 	proto.RegisterType((*Payload)(nil), "pb.Payload")
 	proto.RegisterType((*ReplicateBlocksRequest)(nil), "pb.ReplicateBlocksRequest")
 	proto.RegisterType((*ReplicateBlocksResponse)(nil), "pb.ReplicateBlocksResponse")
-	proto.RegisterType((*BlockMeta)(nil), "pb.BlockMeta")
+	proto.RegisterType((*AllocExtentRequest)(nil), "pb.AllocExtentRequest")
+	proto.RegisterType((*AllocExtentResponse)(nil), "pb.AllocExtentResponse")
 }
 
 func init() { proto.RegisterFile("pb.proto", fileDescriptor_f80abaa17e25ccc8) }
 
 var fileDescriptor_f80abaa17e25ccc8 = []byte{
-	// 596 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x8c, 0x54, 0xcd, 0x6e, 0xd3, 0x40,
-	0x10, 0xce, 0x3a, 0xae, 0x69, 0x26, 0xfd, 0x49, 0x97, 0x36, 0xb5, 0x0c, 0x44, 0xc1, 0xa7, 0xc0,
-	0xa1, 0xa2, 0xe1, 0x80, 0x84, 0xc4, 0xa1, 0x3f, 0x41, 0x54, 0xfd, 0x49, 0xb5, 0x81, 0x03, 0xe2,
-	0x80, 0xd6, 0xf6, 0x24, 0x8d, 0x1a, 0xff, 0x60, 0x6f, 0x10, 0x1c, 0x79, 0x03, 0x8e, 0x3c, 0x12,
-	0x47, 0x1e, 0x01, 0x85, 0x17, 0x41, 0xbb, 0xb6, 0x13, 0x27, 0x29, 0x28, 0xb7, 0x9d, 0xd9, 0xd9,
-	0x99, 0xef, 0xf3, 0xf7, 0x8d, 0x61, 0x3d, 0x72, 0x0e, 0xa2, 0x38, 0x14, 0x21, 0xd5, 0x22, 0xc7,
-	0xf6, 0x61, 0xed, 0x78, 0x14, 0xba, 0xb7, 0xd4, 0x82, 0x75, 0xf7, 0x06, 0xdd, 0xdb, 0xde, 0xd8,
-	0x37, 0x49, 0x93, 0xb4, 0x36, 0xd9, 0x34, 0xa6, 0x4d, 0xa8, 0x3a, 0xb2, 0xe8, 0x02, 0x83, 0x81,
-	0xb8, 0x31, 0x35, 0x75, 0x5d, 0x4c, 0x51, 0x0a, 0x7a, 0xc0, 0x7d, 0x34, 0xcb, 0x4d, 0xd2, 0xaa,
-	0x30, 0x75, 0x96, 0x39, 0x8f, 0x0b, 0x6e, 0xea, 0x4d, 0xd2, 0xda, 0x60, 0xea, 0x6c, 0x5f, 0xc1,
-	0xe6, 0x51, 0x14, 0x61, 0xe0, 0x31, 0xfc, 0x34, 0xc6, 0x44, 0xc8, 0xb1, 0xf8, 0x45, 0x60, 0x20,
-	0xce, 0x4e, 0xd5, 0x58, 0x9d, 0x4d, 0x63, 0xfa, 0x18, 0x0c, 0x35, 0x23, 0x31, 0xb5, 0x66, 0xb9,
-	0x55, 0x6d, 0x57, 0x0e, 0x22, 0xe7, 0x40, 0xa1, 0x65, 0xd9, 0x85, 0xfd, 0x1a, 0xb6, 0xf2, 0x7e,
-	0x49, 0x14, 0x06, 0x09, 0xd2, 0x87, 0xa0, 0xbb, 0xa1, 0x87, 0xaa, 0xd9, 0x56, 0x7b, 0x5d, 0x3e,
-	0x39, 0x09, 0x3d, 0x64, 0x2a, 0x4b, 0xeb, 0x60, 0x84, 0xfd, 0x7e, 0x82, 0x42, 0x91, 0xd0, 0x59,
-	0x16, 0xd9, 0x87, 0x70, 0xff, 0x24, 0x46, 0x2e, 0xb0, 0xa3, 0x86, 0x17, 0xd0, 0x25, 0x22, 0x46,
-	0xee, 0xcf, 0xd0, 0xe5, 0xb1, 0x7d, 0x0d, 0xbb, 0xf3, 0x4f, 0x56, 0x02, 0x50, 0xe4, 0xab, 0xcd,
-	0xf3, 0xb5, 0xcf, 0x61, 0x87, 0x21, 0xf7, 0x14, 0xc3, 0x24, 0x87, 0x30, 0x43, 0x4c, 0x8a, 0x88,
-	0x69, 0x03, 0x20, 0x18, 0xfb, 0xdd, 0xbe, 0xaa, 0xce, 0x24, 0x29, 0x64, 0xec, 0x77, 0x40, 0x8b,
-	0xcd, 0x56, 0x02, 0xb7, 0xc2, 0x07, 0x7f, 0x04, 0xf7, 0xae, 0xf9, 0xd7, 0x51, 0xc8, 0x3d, 0xa9,
-	0xef, 0xa9, 0xd4, 0x97, 0xa4, 0xfa, 0xca, 0xb3, 0x1d, 0x42, 0x9d, 0x61, 0x34, 0x1a, 0xba, 0x5c,
-	0xe0, 0x3c, 0x8f, 0xff, 0x09, 0x5d, 0x07, 0xc3, 0x0d, 0x7d, 0x7f, 0x28, 0x32, 0x1e, 0x59, 0x54,
-	0xc0, 0x53, 0xfe, 0x17, 0x9e, 0x17, 0xb0, 0xbf, 0x34, 0x70, 0x15, 0xae, 0xf6, 0x00, 0x2a, 0xaa,
-	0xfe, 0x12, 0x05, 0x5f, 0x34, 0x38, 0x59, 0x36, 0x78, 0x5e, 0xd1, 0x9d, 0xb9, 0x27, 0xaf, 0x48,
-	0x53, 0x05, 0xa1, 0xca, 0x29, 0x89, 0x34, 0x7a, 0xfa, 0x12, 0x74, 0x39, 0x96, 0x1a, 0xa0, 0x75,
-	0xcf, 0x6b, 0x25, 0xba, 0x05, 0x70, 0xd5, 0x7d, 0xfb, 0xf1, 0xa2, 0x73, 0x74, 0xda, 0x61, 0x35,
-	0x42, 0xb7, 0xa1, 0x2a, 0xe3, 0x6b, 0x76, 0x76, 0x79, 0xc4, 0xde, 0xd7, 0x34, 0x5a, 0x81, 0xb5,
-	0x0e, 0x63, 0x5d, 0x56, 0x2b, 0xb7, 0xbf, 0x11, 0xd8, 0x4c, 0xed, 0xd5, 0xc3, 0xf8, 0xf3, 0xd0,
-	0x45, 0x7a, 0x08, 0x46, 0x6a, 0x78, 0xba, 0x23, 0x09, 0xcd, 0x2d, 0x93, 0x45, 0x8b, 0xa9, 0xf4,
-	0x2b, 0xd8, 0x25, 0xfa, 0x0a, 0x60, 0xe6, 0x04, 0xba, 0x27, 0x6b, 0x96, 0x6c, 0x66, 0xd5, 0x17,
-	0xd3, 0xf9, 0xf3, 0xf6, 0x77, 0x02, 0x7b, 0x67, 0x81, 0xc0, 0x38, 0xe0, 0xa3, 0x79, 0x2c, 0x4f,
-	0xa0, 0xf2, 0x06, 0x79, 0x2c, 0x1c, 0xe4, 0x82, 0x56, 0x65, 0x83, 0xcc, 0x1a, 0x56, 0x31, 0xb0,
-	0x4b, 0xcf, 0x08, 0xbd, 0x80, 0xed, 0x05, 0x99, 0xa8, 0x95, 0x4e, 0xbc, 0xcb, 0x2c, 0xd6, 0x83,
-	0x3b, 0xef, 0xa6, 0x90, 0x3e, 0xc0, 0x6e, 0x4f, 0xad, 0xe1, 0x25, 0x0f, 0xf8, 0x00, 0xe3, 0x1c,
-	0xd0, 0x09, 0x6c, 0x14, 0x57, 0x92, 0xee, 0x2b, 0xcd, 0x97, 0xf7, 0xda, 0x32, 0x97, 0x2f, 0xf2,
-	0xe6, 0xc7, 0xb5, 0x9f, 0x93, 0x06, 0xf9, 0x35, 0x69, 0x90, 0xdf, 0x93, 0x06, 0xf9, 0xf1, 0xa7,
-	0x51, 0x72, 0x0c, 0xf5, 0xbb, 0x7c, 0xfe, 0x37, 0x00, 0x00, 0xff, 0xff, 0xb5, 0xf4, 0x40, 0x56,
-	0x3a, 0x05, 0x00, 0x00,
+	// 568 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xa4, 0x54, 0xcd, 0x6e, 0xda, 0x4c,
+	0x14, 0x65, 0x0c, 0x21, 0xe1, 0xf2, 0x91, 0x90, 0x49, 0x42, 0x2c, 0x7f, 0x2d, 0xa2, 0x5e, 0xd1,
+	0x2e, 0x50, 0x42, 0x76, 0x95, 0x2a, 0x95, 0x04, 0xa4, 0xa0, 0x92, 0x40, 0x87, 0x76, 0xd1, 0x55,
+	0x35, 0xb6, 0x6f, 0x12, 0x14, 0xff, 0xd5, 0x9e, 0x54, 0xed, 0xb2, 0x6f, 0xd1, 0x47, 0xea, 0xb2,
+	0xea, 0x13, 0x54, 0xf4, 0x45, 0xaa, 0x19, 0x03, 0x31, 0x21, 0x48, 0x96, 0xba, 0x9b, 0x73, 0xc7,
+	0x73, 0xcf, 0x39, 0x73, 0xcf, 0x18, 0xb6, 0x42, 0xab, 0x15, 0x46, 0x81, 0x08, 0xa8, 0x16, 0x5a,
+	0xa6, 0x07, 0x1b, 0xa7, 0x6e, 0x60, 0xdf, 0x52, 0x03, 0xb6, 0xec, 0x1b, 0xb4, 0x6f, 0xc7, 0x77,
+	0x9e, 0x4e, 0x1a, 0xa4, 0x59, 0x61, 0x0b, 0x4c, 0x1b, 0x50, 0xb6, 0xe4, 0x47, 0x03, 0xf4, 0xaf,
+	0xc5, 0x8d, 0xae, 0xa9, 0xed, 0x74, 0x89, 0x52, 0x28, 0xf8, 0xdc, 0x43, 0x3d, 0xdf, 0x20, 0xcd,
+	0x12, 0x53, 0x6b, 0x59, 0x73, 0xb8, 0xe0, 0x7a, 0xa1, 0x41, 0x9a, 0xff, 0x31, 0xb5, 0x36, 0x2f,
+	0xa1, 0xd2, 0x09, 0x43, 0xf4, 0x1d, 0x86, 0x9f, 0xee, 0x30, 0x16, 0x92, 0x16, 0xbf, 0x08, 0xf4,
+	0x45, 0xbf, 0xab, 0x68, 0x0b, 0x6c, 0x81, 0xe9, 0x33, 0x28, 0x2a, 0x8e, 0x58, 0xd7, 0x1a, 0xf9,
+	0x66, 0xb9, 0x5d, 0x6a, 0x85, 0x56, 0x4b, 0xa9, 0x65, 0xb3, 0x0d, 0xf3, 0x1c, 0xb6, 0xe7, 0xfd,
+	0xe2, 0x30, 0xf0, 0x63, 0xa4, 0x4f, 0xa0, 0x60, 0x07, 0x0e, 0xaa, 0x66, 0xdb, 0xed, 0x2d, 0x79,
+	0xe4, 0x2c, 0x70, 0x90, 0xa9, 0x2a, 0xd5, 0x61, 0x33, 0xb8, 0xba, 0x8a, 0x51, 0x24, 0x3d, 0x2b,
+	0x6c, 0x0e, 0xcd, 0x63, 0xd8, 0x3b, 0x8b, 0x90, 0x0b, 0xec, 0x29, 0xfa, 0x94, 0xbe, 0x58, 0x44,
+	0xc8, 0xbd, 0x7b, 0x7d, 0x73, 0x6c, 0x8e, 0x60, 0x7f, 0xf9, 0x48, 0x26, 0x09, 0x69, 0xc7, 0xda,
+	0xb2, 0x63, 0xb3, 0x0f, 0xbb, 0x0c, 0xb9, 0xa3, 0x3c, 0xc6, 0x59, 0xae, 0x68, 0xbd, 0x9f, 0xf7,
+	0x40, 0xd3, 0xad, 0x32, 0x49, 0xcb, 0x70, 0xe1, 0x4f, 0x61, 0x73, 0xc4, 0xbf, 0xba, 0x01, 0x77,
+	0xe4, 0x7c, 0xbb, 0x72, 0xbe, 0x24, 0x99, 0xaf, 0x5c, 0x9b, 0x01, 0xd4, 0x18, 0x86, 0xee, 0xc4,
+	0xe6, 0x02, 0xb3, 0xbb, 0xa8, 0x41, 0xd1, 0x0e, 0x3c, 0x6f, 0x22, 0x66, 0xd1, 0x9a, 0xa1, 0x94,
+	0x9e, 0xfc, 0x3a, 0x3d, 0x6f, 0xe1, 0x70, 0x85, 0xf0, 0x1f, 0x93, 0x70, 0x04, 0xb4, 0xe3, 0xba,
+	0x81, 0xbd, 0x12, 0x84, 0x75, 0xfa, 0xcd, 0x13, 0xd8, 0x5b, 0x3a, 0x91, 0x45, 0xc0, 0x8b, 0x97,
+	0x50, 0x90, 0x88, 0x16, 0x41, 0x1b, 0xbe, 0xa9, 0xe6, 0xe8, 0x36, 0xc0, 0xe5, 0xf0, 0xdd, 0xc7,
+	0x41, 0xaf, 0xd3, 0xed, 0xb1, 0x2a, 0xa1, 0x3b, 0x50, 0x96, 0x78, 0xc4, 0xfa, 0x17, 0x1d, 0xf6,
+	0xa1, 0xaa, 0xd1, 0x12, 0x6c, 0xf4, 0x18, 0x1b, 0xb2, 0x6a, 0xbe, 0xfd, 0x8d, 0x40, 0x25, 0x21,
+	0x1b, 0x63, 0xf4, 0x79, 0x62, 0x23, 0x3d, 0x86, 0x62, 0xf2, 0x10, 0xe8, 0xae, 0xe4, 0x59, 0x7a,
+	0x64, 0x06, 0x4d, 0x97, 0x12, 0x71, 0x66, 0x8e, 0xbe, 0x02, 0xb8, 0x4f, 0x08, 0x3d, 0x90, 0xdf,
+	0xac, 0x84, 0xcf, 0xa8, 0x3d, 0x2c, 0xcf, 0x8f, 0xb7, 0x7f, 0x11, 0x38, 0xe8, 0xfb, 0x02, 0x23,
+	0x9f, 0xbb, 0xcb, 0x5a, 0x9e, 0x43, 0xe9, 0x1c, 0x79, 0x24, 0x2c, 0xe4, 0x82, 0x96, 0x65, 0x83,
+	0x59, 0x64, 0x8c, 0x34, 0x30, 0x73, 0x47, 0x84, 0x0e, 0x60, 0xe7, 0xc1, 0xf8, 0xa8, 0x91, 0x30,
+	0x3e, 0x16, 0x22, 0xe3, 0xff, 0x47, 0xf7, 0x16, 0x8e, 0x5e, 0x43, 0x39, 0x35, 0x07, 0xaa, 0xb4,
+	0xaf, 0x8e, 0xd2, 0x38, 0x5c, 0xa9, 0x2f, 0x4c, 0xd5, 0x60, 0x7f, 0xac, 0x9e, 0xf7, 0x05, 0xf7,
+	0xf9, 0x35, 0x46, 0x33, 0x4b, 0xa7, 0xd5, 0x1f, 0xd3, 0x3a, 0xf9, 0x39, 0xad, 0x93, 0xdf, 0xd3,
+	0x3a, 0xf9, 0xfe, 0xa7, 0x9e, 0xb3, 0x8a, 0xea, 0x1f, 0x7a, 0xf2, 0x37, 0x00, 0x00, 0xff, 0xff,
+	0x3a, 0xe5, 0xa0, 0x54, 0x4f, 0x05, 0x00, 0x00,
 }
 
 // Reference imports to suppress errors if they are not otherwise used.
@@ -852,6 +889,7 @@ var _ExtentService_serviceDesc = grpc.ServiceDesc{
 type InternalExtentServiceClient interface {
 	Heartbeat(ctx context.Context, in *Payload, opts ...grpc.CallOption) (InternalExtentService_HeartbeatClient, error)
 	ReplicateBlocks(ctx context.Context, in *ReplicateBlocksRequest, opts ...grpc.CallOption) (*ReplicateBlocksResponse, error)
+	AllocExtent(ctx context.Context, in *AllocExtentRequest, opts ...grpc.CallOption) (*AllocExtentResponse, error)
 }
 
 type internalExtentServiceClient struct {
@@ -903,10 +941,20 @@ func (c *internalExtentServiceClient) ReplicateBlocks(ctx context.Context, in *R
 	return out, nil
 }
 
+func (c *internalExtentServiceClient) AllocExtent(ctx context.Context, in *AllocExtentRequest, opts ...grpc.CallOption) (*AllocExtentResponse, error) {
+	out := new(AllocExtentResponse)
+	err := c.cc.Invoke(ctx, "/pb.InternalExtentService/AllocExtent", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // InternalExtentServiceServer is the server API for InternalExtentService service.
 type InternalExtentServiceServer interface {
 	Heartbeat(*Payload, InternalExtentService_HeartbeatServer) error
 	ReplicateBlocks(context.Context, *ReplicateBlocksRequest) (*ReplicateBlocksResponse, error)
+	AllocExtent(context.Context, *AllocExtentRequest) (*AllocExtentResponse, error)
 }
 
 // UnimplementedInternalExtentServiceServer can be embedded to have forward compatible implementations.
@@ -918,6 +966,9 @@ func (*UnimplementedInternalExtentServiceServer) Heartbeat(req *Payload, srv Int
 }
 func (*UnimplementedInternalExtentServiceServer) ReplicateBlocks(ctx context.Context, req *ReplicateBlocksRequest) (*ReplicateBlocksResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ReplicateBlocks not implemented")
+}
+func (*UnimplementedInternalExtentServiceServer) AllocExtent(ctx context.Context, req *AllocExtentRequest) (*AllocExtentResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method AllocExtent not implemented")
 }
 
 func RegisterInternalExtentServiceServer(s *grpc.Server, srv InternalExtentServiceServer) {
@@ -963,6 +1014,24 @@ func _InternalExtentService_ReplicateBlocks_Handler(srv interface{}, ctx context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _InternalExtentService_AllocExtent_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AllocExtentRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalExtentServiceServer).AllocExtent(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/pb.InternalExtentService/AllocExtent",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalExtentServiceServer).AllocExtent(ctx, req.(*AllocExtentRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 var _InternalExtentService_serviceDesc = grpc.ServiceDesc{
 	ServiceName: "pb.InternalExtentService",
 	HandlerType: (*InternalExtentServiceServer)(nil),
@@ -970,6 +1039,10 @@ var _InternalExtentService_serviceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReplicateBlocks",
 			Handler:    _InternalExtentService_ReplicateBlocks_Handler,
+		},
+		{
+			MethodName: "AllocExtent",
+			Handler:    _InternalExtentService_AllocExtent_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
@@ -986,7 +1059,6 @@ var _InternalExtentService_serviceDesc = grpc.ServiceDesc{
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://godoc.org/google.golang.org/grpc#ClientConn.NewStream.
 type StreamManagerServiceClient interface {
-	CreateExtent(ctx context.Context, in *CreateExtentRequest, opts ...grpc.CallOption) (*CreateExtentResponse, error)
 }
 
 type streamManagerServiceClient struct {
@@ -997,61 +1069,24 @@ func NewStreamManagerServiceClient(cc *grpc.ClientConn) StreamManagerServiceClie
 	return &streamManagerServiceClient{cc}
 }
 
-func (c *streamManagerServiceClient) CreateExtent(ctx context.Context, in *CreateExtentRequest, opts ...grpc.CallOption) (*CreateExtentResponse, error) {
-	out := new(CreateExtentResponse)
-	err := c.cc.Invoke(ctx, "/pb.StreamManagerService/CreateExtent", in, out, opts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 // StreamManagerServiceServer is the server API for StreamManagerService service.
 type StreamManagerServiceServer interface {
-	CreateExtent(context.Context, *CreateExtentRequest) (*CreateExtentResponse, error)
 }
 
 // UnimplementedStreamManagerServiceServer can be embedded to have forward compatible implementations.
 type UnimplementedStreamManagerServiceServer struct {
 }
 
-func (*UnimplementedStreamManagerServiceServer) CreateExtent(ctx context.Context, req *CreateExtentRequest) (*CreateExtentResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method CreateExtent not implemented")
-}
-
 func RegisterStreamManagerServiceServer(s *grpc.Server, srv StreamManagerServiceServer) {
 	s.RegisterService(&_StreamManagerService_serviceDesc, srv)
-}
-
-func _StreamManagerService_CreateExtent_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(CreateExtentRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(StreamManagerServiceServer).CreateExtent(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: "/pb.StreamManagerService/CreateExtent",
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(StreamManagerServiceServer).CreateExtent(ctx, req.(*CreateExtentRequest))
-	}
-	return interceptor(ctx, in, info, handler)
 }
 
 var _StreamManagerService_serviceDesc = grpc.ServiceDesc{
 	ServiceName: "pb.StreamManagerService",
 	HandlerType: (*StreamManagerServiceServer)(nil),
-	Methods: []grpc.MethodDesc{
-		{
-			MethodName: "CreateExtent",
-			Handler:    _StreamManagerService_CreateExtent_Handler,
-		},
-	},
-	Streams:  []grpc.StreamDesc{},
-	Metadata: "pb.proto",
+	Methods:     []grpc.MethodDesc{},
+	Streams:     []grpc.StreamDesc{},
+	Metadata:    "pb.proto",
 }
 
 func (m *Block) Marshal() (dAtA []byte, err error) {
@@ -1175,10 +1210,23 @@ func (m *AppendResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 		i -= len(m.XXX_unrecognized)
 		copy(dAtA[i:], m.XXX_unrecognized)
 	}
-	if m.Offset != 0 {
-		i = encodeVarintPb(dAtA, i, uint64(m.Offset))
+	if len(m.Offsets) > 0 {
+		dAtA2 := make([]byte, len(m.Offsets)*10)
+		var j1 int
+		for _, num := range m.Offsets {
+			for num >= 1<<7 {
+				dAtA2[j1] = uint8(uint64(num)&0x7f | 0x80)
+				num >>= 7
+				j1++
+			}
+			dAtA2[j1] = uint8(num)
+			j1++
+		}
+		i -= j1
+		copy(dAtA[i:], dAtA2[:j1])
+		i = encodeVarintPb(dAtA, i, uint64(j1))
 		i--
-		dAtA[i] = 0x10
+		dAtA[i] = 0x12
 	}
 	if m.Code != 0 {
 		i = encodeVarintPb(dAtA, i, uint64(m.Code))
@@ -1281,13 +1329,26 @@ func (m *ReadBlocksRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 		i -= len(m.XXX_unrecognized)
 		copy(dAtA[i:], m.XXX_unrecognized)
 	}
-	if m.NumOfBlock != 0 {
-		i = encodeVarintPb(dAtA, i, uint64(m.NumOfBlock))
+	if len(m.Offsets) > 0 {
+		dAtA4 := make([]byte, len(m.Offsets)*10)
+		var j3 int
+		for _, num := range m.Offsets {
+			for num >= 1<<7 {
+				dAtA4[j3] = uint8(uint64(num)&0x7f | 0x80)
+				num >>= 7
+				j3++
+			}
+			dAtA4[j3] = uint8(num)
+			j3++
+		}
+		i -= j3
+		copy(dAtA[i:], dAtA4[:j3])
+		i = encodeVarintPb(dAtA, i, uint64(j3))
 		i--
-		dAtA[i] = 0x10
+		dAtA[i] = 0x12
 	}
-	if m.Offset != 0 {
-		i = encodeVarintPb(dAtA, i, uint64(m.Offset))
+	if m.ExtentID != 0 {
+		i = encodeVarintPb(dAtA, i, uint64(m.ExtentID))
 		i--
 		dAtA[i] = 0x8
 	}
@@ -1449,6 +1510,24 @@ func (m *ReplicateBlocksResponse) MarshalToSizedBuffer(dAtA []byte) (int, error)
 		i -= len(m.XXX_unrecognized)
 		copy(dAtA[i:], m.XXX_unrecognized)
 	}
+	if len(m.Offsets) > 0 {
+		dAtA6 := make([]byte, len(m.Offsets)*10)
+		var j5 int
+		for _, num := range m.Offsets {
+			for num >= 1<<7 {
+				dAtA6[j5] = uint8(uint64(num)&0x7f | 0x80)
+				num >>= 7
+				j5++
+			}
+			dAtA6[j5] = uint8(num)
+			j5++
+		}
+		i -= j5
+		copy(dAtA[i:], dAtA6[:j5])
+		i = encodeVarintPb(dAtA, i, uint64(j5))
+		i--
+		dAtA[i] = 0x12
+	}
 	if m.Code != 0 {
 		i = encodeVarintPb(dAtA, i, uint64(m.Code))
 		i--
@@ -1457,7 +1536,7 @@ func (m *ReplicateBlocksResponse) MarshalToSizedBuffer(dAtA []byte) (int, error)
 	return len(dAtA) - i, nil
 }
 
-func (m *BlockMeta) Marshal() (dAtA []byte, err error) {
+func (m *AllocExtentRequest) Marshal() (dAtA []byte, err error) {
 	size := m.Size()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
@@ -1467,12 +1546,12 @@ func (m *BlockMeta) Marshal() (dAtA []byte, err error) {
 	return dAtA[:n], nil
 }
 
-func (m *BlockMeta) MarshalTo(dAtA []byte) (int, error) {
+func (m *AllocExtentRequest) MarshalTo(dAtA []byte) (int, error) {
 	size := m.Size()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
-func (m *BlockMeta) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+func (m *AllocExtentRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	i := len(dAtA)
 	_ = i
 	var l int
@@ -1481,18 +1560,40 @@ func (m *BlockMeta) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 		i -= len(m.XXX_unrecognized)
 		copy(dAtA[i:], m.XXX_unrecognized)
 	}
-	if m.Offset != 0 {
-		i = encodeVarintPb(dAtA, i, uint64(m.Offset))
+	if m.ExtentID != 0 {
+		i = encodeVarintPb(dAtA, i, uint64(m.ExtentID))
 		i--
-		dAtA[i] = 0x18
+		dAtA[i] = 0x8
 	}
-	if m.BlockOffset != 0 {
-		i = encodeVarintPb(dAtA, i, uint64(m.BlockOffset))
-		i--
-		dAtA[i] = 0x10
+	return len(dAtA) - i, nil
+}
+
+func (m *AllocExtentResponse) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
 	}
-	if m.BlockLength != 0 {
-		i = encodeVarintPb(dAtA, i, uint64(m.BlockLength))
+	return dAtA[:n], nil
+}
+
+func (m *AllocExtentResponse) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *AllocExtentResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if m.XXX_unrecognized != nil {
+		i -= len(m.XXX_unrecognized)
+		copy(dAtA[i:], m.XXX_unrecognized)
+	}
+	if m.Code != 0 {
+		i = encodeVarintPb(dAtA, i, uint64(m.Code))
 		i--
 		dAtA[i] = 0x8
 	}
@@ -1566,8 +1667,12 @@ func (m *AppendResponse) Size() (n int) {
 	if m.Code != 0 {
 		n += 1 + sovPb(uint64(m.Code))
 	}
-	if m.Offset != 0 {
-		n += 1 + sovPb(uint64(m.Offset))
+	if len(m.Offsets) > 0 {
+		l = 0
+		for _, e := range m.Offsets {
+			l += sovPb(uint64(e))
+		}
+		n += 1 + sovPb(uint64(l)) + l
 	}
 	if m.XXX_unrecognized != nil {
 		n += len(m.XXX_unrecognized)
@@ -1614,11 +1719,15 @@ func (m *ReadBlocksRequest) Size() (n int) {
 	}
 	var l int
 	_ = l
-	if m.Offset != 0 {
-		n += 1 + sovPb(uint64(m.Offset))
+	if m.ExtentID != 0 {
+		n += 1 + sovPb(uint64(m.ExtentID))
 	}
-	if m.NumOfBlock != 0 {
-		n += 1 + sovPb(uint64(m.NumOfBlock))
+	if len(m.Offsets) > 0 {
+		l = 0
+		for _, e := range m.Offsets {
+			l += sovPb(uint64(e))
+		}
+		n += 1 + sovPb(uint64(l)) + l
 	}
 	if m.XXX_unrecognized != nil {
 		n += len(m.XXX_unrecognized)
@@ -1696,26 +1805,42 @@ func (m *ReplicateBlocksResponse) Size() (n int) {
 	if m.Code != 0 {
 		n += 1 + sovPb(uint64(m.Code))
 	}
+	if len(m.Offsets) > 0 {
+		l = 0
+		for _, e := range m.Offsets {
+			l += sovPb(uint64(e))
+		}
+		n += 1 + sovPb(uint64(l)) + l
+	}
 	if m.XXX_unrecognized != nil {
 		n += len(m.XXX_unrecognized)
 	}
 	return n
 }
 
-func (m *BlockMeta) Size() (n int) {
+func (m *AllocExtentRequest) Size() (n int) {
 	if m == nil {
 		return 0
 	}
 	var l int
 	_ = l
-	if m.BlockLength != 0 {
-		n += 1 + sovPb(uint64(m.BlockLength))
+	if m.ExtentID != 0 {
+		n += 1 + sovPb(uint64(m.ExtentID))
 	}
-	if m.BlockOffset != 0 {
-		n += 1 + sovPb(uint64(m.BlockOffset))
+	if m.XXX_unrecognized != nil {
+		n += len(m.XXX_unrecognized)
 	}
-	if m.Offset != 0 {
-		n += 1 + sovPb(uint64(m.Offset))
+	return n
+}
+
+func (m *AllocExtentResponse) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.Code != 0 {
+		n += 1 + sovPb(uint64(m.Code))
 	}
 	if m.XXX_unrecognized != nil {
 		n += len(m.XXX_unrecognized)
@@ -2043,23 +2168,80 @@ func (m *AppendResponse) Unmarshal(dAtA []byte) error {
 				}
 			}
 		case 2:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Offset", wireType)
-			}
-			m.Offset = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowPb
+			if wireType == 0 {
+				var v uint32
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowPb
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					v |= uint32(b&0x7F) << shift
+					if b < 0x80 {
+						break
+					}
 				}
-				if iNdEx >= l {
+				m.Offsets = append(m.Offsets, v)
+			} else if wireType == 2 {
+				var packedLen int
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowPb
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					packedLen |= int(b&0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				if packedLen < 0 {
+					return ErrInvalidLengthPb
+				}
+				postIndex := iNdEx + packedLen
+				if postIndex < 0 {
+					return ErrInvalidLengthPb
+				}
+				if postIndex > l {
 					return io.ErrUnexpectedEOF
 				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				m.Offset |= uint64(b&0x7F) << shift
-				if b < 0x80 {
-					break
+				var elementCount int
+				var count int
+				for _, integer := range dAtA[iNdEx:postIndex] {
+					if integer < 128 {
+						count++
+					}
 				}
+				elementCount = count
+				if elementCount != 0 && len(m.Offsets) == 0 {
+					m.Offsets = make([]uint32, 0, elementCount)
+				}
+				for iNdEx < postIndex {
+					var v uint32
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowPb
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						v |= uint32(b&0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					m.Offsets = append(m.Offsets, v)
+				}
+			} else {
+				return fmt.Errorf("proto: wrong wireType = %d for field Offsets", wireType)
 			}
 		default:
 			iNdEx = preIndex
@@ -2282,9 +2464,9 @@ func (m *ReadBlocksRequest) Unmarshal(dAtA []byte) error {
 		switch fieldNum {
 		case 1:
 			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Offset", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field ExtentID", wireType)
 			}
-			m.Offset = 0
+			m.ExtentID = 0
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowPb
@@ -2294,29 +2476,86 @@ func (m *ReadBlocksRequest) Unmarshal(dAtA []byte) error {
 				}
 				b := dAtA[iNdEx]
 				iNdEx++
-				m.Offset |= uint64(b&0x7F) << shift
+				m.ExtentID |= uint64(b&0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
 		case 2:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field NumOfBlock", wireType)
-			}
-			m.NumOfBlock = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowPb
+			if wireType == 0 {
+				var v uint32
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowPb
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					v |= uint32(b&0x7F) << shift
+					if b < 0x80 {
+						break
+					}
 				}
-				if iNdEx >= l {
+				m.Offsets = append(m.Offsets, v)
+			} else if wireType == 2 {
+				var packedLen int
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowPb
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					packedLen |= int(b&0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				if packedLen < 0 {
+					return ErrInvalidLengthPb
+				}
+				postIndex := iNdEx + packedLen
+				if postIndex < 0 {
+					return ErrInvalidLengthPb
+				}
+				if postIndex > l {
 					return io.ErrUnexpectedEOF
 				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				m.NumOfBlock |= uint32(b&0x7F) << shift
-				if b < 0x80 {
-					break
+				var elementCount int
+				var count int
+				for _, integer := range dAtA[iNdEx:postIndex] {
+					if integer < 128 {
+						count++
+					}
 				}
+				elementCount = count
+				if elementCount != 0 && len(m.Offsets) == 0 {
+					m.Offsets = make([]uint32, 0, elementCount)
+				}
+				for iNdEx < postIndex {
+					var v uint32
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowPb
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						v |= uint32(b&0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					m.Offsets = append(m.Offsets, v)
+				}
+			} else {
+				return fmt.Errorf("proto: wrong wireType = %d for field Offsets", wireType)
 			}
 		default:
 			iNdEx = preIndex
@@ -2712,6 +2951,82 @@ func (m *ReplicateBlocksResponse) Unmarshal(dAtA []byte) error {
 					break
 				}
 			}
+		case 2:
+			if wireType == 0 {
+				var v uint32
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowPb
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					v |= uint32(b&0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				m.Offsets = append(m.Offsets, v)
+			} else if wireType == 2 {
+				var packedLen int
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowPb
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					packedLen |= int(b&0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				if packedLen < 0 {
+					return ErrInvalidLengthPb
+				}
+				postIndex := iNdEx + packedLen
+				if postIndex < 0 {
+					return ErrInvalidLengthPb
+				}
+				if postIndex > l {
+					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				var count int
+				for _, integer := range dAtA[iNdEx:postIndex] {
+					if integer < 128 {
+						count++
+					}
+				}
+				elementCount = count
+				if elementCount != 0 && len(m.Offsets) == 0 {
+					m.Offsets = make([]uint32, 0, elementCount)
+				}
+				for iNdEx < postIndex {
+					var v uint32
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowPb
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						v |= uint32(b&0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					m.Offsets = append(m.Offsets, v)
+				}
+			} else {
+				return fmt.Errorf("proto: wrong wireType = %d for field Offsets", wireType)
+			}
 		default:
 			iNdEx = preIndex
 			skippy, err := skipPb(dAtA[iNdEx:])
@@ -2737,7 +3052,7 @@ func (m *ReplicateBlocksResponse) Unmarshal(dAtA []byte) error {
 	}
 	return nil
 }
-func (m *BlockMeta) Unmarshal(dAtA []byte) error {
+func (m *AllocExtentRequest) Unmarshal(dAtA []byte) error {
 	l := len(dAtA)
 	iNdEx := 0
 	for iNdEx < l {
@@ -2760,17 +3075,17 @@ func (m *BlockMeta) Unmarshal(dAtA []byte) error {
 		fieldNum := int32(wire >> 3)
 		wireType := int(wire & 0x7)
 		if wireType == 4 {
-			return fmt.Errorf("proto: BlockMeta: wiretype end group for non-group")
+			return fmt.Errorf("proto: AllocExtentRequest: wiretype end group for non-group")
 		}
 		if fieldNum <= 0 {
-			return fmt.Errorf("proto: BlockMeta: illegal tag %d (wire type %d)", fieldNum, wire)
+			return fmt.Errorf("proto: AllocExtentRequest: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
 		case 1:
 			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field BlockLength", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field ExtentID", wireType)
 			}
-			m.BlockLength = 0
+			m.ExtentID = 0
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowPb
@@ -2780,16 +3095,70 @@ func (m *BlockMeta) Unmarshal(dAtA []byte) error {
 				}
 				b := dAtA[iNdEx]
 				iNdEx++
-				m.BlockLength |= uint32(b&0x7F) << shift
+				m.ExtentID |= uint64(b&0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
-		case 2:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field BlockOffset", wireType)
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPb(dAtA[iNdEx:])
+			if err != nil {
+				return err
 			}
-			m.BlockOffset = 0
+			if skippy < 0 {
+				return ErrInvalidLengthPb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *AllocExtentResponse) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: AllocExtentResponse: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: AllocExtentResponse: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Code", wireType)
+			}
+			m.Code = 0
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowPb
@@ -2799,26 +3168,7 @@ func (m *BlockMeta) Unmarshal(dAtA []byte) error {
 				}
 				b := dAtA[iNdEx]
 				iNdEx++
-				m.BlockOffset |= uint32(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		case 3:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Offset", wireType)
-			}
-			m.Offset = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowPb
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				m.Offset |= uint32(b&0x7F) << shift
+				m.Code |= Code(b&0x7F) << shift
 				if b < 0x80 {
 					break
 				}

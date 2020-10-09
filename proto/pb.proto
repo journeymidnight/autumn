@@ -38,7 +38,7 @@ message AppendRequest {
 
 message AppendResponse {
 	Code code = 1;
-	uint64 offset = 2;
+	repeated uint32 offsets = 2;
 }
 
 message CreateExtentRequest {
@@ -51,8 +51,8 @@ message CreateExtentResponse{
 }
 
 message ReadBlocksRequest {
-	uint64 offset = 1;
-	uint32 numOfBlock = 2;
+	uint64 extentID = 1;
+	repeated uint32 offsets = 2;
 }
 
 message ReadBlocksResponse {
@@ -79,25 +79,26 @@ message ReplicateBlocksRequest {
 
 message ReplicateBlocksResponse {
 	Code code = 1;
+	repeated uint32 offsets = 2;
+}
+
+message AllocExtentRequest {
+	uint64 extentID = 1;	
+}
+
+message AllocExtentResponse {
+	Code code = 1;
 }
 
 service InternalExtentService {
 	rpc Heartbeat (Payload)        returns (stream Payload) {}
 	rpc ReplicateBlocks(ReplicateBlocksRequest) returns (ReplicateBlocksResponse) {}
+	rpc AllocExtent(AllocExtentRequest) returns (AllocExtentResponse){}
 }
 
 
 service StreamManagerService {
-	rpc CreateExtent(CreateExtentRequest) returns (CreateExtentResponse) {}
 	//rpc ListStreams()
 	//rpc GetStreamInfo()
 }
-
-
-//used in extent index internally, maybe remove in the futhure
-message BlockMeta {
-	uint32 blockOffset = 1;
-	uint32 offset = 2;
-}
-
 

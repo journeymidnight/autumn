@@ -1,0 +1,3 @@
+node1: ./extent-node --ID 1 --dir store1 --listen :3001
+node2: ./extent-node --ID 2 --dir store2 --listen :3002
+node3: ./extent-node --ID 3 --dir store3 --listen :3003
