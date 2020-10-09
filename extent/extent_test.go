@@ -69,7 +69,7 @@ func TestReadWriteBlock(t *testing.T) {
 	}
 
 	f := newMemory(3000)
-	err := writeBlock(f, block)
+	err := writeBlock(f, &block)
 	assert.Nil(t, err)
 
 	f.resetPos()
@@ -85,10 +85,10 @@ func setRandStringBytes(data []byte) {
 	}
 }
 
-func generateBlock(name string, size uint32) pb.Block {
+func generateBlock(name string, size uint32) *pb.Block {
 	data := make([]byte, size)
 	setRandStringBytes(data)
-	return pb.Block{
+	return &pb.Block{
 		CheckSum:    AdlerCheckSum(data),
 		BlockLength: size,
 		Name:        name,
@@ -97,7 +97,7 @@ func generateBlock(name string, size uint32) pb.Block {
 }
 
 func TestAppendReadFile(t *testing.T) {
-	cases := []pb.Block{
+	cases := []*pb.Block{
 		generateBlock("object1", 4096),
 		generateBlock("object2", 4096),
 		generateBlock("object3", 8192),
@@ -152,7 +152,7 @@ func TestAppendReadFile(t *testing.T) {
 func TestReplayExtent(t *testing.T) {
 
 	extentName := "localtest.ext"
-	cases := []pb.Block{
+	cases := []*pb.Block{
 		generateBlock("object1", 4096),
 		generateBlock("object2", 4096),
 		generateBlock("object3", 8192),
@@ -170,7 +170,7 @@ func TestReplayExtent(t *testing.T) {
 	extent.Close()
 
 	//open append extent, replay all the data
-	ex, err := OpenExtent(extentName, "")
+	ex, err := OpenExtent(extentName)
 	assert.Nil(t, err)
 	assert.False(t, ex.IsSeal())
 	assert.Equal(t, uint32(512*5+4096*3+8192), ex.CommitLength())
@@ -188,7 +188,7 @@ func TestReplayExtent(t *testing.T) {
 	ex.Close()
 
 	//open sealed extent
-	ex, err = OpenExtent(extentName, "localtest.idx")
+	ex, err = OpenExtent(extentName)
 	assert.Nil(t, err)
 	assert.True(t, ex.IsSeal())
 	assert.Equal(t, commit, ex.CommitLength())
@@ -197,5 +197,22 @@ func TestReplayExtent(t *testing.T) {
 	blocks, err := ex.ReadBlocks([]uint32{512}) //read object1
 	assert.Nil(t, err)
 	assert.Equal(t, cases[0], blocks[0])
+
+}
+
+func TestExtentHeader(t *testing.T) {
+	header := newExtentHeader(3)
+	assert.Equal(t, extentMagicNumber, string(header.magicNumber))
+
+	f := newMemory(512)
+	err := header.Marshal(f)
+	assert.Nil(t, err)
+
+	f.resetPos()
+
+	newHeader := newExtentHeader(0)
+	newHeader.Unmarshal(f)
+
+	assert.Equal(t, header, newHeader)
 
 }

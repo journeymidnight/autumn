@@ -169,7 +169,7 @@ func (p *Pool) SetUnhealthy() {
 
 func (p *Pool) listenToHeartbeat() error {
 	conn := p.Get()
-	c := pb.NewExtentServiceClient(conn)
+	c := pb.NewInternalExtentServiceClient(conn)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

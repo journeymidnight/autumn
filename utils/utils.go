@@ -25,3 +25,15 @@ func AssertTrue(b bool) {
 		panic(fmt.Sprintf("%+v", errors.Errorf("Assert failed")))
 	}
 }
+
+func EqualUint32(a, b []uint32) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

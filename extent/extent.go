@@ -15,6 +15,7 @@
 package extent
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"hash"
@@ -27,12 +28,11 @@ import (
 	"io"
 
 	"github.com/pkg/errors"
+	"github.com/pkg/xattr"
 
 	"github.com/journeymidnight/streamlayer/proto/pb"
 	"github.com/journeymidnight/streamlayer/utils"
 )
-
-//TODO: block的元数据, 和持久化的index都需要做checksum
 
 //FIXME: put all errors into errors directory
 func align(n uint64) bool {
@@ -44,21 +44,15 @@ func formatExtentName(id uint64) string {
 	return fmt.Sprintf("store/extents/%d.ext", id)
 }
 
-func formatExtentIndexName(id uint64) string {
-	return fmt.Sprintf("store/index/%d.index", id)
-}
-
 type Extent struct {
 	//sync.Mutex //only one AppendBlocks could be called at a time
 	utils.SafeMutex
 	isSeal        int32  //atomic
 	commitLength  uint32 //atomic
-	fileName      string
 	indexFileName string
 	ID            uint64
-
-	file  *os.File
-	index Index
+	fileName      string
+	file          *os.File
 	//FIXME: add SSD Chanel
 
 }
@@ -68,7 +62,7 @@ const (
 )
 
 type extentHeader struct {
-	magicNumber [8]byte
+	magicNumber []byte
 	ID          uint64
 }
 
@@ -76,7 +70,7 @@ func newExtentHeader(ID uint64) *extentHeader {
 	eh := extentHeader{
 		ID: ID,
 	}
-	copy(eh.magicNumber[:], extentMagicNumber)
+	eh.magicNumber = []byte(extentMagicNumber)
 	return &eh
 }
 
@@ -84,10 +78,10 @@ func (eh *extentHeader) Size() uint32 {
 	return 16
 }
 
-func (eh extentHeader) Marshal(w io.Writer) error {
+func (eh *extentHeader) Marshal(w io.Writer) error {
 	var buf [512]byte
 	copy(buf[:], eh.magicNumber[:])
-	binary.BigEndian.PutUint64(buf[:8], eh.ID)
+	binary.BigEndian.PutUint64(buf[8:], eh.ID)
 
 	n, err := w.Write(buf[:])
 	if n != 512 || err != nil {
@@ -96,19 +90,18 @@ func (eh extentHeader) Marshal(w io.Writer) error {
 	return nil
 }
 
-func (eh extentHeader) Unmarshal(r io.Reader) error {
+func (eh *extentHeader) Unmarshal(r io.Reader) error {
 	var buf [512]byte
 	_, err := io.ReadFull(r, buf[:])
 	if err != nil {
 		return err
 	}
-
-	copy(eh.magicNumber[:], buf[:8])
-	eh.ID = binary.BigEndian.Uint64(buf[8:16])
-
-	if string(eh.magicNumber[:]) != extentMagicNumber {
-		errors.Errorf("extent magic number failed")
+	if bytes.Compare(buf[:8], []byte(extentMagicNumber)) != 0 {
+		return errors.Errorf("magic number fail")
 	}
+	eh.magicNumber = []byte(extentMagicNumber)
+	copy(eh.magicNumber, buf[:8])
+	eh.ID = binary.BigEndian.Uint64(buf[8:16])
 	return nil
 }
 
@@ -127,23 +120,16 @@ func CreateExtent(fileName string, ID uint64) (*Extent, error) {
 		commitLength: 512,
 		fileName:     fileName,
 		file:         f,
-		index:        NewDynamicIndex(),
 	}, nil
 
 }
 
-func OpenExtent(fileName string, indexFileName string) (*Extent, error) {
-	//if extent is a sealed extent
-	if indexFileName != "" {
-		indexFile, err := os.Open(indexFileName)
-		if err != nil {
-			return nil, err
-		}
-		index := NewStaticIndex()
-		if err = index.Unmarshal(indexFile); err != nil {
-			return nil, err
-		}
+func OpenExtent(fileName string) (*Extent, error) {
 
+	d, err := xattr.LGet(fileName, "seal")
+
+	//if extent is a sealed extent
+	if err == nil && bytes.Compare(d, []byte("true")) == 0 {
 		file, err := os.Open(fileName)
 		if err != nil {
 			return nil, err
@@ -160,13 +146,11 @@ func OpenExtent(fileName string, indexFileName string) (*Extent, error) {
 		}
 
 		return &Extent{
-			isSeal:        1,
-			commitLength:  uint32(info.Size()),
-			fileName:      fileName,
-			indexFileName: indexFileName,
-			file:          file,
-			index:         index,
-			ID:            eh.ID,
+			isSeal:       1,
+			commitLength: uint32(info.Size()),
+			fileName:     fileName,
+			file:         file,
+			ID:           eh.ID,
 		}, nil
 	}
 
@@ -188,7 +172,6 @@ func OpenExtent(fileName string, indexFileName string) (*Extent, error) {
 	}
 	info, _ := f.Stat()
 	currentSize := uint32(info.Size())
-	index := NewDynamicIndex()
 
 	eh := newExtentHeader(0)
 	err = eh.Unmarshal(f)
@@ -196,6 +179,7 @@ func OpenExtent(fileName string, indexFileName string) (*Extent, error) {
 		return nil, err
 	}
 	offset := uint32(512)
+
 	for offset < currentSize {
 		b, err := readBlock(f)
 		if err != nil {
@@ -208,23 +192,15 @@ func OpenExtent(fileName string, indexFileName string) (*Extent, error) {
 			}
 			break
 		}
-		//BlockOffset and Offset should be the same
-		index.Put(offset, &pb.BlockMeta{
-			BlockLength: b.BlockLength,
-			BlockOffset: offset,
-			Offset:      offset,
-		})
 		offset += b.BlockLength + 512
 	}
 
 	return &Extent{
-		isSeal:        0,
-		commitLength:  offset,
-		fileName:      fileName,
-		indexFileName: indexFileName,
-		file:          f,
-		index:         index,
-		ID:            eh.ID,
+		isSeal:       0,
+		commitLength: offset,
+		fileName:     fileName,
+		file:         f,
+		ID:           eh.ID,
 	}, nil
 }
 
@@ -233,24 +209,14 @@ func OpenExtent(fileName string, indexFileName string) (*Extent, error) {
 type extentBlockReader struct {
 	extent   *Extent
 	position uint32
-	n        uint32 // max bytes remaining
 }
 
 func (r *extentBlockReader) Read(p []byte) (n int, err error) {
-	if r.n <= 0 {
-		return 0, io.EOF
-	}
-	if uint32(len(p)) > r.n {
-		p = p[0:r.n]
-
-	}
 	n, err = r.extent.file.ReadAt(p, int64(r.position))
 	if err != nil {
 		return n, err
 	}
 	r.position += uint32(n)
-	r.n -= uint32(n)
-
 	return n, nil
 }
 
@@ -268,36 +234,22 @@ func (ex *Extent) Seal(commit uint32, indexFileName string) error {
 	} else if currentLength > commit {
 		ex.file.Truncate(int64(commit))
 	}
-	//write index file
-	//TODO: cleanup index:如果有任何大于commit的entry, 也要删除, 保证数据完整
-	ex.indexFileName = indexFileName
-	f, err := os.OpenFile(ex.indexFileName, os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
+
+	if err := xattr.FSet(ex.file, "seal", []byte("true")); err != nil {
 		return err
 	}
-	if err = ex.index.Marshal(f); err != nil {
-		return err
-	}
-	if err = f.Sync(); err != nil {
-		return err
-	}
-	//TODO : convert dynamic index into static index to save memory when sealing,
-	//request a atomic swap to implement this operation
+
 	return nil
+
 }
 
 func (ex *Extent) IsSeal() bool {
 	return atomic.LoadInt32(&ex.isSeal) == 1
 }
 func (ex *Extent) GetReader(offset uint32) (io.Reader, error) {
-	meta, ok := ex.index.Get(offset)
-	if !ok {
-		return nil, errors.Errorf("can not find offset %d", offset)
-	}
 	return &extentBlockReader{
 		extent:   ex,
-		position: meta.BlockOffset,
-		n:        meta.BlockLength + 512,
+		position: offset,
 	}, nil
 
 }
@@ -307,12 +259,11 @@ func (ex *Extent) Close() {
 	ex.Lock()
 	defer ex.Unlock()
 	ex.file.Close()
-	ex.index = nil
 }
 
-func (ex *Extent) ReadBlocks(offsets []uint32) ([]pb.Block, error) {
+func (ex *Extent) ReadBlocks(offsets []uint32) ([]*pb.Block, error) {
 
-	var ret []pb.Block
+	var ret []*pb.Block
 	//TODO: fix block number
 	for _, offset := range offsets {
 		current := atomic.LoadUint32(&ex.commitLength)
@@ -327,7 +278,7 @@ func (ex *Extent) ReadBlocks(offsets []uint32) ([]pb.Block, error) {
 		if err != nil {
 			return nil, err
 		}
-		ret = append(ret, block)
+		ret = append(ret, &block)
 	}
 	return ret, nil
 }
@@ -336,7 +287,7 @@ func (ex *Extent) CommitLength() uint32 {
 	return atomic.LoadUint32(&ex.commitLength)
 }
 
-func (ex *Extent) AppendBlocks(blocks []pb.Block, lastCommit uint32) (ret []uint32, err error) {
+func (ex *Extent) AppendBlocks(blocks []*pb.Block, lastCommit uint32) (ret []uint32, err error) {
 	ex.AssertLock()
 
 	if atomic.LoadInt32(&ex.isSeal) == 1 {
@@ -351,6 +302,7 @@ func (ex *Extent) AppendBlocks(blocks []pb.Block, lastCommit uint32) (ret []uint
 		wrap <offset + blocks>
 		offset := ex.commitLength
 	*/
+	currentLength := atomic.LoadUint32(&ex.commitLength)
 	for _, block := range blocks {
 		if err = writeBlock(ex.file, block); err != nil {
 			return nil, err
@@ -358,21 +310,15 @@ func (ex *Extent) AppendBlocks(blocks []pb.Block, lastCommit uint32) (ret []uint
 		//if we have ssd journal, do not have to sync every time.
 		//TODO: wait ssd channel,  这里分情况, 如果有SSD journal, 就不需要调用sync
 		//如果没有SSD journal,就需要调用sync
-		ex.file.Sync()
-
-		currentLength := atomic.LoadUint32(&ex.commitLength)
 		ret = append(ret, currentLength)
-		ex.index.Put(currentLength, &pb.BlockMeta{
-			BlockLength: block.BlockLength,
-			BlockOffset: ex.commitLength,
-			Offset:      ex.commitLength,
-		})
-		atomic.AddUint32(&ex.commitLength, block.BlockLength+512)
+		currentLength += block.BlockLength + 512
 	}
+	ex.file.Sync()
+	atomic.StoreUint32(&ex.commitLength, currentLength)
 	return
 }
 
-func writeBlock(w io.Writer, block pb.Block) (err error) {
+func writeBlock(w io.Writer, block *pb.Block) (err error) {
 	if len(block.Name) > 256 {
 		return errors.Errorf("block name is too long :%d", len(block.Name))
 	}
