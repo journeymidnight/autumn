@@ -3,13 +3,12 @@ package extent
 import (
 	"fmt"
 	"io"
-	"math/rand"
 	"os"
 	"sync/atomic"
 	"testing"
 
-	"github.com/journeymidnight/streamlayer/proto/pb"
-	"github.com/journeymidnight/streamlayer/utils"
+	"github.com/journeymidnight/autumn/proto/pb"
+	"github.com/journeymidnight/autumn/utils"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -62,9 +61,8 @@ func (f *memory) Write(p []byte) (n int, err error) {
 func TestReadWriteBlock(t *testing.T) {
 	data := make([]byte, 1024)
 	block := pb.Block{
-		CheckSum:    AdlerCheckSum(data),
+		CheckSum:    utils.AdlerCheckSum(data),
 		BlockLength: 1024,
-		Name:        "test",
 		Data:        data,
 	}
 
@@ -78,20 +76,12 @@ func TestReadWriteBlock(t *testing.T) {
 	assert.Equal(t, block, block1)
 }
 
-func setRandStringBytes(data []byte) {
-	letterBytes := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-	for i := range data {
-		data[i] = letterBytes[rand.Intn(len(letterBytes))]
-	}
-}
-
 func generateBlock(name string, size uint32) *pb.Block {
 	data := make([]byte, size)
-	setRandStringBytes(data)
+	utils.SetRandStringBytes(data)
 	return &pb.Block{
-		CheckSum:    AdlerCheckSum(data),
+		CheckSum:    utils.AdlerCheckSum(data),
 		BlockLength: size,
-		Name:        name,
 		Data:        data,
 	}
 }

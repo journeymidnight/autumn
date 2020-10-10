@@ -2,8 +2,20 @@ package utils
 
 import (
 	"fmt"
+	"hash"
+	"hash/adler32"
+	"math/rand"
+	"sync"
 
 	"github.com/pkg/errors"
+)
+
+var (
+	hashPool = sync.Pool{
+		New: func() interface{} {
+			return adler32.New()
+		},
+	}
 )
 
 func Max(a, b int) int {
@@ -36,4 +48,18 @@ func EqualUint32(a, b []uint32) bool {
 		}
 	}
 	return true
+}
+func SetRandStringBytes(data []byte) {
+	letterBytes := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	for i := range data {
+		data[i] = letterBytes[rand.Intn(len(letterBytes))]
+	}
+}
+
+func AdlerCheckSum(data []byte) uint32 {
+	hash := hashPool.Get().(hash.Hash32)
+	defer hashPool.Put(hash)
+	hash.Reset()
+	hash.Write(data)
+	return hash.Sum32()
 }

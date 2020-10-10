@@ -18,11 +18,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"hash"
-	"hash/adler32"
 	"math"
 	"os"
-	"sync"
 	"sync/atomic"
 
 	"io"
@@ -30,8 +27,8 @@ import (
 	"github.com/pkg/errors"
 	"github.com/pkg/xattr"
 
-	"github.com/journeymidnight/streamlayer/proto/pb"
-	"github.com/journeymidnight/streamlayer/utils"
+	"github.com/journeymidnight/autumn/proto/pb"
+	"github.com/journeymidnight/autumn/utils"
 )
 
 //FIXME: put all errors into errors directory
@@ -47,12 +44,11 @@ func formatExtentName(id uint64) string {
 type Extent struct {
 	//sync.Mutex //only one AppendBlocks could be called at a time
 	utils.SafeMutex
-	isSeal        int32  //atomic
-	commitLength  uint32 //atomic
-	indexFileName string
-	ID            uint64
-	fileName      string
-	file          *os.File
+	isSeal       int32  //atomic
+	commitLength uint32 //atomic
+	ID           uint64
+	fileName     string
+	file         *os.File
 	//FIXME: add SSD Chanel
 
 }
@@ -114,8 +110,10 @@ func CreateExtent(fileName string, ID uint64) (*Extent, error) {
 	if err = extentHeader.Marshal(f); err != nil {
 		return nil, err
 	}
+	f.Sync()
 	//write header of Extent
 	return &Extent{
+		ID:           ID,
 		isSeal:       0,
 		commitLength: 512,
 		fileName:     fileName,
@@ -268,7 +266,7 @@ func (ex *Extent) ReadBlocks(offsets []uint32) ([]*pb.Block, error) {
 	for _, offset := range offsets {
 		current := atomic.LoadUint32(&ex.commitLength)
 		if current <= offset {
-			return nil, errors.Errorf("offset is too big")
+			return nil, errors.Errorf("read offset is beyond current %d, %d", current, offset)
 		}
 		r, err := ex.GetReader(offset)
 		if err != nil {
@@ -319,28 +317,19 @@ func (ex *Extent) AppendBlocks(blocks []*pb.Block, lastCommit uint32) (ret []uin
 }
 
 func writeBlock(w io.Writer, block *pb.Block) (err error) {
-	if len(block.Name) > 256 {
-		return errors.Errorf("block name is too long :%d", len(block.Name))
-	}
 
 	if !align(uint64(block.BlockLength)) {
 		return errors.Errorf("block is not  aligned %d", block.BlockLength)
 	}
 	//checkSum
-
-	if block.CheckSum != AdlerCheckSum(block.Data) {
+	if block.CheckSum != utils.AdlerCheckSum(block.Data) {
 		return errors.Errorf("alder32 checksum not match")
 	}
-	padding := 512 - (4 + 4 + 4 + len(block.Name))
+	padding := 512 - (4 + 4)
 
 	//write block metadata
 	binary.Write(w, binary.BigEndian, block.CheckSum)
 	binary.Write(w, binary.BigEndian, block.BlockLength)
-	binary.Write(w, binary.BigEndian, uint32(len(block.Name)))
-	_, err = w.Write([]byte(block.Name))
-	if err != nil {
-		return err
-	}
 
 	_, err = w.Write(make([]byte, padding))
 	if err != nil {
@@ -350,22 +339,6 @@ func writeBlock(w io.Writer, block *pb.Block) (err error) {
 	//write block data
 	_, err = w.Write(block.Data)
 	return err
-}
-
-var (
-	hashPool = sync.Pool{
-		New: func() interface{} {
-			return adler32.New()
-		},
-	}
-)
-
-func AdlerCheckSum(data []byte) uint32 {
-	hash := hashPool.Get().(hash.Hash32)
-	defer hashPool.Put(hash)
-	hash.Reset()
-	hash.Write(data)
-	return hash.Sum32()
 }
 
 func readBlock(reader io.Reader) (pb.Block, error) {
@@ -380,14 +353,10 @@ func readBlock(reader io.Reader) (pb.Block, error) {
 
 	checkSum := binary.BigEndian.Uint32(buf[:4])
 	blockLength := binary.BigEndian.Uint32(buf[4:8])
-	nameLength := binary.BigEndian.Uint32(buf[8:12])
-	if nameLength > 256 {
-		return pb.Block{}, errors.Errorf("block name is too long :%d", nameLength)
-	}
+
 	if !align(uint64(blockLength)) {
 		return pb.Block{}, errors.Errorf("block is not aligned %d", blockLength)
 	}
-	name := buf[12 : 12+nameLength]
 
 	data := make([]byte, blockLength, blockLength)
 	_, err = io.ReadFull(reader, data)
@@ -397,14 +366,13 @@ func readBlock(reader io.Reader) (pb.Block, error) {
 	}
 
 	//checkSum
-	if AdlerCheckSum(data) != checkSum {
+	if utils.AdlerCheckSum(data) != checkSum {
 		return pb.Block{}, errors.Errorf("alder32 checksum not match")
 	}
 
 	return pb.Block{
 		CheckSum:    checkSum,
 		BlockLength: blockLength,
-		Name:        string(name),
 		Data:        data,
 	}, nil
 }

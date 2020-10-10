@@ -27,8 +27,7 @@ enum Code {
 message Block {
 	uint32 checkSum = 1;
 	uint32 blockLength = 2;
-	string name  = 3;
-	bytes data = 4;
+	bytes data = 3;
 }
 
 message AppendRequest {
@@ -101,4 +100,15 @@ service StreamManagerService {
 	//rpc ListStreams()
 	//rpc GetStreamInfo()
 }
+
+
+
+message OrderedExtentIDs {
+	repeated uint64 extents = 1;
+}
+
+message OrderedNodesReplicates {
+	repeated uint64 nodeIDs = 1;
+}
+
 

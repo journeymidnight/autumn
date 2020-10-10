@@ -20,11 +20,11 @@ import (
 	"path"
 	"time"
 
-	"github.com/journeymidnight/streamlayer/extent"
-	"github.com/journeymidnight/streamlayer/node/conn"
-	"github.com/journeymidnight/streamlayer/proto/pb"
-	"github.com/journeymidnight/streamlayer/utils"
-	"github.com/journeymidnight/streamlayer/xlog"
+	"github.com/journeymidnight/autumn/extent"
+	"github.com/journeymidnight/autumn/node/conn"
+	"github.com/journeymidnight/autumn/proto/pb"
+	"github.com/journeymidnight/autumn/utils"
+	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
 )
 
@@ -60,12 +60,13 @@ func (en *ExtentNode) ReplicateBlocks(ctx context.Context, req *pb.ReplicateBloc
 	}
 	ex.Lock()
 	defer ex.Unlock()
-	_, err := ex.AppendBlocks(req.Blocks, req.Commit)
+	ret, err := ex.AppendBlocks(req.Blocks, req.Commit)
 	if err != nil {
 		return nil, err
 	}
 	return &pb.ReplicateBlocksResponse{
-		Code: pb.Code_OK,
+		Code:    pb.Code_OK,
+		Offsets: ret,
 	}, nil
 
 }
@@ -74,14 +75,10 @@ func (en *ExtentNode) ReplicateBlocks(ctx context.Context, req *pb.ReplicateBloc
 
 func (en *ExtentNode) connPoolOfReplicates(extentID uint64) ([]*conn.Pool, error) {
 	peers := en.getReplicates(extentID)
-
 	if len(peers) == 0 {
 		//get from SM
 		return nil, errors.Errorf("can not find relicates")
 	}
-
-	peers = []string{"127.0.0.1:3002", "127.0.0.1:3003"}
-
 	var ret []*conn.Pool
 	for _, peer := range peers {
 		pool := conn.GetPools().Connect(peer)
@@ -123,9 +120,15 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 	//primary
 	stopper.RunWorker(func() {
 		ret, err := ex.AppendBlocks(req.Blocks, offset)
-		retChan <- Result{Error: err, Offsets: ret}
+		if ret != nil {
+			retChan <- Result{Error: err, Offsets: ret}
+		} else {
+			retChan <- Result{Error: err}
+		}
+		fmt.Printf("err :%v,  offset %v", err, ret)
 	})
 	//secondary
+
 	for i := 0; i < 2; i++ {
 		j := i
 		stopper.RunWorker(func() {
@@ -136,7 +139,11 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 				Commit:   offset,
 				Blocks:   req.Blocks,
 			})
-			retChan <- Result{Error: err, Offsets: res.Offsets}
+			if res != nil {
+				retChan <- Result{Error: err, Offsets: res.Offsets}
+			} else {
+				retChan <- Result{Error: err}
+			}
 		})
 	}
 
