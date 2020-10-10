@@ -21,9 +21,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/journeymidnight/streamlayer/proto/pb"
-	"github.com/journeymidnight/streamlayer/utils"
-	"github.com/journeymidnight/streamlayer/xlog"
+	"github.com/journeymidnight/autumn/proto/pb"
+	"github.com/journeymidnight/autumn/utils"
+	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 )

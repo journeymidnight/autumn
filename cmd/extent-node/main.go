@@ -6,48 +6,26 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/journeymidnight/streamlayer/node"
-	"github.com/journeymidnight/streamlayer/xlog"
-	"github.com/urfave/cli"
+	"github.com/journeymidnight/autumn/manager"
+	"github.com/journeymidnight/autumn/manager/sm"
+	"github.com/journeymidnight/autumn/xlog"
 	"go.uber.org/zap"
 )
 
 func main() {
+	config := manager.NewConfig()
 
-	var listen string
-	var dir string
-	var ID uint64
-	app := &cli.App{
-		HelpName: "",
-		Flags: []cli.Flag{
-			&cli.StringFlag{
-				Name:        "listen",
-				Usage:       "grpc listen url",
-				Destination: &listen,
-				Required:    true,
-			},
-			&cli.StringFlag{
-				Name:        "dir",
-				Usage:       "dir",
-				Destination: &dir,
-				Required:    true,
-			},
-			&cli.Uint64Flag{
-				Name:        "ID",
-				Destination: &ID,
-				Required:    true,
-			},
-		},
+	xlog.InitLog([]string{fmt.Sprintf("sm_%s.log", config.Name)}, zap.DebugLevel)
+
+	etcd, client, err := manager.ServeETCD(config)
+	if err != nil {
+		xlog.Logger.Fatal(err.Error())
+
 	}
 
-	if err := app.Run(os.Args); err != nil {
-		panic(err.Error())
-	}
-	xlog.InitLog([]string{fmt.Sprintf("node_%d.log", ID)}, zap.DebugLevel)
+	sm := sm.NewStreamManager(etcd, client, config)
 
-	node := node.NewExtentNode(dir, listen)
-	node.LoadExtents()
-	node.ServeGRPC()
+	sm.ServeGRPC()
 
 	xlog.Logger.Infof("node is ready!")
 	sc := make(chan os.Signal, 1)
@@ -58,7 +36,8 @@ func main() {
 	for {
 		select {
 		case <-sc:
-			node.Shutdown()
+			sm.Close()
+			etcd.Close()
 			return
 		}
 	}
