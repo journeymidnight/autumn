@@ -7,7 +7,7 @@ import (
 	"syscall"
 
 	"github.com/journeymidnight/autumn/manager"
-	"github.com/journeymidnight/autumn/manager/sm"
+	"github.com/journeymidnight/autumn/manager/streammanager"
 	"github.com/journeymidnight/autumn/xlog"
 	"go.uber.org/zap"
 )

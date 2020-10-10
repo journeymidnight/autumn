@@ -90,7 +90,7 @@ message AllocExtentResponse {
 }
 
 service InternalExtentService {
-	rpc Heartbeat (Payload)        returns (stream Payload) {}
+	rpc Heartbeat (Payload)  returns (stream Payload) {}
 	rpc ReplicateBlocks(ReplicateBlocksRequest) returns (ReplicateBlocksResponse) {}
 	rpc AllocExtent(AllocExtentRequest) returns (AllocExtentResponse){}
 }
