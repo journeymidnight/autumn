@@ -96,19 +96,90 @@ service InternalExtentService {
 }
 
 
-service StreamManagerService {
-	//rpc ListStreams()
-	//rpc GetStreamInfo()
+message StreamAllocExtentRequest{
+	uint64 streamID = 1;
 }
 
 
+message StreamAllocExtentResponse{
+	uint64 streamID = 1;
+	uint64 extentID = 2;
+	OrderedNodesReplicates extentIDreplicates = 4;
+}
+
+
+message StreamInfoRequest {
+	repeated uint64 streamIDs = 1;
+}
+
+message StreamInfoResponse {
+	Code code = 1;
+	map<uint64, OrderedExtentIDs> streams = 2;
+	map<uint64, OrderedNodesReplicates> extents = 3;
+}
+
+message ExtentInfoRequest {
+	repeated uint64 extents = 1;
+}
+
+message ExtentInfoResponse {
+	Code code = 1;
+	map<uint64, OrderedNodesReplicates> nodes = 2;
+}
+
+message NodesInfoRequest{}
+message NodesInfoResponse{
+	Code code = 1;
+	map<uint64, string> nodesAddress = 2;
+}
+
+message RegisterNodeRequest{
+	string addr = 1;
+}
+
+message RegisterNodeResponse {
+	Code code = 1;
+	uint64 nodeId = 2;
+	map<uint64, string> nodesAddress = 3;
+}
+
+
+message CreateStreamRequest {
+}
+
+message CreateStreamResponse {
+	Code code = 1;
+	uint64 streamID = 2;
+	uint64 extentID = 3;
+	OrderedNodesReplicates extentIDreplicates = 4;
+}
+
+service StreamManagerService {
+	rpc StreamInfo(StreamInfoRequest) returns (StreamInfoResponse) {}
+	rpc ExtentInfo(ExtentInfoRequest) returns (ExtentInfoResponse) {}
+	rpc NodesInfo(NodesInfoRequest) returns(NodesInfoResponse) {}
+	rpc StreamAllocExtent(StreamAllocExtentRequest) returns  (StreamAllocExtentResponse) {}
+	rpc CreateStream(CreateStreamRequest) returns  (CreateStreamResponse) {}
+	rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse) {}
+	//gabage colleciton
+	//1. 找到所有在stream里面不再引用的extent, rm//easy
+	//2. extent的三副本中, 如果任何一个不存在, 发relicate exent的操作
+	//2.a 在sm里面循环每一个extent,发req到en, 检查状态,(这个类似于论文中的poll)
+	//2.b EN通过heartstream上报
+}
 
 message OrderedExtentIDs {
 	repeated uint64 extents = 1;
 }
 
 message OrderedNodesReplicates {
-	repeated uint64 nodeIDs = 1;
+	repeated uint64 nodes = 1;
 }
 
 
+//used in Etcd Campaign
+message SMMemberValue {
+        uint64 ID = 1;
+        string Name = 2;
+        string GrpcURL =3;
+}

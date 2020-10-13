@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"sync"
 
+	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
 )
 
@@ -62,4 +63,10 @@ func AdlerCheckSum(data []byte) uint32 {
 	hash.Reset()
 	hash.Write(data)
 	return hash.Sum32()
+}
+
+func Check(err error) {
+	if err != nil {
+		xlog.Logger.Fatalf("%+v", errors.Wrap(err, ""))
+	}
 }

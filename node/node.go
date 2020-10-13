@@ -19,11 +19,12 @@ import (
 	"io/ioutil"
 	"net"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 
+	"github.com/journeymidnight/autumn/conn"
 	"github.com/journeymidnight/autumn/extent"
-	"github.com/journeymidnight/autumn/node/conn"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
@@ -89,7 +90,32 @@ func (en *ExtentNode) setReplicates(extentID uint64, addrs []string) {
 }
 
 func (en *ExtentNode) RegisterNode() error {
-	return nil
+	xlog.Logger.Infof("RegisterNode")
+	storeIDPath := path.Join(en.baseFileDir, "node_id")
+	idString, err := ioutil.ReadFile(storeIDPath)
+	if err == nil {
+		id, err := strconv.ParseUint(string(idString), 10, 64)
+		if err != nil {
+			xlog.Logger.Fatalf("can not read ioString")
+		}
+		en.nodeID = id
+		return nil
+	}
+
+	/*
+		//TODO loop for a while?
+		var ids []uint64
+		for loop := 0; loop < 3; loop++ {
+			ids, err = as.zClient.AllocID(1)
+			if err == nil {
+				break
+			}
+			time.Sleep(time.Second)
+		}
+		if err != nil {
+			return err
+		}
+	*/
 }
 
 func (en *ExtentNode) LoadExtents() error {

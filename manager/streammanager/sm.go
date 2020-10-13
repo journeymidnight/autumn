@@ -1,25 +1,198 @@
-package sm
+package streammanager
 
 import (
+	"context"
+	"encoding/binary"
+	"net"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/embed"
 	"github.com/journeymidnight/autumn/manager"
+	"github.com/journeymidnight/autumn/proto/pb"
+	"github.com/journeymidnight/autumn/utils"
+	"github.com/journeymidnight/autumn/xlog"
+	"go.etcd.io/etcd/clientv3/concurrency"
+	"google.golang.org/grpc"
 )
 
-type StreamManager struct {
-	streams    *sync.Map //streamID=>pb.OrderedExtentIDs
-	replicates *sync.Map //extentID=>pb.OrderedNodesReplicates
-	nodes      *sync.Map //"nodeid" => "addr" //support update IP address
+var (
+	idKey             = "AutumnSmIDKey"
+	electionKeyPrefix = "AutumnSmLeader"
+)
+
+type NodeStatus struct {
+	ID       uint64
+	addr     string
+	usage    float64
+	lastEcho time.Time
 }
 
-func NewStreamManager(etcd *embed.Etcd, client *clientv3.Client, config *manager.Config) {
+type StreamManager struct {
+	streams map[uint64]pb.OrderedExtentIDs
+	//streams    *sync.Map //streamID=>pb.OrderedExtentIDs
+	replicates map[uint64]pb.OrderedNodesReplicates
+	//replicates *sync.Map //extentID=>pb.OrderedNodesReplicates
+
+	nodes map[uint64]*NodeStatus
+	//nodes      *sync.Map //"nodeid" => "addr" //support update IP address
+
+	etcd       *embed.Etcd
+	client     *clientv3.Client
+	config     *manager.Config
+	grcpServer *grpc.Server
+	ID         uint64
+
+	allocIdLock sync.Mutex //used in AllocID
+
+	isLeader    int32
+	memberValue string
+	//leadeKey is to store Election key
+	leaderKey string
+
+	policy AllocExtentPolicy
+}
+
+func NewStreamManager(etcd *embed.Etcd, client *clientv3.Client, config *manager.Config) *StreamManager {
+	sm := &StreamManager{
+		streams:    make(map[uint64]pb.OrderedExtentIDs),
+		replicates: make(map[uint64]pb.OrderedNodesReplicates),
+		nodes:      make(map[uint64]*NodeStatus),
+		etcd:       etcd,
+		client:     client,
+		config:     config,
+		ID:         uint64(etcd.Server.ID()),
+		policy:     new(SimplePolicy),
+	}
+
+	v := pb.SMMemberValue{
+		ID:      sm.ID,
+		Name:    etcd.Config().Name,
+		GrpcURL: config.GrpcUrl,
+	}
+
+	data, err := v.Marshal()
+	utils.Check(err)
+
+	sm.memberValue = string(data)
+
+	return sm
+
+}
+
+func (sm *StreamManager) etcdLeader() uint64 {
+	return uint64(sm.etcd.Server.Leader())
+}
+
+func (sm *StreamManager) AmLeader() bool {
+	return atomic.LoadInt32(&sm.isLeader) == 1
+}
+
+func (sm *StreamManager) runAsLeader() {
+	//load system
+	atomic.StoreInt32(&sm.isLeader, 1)
+}
+
+func (sm *StreamManager) LeaderLoop() {
+	for {
+		if sm.ID != sm.etcdLeader() {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		s, err := concurrency.NewSession(sm.client, concurrency.WithTTL(15))
+		if err != nil {
+			xlog.Logger.Warnf(err.Error())
+			continue
+		}
+		//returns a new election on a given key prefix
+		e := concurrency.NewElection(s, electionKeyPrefix)
+		ctx := context.TODO()
+
+		if err = e.Campaign(ctx, sm.memberValue); err != nil {
+			xlog.Logger.Warnf(err.Error())
+			continue
+		}
+		sm.leaderKey = e.Key()
+		xlog.Logger.Infof("elected %d as leader", sm.ID)
+		sm.runAsLeader()
+
+		select {
+		case <-s.Done():
+			s.Close()
+			atomic.StoreInt32(&sm.isLeader, 0)
+			xlog.Logger.Info("%d's leadershipt expire", sm.ID)
+		}
+	}
+}
+
+func (sm *StreamManager) allocUniqID(count uint64) (uint64, uint64) {
+	n := 10
+	for {
+		start, end, err := sm._allocUniqID(count)
+		if err == nil {
+			return start, end
+		}
+		time.Sleep(time.Duration(n) * time.Millisecond)
+		n *= 2
+	}
+}
+
+func (sm *StreamManager) _allocUniqID(count uint64) (uint64, uint64, error) {
+
+	var err error
+	sm.allocIdLock.Lock()
+	defer sm.allocIdLock.Unlock()
+
+	curValue, err := manager.EtcdGetKV(sm.client, idKey)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	//build txn, compare and set ID
+	var cmp clientv3.Cmp
+	var curr uint64
+
+	if curValue == nil {
+		cmp = clientv3.Compare(clientv3.CreateRevision(idKey), "=", 0)
+	} else {
+		curr = binary.BigEndian.Uint64(curValue)
+		cmp = clientv3.Compare(clientv3.Value(idKey), "=", string(curValue))
+	}
+
+	var newValue [8]byte
+	binary.BigEndian.PutUint64(newValue[:], curr+count)
+
+	txn := clientv3.NewKV(sm.client).Txn(context.Background())
+	t := txn.If(cmp)
+	_, err = t.Then(clientv3.OpPut(idKey, string(newValue[:]))).Commit()
+	if err != nil {
+		return 0, 0, err
+	}
+	return curr, curr + count, nil
 
 }
 
 func (sm *StreamManager) ServeGRPC() error {
+	grpcServer := grpc.NewServer(
+		grpc.MaxRecvMsgSize(8<<20),
+		grpc.MaxSendMsgSize(8<<20),
+		grpc.MaxConcurrentStreams(1000),
+	)
+
+	//pb.Reg
+
+	listener, err := net.Listen("tcp", sm.config.GrpcUrl)
+	if err != nil {
+		return err
+	}
+	go func() {
+		grpcServer.Serve(listener)
+	}()
+	sm.grcpServer = grpcServer
 	return nil
+
 }
 
 func (sm *StreamManager) Close() {

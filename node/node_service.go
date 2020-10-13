@@ -20,8 +20,8 @@ import (
 	"path"
 	"time"
 
+	"github.com/journeymidnight/autumn/conn"
 	"github.com/journeymidnight/autumn/extent"
-	"github.com/journeymidnight/autumn/node/conn"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
