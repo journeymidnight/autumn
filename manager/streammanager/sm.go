@@ -24,19 +24,21 @@ var (
 )
 
 type NodeStatus struct {
-	ID       uint64
-	addr     string
+	pb.NodeInfo
 	usage    float64
 	lastEcho time.Time
 }
 
 type StreamManager struct {
-	streams map[uint64]pb.OrderedExtentIDs
-	//streams    *sync.Map //streamID=>pb.OrderedExtentIDs
-	replicates map[uint64]pb.OrderedNodesReplicates
-	//replicates *sync.Map //extentID=>pb.OrderedNodesReplicates
+	//FIXME: version support
+	streamLock utils.SafeMutex
+	streams    map[uint64]*pb.StreamInfo
 
-	nodes map[uint64]*NodeStatus
+	extentsLock utils.SafeMutex
+	extents     map[uint64]*pb.ExtentInfo
+
+	nodeLock utils.SafeMutex
+	nodes    map[uint64]*NodeStatus
 	//nodes      *sync.Map //"nodeid" => "addr" //support update IP address
 
 	etcd       *embed.Etcd
@@ -57,14 +59,14 @@ type StreamManager struct {
 
 func NewStreamManager(etcd *embed.Etcd, client *clientv3.Client, config *manager.Config) *StreamManager {
 	sm := &StreamManager{
-		streams:    make(map[uint64]pb.OrderedExtentIDs),
-		replicates: make(map[uint64]pb.OrderedNodesReplicates),
-		nodes:      make(map[uint64]*NodeStatus),
-		etcd:       etcd,
-		client:     client,
-		config:     config,
-		ID:         uint64(etcd.Server.ID()),
-		policy:     new(SimplePolicy),
+		streams: make(map[uint64]*pb.StreamInfo),
+		extents: make(map[uint64]*pb.ExtentInfo),
+		nodes:   make(map[uint64]*NodeStatus),
+		etcd:    etcd,
+		client:  client,
+		config:  config,
+		ID:      uint64(etcd.Server.ID()),
+		policy:  new(SimplePolicy),
 	}
 
 	v := pb.SMMemberValue{
@@ -127,6 +129,7 @@ func (sm *StreamManager) LeaderLoop() {
 	}
 }
 
+/*
 func (sm *StreamManager) allocUniqID(count uint64) (uint64, uint64) {
 	n := 10
 	for {
@@ -138,8 +141,9 @@ func (sm *StreamManager) allocUniqID(count uint64) (uint64, uint64) {
 		n *= 2
 	}
 }
+*/
 
-func (sm *StreamManager) _allocUniqID(count uint64) (uint64, uint64, error) {
+func (sm *StreamManager) allocUniqID(count uint64) (uint64, uint64, error) {
 
 	var err error
 	sm.allocIdLock.Lock()

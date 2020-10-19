@@ -90,7 +90,7 @@ func (en *ExtentNode) connPoolOfReplicates(extentID uint64) ([]*conn.Pool, error
 	return ret, nil
 }
 
-//一般来说,需要用slurp的方式合并IO, 但是考虑到stream上层是由一个单线程,似乎不需要用slurp
+//一般来说,需要用slurp的方式合并IO, 但是考虑到stream上层是由一单线程, io queue在partiion layer实现
 func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.AppendResponse, error) {
 	ex := en.getExtent(req.ExtentID)
 	if ex == nil {

@@ -25,9 +25,11 @@ import (
 
 	"github.com/journeymidnight/autumn/conn"
 	"github.com/journeymidnight/autumn/extent"
+	smclient "github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
+	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 )
 
@@ -50,9 +52,11 @@ type ExtentNode struct {
 	//TODO: cached SM date in EN
 	replicates *sync.Map
 	//replicates map[uint64][]string //extentID => [addr1, addr2]
+
+	smClient *smclient.SMClient
 }
 
-func NewExtentNode(baseFileDir string, listenUrl string) *ExtentNode {
+func NewExtentNode(baseFileDir string, listenUrl string, smAddr []string) *ExtentNode {
 	utils.AssertTrue(xlog.Logger != nil)
 
 	return &ExtentNode{
@@ -60,6 +64,7 @@ func NewExtentNode(baseFileDir string, listenUrl string) *ExtentNode {
 		replicates:  new(sync.Map),
 		baseFileDir: baseFileDir,
 		listenUrl:   listenUrl,
+		smClient:    smclient.NewSMClient(smAddr),
 	}
 }
 
@@ -89,7 +94,7 @@ func (en *ExtentNode) setReplicates(extentID uint64, addrs []string) {
 
 }
 
-func (en *ExtentNode) RegisterNode() error {
+func (en *ExtentNode) RegisterNode() {
 	xlog.Logger.Infof("RegisterNode")
 	storeIDPath := path.Join(en.baseFileDir, "node_id")
 	idString, err := ioutil.ReadFile(storeIDPath)
@@ -99,23 +104,13 @@ func (en *ExtentNode) RegisterNode() error {
 			xlog.Logger.Fatalf("can not read ioString")
 		}
 		en.nodeID = id
-		return nil
 	}
 
-	/*
-		//TODO loop for a while?
-		var ids []uint64
-		for loop := 0; loop < 3; loop++ {
-			ids, err = as.zClient.AllocID(1)
-			if err == nil {
-				break
-			}
-			time.Sleep(time.Second)
-		}
-		if err != nil {
-			return err
-		}
-	*/
+	id, err := en.smClient.RegisterNode(context.Background(), en.listenUrl)
+	if err != nil {
+		xlog.Logger.Fatal("can not register myself")
+	}
+	en.nodeID = id
 }
 
 func (en *ExtentNode) LoadExtents() error {
