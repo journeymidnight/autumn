@@ -749,12 +749,11 @@ func (m *StreamAllocExtentRequest) GetStreamID() uint64 {
 }
 
 type StreamAllocExtentResponse struct {
-	StreamID             uint64                  `protobuf:"varint,1,opt,name=streamID,proto3" json:"streamID,omitempty"`
-	ExtentID             uint64                  `protobuf:"varint,2,opt,name=extentID,proto3" json:"extentID,omitempty"`
-	ExtentIDreplicates   *OrderedNodesReplicates `protobuf:"bytes,4,opt,name=extentIDreplicates,proto3" json:"extentIDreplicates,omitempty"`
-	XXX_NoUnkeyedLiteral struct{}                `json:"-"`
-	XXX_unrecognized     []byte                  `json:"-"`
-	XXX_sizecache        int32                   `json:"-"`
+	StreamID             uint64      `protobuf:"varint,1,opt,name=streamID,proto3" json:"streamID,omitempty"`
+	Extent               *ExtentInfo `protobuf:"bytes,2,opt,name=extent,proto3" json:"extent,omitempty"`
+	XXX_NoUnkeyedLiteral struct{}    `json:"-"`
+	XXX_unrecognized     []byte      `json:"-"`
+	XXX_sizecache        int32       `json:"-"`
 }
 
 func (m *StreamAllocExtentResponse) Reset()         { *m = StreamAllocExtentResponse{} }
@@ -797,16 +796,9 @@ func (m *StreamAllocExtentResponse) GetStreamID() uint64 {
 	return 0
 }
 
-func (m *StreamAllocExtentResponse) GetExtentID() uint64 {
+func (m *StreamAllocExtentResponse) GetExtent() *ExtentInfo {
 	if m != nil {
-		return m.ExtentID
-	}
-	return 0
-}
-
-func (m *StreamAllocExtentResponse) GetExtentIDreplicates() *OrderedNodesReplicates {
-	if m != nil {
-		return m.ExtentIDreplicates
+		return m.Extent
 	}
 	return nil
 }
@@ -859,12 +851,12 @@ func (m *StreamInfoRequest) GetStreamIDs() []uint64 {
 }
 
 type StreamInfoResponse struct {
-	Code                 Code                               `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
-	Streams              map[uint64]*OrderedExtentIDs       `protobuf:"bytes,2,rep,name=streams,proto3" json:"streams,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
-	Extents              map[uint64]*OrderedNodesReplicates `protobuf:"bytes,3,rep,name=extents,proto3" json:"extents,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
-	XXX_NoUnkeyedLiteral struct{}                           `json:"-"`
-	XXX_unrecognized     []byte                             `json:"-"`
-	XXX_sizecache        int32                              `json:"-"`
+	Code                 Code                   `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
+	Streams              map[uint64]*StreamInfo `protobuf:"bytes,2,rep,name=streams,proto3" json:"streams,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+	Extents              map[uint64]*ExtentInfo `protobuf:"bytes,3,rep,name=extents,proto3" json:"extents,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+	XXX_NoUnkeyedLiteral struct{}               `json:"-"`
+	XXX_unrecognized     []byte                 `json:"-"`
+	XXX_sizecache        int32                  `json:"-"`
 }
 
 func (m *StreamInfoResponse) Reset()         { *m = StreamInfoResponse{} }
@@ -907,14 +899,14 @@ func (m *StreamInfoResponse) GetCode() Code {
 	return Code_OK
 }
 
-func (m *StreamInfoResponse) GetStreams() map[uint64]*OrderedExtentIDs {
+func (m *StreamInfoResponse) GetStreams() map[uint64]*StreamInfo {
 	if m != nil {
 		return m.Streams
 	}
 	return nil
 }
 
-func (m *StreamInfoResponse) GetExtents() map[uint64]*OrderedNodesReplicates {
+func (m *StreamInfoResponse) GetExtents() map[uint64]*ExtentInfo {
 	if m != nil {
 		return m.Extents
 	}
@@ -969,11 +961,11 @@ func (m *ExtentInfoRequest) GetExtents() []uint64 {
 }
 
 type ExtentInfoResponse struct {
-	Code                 Code                               `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
-	Nodes                map[uint64]*OrderedNodesReplicates `protobuf:"bytes,2,rep,name=nodes,proto3" json:"nodes,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
-	XXX_NoUnkeyedLiteral struct{}                           `json:"-"`
-	XXX_unrecognized     []byte                             `json:"-"`
-	XXX_sizecache        int32                              `json:"-"`
+	Code                 Code                   `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
+	Extents              map[uint64]*ExtentInfo `protobuf:"bytes,2,rep,name=extents,proto3" json:"extents,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+	XXX_NoUnkeyedLiteral struct{}               `json:"-"`
+	XXX_unrecognized     []byte                 `json:"-"`
+	XXX_sizecache        int32                  `json:"-"`
 }
 
 func (m *ExtentInfoResponse) Reset()         { *m = ExtentInfoResponse{} }
@@ -1016,9 +1008,9 @@ func (m *ExtentInfoResponse) GetCode() Code {
 	return Code_OK
 }
 
-func (m *ExtentInfoResponse) GetNodes() map[uint64]*OrderedNodesReplicates {
+func (m *ExtentInfoResponse) GetExtents() map[uint64]*ExtentInfo {
 	if m != nil {
-		return m.Nodes
+		return m.Extents
 	}
 	return nil
 }
@@ -1063,11 +1055,11 @@ func (m *NodesInfoRequest) XXX_DiscardUnknown() {
 var xxx_messageInfo_NodesInfoRequest proto.InternalMessageInfo
 
 type NodesInfoResponse struct {
-	Code                 Code              `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
-	NodesAddress         map[uint64]string `protobuf:"bytes,2,rep,name=nodesAddress,proto3" json:"nodesAddress,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
-	XXX_NoUnkeyedLiteral struct{}          `json:"-"`
-	XXX_unrecognized     []byte            `json:"-"`
-	XXX_sizecache        int32             `json:"-"`
+	Code                 Code                 `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
+	Nodes                map[uint64]*NodeInfo `protobuf:"bytes,2,rep,name=nodes,proto3" json:"nodes,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+	XXX_NoUnkeyedLiteral struct{}             `json:"-"`
+	XXX_unrecognized     []byte               `json:"-"`
+	XXX_sizecache        int32                `json:"-"`
 }
 
 func (m *NodesInfoResponse) Reset()         { *m = NodesInfoResponse{} }
@@ -1110,9 +1102,9 @@ func (m *NodesInfoResponse) GetCode() Code {
 	return Code_OK
 }
 
-func (m *NodesInfoResponse) GetNodesAddress() map[uint64]string {
+func (m *NodesInfoResponse) GetNodes() map[uint64]*NodeInfo {
 	if m != nil {
-		return m.NodesAddress
+		return m.Nodes
 	}
 	return nil
 }
@@ -1165,12 +1157,11 @@ func (m *RegisterNodeRequest) GetAddr() string {
 }
 
 type RegisterNodeResponse struct {
-	Code                 Code              `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
-	NodeId               uint64            `protobuf:"varint,2,opt,name=nodeId,proto3" json:"nodeId,omitempty"`
-	NodesAddress         map[uint64]string `protobuf:"bytes,3,rep,name=nodesAddress,proto3" json:"nodesAddress,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
-	XXX_NoUnkeyedLiteral struct{}          `json:"-"`
-	XXX_unrecognized     []byte            `json:"-"`
-	XXX_sizecache        int32             `json:"-"`
+	Code                 Code     `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
+	NodeId               uint64   `protobuf:"varint,2,opt,name=nodeId,proto3" json:"nodeId,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
 }
 
 func (m *RegisterNodeResponse) Reset()         { *m = RegisterNodeResponse{} }
@@ -1220,13 +1211,6 @@ func (m *RegisterNodeResponse) GetNodeId() uint64 {
 	return 0
 }
 
-func (m *RegisterNodeResponse) GetNodesAddress() map[uint64]string {
-	if m != nil {
-		return m.NodesAddress
-	}
-	return nil
-}
-
 type CreateStreamRequest struct {
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
@@ -1267,13 +1251,12 @@ func (m *CreateStreamRequest) XXX_DiscardUnknown() {
 var xxx_messageInfo_CreateStreamRequest proto.InternalMessageInfo
 
 type CreateStreamResponse struct {
-	Code                 Code                    `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
-	StreamID             uint64                  `protobuf:"varint,2,opt,name=streamID,proto3" json:"streamID,omitempty"`
-	ExtentID             uint64                  `protobuf:"varint,3,opt,name=extentID,proto3" json:"extentID,omitempty"`
-	ExtentIDreplicates   *OrderedNodesReplicates `protobuf:"bytes,4,opt,name=extentIDreplicates,proto3" json:"extentIDreplicates,omitempty"`
-	XXX_NoUnkeyedLiteral struct{}                `json:"-"`
-	XXX_unrecognized     []byte                  `json:"-"`
-	XXX_sizecache        int32                   `json:"-"`
+	Code                 Code        `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
+	Stream               *StreamInfo `protobuf:"bytes,2,opt,name=stream,proto3" json:"stream,omitempty"`
+	Extent               *ExtentInfo `protobuf:"bytes,3,opt,name=extent,proto3" json:"extent,omitempty"`
+	XXX_NoUnkeyedLiteral struct{}    `json:"-"`
+	XXX_unrecognized     []byte      `json:"-"`
+	XXX_sizecache        int32       `json:"-"`
 }
 
 func (m *CreateStreamResponse) Reset()         { *m = CreateStreamResponse{} }
@@ -1316,117 +1299,16 @@ func (m *CreateStreamResponse) GetCode() Code {
 	return Code_OK
 }
 
-func (m *CreateStreamResponse) GetStreamID() uint64 {
+func (m *CreateStreamResponse) GetStream() *StreamInfo {
 	if m != nil {
-		return m.StreamID
-	}
-	return 0
-}
-
-func (m *CreateStreamResponse) GetExtentID() uint64 {
-	if m != nil {
-		return m.ExtentID
-	}
-	return 0
-}
-
-func (m *CreateStreamResponse) GetExtentIDreplicates() *OrderedNodesReplicates {
-	if m != nil {
-		return m.ExtentIDreplicates
+		return m.Stream
 	}
 	return nil
 }
 
-type OrderedExtentIDs struct {
-	Extents              []uint64 `protobuf:"varint,1,rep,packed,name=extents,proto3" json:"extents,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
-}
-
-func (m *OrderedExtentIDs) Reset()         { *m = OrderedExtentIDs{} }
-func (m *OrderedExtentIDs) String() string { return proto.CompactTextString(m) }
-func (*OrderedExtentIDs) ProtoMessage()    {}
-func (*OrderedExtentIDs) Descriptor() ([]byte, []int) {
-	return fileDescriptor_f80abaa17e25ccc8, []int{24}
-}
-func (m *OrderedExtentIDs) XXX_Unmarshal(b []byte) error {
-	return m.Unmarshal(b)
-}
-func (m *OrderedExtentIDs) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
-	if deterministic {
-		return xxx_messageInfo_OrderedExtentIDs.Marshal(b, m, deterministic)
-	} else {
-		b = b[:cap(b)]
-		n, err := m.MarshalToSizedBuffer(b)
-		if err != nil {
-			return nil, err
-		}
-		return b[:n], nil
-	}
-}
-func (m *OrderedExtentIDs) XXX_Merge(src proto.Message) {
-	xxx_messageInfo_OrderedExtentIDs.Merge(m, src)
-}
-func (m *OrderedExtentIDs) XXX_Size() int {
-	return m.Size()
-}
-func (m *OrderedExtentIDs) XXX_DiscardUnknown() {
-	xxx_messageInfo_OrderedExtentIDs.DiscardUnknown(m)
-}
-
-var xxx_messageInfo_OrderedExtentIDs proto.InternalMessageInfo
-
-func (m *OrderedExtentIDs) GetExtents() []uint64 {
+func (m *CreateStreamResponse) GetExtent() *ExtentInfo {
 	if m != nil {
-		return m.Extents
-	}
-	return nil
-}
-
-type OrderedNodesReplicates struct {
-	Nodes                []uint64 `protobuf:"varint,1,rep,packed,name=nodes,proto3" json:"nodes,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
-}
-
-func (m *OrderedNodesReplicates) Reset()         { *m = OrderedNodesReplicates{} }
-func (m *OrderedNodesReplicates) String() string { return proto.CompactTextString(m) }
-func (*OrderedNodesReplicates) ProtoMessage()    {}
-func (*OrderedNodesReplicates) Descriptor() ([]byte, []int) {
-	return fileDescriptor_f80abaa17e25ccc8, []int{25}
-}
-func (m *OrderedNodesReplicates) XXX_Unmarshal(b []byte) error {
-	return m.Unmarshal(b)
-}
-func (m *OrderedNodesReplicates) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
-	if deterministic {
-		return xxx_messageInfo_OrderedNodesReplicates.Marshal(b, m, deterministic)
-	} else {
-		b = b[:cap(b)]
-		n, err := m.MarshalToSizedBuffer(b)
-		if err != nil {
-			return nil, err
-		}
-		return b[:n], nil
-	}
-}
-func (m *OrderedNodesReplicates) XXX_Merge(src proto.Message) {
-	xxx_messageInfo_OrderedNodesReplicates.Merge(m, src)
-}
-func (m *OrderedNodesReplicates) XXX_Size() int {
-	return m.Size()
-}
-func (m *OrderedNodesReplicates) XXX_DiscardUnknown() {
-	xxx_messageInfo_OrderedNodesReplicates.DiscardUnknown(m)
-}
-
-var xxx_messageInfo_OrderedNodesReplicates proto.InternalMessageInfo
-
-func (m *OrderedNodesReplicates) GetNodes() []uint64 {
-	if m != nil {
-		return m.Nodes
+		return m.Extent
 	}
 	return nil
 }
@@ -1445,7 +1327,7 @@ func (m *SMMemberValue) Reset()         { *m = SMMemberValue{} }
 func (m *SMMemberValue) String() string { return proto.CompactTextString(m) }
 func (*SMMemberValue) ProtoMessage()    {}
 func (*SMMemberValue) Descriptor() ([]byte, []int) {
-	return fileDescriptor_f80abaa17e25ccc8, []int{26}
+	return fileDescriptor_f80abaa17e25ccc8, []int{24}
 }
 func (m *SMMemberValue) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -1495,6 +1377,171 @@ func (m *SMMemberValue) GetGrpcURL() string {
 	return ""
 }
 
+type ExtentInfo struct {
+	ExtentID             uint64   `protobuf:"varint,1,opt,name=extentID,proto3" json:"extentID,omitempty"`
+	Replicates           []uint64 `protobuf:"varint,2,rep,packed,name=replicates,proto3" json:"replicates,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
+}
+
+func (m *ExtentInfo) Reset()         { *m = ExtentInfo{} }
+func (m *ExtentInfo) String() string { return proto.CompactTextString(m) }
+func (*ExtentInfo) ProtoMessage()    {}
+func (*ExtentInfo) Descriptor() ([]byte, []int) {
+	return fileDescriptor_f80abaa17e25ccc8, []int{25}
+}
+func (m *ExtentInfo) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *ExtentInfo) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_ExtentInfo.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *ExtentInfo) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_ExtentInfo.Merge(m, src)
+}
+func (m *ExtentInfo) XXX_Size() int {
+	return m.Size()
+}
+func (m *ExtentInfo) XXX_DiscardUnknown() {
+	xxx_messageInfo_ExtentInfo.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_ExtentInfo proto.InternalMessageInfo
+
+func (m *ExtentInfo) GetExtentID() uint64 {
+	if m != nil {
+		return m.ExtentID
+	}
+	return 0
+}
+
+func (m *ExtentInfo) GetReplicates() []uint64 {
+	if m != nil {
+		return m.Replicates
+	}
+	return nil
+}
+
+type StreamInfo struct {
+	StreamID             uint64   `protobuf:"varint,1,opt,name=streamID,proto3" json:"streamID,omitempty"`
+	ExtentIDs            []uint64 `protobuf:"varint,2,rep,packed,name=extentIDs,proto3" json:"extentIDs,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
+}
+
+func (m *StreamInfo) Reset()         { *m = StreamInfo{} }
+func (m *StreamInfo) String() string { return proto.CompactTextString(m) }
+func (*StreamInfo) ProtoMessage()    {}
+func (*StreamInfo) Descriptor() ([]byte, []int) {
+	return fileDescriptor_f80abaa17e25ccc8, []int{26}
+}
+func (m *StreamInfo) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *StreamInfo) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_StreamInfo.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *StreamInfo) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_StreamInfo.Merge(m, src)
+}
+func (m *StreamInfo) XXX_Size() int {
+	return m.Size()
+}
+func (m *StreamInfo) XXX_DiscardUnknown() {
+	xxx_messageInfo_StreamInfo.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_StreamInfo proto.InternalMessageInfo
+
+func (m *StreamInfo) GetStreamID() uint64 {
+	if m != nil {
+		return m.StreamID
+	}
+	return 0
+}
+
+func (m *StreamInfo) GetExtentIDs() []uint64 {
+	if m != nil {
+		return m.ExtentIDs
+	}
+	return nil
+}
+
+type NodeInfo struct {
+	NodeID               uint64   `protobuf:"varint,1,opt,name=nodeID,proto3" json:"nodeID,omitempty"`
+	Address              string   `protobuf:"bytes,2,opt,name=address,proto3" json:"address,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
+}
+
+func (m *NodeInfo) Reset()         { *m = NodeInfo{} }
+func (m *NodeInfo) String() string { return proto.CompactTextString(m) }
+func (*NodeInfo) ProtoMessage()    {}
+func (*NodeInfo) Descriptor() ([]byte, []int) {
+	return fileDescriptor_f80abaa17e25ccc8, []int{27}
+}
+func (m *NodeInfo) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *NodeInfo) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_NodeInfo.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *NodeInfo) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_NodeInfo.Merge(m, src)
+}
+func (m *NodeInfo) XXX_Size() int {
+	return m.Size()
+}
+func (m *NodeInfo) XXX_DiscardUnknown() {
+	xxx_messageInfo_NodeInfo.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_NodeInfo proto.InternalMessageInfo
+
+func (m *NodeInfo) GetNodeID() uint64 {
+	if m != nil {
+		return m.NodeID
+	}
+	return 0
+}
+
+func (m *NodeInfo) GetAddress() string {
+	if m != nil {
+		return m.Address
+	}
+	return ""
+}
+
 func init() {
 	proto.RegisterEnum("pb.Code", Code_name, Code_value)
 	proto.RegisterType((*Block)(nil), "pb.Block")
@@ -1513,96 +1560,94 @@ func init() {
 	proto.RegisterType((*StreamAllocExtentResponse)(nil), "pb.StreamAllocExtentResponse")
 	proto.RegisterType((*StreamInfoRequest)(nil), "pb.StreamInfoRequest")
 	proto.RegisterType((*StreamInfoResponse)(nil), "pb.StreamInfoResponse")
-	proto.RegisterMapType((map[uint64]*OrderedNodesReplicates)(nil), "pb.StreamInfoResponse.ExtentsEntry")
-	proto.RegisterMapType((map[uint64]*OrderedExtentIDs)(nil), "pb.StreamInfoResponse.StreamsEntry")
+	proto.RegisterMapType((map[uint64]*ExtentInfo)(nil), "pb.StreamInfoResponse.ExtentsEntry")
+	proto.RegisterMapType((map[uint64]*StreamInfo)(nil), "pb.StreamInfoResponse.StreamsEntry")
 	proto.RegisterType((*ExtentInfoRequest)(nil), "pb.ExtentInfoRequest")
 	proto.RegisterType((*ExtentInfoResponse)(nil), "pb.ExtentInfoResponse")
-	proto.RegisterMapType((map[uint64]*OrderedNodesReplicates)(nil), "pb.ExtentInfoResponse.NodesEntry")
+	proto.RegisterMapType((map[uint64]*ExtentInfo)(nil), "pb.ExtentInfoResponse.ExtentsEntry")
 	proto.RegisterType((*NodesInfoRequest)(nil), "pb.NodesInfoRequest")
 	proto.RegisterType((*NodesInfoResponse)(nil), "pb.NodesInfoResponse")
-	proto.RegisterMapType((map[uint64]string)(nil), "pb.NodesInfoResponse.NodesAddressEntry")
+	proto.RegisterMapType((map[uint64]*NodeInfo)(nil), "pb.NodesInfoResponse.NodesEntry")
 	proto.RegisterType((*RegisterNodeRequest)(nil), "pb.RegisterNodeRequest")
 	proto.RegisterType((*RegisterNodeResponse)(nil), "pb.RegisterNodeResponse")
-	proto.RegisterMapType((map[uint64]string)(nil), "pb.RegisterNodeResponse.NodesAddressEntry")
 	proto.RegisterType((*CreateStreamRequest)(nil), "pb.CreateStreamRequest")
 	proto.RegisterType((*CreateStreamResponse)(nil), "pb.CreateStreamResponse")
-	proto.RegisterType((*OrderedExtentIDs)(nil), "pb.OrderedExtentIDs")
-	proto.RegisterType((*OrderedNodesReplicates)(nil), "pb.OrderedNodesReplicates")
 	proto.RegisterType((*SMMemberValue)(nil), "pb.SMMemberValue")
+	proto.RegisterType((*ExtentInfo)(nil), "pb.ExtentInfo")
+	proto.RegisterType((*StreamInfo)(nil), "pb.StreamInfo")
+	proto.RegisterType((*NodeInfo)(nil), "pb.NodeInfo")
 }
 
 func init() { proto.RegisterFile("pb.proto", fileDescriptor_f80abaa17e25ccc8) }
 
 var fileDescriptor_f80abaa17e25ccc8 = []byte{
-	// 1086 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xb4, 0x57, 0x4f, 0x6f, 0x1b, 0x45,
-	0x14, 0xf7, 0xac, 0x1d, 0x37, 0x7e, 0x4e, 0x52, 0x7b, 0xe2, 0xb8, 0xcb, 0x92, 0x46, 0xee, 0x70,
-	0xc0, 0x8d, 0xc0, 0x4a, 0x5c, 0x09, 0x50, 0xa4, 0x08, 0xdc, 0xc4, 0xa2, 0xa6, 0xb1, 0x13, 0x26,
-	0x6d, 0xa5, 0x9e, 0xd0, 0xda, 0x3b, 0x49, 0xa3, 0xd8, 0xbb, 0x66, 0x77, 0x53, 0x91, 0x23, 0xdf,
-	0x82, 0x1b, 0xdf, 0x80, 0x33, 0x37, 0xc4, 0x8d, 0x23, 0xe2, 0x88, 0x84, 0x84, 0xc2, 0x17, 0x41,
-	0x33, 0xb3, 0x63, 0x8f, 0xbd, 0x6b, 0x6b, 0x25, 0xe8, 0x6d, 0xde, 0x9b, 0x79, 0x7f, 0x7e, 0xbf,
-	0xf7, 0xf6, 0xcd, 0x2c, 0xac, 0x8e, 0xfb, 0x8d, 0xb1, 0xef, 0x85, 0x1e, 0x36, 0xc6, 0x7d, 0xf2,
-	0x1a, 0x56, 0x9e, 0x0e, 0xbd, 0xc1, 0x35, 0xb6, 0x60, 0x75, 0xf0, 0x86, 0x0d, 0xae, 0xcf, 0x6f,
-	0x46, 0x26, 0xaa, 0xa1, 0xfa, 0x3a, 0x9d, 0xc8, 0xb8, 0x06, 0xc5, 0x3e, 0x3f, 0x74, 0xc2, 0xdc,
-	0xcb, 0xf0, 0x8d, 0x69, 0x88, 0x6d, 0x5d, 0x85, 0x31, 0xe4, 0x1c, 0x3b, 0xb4, 0xcd, 0x6c, 0x0d,
-	0xd5, 0xd7, 0xa8, 0x58, 0x93, 0x1e, 0xac, 0xb7, 0xc6, 0x63, 0xe6, 0x3a, 0x94, 0x7d, 0x7b, 0xc3,
-	0x82, 0x90, 0x87, 0x60, 0xdf, 0x85, 0xcc, 0x0d, 0x3b, 0xc7, 0x22, 0x44, 0x8e, 0x4e, 0x64, 0xfc,
-	0x08, 0xf2, 0xc2, 0x5f, 0x60, 0x1a, 0xb5, 0x6c, 0xbd, 0xd8, 0x2c, 0x34, 0xc6, 0xfd, 0x86, 0xc8,
-	0x8c, 0x46, 0x1b, 0xe4, 0x19, 0x6c, 0x28, 0x7f, 0xc1, 0xd8, 0x73, 0x03, 0x86, 0xb7, 0x21, 0x37,
-	0xf0, 0x1c, 0x26, 0x9c, 0x6d, 0x34, 0x57, 0xb9, 0xc9, 0x91, 0xe7, 0x30, 0x2a, 0xb4, 0xd8, 0x84,
-	0x7b, 0xde, 0xc5, 0x45, 0xc0, 0x42, 0xe9, 0x73, 0x9d, 0x2a, 0x91, 0xec, 0xc3, 0xe6, 0x91, 0xcf,
-	0xec, 0x90, 0xb5, 0x45, 0x78, 0x2d, 0xbf, 0x20, 0xf4, 0x99, 0x3d, 0x9a, 0xe6, 0xa7, 0x64, 0x72,
-	0x06, 0x95, 0x59, 0x93, 0x54, 0x29, 0xe8, 0x88, 0x8d, 0x59, 0xc4, 0xa4, 0x03, 0x65, 0xca, 0x6c,
-	0x47, 0x60, 0x0c, 0xd2, 0x50, 0xb4, 0x18, 0xcf, 0x4b, 0xc0, 0xba, 0xab, 0x54, 0xa9, 0xa5, 0x20,
-	0xfc, 0x21, 0xdc, 0x3b, 0xb3, 0x6f, 0x87, 0x9e, 0xed, 0xf0, 0xfa, 0x1e, 0xf3, 0xfa, 0x22, 0x59,
-	0x5f, 0xbe, 0x26, 0x1e, 0x54, 0x29, 0x1b, 0x0f, 0xaf, 0x06, 0x76, 0xc8, 0xd2, 0xa3, 0xa8, 0x42,
-	0x7e, 0xe0, 0x8d, 0x46, 0x57, 0x61, 0xd4, 0x46, 0x91, 0xa4, 0xe5, 0x93, 0x5d, 0x94, 0xcf, 0xd7,
-	0xf0, 0x20, 0x16, 0xf0, 0x3f, 0x76, 0xc2, 0x1e, 0xe0, 0xd6, 0x70, 0xe8, 0x0d, 0x62, 0x8d, 0xb0,
-	0x28, 0x7f, 0xf2, 0x04, 0x36, 0x67, 0x2c, 0xd2, 0x24, 0x40, 0x3e, 0x01, 0xf3, 0x5c, 0x74, 0x52,
-	0x72, 0xb0, 0x85, 0x5d, 0xf7, 0x23, 0x82, 0xf7, 0x12, 0x0c, 0xa3, 0x98, 0x4b, 0x2c, 0x97, 0x75,
-	0x1e, 0xfe, 0x0a, 0xb0, 0x5a, 0xfb, 0x8a, 0xcf, 0xc0, 0xcc, 0xd5, 0x50, 0xbd, 0xd8, 0xb4, 0x78,
-	0xe6, 0xa7, 0xbe, 0xc3, 0x7c, 0xe6, 0xf4, 0x3c, 0x87, 0x05, 0x13, 0xc6, 0x03, 0x9a, 0x60, 0x45,
-	0xf6, 0xa1, 0x2c, 0x13, 0xec, 0xb8, 0x17, 0x9e, 0x82, 0xb4, 0x0d, 0x05, 0x95, 0x48, 0x60, 0xa2,
-	0x5a, 0xb6, 0x9e, 0xa3, 0x53, 0x05, 0xf9, 0xd3, 0x00, 0xac, 0xdb, 0xa4, 0x2a, 0xe1, 0x21, 0xdc,
-	0x93, 0x1e, 0x54, 0xbf, 0x7e, 0xc0, 0x0f, 0xc4, 0xdd, 0x44, 0xaa, 0xa0, 0xed, 0x86, 0xfe, 0x2d,
-	0x55, 0x36, 0xdc, 0x5c, 0x26, 0xaf, 0xda, 0x6b, 0x91, 0xb9, 0xa4, 0x58, 0x99, 0x47, 0x36, 0xd6,
-	0x19, 0xac, 0xe9, 0x7e, 0x71, 0x09, 0xb2, 0xd7, 0xec, 0x36, 0x22, 0x9d, 0x2f, 0xf1, 0x2e, 0xac,
-	0xbc, 0xb5, 0x87, 0x37, 0x4c, 0x90, 0x5d, 0x6c, 0x56, 0x34, 0x1a, 0xdb, 0x11, 0x6b, 0x01, 0x95,
-	0x47, 0x0e, 0x8c, 0xcf, 0x90, 0xf5, 0x0a, 0xd6, 0xf4, 0x50, 0x09, 0x1e, 0xf7, 0x66, 0x3d, 0x2e,
-	0x2b, 0xcc, 0xd4, 0x2f, 0xf9, 0x18, 0xca, 0x51, 0x3c, 0xad, 0x1e, 0xe6, 0x14, 0xbd, 0xac, 0x86,
-	0x12, 0xc9, 0xaf, 0x08, 0xb0, 0x7e, 0x3e, 0x55, 0x2d, 0x3e, 0x85, 0x15, 0x97, 0x67, 0x10, 0x55,
-	0xe2, 0x11, 0xdf, 0x8e, 0x3b, 0x69, 0x88, 0x2c, 0x25, 0x91, 0xf2, 0xbc, 0xf5, 0x02, 0x60, 0xaa,
-	0xfc, 0xdf, 0x20, 0x63, 0x28, 0x89, 0x5d, 0x0d, 0x31, 0xf9, 0x05, 0x41, 0x59, 0x53, 0xa6, 0x82,
-	0xf5, 0x1c, 0xd6, 0x44, 0x9a, 0x2d, 0xc7, 0xf1, 0x59, 0xa0, 0xd0, 0x7d, 0xc8, 0x4f, 0xc5, 0x5c,
-	0x49, 0x4d, 0x74, 0x52, 0x62, 0x9c, 0x31, 0xb6, 0x3e, 0x8f, 0xe2, 0xeb, 0x47, 0x12, 0x10, 0x57,
-	0x74, 0xc4, 0x05, 0x1d, 0xd5, 0x63, 0xd8, 0xa4, 0xec, 0xf2, 0x2a, 0x08, 0x99, 0xcf, 0x1d, 0xa9,
-	0x52, 0x62, 0xc8, 0xd9, 0x8e, 0xe3, 0x0b, 0x1f, 0x05, 0x2a, 0xd6, 0xe4, 0x2f, 0x04, 0x95, 0xd9,
-	0xb3, 0xa9, 0xf0, 0x56, 0x21, 0xcf, 0x53, 0xee, 0x38, 0xd1, 0x80, 0x88, 0x24, 0xdc, 0x9b, 0xe3,
-	0x41, 0x7e, 0x30, 0xbb, 0xdc, 0x3a, 0x29, 0xca, 0xbb, 0xa7, 0x62, 0x4b, 0x5d, 0xd7, 0xf2, 0x1b,
-	0x54, 0x35, 0xfe, 0x19, 0xa9, 0x3b, 0x59, 0xe9, 0xd3, 0xde, 0xc9, 0x93, 0xa9, 0x69, 0x2c, 0x99,
-	0x9a, 0xd9, 0x77, 0x38, 0x35, 0x3f, 0x82, 0xd2, 0xfc, 0x70, 0x58, 0xf2, 0x91, 0x36, 0xa0, 0x9a,
-	0xec, 0x9b, 0x73, 0x26, 0xbf, 0x44, 0x69, 0x21, 0x05, 0xd2, 0x85, 0xf5, 0xf3, 0x6e, 0x97, 0x8d,
-	0xfa, 0xcc, 0x7f, 0xc5, 0x49, 0xc4, 0x1b, 0x60, 0x4c, 0xae, 0x08, 0xa3, 0x73, 0xcc, 0x9b, 0xa8,
-	0x67, 0x8f, 0x14, 0xd3, 0x62, 0xcd, 0xc3, 0x7f, 0xe9, 0x8f, 0x07, 0x2f, 0xe9, 0x89, 0x40, 0x5e,
-	0xa0, 0x4a, 0xdc, 0x3d, 0x80, 0x1c, 0xa7, 0x0f, 0xe7, 0xc1, 0x38, 0x7d, 0x5e, 0xca, 0xe0, 0x0d,
-	0x80, 0xde, 0xe9, 0x8b, 0x6f, 0x4e, 0xda, 0xad, 0xe3, 0x36, 0x2d, 0x21, 0x7c, 0x1f, 0x8a, 0x5c,
-	0x3e, 0xa3, 0x9d, 0x6e, 0x8b, 0xbe, 0x2e, 0x19, 0xb8, 0x00, 0x2b, 0x6d, 0x4a, 0x4f, 0x69, 0x29,
-	0xdb, 0xfc, 0x1e, 0xc1, 0xba, 0x84, 0x78, 0xce, 0xfc, 0xb7, 0x57, 0x03, 0x86, 0xf7, 0x21, 0x2f,
-	0x5f, 0x71, 0xb8, 0xcc, 0x49, 0x9b, 0x79, 0x21, 0x5a, 0x58, 0x57, 0xc9, 0x6a, 0x92, 0x0c, 0x3e,
-	0x04, 0x98, 0x3e, 0x6f, 0xf0, 0x96, 0x6c, 0xc4, 0xb9, 0x97, 0x93, 0x55, 0x9d, 0x57, 0x2b, 0xf3,
-	0xe6, 0x1f, 0x08, 0xb6, 0x3a, 0x6e, 0xc8, 0x7c, 0xd7, 0x1e, 0xce, 0xe6, 0xf2, 0x18, 0x0a, 0xcf,
-	0x98, 0xed, 0x87, 0x7d, 0x66, 0x87, 0xb8, 0xc8, 0x1d, 0x44, 0xef, 0x1d, 0x4b, 0x17, 0x48, 0x66,
-	0x0f, 0xe1, 0x13, 0xb8, 0x3f, 0xf7, 0xf6, 0xc0, 0x96, 0x8c, 0x98, 0xf4, 0x02, 0xb2, 0xde, 0x4f,
-	0xdc, 0x9b, 0x20, 0xfa, 0x02, 0x8a, 0xda, 0x85, 0x8e, 0x45, 0xee, 0xf1, 0xa7, 0x81, 0xf5, 0x20,
-	0xa6, 0x9f, 0x80, 0xfa, 0x29, 0x0b, 0x15, 0xd9, 0xf6, 0x5d, 0xdb, 0xb5, 0x2f, 0x99, 0xaf, 0x30,
-	0x1d, 0x02, 0x4c, 0xaf, 0x35, 0x49, 0x56, 0xec, 0x82, 0x96, 0x64, 0xc5, 0x6f, 0x3f, 0xc9, 0xf5,
-	0x74, 0x94, 0x4b, 0xf3, 0xd8, 0x7d, 0x22, 0xcd, 0xe3, 0x13, 0x9f, 0x64, 0xf0, 0x01, 0x14, 0x26,
-	0xb3, 0x12, 0x57, 0xe6, 0x46, 0xa7, 0x34, 0xde, 0x4a, 0x1c, 0xa8, 0x24, 0x83, 0xa9, 0x7a, 0x4a,
-	0xe8, 0xd4, 0x6c, 0x4f, 0x33, 0x4d, 0x20, 0xe8, 0xe1, 0x82, 0xdd, 0x89, 0xcf, 0x23, 0x58, 0xd3,
-	0x47, 0x04, 0x16, 0x8c, 0x26, 0x0c, 0x13, 0xcb, 0x8c, 0x6f, 0xe8, 0x4e, 0xf4, 0xc1, 0x27, 0x9d,
-	0x24, 0x0c, 0x67, 0xe9, 0x24, 0x69, 0x46, 0x92, 0xcc, 0xd3, 0xd2, 0x6f, 0x77, 0x3b, 0xe8, 0xf7,
-	0xbb, 0x1d, 0xf4, 0xf7, 0xdd, 0x0e, 0xfa, 0xe1, 0x9f, 0x9d, 0x4c, 0x3f, 0x2f, 0xfe, 0xc2, 0x9e,
-	0xfc, 0x1b, 0x00, 0x00, 0xff, 0xff, 0xe1, 0x88, 0xd5, 0x6a, 0x91, 0x0d, 0x00, 0x00,
+	// 1055 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xac, 0x57, 0xe1, 0x6e, 0xdb, 0x36,
+	0x10, 0xb6, 0x64, 0xc7, 0x89, 0xce, 0x89, 0x6b, 0x33, 0x71, 0xaa, 0x69, 0xa9, 0xe1, 0x71, 0x43,
+	0x91, 0x0e, 0x58, 0xd0, 0xb8, 0x40, 0x31, 0x04, 0x0b, 0xb0, 0x34, 0x71, 0x17, 0x6f, 0x76, 0x92,
+	0x31, 0xeb, 0x80, 0xfe, 0x2a, 0x64, 0x89, 0x49, 0x83, 0xd8, 0x92, 0x26, 0x29, 0xc5, 0xf2, 0x73,
+	0xc0, 0x1e, 0x62, 0x4f, 0x31, 0x60, 0x0f, 0xb0, 0xff, 0xfd, 0x39, 0xec, 0x09, 0x86, 0xec, 0x45,
+	0x06, 0x92, 0xa2, 0x45, 0x5b, 0x72, 0x20, 0x60, 0xfd, 0xa7, 0x3b, 0xf2, 0x3e, 0xde, 0xf7, 0xf1,
+	0x7c, 0x47, 0xc3, 0x4a, 0x30, 0xda, 0x09, 0x42, 0x3f, 0xf6, 0x91, 0x1e, 0x8c, 0xf0, 0x6b, 0x58,
+	0x7a, 0x31, 0xf6, 0x9d, 0x6b, 0x64, 0xc1, 0x8a, 0xf3, 0x96, 0x3a, 0xd7, 0xe7, 0x37, 0x13, 0x53,
+	0xeb, 0x68, 0xdb, 0x6b, 0x64, 0x6a, 0xa3, 0x0e, 0xd4, 0x46, 0x6c, 0xd3, 0x80, 0x7a, 0x97, 0xf1,
+	0x5b, 0x53, 0xe7, 0xcb, 0xaa, 0x0b, 0x21, 0xa8, 0xb8, 0x76, 0x6c, 0x9b, 0xe5, 0x8e, 0xb6, 0xbd,
+	0x4a, 0xf8, 0x37, 0x3e, 0x81, 0xb5, 0x83, 0x20, 0xa0, 0x9e, 0x4b, 0xe8, 0x4f, 0x37, 0x34, 0x8a,
+	0xd9, 0x11, 0xf4, 0xe7, 0x98, 0x7a, 0x71, 0xff, 0x88, 0x1f, 0x51, 0x21, 0x53, 0x1b, 0x7d, 0x02,
+	0x55, 0x8e, 0x17, 0x99, 0x7a, 0xa7, 0xbc, 0x5d, 0xeb, 0x1a, 0x3b, 0xc1, 0x68, 0x87, 0x67, 0x46,
+	0x92, 0x05, 0x7c, 0x0c, 0x75, 0x89, 0x17, 0x05, 0xbe, 0x17, 0x51, 0xb4, 0x05, 0x15, 0xc7, 0x77,
+	0x29, 0x07, 0xab, 0x77, 0x57, 0x58, 0xc8, 0xa1, 0xef, 0x52, 0xc2, 0xbd, 0xc8, 0x84, 0x65, 0xff,
+	0xe2, 0x22, 0xa2, 0xb1, 0xc0, 0x5c, 0x23, 0xd2, 0xc4, 0xbb, 0xb0, 0x7e, 0x18, 0x52, 0x3b, 0xa6,
+	0x3d, 0x7e, 0xbc, 0x92, 0x5f, 0x14, 0x87, 0xd4, 0x9e, 0xa4, 0xf9, 0x49, 0x1b, 0x9f, 0xc1, 0xc6,
+	0x6c, 0x48, 0xa1, 0x14, 0x54, 0xc6, 0xfa, 0x2c, 0x63, 0xdc, 0x87, 0x26, 0xa1, 0xb6, 0xcb, 0x39,
+	0x46, 0x45, 0x24, 0x5a, 0xcc, 0xe7, 0x15, 0x20, 0x15, 0xaa, 0x50, 0x6a, 0x05, 0x04, 0x7f, 0x04,
+	0xcb, 0x67, 0xf6, 0xed, 0xd8, 0xb7, 0x5d, 0x76, 0xbf, 0x47, 0xec, 0x7e, 0x35, 0x71, 0xbf, 0xec,
+	0x1b, 0xfb, 0xb0, 0x49, 0x68, 0x30, 0xbe, 0x72, 0xec, 0x98, 0x16, 0x67, 0xb1, 0x09, 0x55, 0xc7,
+	0x9f, 0x4c, 0xae, 0xe2, 0xa4, 0x8c, 0x12, 0x4b, 0xc9, 0xa7, 0xbc, 0x28, 0x9f, 0xef, 0xe1, 0x61,
+	0xe6, 0xc0, 0xff, 0x59, 0x09, 0x4f, 0x01, 0x1d, 0x8c, 0xc7, 0xbe, 0x93, 0x29, 0x84, 0x45, 0xf9,
+	0xe3, 0x67, 0xb0, 0x3e, 0x13, 0x51, 0x24, 0x01, 0xfc, 0x1c, 0xcc, 0x73, 0x5e, 0x49, 0xf9, 0x87,
+	0x2d, 0xac, 0xba, 0x37, 0xf0, 0x51, 0x4e, 0x5c, 0x72, 0xe4, 0x3d, 0x81, 0xe8, 0x31, 0x54, 0x45,
+	0xc6, 0x5c, 0xe5, 0x5a, 0xb7, 0xce, 0x12, 0x12, 0xf1, 0x7d, 0xef, 0xc2, 0x27, 0xc9, 0x2a, 0xde,
+	0x85, 0xa6, 0x38, 0x80, 0x7b, 0x93, 0x8c, 0xb6, 0xc0, 0x90, 0x40, 0x91, 0xa9, 0x75, 0xca, 0xdb,
+	0x15, 0x92, 0x3a, 0xf0, 0x7b, 0x1d, 0x90, 0x1a, 0x53, 0xe8, 0x06, 0xf6, 0x61, 0x59, 0x20, 0xc8,
+	0x72, 0xfb, 0x94, 0x6d, 0xc8, 0xc2, 0x24, 0xae, 0xa8, 0xe7, 0xc5, 0xe1, 0x2d, 0x91, 0x31, 0x2c,
+	0x5c, 0x24, 0x2c, 0xab, 0x63, 0x51, 0xb8, 0xa0, 0x28, 0xc3, 0x93, 0x18, 0xeb, 0x5b, 0x58, 0x55,
+	0x71, 0x51, 0x03, 0xca, 0xd7, 0xf4, 0x36, 0x11, 0x8d, 0x7d, 0xa2, 0xcf, 0x60, 0xe9, 0x9d, 0x3d,
+	0xbe, 0xa1, 0xaa, 0x5c, 0x0a, 0xbc, 0x58, 0xdc, 0xd3, 0xbf, 0xd4, 0x18, 0x96, 0x7a, 0x48, 0x41,
+	0x2c, 0x45, 0xfa, 0x14, 0x0b, 0x7f, 0x01, 0x4d, 0x65, 0x21, 0x51, 0xdf, 0x4c, 0xb9, 0x0a, 0xed,
+	0xa5, 0x89, 0xff, 0xd4, 0x00, 0xa9, 0xfb, 0x8b, 0x2a, 0x2f, 0xe1, 0x14, 0xe5, 0xb3, 0x30, 0x8b,
+	0xa5, 0xfb, 0x60, 0x74, 0x11, 0x34, 0x4e, 0x7c, 0x97, 0x46, 0x0a, 0x5b, 0xfc, 0x87, 0x06, 0x4d,
+	0xc5, 0x59, 0x88, 0xd2, 0x73, 0x58, 0xf2, 0x58, 0x48, 0x42, 0xa8, 0xc3, 0x96, 0x33, 0x18, 0xc2,
+	0x23, 0xd8, 0x88, 0xed, 0xd6, 0x4b, 0x80, 0xd4, 0x99, 0xc3, 0x04, 0xcf, 0x32, 0x59, 0x95, 0xb8,
+	0xf3, 0x3c, 0x9e, 0xc0, 0x3a, 0xa1, 0x97, 0x57, 0x51, 0x4c, 0x43, 0xb6, 0x2c, 0x2f, 0x0e, 0x41,
+	0xc5, 0x76, 0xdd, 0x90, 0x23, 0x1a, 0x84, 0x7f, 0xe3, 0x01, 0x6c, 0xcc, 0x6e, 0x2d, 0x44, 0x70,
+	0x13, 0xaa, 0x2c, 0xe3, 0xbe, 0x9b, 0x0c, 0x8d, 0xc4, 0xc2, 0x2d, 0x39, 0xb7, 0x44, 0x69, 0x4a,
+	0x0d, 0x7f, 0xd5, 0xe4, 0x70, 0x92, 0xfe, 0x42, 0xa7, 0x3c, 0x86, 0xaa, 0xf8, 0x7d, 0x2d, 0x28,
+	0xfa, 0x64, 0x55, 0xe9, 0x25, 0xe5, 0x7b, 0x7b, 0xc9, 0x10, 0xd6, 0xce, 0x87, 0x43, 0x3a, 0x19,
+	0xd1, 0xf0, 0x47, 0xa6, 0x15, 0xaa, 0x83, 0x3e, 0x6d, 0x4d, 0x7a, 0xff, 0x88, 0x09, 0x74, 0x62,
+	0x4f, 0x84, 0xbc, 0x06, 0xe1, 0xdf, 0xac, 0xda, 0xbf, 0x09, 0x03, 0xe7, 0x15, 0x19, 0x70, 0x74,
+	0x83, 0x48, 0x13, 0x1f, 0x03, 0xa4, 0x87, 0xdc, 0x3b, 0x52, 0xda, 0x00, 0xa1, 0x9c, 0x0b, 0xa2,
+	0x28, 0x2a, 0x44, 0xf1, 0xe0, 0x97, 0x00, 0x29, 0xad, 0x7b, 0xdb, 0xe6, 0x16, 0x18, 0x12, 0x55,
+	0x02, 0xa5, 0x0e, 0xfc, 0x15, 0xac, 0xc8, 0x72, 0x98, 0x5e, 0x91, 0xc4, 0x48, 0x2c, 0xc6, 0x87,
+	0x5d, 0x3c, 0x8d, 0xa2, 0x84, 0xa6, 0x34, 0x3f, 0xdf, 0x83, 0x0a, 0x13, 0x1f, 0x55, 0x41, 0x3f,
+	0xfd, 0xae, 0x51, 0x42, 0x75, 0x80, 0x93, 0xd3, 0x1f, 0xde, 0x0c, 0x7a, 0x07, 0x47, 0x3d, 0xd2,
+	0xd0, 0xd0, 0x03, 0xa8, 0x31, 0xfb, 0x8c, 0xf4, 0x87, 0x07, 0xe4, 0x75, 0x43, 0x47, 0x06, 0x2c,
+	0xf5, 0x08, 0x39, 0x25, 0x8d, 0x72, 0xf7, 0x17, 0x0d, 0xd6, 0x84, 0x18, 0xe7, 0x34, 0x7c, 0x77,
+	0xe5, 0x50, 0xb4, 0x0b, 0x55, 0xf1, 0x18, 0x42, 0x4d, 0x76, 0x1d, 0x33, 0x0f, 0x2d, 0x0b, 0xa9,
+	0x2e, 0x51, 0x0b, 0xb8, 0x84, 0xf6, 0x01, 0xd2, 0x57, 0x02, 0x6a, 0xb1, 0x3d, 0x99, 0x07, 0x88,
+	0xb5, 0x39, 0xef, 0x96, 0xe1, 0xdd, 0xbf, 0x35, 0x68, 0xf5, 0xbd, 0x98, 0x86, 0x9e, 0x3d, 0x9e,
+	0xcd, 0xe5, 0x09, 0x18, 0xc7, 0xd4, 0x0e, 0xe3, 0x11, 0xb5, 0x63, 0x54, 0x63, 0x00, 0xc9, 0xb3,
+	0xc1, 0x52, 0x0d, 0x5c, 0x7a, 0xaa, 0xa1, 0x01, 0x3c, 0x98, 0x1b, 0xe1, 0xc8, 0x12, 0x27, 0xe6,
+	0x3d, 0x24, 0xac, 0x8f, 0x73, 0xd7, 0xa6, 0x8c, 0xbe, 0x86, 0x9a, 0x32, 0x18, 0x11, 0xcf, 0x3d,
+	0x3b, 0x61, 0xad, 0x87, 0x19, 0xff, 0x94, 0xd4, 0xef, 0x65, 0xd8, 0x10, 0xb5, 0x31, 0xb4, 0x3d,
+	0xfb, 0x92, 0x86, 0x92, 0xd3, 0xfe, 0x4c, 0xcd, 0xb4, 0xe6, 0xc7, 0x8d, 0x22, 0x56, 0x76, 0x0a,
+	0x09, 0xad, 0x95, 0xe2, 0x6d, 0xcd, 0xb7, 0x5c, 0x25, 0x3c, 0xdb, 0x89, 0x71, 0x09, 0xed, 0x81,
+	0x31, 0x6d, 0x68, 0x68, 0x63, 0xae, 0xbf, 0x89, 0xe0, 0x56, 0x6e, 0xd7, 0xc3, 0x25, 0x44, 0xe4,
+	0x48, 0x57, 0xa5, 0xd9, 0x4a, 0x33, 0xcd, 0x11, 0xe8, 0xd1, 0x82, 0xd5, 0x29, 0xe6, 0x21, 0xac,
+	0xaa, 0x0d, 0x06, 0x71, 0x45, 0x73, 0x5a, 0x91, 0x65, 0x66, 0x17, 0x54, 0x10, 0xb5, 0x17, 0x0a,
+	0x90, 0x9c, 0x46, 0x2a, 0x40, 0xf2, 0xda, 0x26, 0x2e, 0xbd, 0x68, 0xbc, 0xbf, 0x6b, 0x6b, 0x7f,
+	0xdd, 0xb5, 0xb5, 0x7f, 0xee, 0xda, 0xda, 0x6f, 0xff, 0xb6, 0x4b, 0xa3, 0x2a, 0xff, 0x33, 0xf3,
+	0xec, 0xbf, 0x00, 0x00, 0x00, 0xff, 0xff, 0x7c, 0x3e, 0xe0, 0x42, 0xd8, 0x0c, 0x00, 0x00,
 }
 
 // Reference imports to suppress errors if they are not otherwise used.
@@ -2705,9 +2750,9 @@ func (m *StreamAllocExtentResponse) MarshalToSizedBuffer(dAtA []byte) (int, erro
 		i -= len(m.XXX_unrecognized)
 		copy(dAtA[i:], m.XXX_unrecognized)
 	}
-	if m.ExtentIDreplicates != nil {
+	if m.Extent != nil {
 		{
-			size, err := m.ExtentIDreplicates.MarshalToSizedBuffer(dAtA[:i])
+			size, err := m.Extent.MarshalToSizedBuffer(dAtA[:i])
 			if err != nil {
 				return 0, err
 			}
@@ -2715,12 +2760,7 @@ func (m *StreamAllocExtentResponse) MarshalToSizedBuffer(dAtA []byte) (int, erro
 			i = encodeVarintPb(dAtA, i, uint64(size))
 		}
 		i--
-		dAtA[i] = 0x22
-	}
-	if m.ExtentID != 0 {
-		i = encodeVarintPb(dAtA, i, uint64(m.ExtentID))
-		i--
-		dAtA[i] = 0x10
+		dAtA[i] = 0x12
 	}
 	if m.StreamID != 0 {
 		i = encodeVarintPb(dAtA, i, uint64(m.StreamID))
@@ -2924,9 +2964,9 @@ func (m *ExtentInfoResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 		i -= len(m.XXX_unrecognized)
 		copy(dAtA[i:], m.XXX_unrecognized)
 	}
-	if len(m.Nodes) > 0 {
-		for k := range m.Nodes {
-			v := m.Nodes[k]
+	if len(m.Extents) > 0 {
+		for k := range m.Extents {
+			v := m.Extents[k]
 			baseI := i
 			if v != nil {
 				{
@@ -3007,15 +3047,22 @@ func (m *NodesInfoResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 		i -= len(m.XXX_unrecognized)
 		copy(dAtA[i:], m.XXX_unrecognized)
 	}
-	if len(m.NodesAddress) > 0 {
-		for k := range m.NodesAddress {
-			v := m.NodesAddress[k]
+	if len(m.Nodes) > 0 {
+		for k := range m.Nodes {
+			v := m.Nodes[k]
 			baseI := i
-			i -= len(v)
-			copy(dAtA[i:], v)
-			i = encodeVarintPb(dAtA, i, uint64(len(v)))
-			i--
-			dAtA[i] = 0x12
+			if v != nil {
+				{
+					size, err := v.MarshalToSizedBuffer(dAtA[:i])
+					if err != nil {
+						return 0, err
+					}
+					i -= size
+					i = encodeVarintPb(dAtA, i, uint64(size))
+				}
+				i--
+				dAtA[i] = 0x12
+			}
 			i = encodeVarintPb(dAtA, i, uint64(k))
 			i--
 			dAtA[i] = 0x8
@@ -3090,23 +3137,6 @@ func (m *RegisterNodeResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 		i -= len(m.XXX_unrecognized)
 		copy(dAtA[i:], m.XXX_unrecognized)
 	}
-	if len(m.NodesAddress) > 0 {
-		for k := range m.NodesAddress {
-			v := m.NodesAddress[k]
-			baseI := i
-			i -= len(v)
-			copy(dAtA[i:], v)
-			i = encodeVarintPb(dAtA, i, uint64(len(v)))
-			i--
-			dAtA[i] = 0x12
-			i = encodeVarintPb(dAtA, i, uint64(k))
-			i--
-			dAtA[i] = 0x8
-			i = encodeVarintPb(dAtA, i, uint64(baseI-i))
-			i--
-			dAtA[i] = 0x1a
-		}
-	}
 	if m.NodeId != 0 {
 		i = encodeVarintPb(dAtA, i, uint64(m.NodeId))
 		i--
@@ -3171,9 +3201,9 @@ func (m *CreateStreamResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 		i -= len(m.XXX_unrecognized)
 		copy(dAtA[i:], m.XXX_unrecognized)
 	}
-	if m.ExtentIDreplicates != nil {
+	if m.Extent != nil {
 		{
-			size, err := m.ExtentIDreplicates.MarshalToSizedBuffer(dAtA[:i])
+			size, err := m.Extent.MarshalToSizedBuffer(dAtA[:i])
 			if err != nil {
 				return 0, err
 			}
@@ -3181,112 +3211,24 @@ func (m *CreateStreamResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 			i = encodeVarintPb(dAtA, i, uint64(size))
 		}
 		i--
-		dAtA[i] = 0x22
+		dAtA[i] = 0x1a
 	}
-	if m.ExtentID != 0 {
-		i = encodeVarintPb(dAtA, i, uint64(m.ExtentID))
+	if m.Stream != nil {
+		{
+			size, err := m.Stream.MarshalToSizedBuffer(dAtA[:i])
+			if err != nil {
+				return 0, err
+			}
+			i -= size
+			i = encodeVarintPb(dAtA, i, uint64(size))
+		}
 		i--
-		dAtA[i] = 0x18
-	}
-	if m.StreamID != 0 {
-		i = encodeVarintPb(dAtA, i, uint64(m.StreamID))
-		i--
-		dAtA[i] = 0x10
+		dAtA[i] = 0x12
 	}
 	if m.Code != 0 {
 		i = encodeVarintPb(dAtA, i, uint64(m.Code))
 		i--
 		dAtA[i] = 0x8
-	}
-	return len(dAtA) - i, nil
-}
-
-func (m *OrderedExtentIDs) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
-	dAtA = make([]byte, size)
-	n, err := m.MarshalToSizedBuffer(dAtA[:size])
-	if err != nil {
-		return nil, err
-	}
-	return dAtA[:n], nil
-}
-
-func (m *OrderedExtentIDs) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
-	return m.MarshalToSizedBuffer(dAtA[:size])
-}
-
-func (m *OrderedExtentIDs) MarshalToSizedBuffer(dAtA []byte) (int, error) {
-	i := len(dAtA)
-	_ = i
-	var l int
-	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
-	if len(m.Extents) > 0 {
-		dAtA17 := make([]byte, len(m.Extents)*10)
-		var j16 int
-		for _, num := range m.Extents {
-			for num >= 1<<7 {
-				dAtA17[j16] = uint8(uint64(num)&0x7f | 0x80)
-				num >>= 7
-				j16++
-			}
-			dAtA17[j16] = uint8(num)
-			j16++
-		}
-		i -= j16
-		copy(dAtA[i:], dAtA17[:j16])
-		i = encodeVarintPb(dAtA, i, uint64(j16))
-		i--
-		dAtA[i] = 0xa
-	}
-	return len(dAtA) - i, nil
-}
-
-func (m *OrderedNodesReplicates) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
-	dAtA = make([]byte, size)
-	n, err := m.MarshalToSizedBuffer(dAtA[:size])
-	if err != nil {
-		return nil, err
-	}
-	return dAtA[:n], nil
-}
-
-func (m *OrderedNodesReplicates) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
-	return m.MarshalToSizedBuffer(dAtA[:size])
-}
-
-func (m *OrderedNodesReplicates) MarshalToSizedBuffer(dAtA []byte) (int, error) {
-	i := len(dAtA)
-	_ = i
-	var l int
-	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
-	if len(m.Nodes) > 0 {
-		dAtA19 := make([]byte, len(m.Nodes)*10)
-		var j18 int
-		for _, num := range m.Nodes {
-			for num >= 1<<7 {
-				dAtA19[j18] = uint8(uint64(num)&0x7f | 0x80)
-				num >>= 7
-				j18++
-			}
-			dAtA19[j18] = uint8(num)
-			j18++
-		}
-		i -= j18
-		copy(dAtA[i:], dAtA19[:j18])
-		i = encodeVarintPb(dAtA, i, uint64(j18))
-		i--
-		dAtA[i] = 0xa
 	}
 	return len(dAtA) - i, nil
 }
@@ -3331,6 +3273,145 @@ func (m *SMMemberValue) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	}
 	if m.ID != 0 {
 		i = encodeVarintPb(dAtA, i, uint64(m.ID))
+		i--
+		dAtA[i] = 0x8
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *ExtentInfo) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *ExtentInfo) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *ExtentInfo) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if m.XXX_unrecognized != nil {
+		i -= len(m.XXX_unrecognized)
+		copy(dAtA[i:], m.XXX_unrecognized)
+	}
+	if len(m.Replicates) > 0 {
+		dAtA19 := make([]byte, len(m.Replicates)*10)
+		var j18 int
+		for _, num := range m.Replicates {
+			for num >= 1<<7 {
+				dAtA19[j18] = uint8(uint64(num)&0x7f | 0x80)
+				num >>= 7
+				j18++
+			}
+			dAtA19[j18] = uint8(num)
+			j18++
+		}
+		i -= j18
+		copy(dAtA[i:], dAtA19[:j18])
+		i = encodeVarintPb(dAtA, i, uint64(j18))
+		i--
+		dAtA[i] = 0x12
+	}
+	if m.ExtentID != 0 {
+		i = encodeVarintPb(dAtA, i, uint64(m.ExtentID))
+		i--
+		dAtA[i] = 0x8
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *StreamInfo) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *StreamInfo) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *StreamInfo) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if m.XXX_unrecognized != nil {
+		i -= len(m.XXX_unrecognized)
+		copy(dAtA[i:], m.XXX_unrecognized)
+	}
+	if len(m.ExtentIDs) > 0 {
+		dAtA21 := make([]byte, len(m.ExtentIDs)*10)
+		var j20 int
+		for _, num := range m.ExtentIDs {
+			for num >= 1<<7 {
+				dAtA21[j20] = uint8(uint64(num)&0x7f | 0x80)
+				num >>= 7
+				j20++
+			}
+			dAtA21[j20] = uint8(num)
+			j20++
+		}
+		i -= j20
+		copy(dAtA[i:], dAtA21[:j20])
+		i = encodeVarintPb(dAtA, i, uint64(j20))
+		i--
+		dAtA[i] = 0x12
+	}
+	if m.StreamID != 0 {
+		i = encodeVarintPb(dAtA, i, uint64(m.StreamID))
+		i--
+		dAtA[i] = 0x8
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *NodeInfo) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *NodeInfo) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *NodeInfo) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if m.XXX_unrecognized != nil {
+		i -= len(m.XXX_unrecognized)
+		copy(dAtA[i:], m.XXX_unrecognized)
+	}
+	if len(m.Address) > 0 {
+		i -= len(m.Address)
+		copy(dAtA[i:], m.Address)
+		i = encodeVarintPb(dAtA, i, uint64(len(m.Address)))
+		i--
+		dAtA[i] = 0x12
+	}
+	if m.NodeID != 0 {
+		i = encodeVarintPb(dAtA, i, uint64(m.NodeID))
 		i--
 		dAtA[i] = 0x8
 	}
@@ -3605,11 +3686,8 @@ func (m *StreamAllocExtentResponse) Size() (n int) {
 	if m.StreamID != 0 {
 		n += 1 + sovPb(uint64(m.StreamID))
 	}
-	if m.ExtentID != 0 {
-		n += 1 + sovPb(uint64(m.ExtentID))
-	}
-	if m.ExtentIDreplicates != nil {
-		l = m.ExtentIDreplicates.Size()
+	if m.Extent != nil {
+		l = m.Extent.Size()
 		n += 1 + l + sovPb(uint64(l))
 	}
 	if m.XXX_unrecognized != nil {
@@ -3706,8 +3784,8 @@ func (m *ExtentInfoResponse) Size() (n int) {
 	if m.Code != 0 {
 		n += 1 + sovPb(uint64(m.Code))
 	}
-	if len(m.Nodes) > 0 {
-		for k, v := range m.Nodes {
+	if len(m.Extents) > 0 {
+		for k, v := range m.Extents {
 			_ = k
 			_ = v
 			l = 0
@@ -3746,11 +3824,16 @@ func (m *NodesInfoResponse) Size() (n int) {
 	if m.Code != 0 {
 		n += 1 + sovPb(uint64(m.Code))
 	}
-	if len(m.NodesAddress) > 0 {
-		for k, v := range m.NodesAddress {
+	if len(m.Nodes) > 0 {
+		for k, v := range m.Nodes {
 			_ = k
 			_ = v
-			mapEntrySize := 1 + sovPb(uint64(k)) + 1 + len(v) + sovPb(uint64(len(v)))
+			l = 0
+			if v != nil {
+				l = v.Size()
+				l += 1 + sovPb(uint64(l))
+			}
+			mapEntrySize := 1 + sovPb(uint64(k)) + l
 			n += mapEntrySize + 1 + sovPb(uint64(mapEntrySize))
 		}
 	}
@@ -3788,14 +3871,6 @@ func (m *RegisterNodeResponse) Size() (n int) {
 	if m.NodeId != 0 {
 		n += 1 + sovPb(uint64(m.NodeId))
 	}
-	if len(m.NodesAddress) > 0 {
-		for k, v := range m.NodesAddress {
-			_ = k
-			_ = v
-			mapEntrySize := 1 + sovPb(uint64(k)) + 1 + len(v) + sovPb(uint64(len(v)))
-			n += mapEntrySize + 1 + sovPb(uint64(mapEntrySize))
-		}
-	}
 	if m.XXX_unrecognized != nil {
 		n += len(m.XXX_unrecognized)
 	}
@@ -3823,53 +3898,13 @@ func (m *CreateStreamResponse) Size() (n int) {
 	if m.Code != 0 {
 		n += 1 + sovPb(uint64(m.Code))
 	}
-	if m.StreamID != 0 {
-		n += 1 + sovPb(uint64(m.StreamID))
-	}
-	if m.ExtentID != 0 {
-		n += 1 + sovPb(uint64(m.ExtentID))
-	}
-	if m.ExtentIDreplicates != nil {
-		l = m.ExtentIDreplicates.Size()
+	if m.Stream != nil {
+		l = m.Stream.Size()
 		n += 1 + l + sovPb(uint64(l))
 	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
-	}
-	return n
-}
-
-func (m *OrderedExtentIDs) Size() (n int) {
-	if m == nil {
-		return 0
-	}
-	var l int
-	_ = l
-	if len(m.Extents) > 0 {
-		l = 0
-		for _, e := range m.Extents {
-			l += sovPb(uint64(e))
-		}
-		n += 1 + sovPb(uint64(l)) + l
-	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
-	}
-	return n
-}
-
-func (m *OrderedNodesReplicates) Size() (n int) {
-	if m == nil {
-		return 0
-	}
-	var l int
-	_ = l
-	if len(m.Nodes) > 0 {
-		l = 0
-		for _, e := range m.Nodes {
-			l += sovPb(uint64(e))
-		}
-		n += 1 + sovPb(uint64(l)) + l
+	if m.Extent != nil {
+		l = m.Extent.Size()
+		n += 1 + l + sovPb(uint64(l))
 	}
 	if m.XXX_unrecognized != nil {
 		n += len(m.XXX_unrecognized)
@@ -3891,6 +3926,69 @@ func (m *SMMemberValue) Size() (n int) {
 		n += 1 + l + sovPb(uint64(l))
 	}
 	l = len(m.GrpcURL)
+	if l > 0 {
+		n += 1 + l + sovPb(uint64(l))
+	}
+	if m.XXX_unrecognized != nil {
+		n += len(m.XXX_unrecognized)
+	}
+	return n
+}
+
+func (m *ExtentInfo) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.ExtentID != 0 {
+		n += 1 + sovPb(uint64(m.ExtentID))
+	}
+	if len(m.Replicates) > 0 {
+		l = 0
+		for _, e := range m.Replicates {
+			l += sovPb(uint64(e))
+		}
+		n += 1 + sovPb(uint64(l)) + l
+	}
+	if m.XXX_unrecognized != nil {
+		n += len(m.XXX_unrecognized)
+	}
+	return n
+}
+
+func (m *StreamInfo) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.StreamID != 0 {
+		n += 1 + sovPb(uint64(m.StreamID))
+	}
+	if len(m.ExtentIDs) > 0 {
+		l = 0
+		for _, e := range m.ExtentIDs {
+			l += sovPb(uint64(e))
+		}
+		n += 1 + sovPb(uint64(l)) + l
+	}
+	if m.XXX_unrecognized != nil {
+		n += len(m.XXX_unrecognized)
+	}
+	return n
+}
+
+func (m *NodeInfo) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.NodeID != 0 {
+		n += 1 + sovPb(uint64(m.NodeID))
+	}
+	l = len(m.Address)
 	if l > 0 {
 		n += 1 + l + sovPb(uint64(l))
 	}
@@ -5340,27 +5438,8 @@ func (m *StreamAllocExtentResponse) Unmarshal(dAtA []byte) error {
 				}
 			}
 		case 2:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field ExtentID", wireType)
-			}
-			m.ExtentID = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowPb
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				m.ExtentID |= uint64(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		case 4:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field ExtentIDreplicates", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field Extent", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -5387,10 +5466,10 @@ func (m *StreamAllocExtentResponse) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if m.ExtentIDreplicates == nil {
-				m.ExtentIDreplicates = &OrderedNodesReplicates{}
+			if m.Extent == nil {
+				m.Extent = &ExtentInfo{}
 			}
-			if err := m.ExtentIDreplicates.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+			if err := m.Extent.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -5627,10 +5706,10 @@ func (m *StreamInfoResponse) Unmarshal(dAtA []byte) error {
 				return io.ErrUnexpectedEOF
 			}
 			if m.Streams == nil {
-				m.Streams = make(map[uint64]*OrderedExtentIDs)
+				m.Streams = make(map[uint64]*StreamInfo)
 			}
 			var mapkey uint64
-			var mapvalue *OrderedExtentIDs
+			var mapvalue *StreamInfo
 			for iNdEx < postIndex {
 				entryPreIndex := iNdEx
 				var wire uint64
@@ -5690,7 +5769,7 @@ func (m *StreamInfoResponse) Unmarshal(dAtA []byte) error {
 					if postmsgIndex > l {
 						return io.ErrUnexpectedEOF
 					}
-					mapvalue = &OrderedExtentIDs{}
+					mapvalue = &StreamInfo{}
 					if err := mapvalue.Unmarshal(dAtA[iNdEx:postmsgIndex]); err != nil {
 						return err
 					}
@@ -5742,10 +5821,10 @@ func (m *StreamInfoResponse) Unmarshal(dAtA []byte) error {
 				return io.ErrUnexpectedEOF
 			}
 			if m.Extents == nil {
-				m.Extents = make(map[uint64]*OrderedNodesReplicates)
+				m.Extents = make(map[uint64]*ExtentInfo)
 			}
 			var mapkey uint64
-			var mapvalue *OrderedNodesReplicates
+			var mapvalue *ExtentInfo
 			for iNdEx < postIndex {
 				entryPreIndex := iNdEx
 				var wire uint64
@@ -5805,7 +5884,7 @@ func (m *StreamInfoResponse) Unmarshal(dAtA []byte) error {
 					if postmsgIndex > l {
 						return io.ErrUnexpectedEOF
 					}
-					mapvalue = &OrderedNodesReplicates{}
+					mapvalue = &ExtentInfo{}
 					if err := mapvalue.Unmarshal(dAtA[iNdEx:postmsgIndex]); err != nil {
 						return err
 					}
@@ -6032,7 +6111,7 @@ func (m *ExtentInfoResponse) Unmarshal(dAtA []byte) error {
 			}
 		case 2:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Nodes", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field Extents", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -6059,11 +6138,11 @@ func (m *ExtentInfoResponse) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if m.Nodes == nil {
-				m.Nodes = make(map[uint64]*OrderedNodesReplicates)
+			if m.Extents == nil {
+				m.Extents = make(map[uint64]*ExtentInfo)
 			}
 			var mapkey uint64
-			var mapvalue *OrderedNodesReplicates
+			var mapvalue *ExtentInfo
 			for iNdEx < postIndex {
 				entryPreIndex := iNdEx
 				var wire uint64
@@ -6123,7 +6202,7 @@ func (m *ExtentInfoResponse) Unmarshal(dAtA []byte) error {
 					if postmsgIndex > l {
 						return io.ErrUnexpectedEOF
 					}
-					mapvalue = &OrderedNodesReplicates{}
+					mapvalue = &ExtentInfo{}
 					if err := mapvalue.Unmarshal(dAtA[iNdEx:postmsgIndex]); err != nil {
 						return err
 					}
@@ -6143,7 +6222,7 @@ func (m *ExtentInfoResponse) Unmarshal(dAtA []byte) error {
 					iNdEx += skippy
 				}
 			}
-			m.Nodes[mapkey] = mapvalue
+			m.Extents[mapkey] = mapvalue
 			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
@@ -6274,7 +6353,7 @@ func (m *NodesInfoResponse) Unmarshal(dAtA []byte) error {
 			}
 		case 2:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field NodesAddress", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field Nodes", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -6301,11 +6380,11 @@ func (m *NodesInfoResponse) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if m.NodesAddress == nil {
-				m.NodesAddress = make(map[uint64]string)
+			if m.Nodes == nil {
+				m.Nodes = make(map[uint64]*NodeInfo)
 			}
 			var mapkey uint64
-			var mapvalue string
+			var mapvalue *NodeInfo
 			for iNdEx < postIndex {
 				entryPreIndex := iNdEx
 				var wire uint64
@@ -6340,7 +6419,7 @@ func (m *NodesInfoResponse) Unmarshal(dAtA []byte) error {
 						}
 					}
 				} else if fieldNum == 2 {
-					var stringLenmapvalue uint64
+					var mapmsglen int
 					for shift := uint(0); ; shift += 7 {
 						if shift >= 64 {
 							return ErrIntOverflowPb
@@ -6350,24 +6429,26 @@ func (m *NodesInfoResponse) Unmarshal(dAtA []byte) error {
 						}
 						b := dAtA[iNdEx]
 						iNdEx++
-						stringLenmapvalue |= uint64(b&0x7F) << shift
+						mapmsglen |= int(b&0x7F) << shift
 						if b < 0x80 {
 							break
 						}
 					}
-					intStringLenmapvalue := int(stringLenmapvalue)
-					if intStringLenmapvalue < 0 {
+					if mapmsglen < 0 {
 						return ErrInvalidLengthPb
 					}
-					postStringIndexmapvalue := iNdEx + intStringLenmapvalue
-					if postStringIndexmapvalue < 0 {
+					postmsgIndex := iNdEx + mapmsglen
+					if postmsgIndex < 0 {
 						return ErrInvalidLengthPb
 					}
-					if postStringIndexmapvalue > l {
+					if postmsgIndex > l {
 						return io.ErrUnexpectedEOF
 					}
-					mapvalue = string(dAtA[iNdEx:postStringIndexmapvalue])
-					iNdEx = postStringIndexmapvalue
+					mapvalue = &NodeInfo{}
+					if err := mapvalue.Unmarshal(dAtA[iNdEx:postmsgIndex]); err != nil {
+						return err
+					}
+					iNdEx = postmsgIndex
 				} else {
 					iNdEx = entryPreIndex
 					skippy, err := skipPb(dAtA[iNdEx:])
@@ -6383,7 +6464,7 @@ func (m *NodesInfoResponse) Unmarshal(dAtA []byte) error {
 					iNdEx += skippy
 				}
 			}
-			m.NodesAddress[mapkey] = mapvalue
+			m.Nodes[mapkey] = mapvalue
 			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
@@ -6563,119 +6644,6 @@ func (m *RegisterNodeResponse) Unmarshal(dAtA []byte) error {
 					break
 				}
 			}
-		case 3:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field NodesAddress", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowPb
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				msglen |= int(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthPb
-			}
-			postIndex := iNdEx + msglen
-			if postIndex < 0 {
-				return ErrInvalidLengthPb
-			}
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			if m.NodesAddress == nil {
-				m.NodesAddress = make(map[uint64]string)
-			}
-			var mapkey uint64
-			var mapvalue string
-			for iNdEx < postIndex {
-				entryPreIndex := iNdEx
-				var wire uint64
-				for shift := uint(0); ; shift += 7 {
-					if shift >= 64 {
-						return ErrIntOverflowPb
-					}
-					if iNdEx >= l {
-						return io.ErrUnexpectedEOF
-					}
-					b := dAtA[iNdEx]
-					iNdEx++
-					wire |= uint64(b&0x7F) << shift
-					if b < 0x80 {
-						break
-					}
-				}
-				fieldNum := int32(wire >> 3)
-				if fieldNum == 1 {
-					for shift := uint(0); ; shift += 7 {
-						if shift >= 64 {
-							return ErrIntOverflowPb
-						}
-						if iNdEx >= l {
-							return io.ErrUnexpectedEOF
-						}
-						b := dAtA[iNdEx]
-						iNdEx++
-						mapkey |= uint64(b&0x7F) << shift
-						if b < 0x80 {
-							break
-						}
-					}
-				} else if fieldNum == 2 {
-					var stringLenmapvalue uint64
-					for shift := uint(0); ; shift += 7 {
-						if shift >= 64 {
-							return ErrIntOverflowPb
-						}
-						if iNdEx >= l {
-							return io.ErrUnexpectedEOF
-						}
-						b := dAtA[iNdEx]
-						iNdEx++
-						stringLenmapvalue |= uint64(b&0x7F) << shift
-						if b < 0x80 {
-							break
-						}
-					}
-					intStringLenmapvalue := int(stringLenmapvalue)
-					if intStringLenmapvalue < 0 {
-						return ErrInvalidLengthPb
-					}
-					postStringIndexmapvalue := iNdEx + intStringLenmapvalue
-					if postStringIndexmapvalue < 0 {
-						return ErrInvalidLengthPb
-					}
-					if postStringIndexmapvalue > l {
-						return io.ErrUnexpectedEOF
-					}
-					mapvalue = string(dAtA[iNdEx:postStringIndexmapvalue])
-					iNdEx = postStringIndexmapvalue
-				} else {
-					iNdEx = entryPreIndex
-					skippy, err := skipPb(dAtA[iNdEx:])
-					if err != nil {
-						return err
-					}
-					if skippy < 0 {
-						return ErrInvalidLengthPb
-					}
-					if (iNdEx + skippy) > postIndex {
-						return io.ErrUnexpectedEOF
-					}
-					iNdEx += skippy
-				}
-			}
-			m.NodesAddress[mapkey] = mapvalue
-			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipPb(dAtA[iNdEx:])
@@ -6804,46 +6772,8 @@ func (m *CreateStreamResponse) Unmarshal(dAtA []byte) error {
 				}
 			}
 		case 2:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field StreamID", wireType)
-			}
-			m.StreamID = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowPb
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				m.StreamID |= uint64(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		case 3:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field ExtentID", wireType)
-			}
-			m.ExtentID = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowPb
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				m.ExtentID |= uint64(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		case 4:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field ExtentIDreplicates", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field Stream", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -6870,273 +6800,49 @@ func (m *CreateStreamResponse) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if m.ExtentIDreplicates == nil {
-				m.ExtentIDreplicates = &OrderedNodesReplicates{}
+			if m.Stream == nil {
+				m.Stream = &StreamInfo{}
 			}
-			if err := m.ExtentIDreplicates.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+			if err := m.Stream.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
-		default:
-			iNdEx = preIndex
-			skippy, err := skipPb(dAtA[iNdEx:])
-			if err != nil {
-				return err
+		case 3:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Extent", wireType)
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthPb
-			}
-			if (iNdEx + skippy) < 0 {
-				return ErrInvalidLengthPb
-			}
-			if (iNdEx + skippy) > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
-			iNdEx += skippy
-		}
-	}
-
-	if iNdEx > l {
-		return io.ErrUnexpectedEOF
-	}
-	return nil
-}
-func (m *OrderedExtentIDs) Unmarshal(dAtA []byte) error {
-	l := len(dAtA)
-	iNdEx := 0
-	for iNdEx < l {
-		preIndex := iNdEx
-		var wire uint64
-		for shift := uint(0); ; shift += 7 {
-			if shift >= 64 {
-				return ErrIntOverflowPb
-			}
-			if iNdEx >= l {
-				return io.ErrUnexpectedEOF
-			}
-			b := dAtA[iNdEx]
-			iNdEx++
-			wire |= uint64(b&0x7F) << shift
-			if b < 0x80 {
-				break
-			}
-		}
-		fieldNum := int32(wire >> 3)
-		wireType := int(wire & 0x7)
-		if wireType == 4 {
-			return fmt.Errorf("proto: OrderedExtentIDs: wiretype end group for non-group")
-		}
-		if fieldNum <= 0 {
-			return fmt.Errorf("proto: OrderedExtentIDs: illegal tag %d (wire type %d)", fieldNum, wire)
-		}
-		switch fieldNum {
-		case 1:
-			if wireType == 0 {
-				var v uint64
-				for shift := uint(0); ; shift += 7 {
-					if shift >= 64 {
-						return ErrIntOverflowPb
-					}
-					if iNdEx >= l {
-						return io.ErrUnexpectedEOF
-					}
-					b := dAtA[iNdEx]
-					iNdEx++
-					v |= uint64(b&0x7F) << shift
-					if b < 0x80 {
-						break
-					}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPb
 				}
-				m.Extents = append(m.Extents, v)
-			} else if wireType == 2 {
-				var packedLen int
-				for shift := uint(0); ; shift += 7 {
-					if shift >= 64 {
-						return ErrIntOverflowPb
-					}
-					if iNdEx >= l {
-						return io.ErrUnexpectedEOF
-					}
-					b := dAtA[iNdEx]
-					iNdEx++
-					packedLen |= int(b&0x7F) << shift
-					if b < 0x80 {
-						break
-					}
-				}
-				if packedLen < 0 {
-					return ErrInvalidLengthPb
-				}
-				postIndex := iNdEx + packedLen
-				if postIndex < 0 {
-					return ErrInvalidLengthPb
-				}
-				if postIndex > l {
+				if iNdEx >= l {
 					return io.ErrUnexpectedEOF
 				}
-				var elementCount int
-				var count int
-				for _, integer := range dAtA[iNdEx:postIndex] {
-					if integer < 128 {
-						count++
-					}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
 				}
-				elementCount = count
-				if elementCount != 0 && len(m.Extents) == 0 {
-					m.Extents = make([]uint64, 0, elementCount)
-				}
-				for iNdEx < postIndex {
-					var v uint64
-					for shift := uint(0); ; shift += 7 {
-						if shift >= 64 {
-							return ErrIntOverflowPb
-						}
-						if iNdEx >= l {
-							return io.ErrUnexpectedEOF
-						}
-						b := dAtA[iNdEx]
-						iNdEx++
-						v |= uint64(b&0x7F) << shift
-						if b < 0x80 {
-							break
-						}
-					}
-					m.Extents = append(m.Extents, v)
-				}
-			} else {
-				return fmt.Errorf("proto: wrong wireType = %d for field Extents", wireType)
 			}
-		default:
-			iNdEx = preIndex
-			skippy, err := skipPb(dAtA[iNdEx:])
-			if err != nil {
+			if msglen < 0 {
+				return ErrInvalidLengthPb
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthPb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.Extent == nil {
+				m.Extent = &ExtentInfo{}
+			}
+			if err := m.Extent.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthPb
-			}
-			if (iNdEx + skippy) < 0 {
-				return ErrInvalidLengthPb
-			}
-			if (iNdEx + skippy) > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
-			iNdEx += skippy
-		}
-	}
-
-	if iNdEx > l {
-		return io.ErrUnexpectedEOF
-	}
-	return nil
-}
-func (m *OrderedNodesReplicates) Unmarshal(dAtA []byte) error {
-	l := len(dAtA)
-	iNdEx := 0
-	for iNdEx < l {
-		preIndex := iNdEx
-		var wire uint64
-		for shift := uint(0); ; shift += 7 {
-			if shift >= 64 {
-				return ErrIntOverflowPb
-			}
-			if iNdEx >= l {
-				return io.ErrUnexpectedEOF
-			}
-			b := dAtA[iNdEx]
-			iNdEx++
-			wire |= uint64(b&0x7F) << shift
-			if b < 0x80 {
-				break
-			}
-		}
-		fieldNum := int32(wire >> 3)
-		wireType := int(wire & 0x7)
-		if wireType == 4 {
-			return fmt.Errorf("proto: OrderedNodesReplicates: wiretype end group for non-group")
-		}
-		if fieldNum <= 0 {
-			return fmt.Errorf("proto: OrderedNodesReplicates: illegal tag %d (wire type %d)", fieldNum, wire)
-		}
-		switch fieldNum {
-		case 1:
-			if wireType == 0 {
-				var v uint64
-				for shift := uint(0); ; shift += 7 {
-					if shift >= 64 {
-						return ErrIntOverflowPb
-					}
-					if iNdEx >= l {
-						return io.ErrUnexpectedEOF
-					}
-					b := dAtA[iNdEx]
-					iNdEx++
-					v |= uint64(b&0x7F) << shift
-					if b < 0x80 {
-						break
-					}
-				}
-				m.Nodes = append(m.Nodes, v)
-			} else if wireType == 2 {
-				var packedLen int
-				for shift := uint(0); ; shift += 7 {
-					if shift >= 64 {
-						return ErrIntOverflowPb
-					}
-					if iNdEx >= l {
-						return io.ErrUnexpectedEOF
-					}
-					b := dAtA[iNdEx]
-					iNdEx++
-					packedLen |= int(b&0x7F) << shift
-					if b < 0x80 {
-						break
-					}
-				}
-				if packedLen < 0 {
-					return ErrInvalidLengthPb
-				}
-				postIndex := iNdEx + packedLen
-				if postIndex < 0 {
-					return ErrInvalidLengthPb
-				}
-				if postIndex > l {
-					return io.ErrUnexpectedEOF
-				}
-				var elementCount int
-				var count int
-				for _, integer := range dAtA[iNdEx:postIndex] {
-					if integer < 128 {
-						count++
-					}
-				}
-				elementCount = count
-				if elementCount != 0 && len(m.Nodes) == 0 {
-					m.Nodes = make([]uint64, 0, elementCount)
-				}
-				for iNdEx < postIndex {
-					var v uint64
-					for shift := uint(0); ; shift += 7 {
-						if shift >= 64 {
-							return ErrIntOverflowPb
-						}
-						if iNdEx >= l {
-							return io.ErrUnexpectedEOF
-						}
-						b := dAtA[iNdEx]
-						iNdEx++
-						v |= uint64(b&0x7F) << shift
-						if b < 0x80 {
-							break
-						}
-					}
-					m.Nodes = append(m.Nodes, v)
-				}
-			} else {
-				return fmt.Errorf("proto: wrong wireType = %d for field Nodes", wireType)
-			}
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipPb(dAtA[iNdEx:])
@@ -7273,6 +6979,409 @@ func (m *SMMemberValue) Unmarshal(dAtA []byte) error {
 				return io.ErrUnexpectedEOF
 			}
 			m.GrpcURL = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *ExtentInfo) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: ExtentInfo: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: ExtentInfo: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ExtentID", wireType)
+			}
+			m.ExtentID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.ExtentID |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType == 0 {
+				var v uint64
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowPb
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					v |= uint64(b&0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				m.Replicates = append(m.Replicates, v)
+			} else if wireType == 2 {
+				var packedLen int
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowPb
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					packedLen |= int(b&0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				if packedLen < 0 {
+					return ErrInvalidLengthPb
+				}
+				postIndex := iNdEx + packedLen
+				if postIndex < 0 {
+					return ErrInvalidLengthPb
+				}
+				if postIndex > l {
+					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				var count int
+				for _, integer := range dAtA[iNdEx:postIndex] {
+					if integer < 128 {
+						count++
+					}
+				}
+				elementCount = count
+				if elementCount != 0 && len(m.Replicates) == 0 {
+					m.Replicates = make([]uint64, 0, elementCount)
+				}
+				for iNdEx < postIndex {
+					var v uint64
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowPb
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						v |= uint64(b&0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					m.Replicates = append(m.Replicates, v)
+				}
+			} else {
+				return fmt.Errorf("proto: wrong wireType = %d for field Replicates", wireType)
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *StreamInfo) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: StreamInfo: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: StreamInfo: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field StreamID", wireType)
+			}
+			m.StreamID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.StreamID |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType == 0 {
+				var v uint64
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowPb
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					v |= uint64(b&0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				m.ExtentIDs = append(m.ExtentIDs, v)
+			} else if wireType == 2 {
+				var packedLen int
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowPb
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					packedLen |= int(b&0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				if packedLen < 0 {
+					return ErrInvalidLengthPb
+				}
+				postIndex := iNdEx + packedLen
+				if postIndex < 0 {
+					return ErrInvalidLengthPb
+				}
+				if postIndex > l {
+					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				var count int
+				for _, integer := range dAtA[iNdEx:postIndex] {
+					if integer < 128 {
+						count++
+					}
+				}
+				elementCount = count
+				if elementCount != 0 && len(m.ExtentIDs) == 0 {
+					m.ExtentIDs = make([]uint64, 0, elementCount)
+				}
+				for iNdEx < postIndex {
+					var v uint64
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowPb
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						v |= uint64(b&0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					m.ExtentIDs = append(m.ExtentIDs, v)
+				}
+			} else {
+				return fmt.Errorf("proto: wrong wireType = %d for field ExtentIDs", wireType)
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *NodeInfo) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: NodeInfo: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: NodeInfo: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field NodeID", wireType)
+			}
+			m.NodeID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.NodeID |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Address", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthPb
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return ErrInvalidLengthPb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Address = string(dAtA[iNdEx:postIndex])
 			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
