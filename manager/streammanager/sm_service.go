@@ -3,6 +3,8 @@ package streammanager
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -364,4 +366,17 @@ func formatNodeKey(ID uint64) string {
 
 func formatExtentReplicate(ID uint64) string {
 	return fmt.Sprintf("extents/%d", ID)
+}
+
+func parseKey(s string, prefix string) (uint64, error) {
+	//example: "stream_1" , "extent_1" , "node_1"
+
+	parts := strings.Split(s, "/")
+	if len(parts) != 2 {
+		return 0, errors.Errorf("parse key[%s] failed :", s)
+	}
+	if parts[0] != prefix {
+		return 0, errors.Errorf("parse key[%s] failed, parts[0] not match :", s)
+	}
+	return strconv.ParseUint(parts[1], 10, 64)
 }

@@ -29,7 +29,7 @@ func (sp *SimplePolicy) AllocExtent(ns []NodeStatus, count int, keepNodes []uint
 
 	var ret []NodeStatus
 	for i := 0; i < count; i++ {
-		if _, ok := set[ns[i].ID]; !ok {
+		if _, ok := set[ns[i].NodeID]; !ok {
 			ret = append(ret, ns[i])
 		}
 	}
