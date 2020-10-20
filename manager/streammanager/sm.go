@@ -39,7 +39,6 @@ type StreamManager struct {
 
 	nodeLock utils.SafeMutex
 	nodes    map[uint64]*NodeStatus
-	//nodes      *sync.Map //"nodeid" => "addr" //support update IP address
 
 	etcd       *embed.Etcd
 	client     *clientv3.Client
@@ -59,14 +58,11 @@ type StreamManager struct {
 
 func NewStreamManager(etcd *embed.Etcd, client *clientv3.Client, config *manager.Config) *StreamManager {
 	sm := &StreamManager{
-		streams: make(map[uint64]*pb.StreamInfo),
-		extents: make(map[uint64]*pb.ExtentInfo),
-		nodes:   make(map[uint64]*NodeStatus),
-		etcd:    etcd,
-		client:  client,
-		config:  config,
-		ID:      uint64(etcd.Server.ID()),
-		policy:  new(SimplePolicy),
+		etcd:   etcd,
+		client: client,
+		config: config,
+		ID:     uint64(etcd.Server.ID()),
+		policy: new(SimplePolicy),
 	}
 
 	v := pb.SMMemberValue{
@@ -94,6 +90,82 @@ func (sm *StreamManager) AmLeader() bool {
 
 func (sm *StreamManager) runAsLeader() {
 	//load system
+
+	sm.streamLock.Lock()
+	defer sm.streamLock.Unlock()
+	sm.extentsLock.Lock()
+	defer sm.extentsLock.Unlock()
+	sm.nodeLock.Lock()
+	defer sm.nodeLock.Unlock()
+
+	//load streams
+	kvs, err := manager.EtcdRange(sm.client, "streams")
+	if err != nil {
+		xlog.Logger.Warnf(err.Error())
+		return
+	}
+	sm.streams = make(map[uint64]*pb.StreamInfo)
+
+	for _, kv := range kvs {
+		streamID, err := parseKey(string(kv.Key), "streams")
+		if err != nil {
+			xlog.Logger.Warnf(err.Error())
+			return
+		}
+		var streamInfo pb.StreamInfo
+		if err = streamInfo.Unmarshal(kv.Value); err != nil {
+			xlog.Logger.Warnf(err.Error())
+			return
+		}
+		sm.streams[streamID] = &streamInfo
+	}
+
+	//load extents
+	kvs, err = manager.EtcdRange(sm.client, "extents")
+	if err != nil {
+		xlog.Logger.Warnf(err.Error())
+		return
+	}
+
+	sm.extents = make(map[uint64]*pb.ExtentInfo)
+
+	for _, kv := range kvs {
+		extentID, err := parseKey(string(kv.Key), "extents")
+		if err != nil {
+			xlog.Logger.Warnf(err.Error())
+			return
+		}
+		var extentInfo pb.ExtentInfo
+		if err = extentInfo.Unmarshal(kv.Value); err != nil {
+			xlog.Logger.Warnf(err.Error())
+			return
+		}
+		sm.extents[extentID] = &extentInfo
+	}
+
+	sm.nodes = make(map[uint64]*NodeStatus)
+
+	kvs, err = manager.EtcdRange(sm.client, "nodes")
+	if err != nil {
+		xlog.Logger.Warnf(err.Error())
+		return
+	}
+	for _, kv := range kvs {
+		nodeID, err := parseKey(string(kv.Key), "nodes")
+		if err != nil {
+			xlog.Logger.Warnf(err.Error())
+			return
+		}
+		var nodeInfo pb.NodeInfo
+		if err = nodeInfo.Unmarshal(kv.Value); err != nil {
+			xlog.Logger.Warnf(err.Error())
+			return
+		}
+		sm.nodes[nodeID] = &NodeStatus{
+			NodeInfo: nodeInfo,
+		}
+	}
+
 	atomic.StoreInt32(&sm.isLeader, 1)
 }
 
@@ -196,7 +268,6 @@ func (sm *StreamManager) ServeGRPC() error {
 	}()
 	sm.grcpServer = grpcServer
 	return nil
-
 }
 
 func (sm *StreamManager) Close() {
