@@ -14,13 +14,15 @@ import (
 func main() {
 	config := manager.NewConfig()
 
-	xlog.InitLog(nil, zapcore.DebugLevel)
+	xlog.InitLog([]string{"sm.log"}, zapcore.DebugLevel)
 
 	etcd, client, err := manager.ServeETCD(config)
 	if err != nil {
 		panic(err.Error())
 	}
 	sm := streammanager.NewStreamManager(etcd, client, config)
+	go sm.LeaderLoop()
+
 	err = sm.ServeGRPC()
 	if err != nil {
 		xlog.Logger.Fatalf(err.Error())

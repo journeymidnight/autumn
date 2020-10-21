@@ -257,7 +257,7 @@ func (sm *StreamManager) ServeGRPC() error {
 		grpc.MaxConcurrentStreams(1000),
 	)
 
-	//pb.Reg
+	pb.RegisterStreamManagerServiceServer(grpcServer, sm)
 
 	listener, err := net.Listen("tcp", sm.config.GrpcUrl)
 	if err != nil {
