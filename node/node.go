@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/journeymidnight/autumn/conn"
 	"github.com/journeymidnight/autumn/extent"
@@ -96,6 +97,12 @@ func (en *ExtentNode) setReplicates(extentID uint64, addrs []string) {
 
 func (en *ExtentNode) RegisterNode() {
 	xlog.Logger.Infof("RegisterNode")
+
+	err := en.smClient.Connect()
+	if err != nil {
+		xlog.Logger.Fatalf(err.Error())
+	}
+
 	storeIDPath := path.Join(en.baseFileDir, "node_id")
 	idString, err := ioutil.ReadFile(storeIDPath)
 	if err == nil {
@@ -104,13 +111,31 @@ func (en *ExtentNode) RegisterNode() {
 			xlog.Logger.Fatalf("can not read ioString")
 		}
 		en.nodeID = id
+		return
 	}
 
-	id, err := en.smClient.RegisterNode(context.Background(), en.listenUrl)
-	if err != nil {
-		xlog.Logger.Fatal("can not register myself")
+	//if no such file: node_id, registerNode
+	sleep := 10 * time.Millisecond
+	for loop := 0; ; loop++ {
+		id, err := en.smClient.RegisterNode(context.Background(), en.listenUrl)
+		if err != nil {
+			xlog.Logger.Warnf("can not register myself: %v", err)
+			time.Sleep(sleep)
+			sleep = 2 * sleep
+			if loop > 10 {
+				xlog.Logger.Fatal("can not register myself")
+			}
+			continue
+		}
+		en.nodeID = id
+		break
 	}
-	en.nodeID = id
+
+	if err = ioutil.WriteFile(storeIDPath, []byte(fmt.Sprintf("%d", en.nodeID)), 0644); err != nil {
+		xlog.Logger.Fatalf("try to write file %s, %d, but failed, try to save it manually", storeIDPath, en.nodeID)
+	}
+	xlog.Logger.Infof("success to register to sm")
+
 }
 
 func (en *ExtentNode) LoadExtents() error {

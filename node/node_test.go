@@ -28,9 +28,9 @@ func TestBasicNode(t *testing.T) {
 	os.Mkdir("xnodestore2", 0744)
 	os.Mkdir("xnodestore3", 0744)
 
-	nodes[0] = NewExtentNode("xnodestore1", "127.0.0.1:3301")
-	nodes[1] = NewExtentNode("xnodestore2", "127.0.0.1:3302")
-	nodes[2] = NewExtentNode("xnodestore3", "127.0.0.1:3303")
+	nodes[0] = NewExtentNode("xnodestore1", "127.0.0.1:3301", []string{"127.0.0.1:3401"})
+	nodes[1] = NewExtentNode("xnodestore2", "127.0.0.1:3302", []string{"127.0.0.1:3401"})
+	nodes[2] = NewExtentNode("xnodestore3", "127.0.0.1:3303", []string{"127.0.0.1:3401"})
 
 	defer os.RemoveAll("xnodestore1")
 	defer os.RemoveAll("xnodestore2")

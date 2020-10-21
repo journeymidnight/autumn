@@ -6,8 +6,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/journeymidnight/streamlayer/node"
-	"github.com/journeymidnight/streamlayer/xlog"
+	"github.com/journeymidnight/autumn/node"
+	"github.com/journeymidnight/autumn/xlog"
 	"github.com/urfave/cli"
 	"go.uber.org/zap"
 )
@@ -45,8 +45,9 @@ func main() {
 	}
 	xlog.InitLog([]string{fmt.Sprintf("node_%d.log", ID)}, zap.DebugLevel)
 
-	node := node.NewExtentNode(dir, listen)
+	node := node.NewExtentNode(dir, listen, []string{"127.0.0.1:3401"})
 	node.LoadExtents()
+	node.RegisterNode()
 	node.ServeGRPC()
 
 	xlog.Logger.Infof("node is ready!")

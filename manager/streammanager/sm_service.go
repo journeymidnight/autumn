@@ -22,6 +22,8 @@ func (sm *StreamManager) CreateStream(ctx context.Context, req *pb.CreateStreamR
 	if !sm.AmLeader() {
 		return nil, errors.Errorf("not a leader")
 	}
+	xlog.Logger.Info("alloc new stream")
+
 	//block forever
 	start, _, err := sm.allocUniqID(2)
 	if err != nil {
@@ -107,8 +109,14 @@ func (sm *StreamManager) addExtent(streamID uint64, extent *pb.ExtentInfo) {
 	defer sm.extentsLock.Unlock()
 
 	s, ok := sm.streams[streamID]
-	utils.AssertTrue(ok)
-	s.ExtentIDs = append(s.ExtentIDs, extent.ExtentID)
+	if ok {
+		s.ExtentIDs = append(s.ExtentIDs, extent.ExtentID)
+	} else {
+		sm.streams[streamID] = &pb.StreamInfo{
+			StreamID:  streamID,
+			ExtentIDs: []uint64{extent.ExtentID},
+		}
+	}
 	sm.extents[extent.ExtentID] = extent
 }
 
@@ -243,10 +251,16 @@ func (sm *StreamManager) RegisterNode(ctx context.Context, req *pb.RegisterNodeR
 	}
 
 	//modify etcd
+	nodeInfo := &pb.NodeInfo{
+		NodeID:  id,
+		Address: req.Addr,
+	}
+	data, err := nodeInfo.Marshal()
+	utils.Check(err)
 	nodeKey := formatNodeKey(id)
-	nodeValue := req.Addr
+	nodeValue := data
 	ops := []clientv3.Op{
-		clientv3.OpPut(nodeKey, nodeValue),
+		clientv3.OpPut(nodeKey, string(nodeValue)),
 	}
 
 	err = manager.EtctSetKVS(sm.client, []clientv3.Cmp{

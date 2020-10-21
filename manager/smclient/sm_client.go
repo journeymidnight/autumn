@@ -1,0 +1,241 @@
+package smclient
+
+import (
+	"context"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/journeymidnight/autumn/proto/pb"
+	"github.com/journeymidnight/autumn/utils"
+	"github.com/journeymidnight/autumn/xlog"
+	"github.com/pkg/errors"
+	"google.golang.org/grpc"
+)
+
+type SMClient struct {
+	conns []*grpc.ClientConn //protected by RWMUTEX
+	sync.RWMutex
+	lastLeader int32 //protected by atomic
+	addrs      []string
+}
+
+func NewSMClient(addrs []string) *SMClient {
+	utils.AssertTrue(xlog.Logger != nil)
+	return &SMClient{
+		addrs: addrs,
+	}
+}
+
+// Connect to Zero's grpc service, if all of connect failed to connnect, return error
+func (client *SMClient) Connect() error {
+
+	if len(client.addrs) == 0 {
+		return errors.Errorf("addr is nil")
+	}
+	client.Lock()
+	client.conns = nil
+	errCount := 0
+	for _, addr := range client.addrs {
+		c, err := grpc.Dial(addr, grpc.WithBackoffMaxDelay(time.Second), grpc.WithInsecure())
+		if err != nil {
+			errCount++
+		}
+		client.conns = append(client.conns, c)
+	}
+	client.Unlock()
+	if errCount == len(client.addrs) {
+		return errors.Errorf("all connection failed")
+	}
+	atomic.StoreInt32(&client.lastLeader, 0)
+	return nil
+}
+
+func (client *SMClient) CurrentLeader() string {
+	current := atomic.LoadInt32(&client.lastLeader)
+	return client.addrs[current]
+}
+
+func (client *SMClient) Close() {
+	client.Lock()
+	defer client.Unlock()
+	for _, c := range client.conns {
+		c.Close()
+	}
+	client.conns = nil
+}
+
+func (client *SMClient) Alive() bool {
+	client.RLock()
+	defer client.RUnlock()
+	return len(client.conns) > 0
+}
+
+func (client *SMClient) RegisterNode(ctx context.Context, addr string) (uint64, error) {
+	client.RLock()
+	defer client.RUnlock()
+	current := atomic.LoadInt32(&client.lastLeader)
+	for loop := 0; loop < len(client.conns)*2; loop++ {
+		if client.conns != nil && client.conns[current] != nil {
+			c := pb.NewStreamManagerServiceClient(client.conns[current])
+			res, err := c.RegisterNode(ctx, &pb.RegisterNodeRequest{
+				Addr: addr,
+			})
+			if err == context.Canceled || err == context.DeadlineExceeded {
+				return 0, err
+			}
+			if err != nil {
+				xlog.Logger.Warnf(err.Error())
+				current = (current + 1) % int32(len(client.conns))
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			atomic.StoreInt32(&client.lastLeader, current)
+			return res.NodeId, nil
+		}
+	}
+	return 0, errors.Errorf("timeout : cannot register Node")
+}
+
+func (client *SMClient) CreateStream(ctx context.Context) (*pb.StreamInfo, *pb.ExtentInfo, error) {
+	client.RLock()
+	defer client.RUnlock()
+	current := atomic.LoadInt32(&client.lastLeader)
+	for loop := 0; loop < len(client.conns)*2; loop++ {
+		if client.conns != nil && client.conns[current] != nil {
+			c := pb.NewStreamManagerServiceClient(client.conns[current])
+			res, err := c.CreateStream(ctx, &pb.CreateStreamRequest{})
+			if err == context.Canceled || err == context.DeadlineExceeded {
+				return nil, nil, err
+			}
+			if err != nil {
+				xlog.Logger.Warnf(err.Error())
+				current = (current + 1) % int32(len(client.conns))
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			atomic.StoreInt32(&client.lastLeader, current)
+			return res.Stream, res.Extent, nil
+
+		}
+	}
+	return nil, nil, errors.Errorf("timeout: CreateStream failed")
+}
+
+func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64) (*pb.ExtentInfo, error) {
+	client.RLock()
+	defer client.RUnlock()
+	last := atomic.LoadInt32(&client.lastLeader)
+	current := last
+	for loop := 0; loop < len(client.conns)*2; loop++ {
+		if client.conns != nil && client.conns[current] != nil {
+			c := pb.NewStreamManagerServiceClient(client.conns[current])
+			//
+			res, err := c.StreamAllocExtent(ctx, &pb.StreamAllocExtentRequest{
+				StreamID: streamID,
+			})
+			if err == context.Canceled || err == context.DeadlineExceeded {
+				return nil, err
+			}
+			if err != nil {
+				xlog.Logger.Warnf(err.Error())
+				current = (current + 1) % int32(len(client.conns))
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			if current != last {
+				atomic.StoreInt32(&client.lastLeader, current)
+			}
+			return res.Extent, nil
+		}
+	}
+	return nil, errors.Errorf("timeout: CreateStream failed")
+}
+
+func (client *SMClient) NodesInfo(ctx context.Context, streamID uint64) (map[uint64]*pb.NodeInfo, error) {
+	client.RLock()
+	defer client.RUnlock()
+	last := atomic.LoadInt32(&client.lastLeader)
+	current := last
+	for loop := 0; loop < len(client.conns)*2; loop++ {
+		if client.conns != nil && client.conns[current] != nil {
+			c := pb.NewStreamManagerServiceClient(client.conns[current])
+			//
+			res, err := c.NodesInfo(ctx, &pb.NodesInfoRequest{})
+			if err == context.Canceled || err == context.DeadlineExceeded {
+				return nil, err
+			}
+			if err != nil {
+				xlog.Logger.Warnf(err.Error())
+				current = (current + 1) % int32(len(client.conns))
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			if current != last {
+				atomic.StoreInt32(&client.lastLeader, current)
+			}
+			return res.Nodes, nil
+		}
+	}
+	return nil, errors.Errorf("timeout: NodesInfo failed")
+}
+
+func (client *SMClient) ExtentInfo(ctx context.Context, extentIDs []uint64) (map[uint64]*pb.ExtentInfo, error) {
+	client.RLock()
+	defer client.RUnlock()
+	last := atomic.LoadInt32(&client.lastLeader)
+	current := last
+	for loop := 0; loop < len(client.conns)*2; loop++ {
+		if client.conns != nil && client.conns[current] != nil {
+			c := pb.NewStreamManagerServiceClient(client.conns[current])
+			//
+			res, err := c.ExtentInfo(ctx, &pb.ExtentInfoRequest{
+				Extents: extentIDs,
+			})
+			if err == context.Canceled || err == context.DeadlineExceeded {
+				return nil, err
+			}
+			if err != nil {
+				xlog.Logger.Warnf(err.Error())
+				current = (current + 1) % int32(len(client.conns))
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			if current != last {
+				atomic.StoreInt32(&client.lastLeader, current)
+			}
+			return res.Extents, nil
+		}
+	}
+	return nil, errors.Errorf("timeout: ExtentInfo failed")
+}
+
+func (client *SMClient) StreamInfo(ctx context.Context, streamIDs []uint64) (map[uint64]*pb.StreamInfo, map[uint64]*pb.ExtentInfo, error) {
+	client.RLock()
+	defer client.RUnlock()
+	last := atomic.LoadInt32(&client.lastLeader)
+	current := last
+	for loop := 0; loop < len(client.conns)*2; loop++ {
+		if client.conns != nil && client.conns[current] != nil {
+			c := pb.NewStreamManagerServiceClient(client.conns[current])
+			//
+			res, err := c.StreamInfo(ctx, &pb.StreamInfoRequest{
+				StreamIDs: streamIDs,
+			})
+			if err == context.Canceled || err == context.DeadlineExceeded {
+				return nil, nil, err
+			}
+			if err != nil {
+				xlog.Logger.Warnf(err.Error())
+				current = (current + 1) % int32(len(client.conns))
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			if current != last {
+				atomic.StoreInt32(&client.lastLeader, current)
+			}
+			return res.Streams, res.Extents, nil
+		}
+	}
+	return nil, nil, errors.Errorf("timeout: StreamInfo failed")
+}
