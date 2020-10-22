@@ -34,7 +34,7 @@ var (
 )
 
 //internal services
-func (en *ExtentNode) Heartbeat(in *pb.Payload, stream pb.InternalExtentService_HeartbeatServer) error {
+func (en *ExtentNode) Heartbeat(in *pb.Payload, stream pb.ExtentService_HeartbeatServer) error {
 	ticker := time.NewTicker(conn.EchoDuration)
 	defer ticker.Stop()
 
@@ -133,7 +133,7 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 		j := i
 		stopper.RunWorker(func() {
 			conn := pools[j].Get()
-			client := pb.NewInternalExtentServiceClient(conn)
+			client := pb.NewExtentServiceClient(conn)
 			res, err := client.ReplicateBlocks(pctx, &pb.ReplicateBlocksRequest{
 				ExtentID: req.ExtentID,
 				Commit:   offset,
@@ -169,7 +169,7 @@ func (en *ExtentNode) ReadBlocks(ctx context.Context, req *pb.ReadBlocksRequest)
 	if ex == nil {
 		return nil, errors.Errorf("no such extent")
 	}
-	blocks, err := ex.ReadBlocks(req.Offsets)
+	blocks, err := ex.ReadBlocks(req.Offset, req.NumOfBlocks)
 	if err != nil {
 		return nil, err
 	}
@@ -197,4 +197,31 @@ func (en *ExtentNode) AllocExtent(ctx context.Context, req *pb.AllocExtentReques
 	return &pb.AllocExtentResponse{
 		Code: pb.Code_OK,
 	}, nil
+}
+
+func (en *ExtentNode) Seal(ctx context.Context, req *pb.SealRequest) (*pb.SealResponse, error) {
+	ex := en.getExtent(req.ExtentID)
+	if ex != nil {
+		return nil, errors.Errorf("have extent, can not alloc new")
+	}
+	err := ex.Seal(req.CommitLength)
+	if err != nil {
+		xlog.Logger.Warnf(err.Error())
+		return nil, err
+	}
+	return &pb.SealResponse{Code: pb.Code_OK}, nil
+
+}
+func (en *ExtentNode) CommitLength(ctx context.Context, req *pb.CommitLengthRequest) (*pb.CommitLengthResponse, error) {
+	ex := en.getExtent(req.ExtentID)
+	if ex != nil {
+		return nil, errors.Errorf("have extent, can not alloc new")
+	}
+
+	l := ex.CommitLength()
+	return &pb.CommitLengthResponse{
+		Code:   pb.Code_OK,
+		Length: l,
+	}, nil
+
 }

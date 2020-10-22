@@ -218,10 +218,7 @@ func (r *extentBlockReader) Read(p []byte) (n int, err error) {
 	return n, nil
 }
 
-func (ex *Extent) Seal(commit uint32, indexFileName string) error {
-	if indexFileName == "" {
-		return errors.Errorf("index file is empty")
-	}
+func (ex *Extent) Seal(commit uint32) error {
 	ex.Lock()
 	defer ex.Unlock()
 	atomic.StoreInt32(&ex.isSeal, 1)
@@ -259,15 +256,15 @@ func (ex *Extent) Close() {
 	ex.file.Close()
 }
 
-func (ex *Extent) ReadBlocks(offsets []uint32) ([]*pb.Block, error) {
+func (ex *Extent) ReadBlocks(offset uint32, numOfBlocks uint32) ([]*pb.Block, error) {
 
 	var ret []*pb.Block
 	//TODO: fix block number
-	for _, offset := range offsets {
-		current := atomic.LoadUint32(&ex.commitLength)
-		if current <= offset {
-			return nil, errors.Errorf("read offset is beyond current %d, %d", current, offset)
-		}
+	current := atomic.LoadUint32(&ex.commitLength)
+	if current <= offset {
+		return nil, errors.Errorf("read offset is beyond current %d, %d", current, offset)
+	}
+	for i := uint32(0); i < numOfBlocks; i++ {
 		r, err := ex.GetReader(offset)
 		if err != nil {
 			return nil, err
@@ -277,7 +274,9 @@ func (ex *Extent) ReadBlocks(offsets []uint32) ([]*pb.Block, error) {
 			return nil, err
 		}
 		ret = append(ret, &block)
+		offset += block.BlockLength + 512
 	}
+
 	return ret, nil
 }
 

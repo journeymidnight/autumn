@@ -51,7 +51,8 @@ message CreateExtentResponse{
 
 message ReadBlocksRequest {
 	uint64 extentID = 1;
-	repeated uint32 offsets = 2;
+	uint32 offset = 2;
+	uint32 numOfBlocks = 3;
 }
 
 message ReadBlocksResponse {
@@ -64,10 +65,35 @@ message Payload {
         bytes Data = 1;
 }
 
+
+message CommitLengthRequest {
+	uint64 extentID = 1;
+}
+
+message CommitLengthResponse {
+	Code code = 1;
+	uint32 length = 2;
+}
+
+message SealRequest {
+	uint64 extentID = 1;
+	uint32 commitLength = 2;
+}
+
+message SealResponse {
+	Code code = 1;
+}
+
 service ExtentService {
 	rpc Append(AppendRequest) returns (AppendResponse){}
 	rpc ReadBlocks(ReadBlocksRequest) returns(ReadBlocksResponse){}
 	//rpc ReadBytes(offset, size) returns(){} //stream
+
+	rpc Seal(SealRequest) returns (SealResponse) {}
+	rpc CommitLength(CommitLengthRequest) returns (CommitLengthResponse) {}
+	rpc Heartbeat (Payload)  returns (stream Payload) {}
+	rpc ReplicateBlocks(ReplicateBlocksRequest) returns (ReplicateBlocksResponse) {}
+	rpc AllocExtent(AllocExtentRequest) returns (AllocExtentResponse){}
 }
 
 message ReplicateBlocksRequest {
@@ -87,12 +113,6 @@ message AllocExtentRequest {
 
 message AllocExtentResponse {
 	Code code = 1;
-}
-
-service InternalExtentService {
-	rpc Heartbeat (Payload)  returns (stream Payload) {}
-	rpc ReplicateBlocks(ReplicateBlocksRequest) returns (ReplicateBlocksResponse) {}
-	rpc AllocExtent(AllocExtentRequest) returns (AllocExtentResponse){}
 }
 
 

@@ -218,7 +218,7 @@ func (sm *StreamManager) sendAllocToNodes(ctx context.Context, nodes []NodeStatu
 		stopper.RunWorker(func() {
 			pool := conn.GetPools().Connect(addr)
 			conn := pool.Get()
-			c := pb.NewInternalExtentServiceClient(conn)
+			c := pb.NewExtentServiceClient(conn)
 			_, err := c.AllocExtent(pctx, &pb.AllocExtentRequest{
 				ExtentID: extentID,
 			})

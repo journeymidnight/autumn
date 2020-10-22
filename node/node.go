@@ -175,7 +175,6 @@ func (en *ExtentNode) ServeGRPC() error {
 		grpc.MaxConcurrentStreams(1000),
 	)
 
-	pb.RegisterInternalExtentServiceServer(grpcServer, en)
 	pb.RegisterExtentServiceServer(grpcServer, en)
 
 	listener, err := net.Listen("tcp", en.listenUrl)
