@@ -103,7 +103,7 @@ func TestAppendReadFile(t *testing.T) {
 	assert.Nil(t, err)
 
 	//single thread read
-	retBlocks, err := extent.ReadBlocks(ret)
+	retBlocks, err := extent.ReadBlocks(ret[0], 4)
 	assert.Nil(t, err)
 
 	assert.Equal(t, cases, retBlocks)
@@ -120,7 +120,7 @@ func TestAppendReadFile(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		go func() {
 			for ele := range ch {
-				blocks, err := extent.ReadBlocks([]uint32{ele.offset})
+				blocks, err := extent.ReadBlocks(ele.offset, 1)
 				assert.Nil(t, err)
 				assert.Equal(t, cases[ele.caseIndex], blocks[0])
 				atomic.AddInt32(&complets, 1)
@@ -184,7 +184,7 @@ func TestReplayExtent(t *testing.T) {
 	assert.Equal(t, commit, ex.CommitLength())
 
 	//read test
-	blocks, err := ex.ReadBlocks([]uint32{512}) //read object1
+	blocks, err := ex.ReadBlocks(512, 1) //read object1
 	assert.Nil(t, err)
 	assert.Equal(t, cases[0], blocks[0])
 

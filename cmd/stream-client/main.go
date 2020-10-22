@@ -12,6 +12,24 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
+
+func bench(c *cli.Context) error {
+	cluster := c.String("cluster")
+	client := smclient.NewSMClient([]string{cluster})
+	if err := client.Connect(); err != nil {
+		return err
+	}
+	nodes, err := client.NodesInfo(context.Background())
+	if err != nil {
+		return err
+	}
+	s, e, err := client.CreateStream(context.Background())
+	if err != nil {
+		return err
+	}
+
+
+}
 func info(c *cli.Context) error {
 	cluster := c.String("cluster")
 	client := smclient.NewSMClient([]string{cluster})
@@ -22,8 +40,14 @@ func info(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
+
+	nodes, err := client.NodesInfo(context.Background())
+	if err != nil {
+		return err
+	}
 	fmt.Printf("%v\n", streams)
 	fmt.Printf("%v\n", extents)
+	fmt.Printf("%v\n", nodes)
 	return nil
 }
 
@@ -69,6 +93,14 @@ func main() {
 			},
 			Action: info,
 		},
+		{
+			Name : "bench",
+			Usage: "bench --cluster <path>",
+			Flags: []cli.Flag{
+				&cli.StringFlag{Name: "cluster", Value: "127.0.0.1:3401"},
+			},
+			Action: bench,
+		}
 	}
 	err := app.Run(os.Args)
 	if err != nil {
