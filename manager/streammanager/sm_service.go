@@ -3,6 +3,7 @@ package streammanager
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -145,17 +146,27 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	if !sm.AmLeader() {
 		return nil, errors.Errorf("not a leader")
 	}
-	stream, ok := sm.getStreamInfo(req.StreamID)
-	if !ok {
-		return nil, errors.Errorf("no such stream")
+
+	nodes, id, err := sm.getAppendExtentsAddr(req.StreamID)
+	if err != nil {
+		return nil, err
+	}
+	if id != req.ExtentToSeal {
+		return nil, errors.Errorf("extentID no match %d vs %d", id, req.ExtentToSeal)
 	}
 
+	//recevied commit length
+	size := sm.receiveCommitlength(ctx, nodes, req.ExtentToSeal)
+
+	sm.sealExtents(ctx, nodes, req.ExtentToSeal, size)
+
+	//alloc new extend
 	extentID, _, err := sm.allocUniqID(1)
 	if err != nil {
 		return nil, errors.Errorf("can not alloc id")
 	}
 
-	nodes := sm.cloneNodeStatus()
+	nodes = sm.cloneNodeStatus()
 
 	nodes, err = sm.policy.AllocExtent(nodes, 3, nil)
 	if err != nil {
@@ -166,9 +177,9 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		return nil, err
 	}
 
-	stream.ExtentIDs = append(stream.ExtentIDs, extentID)
 	//update etcd
-
+	stream := sm.cloneStream(req.StreamID)
+	stream.ExtentIDs = append(stream.ExtentIDs, extentID)
 	//add extentID to stream
 	streamKey := formatStreamKey(req.StreamID)
 	sdata, err := stream.Marshal()
@@ -206,6 +217,70 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	}, nil
 }
 
+//sealExtents could be all failed.
+func (sm *StreamManager) sealExtents(ctx context.Context, nodes []NodeStatus, extentID uint64, commitLength uint32) {
+	pctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+
+	stopper := utils.NewStopper()
+	for _, node := range nodes {
+		addr := node.Address
+		stopper.RunWorker(func() {
+			pool := conn.GetPools().Connect(addr)
+			conn := pool.Get()
+			c := pb.NewExtentServiceClient(conn)
+			_, err := c.Seal(pctx, &pb.SealRequest{
+				ExtentID:     extentID,
+				CommitLength: commitLength,
+			})
+			if err != nil { //timeout or other error
+				xlog.Logger.Warnf(err.Error())
+				return
+			}
+		})
+	}
+}
+
+func (sm *StreamManager) receiveCommitlength(ctx context.Context, nodes []NodeStatus, extentID uint64) uint32 {
+	pctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+
+	stopper := utils.NewStopper()
+	reCh := make(chan uint32)
+	for _, node := range nodes {
+		addr := node.Address
+		stopper.RunWorker(func() {
+			pool := conn.GetPools().Connect(addr)
+			conn := pool.Get()
+			c := pb.NewExtentServiceClient(conn)
+			res, err := c.CommitLength(pctx, &pb.CommitLengthRequest{
+				ExtentID: extentID,
+			})
+			if err != nil { //timeout or other error
+				xlog.Logger.Warnf(err.Error())
+				reCh <- math.MaxUint32
+				return
+			}
+			reCh <- res.Length
+		})
+	}
+	stopper.Wait()
+	close(reCh)
+	//choose min of all size
+	ret := uint32(512)
+	for size := range reCh {
+		if size == math.MaxUint32 {
+			continue
+		}
+		if size < ret {
+			ret = size
+		}
+	}
+
+	return ret
+}
+
+//FIXME: sendCmdToNodes()
 func (sm *StreamManager) sendAllocToNodes(ctx context.Context, nodes []NodeStatus, extentID uint64) error {
 	pctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
@@ -341,6 +416,39 @@ func (sm *StreamManager) StreamInfo(ctx context.Context, req *pb.StreamInfoReque
 		Extents: resExtents,
 	}, nil
 
+}
+
+func (sm *StreamManager) getAppendExtentsAddr(streamID uint64) ([]NodeStatus, uint64, error) {
+	sm.streamLock.RLock()
+	s, ok := sm.streams[streamID]
+	lastExtentID := s.ExtentIDs[len(s.ExtentIDs)-1]
+	sm.streamLock.RUnlock()
+	if !ok {
+		return nil, 0, errors.Errorf("no such stream %d", streamID)
+	}
+	sm.extentsLock.RLock()
+	extInfo, ok := sm.extents[lastExtentID]
+	sm.extentsLock.RUnlock()
+	if !ok {
+		return nil, 0, errors.Errorf("no such extentd %d", lastExtentID)
+	}
+	sm.nodeLock.RLock()
+	var ret []NodeStatus
+	for _, nodeID := range extInfo.Replicates {
+		ret = append(ret, *sm.nodes[nodeID])
+	}
+	sm.nodeLock.RUnlock()
+	return ret, lastExtentID, nil
+}
+
+func (sm *StreamManager) cloneStream(streamID uint64) *pb.StreamInfo {
+	sm.streamLock.RLock()
+	defer sm.streamLock.Unlock()
+	stream, ok := sm.streams[streamID]
+	if !ok {
+		return nil
+	}
+	return proto.Clone(stream).(*pb.StreamInfo)
 }
 
 func (sm *StreamManager) cloneNodeStatus() (ret []NodeStatus) {
