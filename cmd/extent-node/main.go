@@ -7,8 +7,9 @@ import (
 	"syscall"
 
 	"github.com/journeymidnight/autumn/node"
+	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 	"go.uber.org/zap"
 )
 
@@ -43,14 +44,25 @@ func main() {
 	if err := app.Run(os.Args); err != nil {
 		panic(err.Error())
 	}
+
 	xlog.InitLog([]string{fmt.Sprintf("node_%d.log", ID)}, zap.DebugLevel)
 
+	//FIXME: sm address
 	node := node.NewExtentNode(dir, listen, []string{"127.0.0.1:3401"})
-	node.LoadExtents()
+
+	//open all extent files
+	err := node.LoadExtents()
+	utils.Check(err)
+
+	//open 'node_id' file, if 'node_id' doesn't exist. register to sm
 	node.RegisterNode()
-	node.ServeGRPC()
+
+	//start grpc service
+	err = node.ServeGRPC()
+	utils.Check(err)
 
 	xlog.Logger.Infof("node is ready!")
+
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc,
 		syscall.SIGINT,

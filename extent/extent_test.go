@@ -172,7 +172,7 @@ func TestReplayExtent(t *testing.T) {
 	assert.Nil(t, err)
 	commit := ex.CommitLength()
 
-	err = ex.Seal(ex.commitLength, "localtest.idx")
+	err = ex.Seal(ex.commitLength)
 	assert.Nil(t, err)
 	defer os.Remove("localtest.idx")
 	ex.Close()
@@ -205,4 +205,25 @@ func TestExtentHeader(t *testing.T) {
 
 	assert.Equal(t, header, newHeader)
 
+}
+
+func BenchmarkExtent(b *testing.B) {
+	extent, err := CreateExtent("localtest.ext", 100)
+	defer os.Remove("localtest.ext")
+	if err != nil {
+		panic(err.Error())
+	}
+	block := generateBlock("test", 4096)
+	commit := uint32(512)
+	extent.Lock()
+	for i := 0; i < b.N; i++ {
+		_, err = extent.AppendBlocks([]*pb.Block{
+			block,
+		}, commit)
+
+		if err != nil {
+			panic(err.Error())
+		}
+		commit += 512 + 4096
+	}
 }

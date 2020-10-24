@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"hash"
 	"hash/adler32"
+	"math"
 	"math/rand"
+	"strings"
 	"sync"
 
 	"github.com/journeymidnight/autumn/xlog"
@@ -69,4 +71,25 @@ func Check(err error) {
 	if err != nil {
 		xlog.Logger.Fatalf("%+v", errors.Wrap(err, ""))
 	}
+}
+
+func HumanReadableThroughput(t float64) string {
+	if t < 0 || t < 1e-9 { //if t <=0 , return ""
+		return ""
+	}
+	units := []string{"B", "KB", "MB", "GB", "TB", "PB", "EB"}
+	power := int(math.Log10(t) / 3)
+	if power >= len(units) {
+		return ""
+	}
+
+	return fmt.Sprintf("%.2f%s/sec", t/math.Pow(1000, float64(power)), units[power])
+}
+
+func SplitAndTrim(s string, sep string) []string {
+	parts := strings.Split(s, sep)
+	for i := 0; i < len(parts); i++ {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return parts
 }

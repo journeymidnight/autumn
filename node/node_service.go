@@ -71,14 +71,7 @@ func (en *ExtentNode) ReplicateBlocks(ctx context.Context, req *pb.ReplicateBloc
 
 }
 
-//external services
-
-func (en *ExtentNode) connPoolOfReplicates(extentID uint64) ([]*conn.Pool, error) {
-	peers := en.getReplicates(extentID)
-	if len(peers) == 0 {
-		//get from SM
-		return nil, errors.Errorf("can not find relicates")
-	}
+func (en *ExtentNode) connPoolOfReplicates(peers []string) ([]*conn.Pool, error) {
 	var ret []*conn.Pool
 	for _, peer := range peers {
 		pool := conn.GetPools().Connect(peer)
@@ -100,7 +93,7 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 	ex.Lock()
 	defer ex.Unlock()
 
-	pools, err := en.connPoolOfReplicates(req.ExtentID)
+	pools, err := en.connPoolOfReplicates(req.Peers)
 	if err != nil {
 		return nil, err
 	}
@@ -119,17 +112,20 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 	retChan := make(chan Result, 3)
 	//primary
 	stopper.RunWorker(func() {
+		//start := time.Now()
 		ret, err := ex.AppendBlocks(req.Blocks, offset)
+		//fmt.Printf("len %d, %v\n", len(req.Blocks), time.Now().Sub(start))
+
 		if ret != nil {
 			retChan <- Result{Error: err, Offsets: ret}
 		} else {
 			retChan <- Result{Error: err}
 		}
-		fmt.Printf("err :%v,  offset %v", err, ret)
+		xlog.Logger.Debugf("write primary done: %v", ret, err)
 	})
 	//secondary
 
-	for i := 0; i < 2; i++ {
+	for i := 1; i < 3; i++ {
 		j := i
 		stopper.RunWorker(func() {
 			conn := pools[j].Get()
@@ -144,6 +140,8 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 			} else {
 				retChan <- Result{Error: err}
 			}
+			xlog.Logger.Debugf("write seconary done %v", err)
+
 		})
 	}
 

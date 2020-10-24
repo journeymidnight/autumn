@@ -34,7 +34,7 @@ func (client *SMClient) LookupNode(nodeID uint64) *pb.NodeInfo {
 	info := client.nodes[nodeID]
 	client.nodesLock.RUnlock()
 	if info != nil {
-		return nil
+		return info
 	}
 
 	//try to update nodes
@@ -163,7 +163,7 @@ func (client *SMClient) CreateStream(ctx context.Context) (*pb.StreamInfo, *pb.E
 	return nil, nil, errors.Errorf("timeout: CreateStream failed")
 }
 
-func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64) (*pb.ExtentInfo, error) {
+func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64, extentToSeal uint64) (*pb.ExtentInfo, error) {
 	client.RLock()
 	defer client.RUnlock()
 	last := atomic.LoadInt32(&client.lastLeader)
@@ -173,7 +173,8 @@ func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64) 
 			c := pb.NewStreamManagerServiceClient(client.conns[current])
 			//
 			res, err := c.StreamAllocExtent(ctx, &pb.StreamAllocExtentRequest{
-				StreamID: streamID,
+				StreamID:     streamID,
+				ExtentToSeal: extentToSeal,
 			})
 			if err == context.Canceled || err == context.DeadlineExceeded {
 				return nil, err

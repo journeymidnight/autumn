@@ -33,6 +33,7 @@ message Block {
 message AppendRequest {
 	uint64 extentID = 1;
 	repeated Block blocks = 2;
+	repeated string peers = 3;
 }
 
 message AppendResponse {
@@ -118,6 +119,7 @@ message AllocExtentResponse {
 
 message StreamAllocExtentRequest{
 	uint64 streamID = 1;
+	uint64 extentToSeal = 2;
 }
 
 

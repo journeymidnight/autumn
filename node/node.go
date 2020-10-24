@@ -51,7 +51,7 @@ type ExtentNode struct {
 	extentMap   *sync.Map
 	//extentMap map[uint64]*extent.Extent //extent it owns: extentID => file
 	//TODO: cached SM date in EN
-	replicates *sync.Map
+	//replicates *sync.Map
 	//replicates map[uint64][]string //extentID => [addr1, addr2]
 
 	smClient *smclient.SMClient
@@ -61,8 +61,8 @@ func NewExtentNode(baseFileDir string, listenUrl string, smAddr []string) *Exten
 	utils.AssertTrue(xlog.Logger != nil)
 
 	return &ExtentNode{
-		extentMap:   new(sync.Map),
-		replicates:  new(sync.Map),
+		extentMap: new(sync.Map),
+		//replicates:  new(sync.Map),
 		baseFileDir: baseFileDir,
 		listenUrl:   listenUrl,
 		smClient:    smclient.NewSMClient(smAddr),
@@ -82,6 +82,7 @@ func (en *ExtentNode) setExtent(ID uint64, ex *extent.Extent) {
 	en.extentMap.Store(ID, ex)
 }
 
+/*
 func (en *ExtentNode) getReplicates(extentID uint64) []string {
 	v, ok := en.replicates.Load(extentID)
 	if !ok {
@@ -92,8 +93,8 @@ func (en *ExtentNode) getReplicates(extentID uint64) []string {
 
 func (en *ExtentNode) setReplicates(extentID uint64, addrs []string) {
 	en.replicates.Store(extentID, addrs)
-
 }
+*/
 
 func (en *ExtentNode) RegisterNode() {
 	xlog.Logger.Infof("RegisterNode")
