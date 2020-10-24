@@ -187,7 +187,7 @@ func (sc *StreamClient) TryComplete() (AppendResult, bool) {
 }
 
 //Append blocks, block until success or error happend
-func (sc *StreamClient) Append(blocks []*pb.Block, userData interface{}) error {
+func (sc *StreamClient) Append(ctx context.Context, blocks []*pb.Block, userData interface{}) error {
 	for i := range blocks {
 		if len(blocks[i].Data)%4096 != 0 {
 			return errors.Errorf("not aligned")
@@ -197,8 +197,12 @@ func (sc *StreamClient) Append(blocks []*pb.Block, userData interface{}) error {
 		blocks:   blocks,
 		userData: userData,
 	}
-	sc.writeCh <- &op
-	return nil
+	select {
+	case <-ctx.Done():
+		return context.Canceled
+	case sc.writeCh <- &op:
+		return nil
+	}
 }
 
 func (sc *StreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, error) {

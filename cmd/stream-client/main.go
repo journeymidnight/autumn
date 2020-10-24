@@ -101,16 +101,23 @@ func benchmark(smAddr []string, op BenchType, threadNum int, duration int, size 
 			loop := 0 //sample to record lantency
 			t := i
 			stopper.RunWorker(func() {
+				var ctx context.Context
+				var cancel context.CancelFunc
 				for {
 					select {
 					case <-stopper.ShouldStop():
+						if cancel != nil {
+							cancel()
+						}
 						return
 					default:
 						write := func(t int) {
-							if err := scs[t].Append(blocks, time.Now()); err != nil {
+							ctx, cancel = context.WithCancel(context.Background())
+							if err := scs[t].Append(ctx, blocks, time.Now()); err != nil {
 								fmt.Println(err)
 								return
 							}
+							cancel()
 
 							for i := 0; i < 10; i++ {
 								end := time.Now()
