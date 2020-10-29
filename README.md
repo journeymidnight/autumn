@@ -20,7 +20,92 @@ make
 
 ### 架构和IO流程
 
-...
+```
+StreamManager管理stream, extent, nodes
+
+ExtentNodes启动时在StreamManager上注册, 管理一台服务器上所有的extent
+
+```
+
+Append流程
+```
+Client从streammaanger得到stream info, 知道最后一个extent的位置
+Client发送AppendBlock到ExtentNode
+ExtentNode采用Append的方式写3副本
+Client得到返回的Offset
+
+如果有超时错误或者client发现Offset超过2G, 调用StreamAllocExtent在当前stream分配一个新的extent,
+写入新的extent
+
+StreamAllocExtent流程:
+```
+1. streammanager首先调用commitLength到三副本, 选择commitLength最小得值
+2. 调用Seal(commitLength)到三副本, 不在乎返回值
+3. streammanager选择出新的三副本,发送AllocExtent到nodes, 必须三个都成功才算成功
+4. 修改结果写入ETCD
+5. 修改sm里面的内存结构
+
+```
+
+
+目录结构
+```
+.
+├── LICENSE
+├── Makefile
+├── README.md
+├── cmd
+│   ├── extent-node
+│   │   ├── Makefile
+│   │   ├── Procfile
+│   │   ├── main.go
+│   ├── stream-client
+│   │   ├── Makefile
+│   │   ├── main.go
+│   └── stream-manager
+│       ├── Makefile
+│       ├── Procfile
+│       ├── main.go
+├── conn
+│   ├── pool.go
+│   └── snappy.go
+├── extent
+│   ├── extent.go
+│   ├── extent.test
+│   └── extent_test.go
+├── manager
+│   ├── config.go
+│   ├── etcd.go
+│   ├── etcd.log
+│   ├── etcd_op.go
+│   ├── etcd_op_test.go
+│   ├── smclient
+│   │   └── sm_client.go
+│   └── streammanager
+│       ├── policy.go
+│       ├── sm.go
+│       └── sm_service.go //grpc interface
+├── node
+│   ├── node.go
+│   ├── node_service.go //grpc interface
+│   ├── node_test.go
+├── proto
+│   ├── gen.sh
+│   ├── pb.proto //stream layer
+│   └── pspb.proto //partition layer
+├── rangepartition
+│   ├── commit_log.go
+│   └── range_partion.go
+├── streamclient
+│   └── streamclient.go
+├── utils
+│   ├── lock.go
+│   ├── stopper.go
+│   ├── stopper_test.go
+│   └── utils.go
+└── xlog
+    └── xlog.go
+```
 
 ### extent结构
 
@@ -31,6 +116,7 @@ extent头(512字节)
 block头 (512字节)
 	checksum    (4字节)
 	blocklength (4字节) // 所以extent理论最大4G, 实际现在2G
+	userData     (小于等于512-8)
 block数据
 	数据  (4k对齐)
 
@@ -40,10 +126,9 @@ extent是否seal, 存储在文件系统的attr里面
 
 主要API:
 1. OpenExtent
-2. AppendBlock
+2. AppendBlock (需要显式调用lock, 保证只有一个写发生)
 3. ReadBlock
 4. Seal
-
 
 ### extent node
 
@@ -64,10 +149,31 @@ extent是否seal, 存储在文件系统的attr里面
 主要内存结构:
 1. extendID => localFileName (在启动时打开所有extent的fd)
 
+OpenExtent首先判断Extent是否是Sealed, 如果是Sealed的就正常打开.
+如果不是Seal的, 说明Extent是正在被写入的, 打开时要检查Block的md5
+
+#### extent node通信 
+
+用```GetPool().Get(add)的场景``
+1. node之间通信
+2. stream manager连接node
+3. client到node
+
+#### 其他通信
+1. client到stream manager
+2. node到stream manager
+
 
 ### stream manager
 
 实现采用embed etcd
+
+通过本地127.0.0.1:XXX直接连接到ETCD
+```
+streamManager1 => etcd1
+streamManager2 => etcd2
+streamManager3 => etcd3
+```
 
 API:
 ```
@@ -93,11 +199,63 @@ AutumnSmLeader/xxx 存储当前leader的memberValue, 用来在leader写入时校
 
 内存结构:
 
+这些结构相当于etcd内容的cache.
+```
+streams    map[uint64]*pb.StreamInfo
+extents   map[uint64]*pb.ExtentInfo
+nodes    map[uint64]*NodeStatus
+```
+
 #### stream manager 选举
+
+#####ETCD的transaction写入
+
+```
+	//在一个transaction写入不同的2个KEY
+	ops := []clientv3.Op{
+		clientv3.OpPut(streamKey, string(sdata)),
+		clientv3.OpPut(extentKey, string(edata)),
+	}
+	//在ops执行前, 做判断sm.leaderkey的值等于sm.memberValue
+	err = manager.EtctSetKVS(sm.client, []clientv3.Cmp{
+		clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
+	}, ops)
+```
+
+#####选举相关
+
+```
+		//returns a new election on a given key prefix
+		e := concurrency.NewElection(s, "session")
+		ctx := context.TODO()
+
+		if err = e.Campaign(ctx, "streamManager1"); err != nil {
+			xlog.Logger.Warnf(err.Error())
+			continue
+		}
+		//存储leaderkey,之后所有的写入ETCD时, 都要验证leaderKey,保证是当前leader写入
+		sm.leaderKey = e.Key()
+		xlog.Logger.Infof("elected %d as leader", sm.ID)
+		sm.runAsLeader()
+
+		select {
+		case <-s.Done():
+			s.Close()
+			atomic.StoreInt32(&sm.isLeader, 0)
+			xlog.Logger.Info("%d's leadershipt expire", sm.ID)
+		}
+```
+
 
 选举成功后:
 1. 从etcd中读取数据到内存中
 2. 把自己标志成leader
+
+##### AllocID
+
+所有的nodeID, extentID和streamID都是唯一的uint64, 由streamManager分配, 这个rpc可以由任何client调用,
+不必要非要到leader
+
 
 #### stream manager TODO
 

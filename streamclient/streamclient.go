@@ -186,7 +186,7 @@ func (sc *StreamClient) TryComplete() (AppendResult, bool) {
 	}
 }
 
-//Append blocks, block until success or error happend
+//Append blocks, it should never blocked
 func (sc *StreamClient) Append(ctx context.Context, blocks []*pb.Block, userData interface{}) error {
 	for i := range blocks {
 		if len(blocks[i].Data)%4096 != 0 {

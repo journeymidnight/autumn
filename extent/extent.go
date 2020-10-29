@@ -324,11 +324,23 @@ func writeBlock(w io.Writer, block *pb.Block) (err error) {
 	if block.CheckSum != utils.AdlerCheckSum(block.Data) {
 		return errors.Errorf("alder32 checksum not match")
 	}
-	padding := 512 - (4 + 4)
+	var padding int
+	if len(block.UserData) == 0 {
+		padding = 512 - (4 + 4)
+	} else {
+		padding = 512 - (4 + 4 + 4 + len(block.UserData))
+	}
 
+	if padding < 0 {
+		return errors.Errorf("user data is too big %d", block.UserData)
+	}
 	//write block metadata
 	binary.Write(w, binary.BigEndian, block.CheckSum)
 	binary.Write(w, binary.BigEndian, block.BlockLength)
+	if len(block.UserData) != 0 {
+		binary.Write(w, binary.BigEndian, uint32(len(block.UserData)))
+		w.Write(block.UserData)
+	}
 
 	_, err = w.Write(make([]byte, padding))
 	if err != nil {
@@ -352,6 +364,11 @@ func readBlock(reader io.Reader) (pb.Block, error) {
 
 	checkSum := binary.BigEndian.Uint32(buf[:4])
 	blockLength := binary.BigEndian.Uint32(buf[4:8])
+	len := binary.BigEndian.Uint32(buf[8:12])
+	var UserData []byte
+	if len > 0 && len < 512 {
+		UserData = buf[12 : 12+len]
+	}
 
 	if !align(uint64(blockLength)) {
 		return pb.Block{}, errors.Errorf("block is not aligned %d", blockLength)
@@ -373,5 +390,6 @@ func readBlock(reader io.Reader) (pb.Block, error) {
 		CheckSum:    checkSum,
 		BlockLength: blockLength,
 		Data:        data,
+		UserData:    UserData,
 	}, nil
 }
