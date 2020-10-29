@@ -58,6 +58,25 @@ func (f *memory) Write(p []byte) (n int, err error) {
 	return n, nil
 }
 
+func TestReadWriteBlockUserData(t *testing.T) {
+	data := make([]byte, 1024)
+	block := pb.Block{
+		CheckSum:    utils.AdlerCheckSum(data),
+		BlockLength: 1024,
+		Data:        data,
+		UserData:    []byte("hello"),
+	}
+
+	f := newMemory(3000)
+	err := writeBlock(f, &block)
+	assert.Nil(t, err)
+
+	f.resetPos()
+	block1, err := readBlock(f)
+
+	assert.Equal(t, block, block1)
+}
+
 func TestReadWriteBlock(t *testing.T) {
 	data := make([]byte, 1024)
 	block := pb.Block{

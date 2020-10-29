@@ -24,10 +24,16 @@ enum Code {
 	ERROR = 3;
 }
 
+enum BlockType {
+	MIXED = 0;
+	PURE = 1;
+}
+
 message Block {
-	uint32 checkSum = 1;
-	uint32 blockLength = 2;
-	bytes data = 3;
+	uint32 checkSum = 1;   //4
+	uint32 blockLength = 2;//4
+	bytes userData = 3;
+	bytes data = 4;
 }
 
 message AppendRequest {
