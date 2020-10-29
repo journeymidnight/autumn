@@ -49,7 +49,7 @@ func benchmark(smAddr []string, op BenchType, threadNum int, duration int, size 
 		if err != nil {
 			return err
 		}
-		sc := streamclient.NewStreamClient(sm, s.StreamID)
+		sc := streamclient.NewStreamClient(sm, s.StreamID, 32)
 		if err = sc.Connect(); err != nil {
 			return err
 		}
@@ -119,12 +119,10 @@ func benchmark(smAddr []string, op BenchType, threadNum int, duration int, size 
 							}
 							cancel()
 
-							for i := 0; i < 10; i++ {
-								end := time.Now()
-								io, ok := scs[t].TryComplete()
-								if !ok {
-									break
-								}
+							end := time.Now()
+							ios := scs[t].TryComplete()
+
+							for _, io := range ios {
 								if loop%10 == 0 {
 									lock.Lock()
 									start := io.UserData.(time.Time)
@@ -135,11 +133,12 @@ func benchmark(smAddr []string, op BenchType, threadNum int, duration int, size 
 										Elapsed:   end.Sub(start).Seconds(),
 									})
 									lock.Unlock()
-
 								}
 								atomic.AddUint64(&totalSize, uint64(size))
 								atomic.AddUint64(&count, 1)
+								loop++
 							}
+
 						}
 
 						read := func(num int) {
@@ -154,7 +153,6 @@ func benchmark(smAddr []string, op BenchType, threadNum int, duration int, size 
 							fmt.Println("bench type is wrong")
 							return
 						}
-						loop++
 					}
 				}
 
@@ -275,6 +273,11 @@ func main() {
 				&cli.IntFlag{Name: "size", Value: 8192, Aliases: []string{"s"}},
 			},
 			Action: wbench,
+		},
+		{
+			Name:   "plot",
+			Usage:  "plot <file.json>",
+			Action: plot,
 		},
 	}
 	err := app.Run(os.Args)

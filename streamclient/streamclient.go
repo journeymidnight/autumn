@@ -24,16 +24,23 @@ type StreamClient struct {
 	writeCh      chan *Op
 	completeCh   chan AppendResult
 	stopper      *utils.Stopper
+	iodepth      int
 }
 
-func NewStreamClient(sm *smclient.SMClient, streamID uint64) *StreamClient {
+var (
+	batchSize = 4
+)
+
+func NewStreamClient(sm *smclient.SMClient, streamID uint64, iodepth int) *StreamClient {
 	utils.AssertTrue(xlog.Logger != nil)
+	utils.AssertTrue(iodepth > batchSize)
 	return &StreamClient{
 		smClient:   sm,
 		streamID:   streamID,
-		writeCh:    make(chan *Op, 16),
-		completeCh: make(chan AppendResult, 32),
+		writeCh:    make(chan *Op, iodepth),
+		completeCh: make(chan AppendResult, iodepth),
 		stopper:    utils.NewStopper(),
+		iodepth:    iodepth,
 	}
 }
 
@@ -172,18 +179,42 @@ func (sc *StreamClient) Close() {
 }
 
 //GetAppendComplete block
+
 func (sc *StreamClient) GetComplete() AppendResult {
 	return <-sc.completeCh
 }
 
-//TryComplete non-block
-func (sc *StreamClient) TryComplete() (AppendResult, bool) {
-	select {
-	case ret := <-sc.completeCh:
-		return ret, true
-	default:
-		return AppendResult{}, false
+//TryComplete will block when writeCh is full
+func (sc *StreamClient) TryComplete() []AppendResult {
+	var result []AppendResult
+	if len(sc.writeCh) == sc.iodepth {
+		for len(sc.writeCh)+batchSize >= sc.iodepth {
+			select {
+			case ret := <-sc.completeCh:
+				result = append(result, ret)
+			}
+		}
+		return result
 	}
+
+slurpLoop:
+	for {
+		select {
+		case ret := <-sc.completeCh:
+			for {
+				result = append(result, ret)
+				select {
+				case ret = <-sc.completeCh:
+				default:
+					break slurpLoop
+				}
+			}
+		default:
+			break slurpLoop
+		}
+	}
+	return result
+
 }
 
 //Append blocks, it should never blocked
