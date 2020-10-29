@@ -29,26 +29,27 @@ ExtentNodes启动时在StreamManager上注册, 管理一台服务器上所有的
 
 Append流程
 ```
-Client从streammaanger得到stream info, 知道最后一个extent的位置
+Client从streamManager得到stream info, 知道最后一个extent的位置
 Client发送AppendBlock到ExtentNode
 ExtentNode采用Append的方式写3副本
 Client得到返回的Offset
 
 如果有超时错误或者client发现Offset超过2G, 调用StreamAllocExtent在当前stream分配一个新的extent,
 写入新的extent
+```
+
 
 StreamAllocExtent流程:
 ```
-1. streammanager首先调用commitLength到三副本, 选择commitLength最小得值
+1. streamManager首先调用commitLength到三副本, 选择commitLength最小值
 2. 调用Seal(commitLength)到三副本, 不在乎返回值
-3. streammanager选择出新的三副本,发送AllocExtent到nodes, 必须三个都成功才算成功
+3. streamManager选择出新的三副本,发送AllocExtent到nodes, 必须三个都成功才算成功
 4. 修改结果写入ETCD
 5. 修改sm里面的内存结构
-
 ```
 
-
 目录结构
+
 ```
 .
 ├── LICENSE
@@ -109,13 +110,14 @@ StreamAllocExtent流程:
 
 ### extent结构
 
+
 ```
 extent头(512字节)
 	magic number (8字节)
 	extent ID    (8字节)
 block头 (512字节)
 	checksum    (4字节)
-	blocklength (4字节) // 所以extent理论最大4G, 实际现在2G
+	blocklength (4字节) //4k ~32M, 4k对齐
 	userData     (小于等于512-8)
 block数据
 	数据  (4k对齐)
@@ -180,6 +182,7 @@ API:
 	rpc StreamInfo(StreamInfoRequest) returns (StreamInfoResponse) {}
 	rpc ExtentInfo(ExtentInfoRequest) returns (ExtentInfoResponse) {}
 	rpc NodesInfo(NodesInfoRequest) returns(NodesInfoResponse) {}
+	
 	rpc StreamAllocExtent(StreamAllocExtentRequest) returns  (StreamAllocExtentResponse) {}
 	rpc CreateStream(CreateStreamRequest) returns  (CreateStreamResponse) {}
 	rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse) {}
