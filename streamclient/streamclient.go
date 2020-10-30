@@ -180,8 +180,8 @@ func (sc *StreamClient) Close() {
 
 //GetAppendComplete block
 
-func (sc *StreamClient) GetComplete() AppendResult {
-	return <-sc.completeCh
+func (sc *StreamClient) GetComplete() chan AppendResult {
+	return sc.completeCh
 }
 
 //TryComplete will block when writeCh is full
