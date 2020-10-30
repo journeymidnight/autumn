@@ -324,28 +324,20 @@ func writeBlock(w io.Writer, block *pb.Block) (err error) {
 	if block.CheckSum != utils.AdlerCheckSum(block.Data) {
 		return errors.Errorf("alder32 checksum not match")
 	}
-	var padding int
-	if len(block.UserData) == 0 {
-		padding = 512 - (4 + 4)
-	} else {
-		padding = 512 - (4 + 4 + 4 + len(block.UserData))
-	}
+	var buf [512]byte
 
-	if padding < 0 {
+	if 512 < (4 + 4 + 4 + len(block.UserData)) {
 		return errors.Errorf("user data is too big %d", block.UserData)
 	}
-	//write block metadata
-	binary.Write(w, binary.BigEndian, block.CheckSum)
-	binary.Write(w, binary.BigEndian, block.BlockLength)
+	binary.BigEndian.PutUint32(buf[:], block.CheckSum)
+	binary.BigEndian.PutUint32(buf[4:], block.BlockLength)
 	if len(block.UserData) != 0 {
-		binary.Write(w, binary.BigEndian, uint32(len(block.UserData)))
-		w.Write(block.UserData)
+		binary.BigEndian.PutUint32(buf[8:], uint32(len(block.UserData)))
+		//w.Write(block.UserData)
+		copy(buf[12:], block.UserData)
 	}
 
-	_, err = w.Write(make([]byte, padding))
-	if err != nil {
-		return err
-	}
+	w.Write(buf[:])
 
 	//write block data
 	_, err = w.Write(block.Data)
