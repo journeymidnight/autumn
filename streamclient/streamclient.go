@@ -46,7 +46,7 @@ func NewStreamClient(sm *smclient.SMClient, streamID uint64, iodepth int) *Strea
 
 type AppendResult struct {
 	ExtentID    uint64
-	Offset      uint32
+	Offsets     []uint32
 	NumOfBlocks int
 	Err         error
 	UserData    interface{}
@@ -136,7 +136,8 @@ func (sc *StreamClient) streamBlocks() {
 			})
 			cancel()
 
-			if err != nil {
+			//FIXME
+			if err == context.DeadlineExceeded { //timeout
 				var newExInfo *pb.ExtentInfo
 				for err != nil {
 					//loop forever to seal and alloc new extent
@@ -151,7 +152,9 @@ func (sc *StreamClient) streamBlocks() {
 			} else {
 				i := 0
 				for _, op := range ops {
-					sc.completeCh <- AppendResult{extentID, res.Offsets[i], len(op.blocks), nil, op.userData}
+					opBlocks := len(op.blocks)
+					opStart := i
+					sc.completeCh <- AppendResult{extentID, res.Offsets[opStart : opStart+opBlocks], len(op.blocks), err, op.userData}
 					i += len(op.blocks)
 				}
 			}
@@ -178,10 +181,12 @@ func (sc *StreamClient) Close() {
 	sc.stopper.Stop()
 }
 
-//GetAppendComplete block
-
 func (sc *StreamClient) GetComplete() chan AppendResult {
 	return sc.completeCh
+}
+
+func (sc *StreamClient) InfightIO() int {
+	return len(sc.writeCh)
 }
 
 //TryComplete will block when writeCh is full
@@ -217,13 +222,14 @@ slurpLoop:
 
 }
 
-//Append blocks, it should never blocked
+//TODO: add urgent flag
 func (sc *StreamClient) Append(ctx context.Context, blocks []*pb.Block, userData interface{}) error {
 	for i := range blocks {
 		if len(blocks[i].Data)%4096 != 0 {
 			return errors.Errorf("not aligned")
 		}
 	}
+	//TODO: get op from sync.Pool
 	op := Op{
 		blocks:   blocks,
 		userData: userData,

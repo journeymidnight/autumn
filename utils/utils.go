@@ -93,3 +93,11 @@ func SplitAndTrim(s string, sep string) []string {
 	}
 	return parts
 }
+
+func Ceil(size uint32, align uint32) uint32 {
+	return (size + size - 1) / align * align
+}
+
+func Floor(size uint32, align uint32) uint32 {
+	return size / align * align
+}

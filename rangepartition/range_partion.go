@@ -8,7 +8,14 @@ type RangePartition struct {
 	blobDataStream *streamclient.StreamClient
 }
 
-func (rp *RangePartition) Write() {
-	//log.Append
-	//wait
+/*
+func (rp *RangePartition) WriteRPC() {
+	ch := make(chan XXX)
+	append(Entry, func() {
+		//blalbal
+		ch <- ok
+	})
+	<-ch
+	return
 }
+*/
