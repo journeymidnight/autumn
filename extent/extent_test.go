@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sync/atomic"
+	"sync/atomic"	
 	"testing"
 
 	"github.com/journeymidnight/autumn/proto/pb"

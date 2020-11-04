@@ -123,12 +123,16 @@ func benchmark(smAddr []string, op BenchType, threadNum int, duration int, size 
 							ios := scs[t].TryComplete()
 
 							for _, io := range ios {
+								if io.Err != nil {
+									fmt.Println(io.Err)
+									continue
+								}
 								if loop%10 == 0 {
 									lock.Lock()
 									start := io.UserData.(time.Time)
 									results = append(results, Result{
 										ExtentID:  io.ExtentID,
-										Offset:    io.Offset,
+										Offset:    io.Offsets[0], //only one block per op
 										StartTime: start.Sub(benchStartTime).Seconds(),
 										Elapsed:   end.Sub(start).Seconds(),
 									})

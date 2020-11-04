@@ -321,9 +321,11 @@ func writeBlock(w io.Writer, block *pb.Block) (err error) {
 		return errors.Errorf("block is not  aligned %d", block.BlockLength)
 	}
 	//checkSum
+
 	if block.CheckSum != utils.AdlerCheckSum(block.Data) {
 		return errors.Errorf("alder32 checksum not match")
 	}
+
 	var buf [512]byte
 
 	if 512 < (4 + 4 + 4 + len(block.UserData)) {
