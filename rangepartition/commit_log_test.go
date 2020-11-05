@@ -1,6 +1,7 @@
 package rangepartition
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -33,12 +34,16 @@ func TestCommitLog(t *testing.T) {
 			commitLog.Append(&pspb.LogEntry{
 				Key:   "hello",
 				Value: []byte("world"),
-			}, func(entry *pspb.LogEntry, extendId uint64, offset uint32, innerOffset int) {
-				fmt.Printf("extentID: %d, offset: %d, innerOffset: %d\n", extendId, offset, innerOffset)
+			}, func(entry *pspb.LogEntry, extendId uint64, offset uint32, innerOffset uint32, err error) {
+				fmt.Printf("extentID: %d, offset: %d, innerOffset: %d, err :%v\n", extendId, offset, innerOffset, err)
+
+				log, err := commitLog.Read(context.Background(), extendId, offset, innerOffset)
+				assert.Nil(t, err)
+				assert.Equal(t, entry, log)
+
 				close(ch)
 			})
 			<-ch
-
 		})
 
 	}

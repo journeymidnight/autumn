@@ -2,6 +2,7 @@ package streamclient
 
 import (
 	"context"
+	"io"
 	"sync"
 	"time"
 
@@ -76,6 +77,27 @@ func (sc *StreamClient) getPeers(extentID uint64) []string {
 		ret = append(ret, n.Address)
 	}
 	return ret
+}
+
+func (sc *StreamClient) getExtentConnFromIndex(extendIdIndex int) (*grpc.ClientConn, uint64, error) {
+	sc.RLock()
+	defer sc.RUnlock()
+	if extendIdIndex >= len(sc.streamInfo.ExtentIDs) {
+		return nil, 0, nil
+	}
+	id := sc.streamInfo.ExtentIDs[extendIdIndex]
+	extentInfo, ok := sc.extentInfo[id]
+	if !ok {
+		return nil, id, errors.Errorf("not found extentID %d", id)
+	}
+	nodeInfo := sc.smClient.LookupNode(extentInfo.Replicates[0])
+	if nodeInfo == nil {
+		return nil, id, errors.Errorf("not found node address %s", extentInfo.Replicates[0])
+	}
+
+	pool := conn.GetPools().Connect(nodeInfo.Address)
+	return pool.Get(), id, nil
+
 }
 
 func (sc *StreamClient) getExtentConn(extentID uint64) *grpc.ClientConn {
@@ -154,7 +176,12 @@ func (sc *StreamClient) streamBlocks() {
 				for _, op := range ops {
 					opBlocks := len(op.blocks)
 					opStart := i
-					sc.completeCh <- AppendResult{extentID, res.Offsets[opStart : opStart+opBlocks], len(op.blocks), err, op.userData}
+					if err != nil {
+						sc.completeCh <- AppendResult{Err: err, UserData: op.userData}
+					} else {
+						sc.completeCh <- AppendResult{extentID, res.Offsets[opStart : opStart+opBlocks], len(op.blocks), err, op.userData}
+
+					}
 					i += len(op.blocks)
 				}
 			}
@@ -224,6 +251,9 @@ slurpLoop:
 
 //TODO: add urgent flag
 func (sc *StreamClient) Append(ctx context.Context, blocks []*pb.Block, userData interface{}) error {
+	if len(blocks) == 0 {
+		return errors.Errorf("blocks can not be nil")
+	}
 	for i := range blocks {
 		if len(blocks[i].Data)%4096 != 0 {
 			return errors.Errorf("not aligned")
@@ -242,6 +272,7 @@ func (sc *StreamClient) Append(ctx context.Context, blocks []*pb.Block, userData
 	}
 }
 
+//Read is random read inside a block
 func (sc *StreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, error) {
 	conn := sc.getExtentConn(extentID)
 	if conn == nil {
@@ -254,4 +285,63 @@ func (sc *StreamClient) Read(ctx context.Context, extentID uint64, offset uint32
 		NumOfBlocks: numOfBlocks,
 	})
 	return res.Blocks, err
+}
+
+type SeqReader struct {
+	sc                 *StreamClient
+	currentExtentIndex int
+	currentOffset      uint32
+}
+
+/* Read could return
+1. (blocks, io.EOF)
+2. (nil, io.EOF)
+3. (blocks, nil)
+4. (nil, Other Error)
+*/
+func (reader *SeqReader) Read(ctx context.Context) ([]*pb.Block, error) {
+	conn, extentID, err := reader.sc.getExtentConnFromIndex(reader.currentExtentIndex)
+	if err != nil {
+		return nil, err
+	}
+	if conn == nil {
+		return nil, io.EOF
+	}
+	c := pb.NewExtentServiceClient(conn)
+	res, err := c.ReadBlocks(ctx, &pb.ReadBlocksRequest{
+		ExtentID:    extentID,
+		Offset:      reader.currentOffset,
+		NumOfBlocks: 16,
+	})
+
+	switch res.Code {
+	case pb.Code_OK:
+		reader.currentOffset += utils.SizeOfBlocks(res.Blocks)
+		return res.Blocks, nil
+	case pb.Code_EOF:
+		reader.currentOffset = 0
+		reader.currentExtentIndex++
+		return res.Blocks, nil
+	case pb.Code_ERROR:
+		return nil, err
+	default:
+		return nil, errors.Errorf("unexpected error")
+	}
+
+}
+
+//SeqRead read all the blocks in stream
+func (sc *StreamClient) NewSeQReader() *SeqReader {
+	/*
+		sc.RLock()
+		defer sc.RUnlock()
+		if len(sc.streamInfo.ExtentIDs) == 0 {
+			return nil, errors.Errorf("stream is nil")
+		}
+	*/
+	return &SeqReader{
+		sc:                 sc,
+		currentExtentIndex: 0,
+		currentOffset:      0,
+	}
 }

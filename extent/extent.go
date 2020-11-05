@@ -31,6 +31,26 @@ import (
 	"github.com/journeymidnight/autumn/utils"
 )
 
+/*
++-----------+-->
+| check sum |
++-----------+
+|blockLength|
++-----------+  512 Bytes
+|           |
+|  User Data|
+|           |
+|           |
++-------------->
+|           |
+|           |
+|  DATA     |  <BlockLength> Bytes
+|           |
+|           |
+|           |
++-----------+-->
+*/
+
 //FIXME: put all errors into errors directory
 func align(n uint64) bool {
 	return n != 0 && n%512 == 0
@@ -256,15 +276,16 @@ func (ex *Extent) Close() {
 	ex.file.Close()
 }
 
-func (ex *Extent) ReadBlocks(offset uint32, numOfBlocks uint32) ([]*pb.Block, error) {
+func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize uint32) ([]*pb.Block, error) {
 
 	var ret []*pb.Block
 	//TODO: fix block number
 	current := atomic.LoadUint32(&ex.commitLength)
 	if current <= offset {
-		return nil, errors.Errorf("read offset is beyond current %d, %d", current, offset)
+		return nil, io.EOF
 	}
-	for i := uint32(0); i < numOfBlocks; i++ {
+	size := uint32(0)
+	for i := uint32(0); i < maxNumOfBlocks; i++ {
 		r, err := ex.GetReader(offset)
 		if err != nil {
 			return nil, err
@@ -275,8 +296,11 @@ func (ex *Extent) ReadBlocks(offset uint32, numOfBlocks uint32) ([]*pb.Block, er
 		}
 		ret = append(ret, &block)
 		offset += block.BlockLength + 512
+		size += block.BlockLength + 512
+		if size > maxTotalSize {
+			break
+		}
 	}
-
 	return ret, nil
 }
 
@@ -323,7 +347,7 @@ func writeBlock(w io.Writer, block *pb.Block) (err error) {
 	//checkSum
 
 	if block.CheckSum != utils.AdlerCheckSum(block.Data) {
-		return errors.Errorf("alder32 checksum not match")
+		return errors.Errorf("alder32 checksum not match  %d vs %d", block.CheckSum, utils.AdlerCheckSum(block.Data))
 	}
 
 	var buf [512]byte
