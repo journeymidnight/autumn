@@ -17,6 +17,7 @@ package node
 import (
 	"context"
 	"fmt"
+	"io"
 	"path"
 	"time"
 
@@ -153,7 +154,10 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 			preOffsets = result.Offsets
 		}
 		if result.Error != nil || !utils.EqualUint32(result.Offsets, preOffsets) {
-			return nil, errors.Errorf("%v, %v vs pre: %v", result.Error, result.Offsets, preOffsets)
+			return nil, result.Error
+		}
+		if !utils.EqualUint32(result.Offsets, preOffsets) {
+			return nil, errors.Errorf("block is not appended at the same offset [%v] vs [%v]", result.Offsets, preOffsets)
 		}
 	}
 	return &pb.AppendResponse{
@@ -167,12 +171,18 @@ func (en *ExtentNode) ReadBlocks(ctx context.Context, req *pb.ReadBlocksRequest)
 	if ex == nil {
 		return nil, errors.Errorf("no such extent")
 	}
-	blocks, err := ex.ReadBlocks(req.Offset, req.NumOfBlocks)
-	if err != nil {
+	blocks, err := ex.ReadBlocks(req.Offset, req.NumOfBlocks, (32 << 20))
+	if err != nil && err != io.EOF {
 		return nil, err
 	}
+	var code pb.Code
+	if err == io.EOF {
+		code = pb.Code_EOF
+	} else {
+		code = pb.Code_OK
+	}
 	return &pb.ReadBlocksResponse{
-		Code:   pb.Code_OK,
+		Code:   code,
 		Blocks: blocks,
 	}, nil
 }

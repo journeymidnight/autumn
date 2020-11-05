@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
 )
@@ -100,4 +101,11 @@ func Ceil(size uint32, align uint32) uint32 {
 
 func Floor(size uint32, align uint32) uint32 {
 	return size / align * align
+}
+
+func SizeOfBlocks(blocks []*pb.Block) (ret uint32) {
+	for i := range blocks {
+		ret += blocks[i].BlockLength + 512
+	}
+	return
 }
