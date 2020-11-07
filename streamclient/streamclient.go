@@ -2,6 +2,7 @@ package streamclient
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"sync"
 	"time"
@@ -82,8 +83,12 @@ func (sc *StreamClient) getPeers(extentID uint64) []string {
 func (sc *StreamClient) getExtentConnFromIndex(extendIdIndex int) (*grpc.ClientConn, uint64, error) {
 	sc.RLock()
 	defer sc.RUnlock()
-	if extendIdIndex >= len(sc.streamInfo.ExtentIDs) {
-		return nil, 0, nil
+	if extendIdIndex == len(sc.streamInfo.ExtentIDs) {
+		return nil, 0, io.EOF
+	}
+
+	if extendIdIndex > len(sc.streamInfo.ExtentIDs) {
+		return nil, 0, errors.Errorf("extentID too big %d", extendIdIndex)
 	}
 	id := sc.streamInfo.ExtentIDs[extendIdIndex]
 	extentInfo, ok := sc.extentInfo[id]
@@ -96,6 +101,8 @@ func (sc *StreamClient) getExtentConnFromIndex(extendIdIndex int) (*grpc.ClientC
 	}
 
 	pool := conn.GetPools().Connect(nodeInfo.Address)
+	//FIXME:
+	//确保pool是healthy, 然后return
 	return pool.Get(), id, nil
 
 }
@@ -304,24 +311,31 @@ func (reader *SeqReader) Read(ctx context.Context) ([]*pb.Block, error) {
 	if err != nil {
 		return nil, err
 	}
-	if conn == nil {
-		return nil, io.EOF
-	}
+	fmt.Printf("read extentID %d, offset : %d\n", extentID, reader.currentOffset)
+	//FIXME: load balance read when connecton error
+
 	c := pb.NewExtentServiceClient(conn)
 	res, err := c.ReadBlocks(ctx, &pb.ReadBlocksRequest{
 		ExtentID:    extentID,
 		Offset:      reader.currentOffset,
-		NumOfBlocks: 16,
+		NumOfBlocks: 8,
 	})
 
+	if err != nil {
+		return nil, err
+	}
+
+	fmt.Printf("res code is %v\n", res.Code)
 	switch res.Code {
 	case pb.Code_OK:
 		reader.currentOffset += utils.SizeOfBlocks(res.Blocks)
 		return res.Blocks, nil
-	case pb.Code_EOF:
-		reader.currentOffset = 0
+	case pb.Code_EndOfExtent:
+		reader.currentOffset = 512 //skip extent header
 		reader.currentExtentIndex++
 		return res.Blocks, nil
+	case pb.Code_EndOfStream:
+		return res.Blocks, io.EOF
 	case pb.Code_ERROR:
 		return nil, err
 	default:
@@ -331,7 +345,7 @@ func (reader *SeqReader) Read(ctx context.Context) ([]*pb.Block, error) {
 }
 
 //SeqRead read all the blocks in stream
-func (sc *StreamClient) NewSeQReader() *SeqReader {
+func (sc *StreamClient) NewSeqReader() *SeqReader {
 	/*
 		sc.RLock()
 		defer sc.RUnlock()
@@ -342,6 +356,6 @@ func (sc *StreamClient) NewSeQReader() *SeqReader {
 	return &SeqReader{
 		sc:                 sc,
 		currentExtentIndex: 0,
-		currentOffset:      0,
+		currentOffset:      512, //skip extent header
 	}
 }

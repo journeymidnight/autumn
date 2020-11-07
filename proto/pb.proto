@@ -22,7 +22,8 @@ enum Code {
 	NOT_LEADER = 1;
 	NOT_PRIMARY = 2;
 	ERROR = 3;
-	EOF = 4;
+	EndOfExtent = 4;
+	EndOfStream = 5;
 }
 
 enum BlockType {

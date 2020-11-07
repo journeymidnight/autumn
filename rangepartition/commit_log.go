@@ -2,6 +2,7 @@ package rangepartition
 
 import (
 	"context"
+	"io"
 
 	"sort"
 	"time"
@@ -47,31 +48,29 @@ commitLog在1ms的时间窗口内, 重新排序输入的log, size小的在前, �
 type AppendCallback func(entry *pspb.LogEntry, extendId uint64, offset uint32, innerOffset uint32, err error)
 
 type CommitLog struct {
-	stream    *streamclient.StreamClient
-	streamID  uint64
-	inputCh   chan LogCommand
-	stopper   *utils.Stopper
-	seqReader *streamclient.SeqReader
+	stream   *streamclient.StreamClient
+	streamID uint64
+	inputCh  chan LogCommand
+	stopper  *utils.Stopper
 }
 
-func NewCommitLog(streamID uint64, sm *smclient.SMClient) *CommitLog {
+func NewCommitLog(streamID uint64, sm *smclient.SMClient) (*CommitLog, error) {
 	utils.AssertTrue(xlog.Logger != nil)
 
 	stream := streamclient.NewStreamClient(sm, streamID, 32)
 	if err := stream.Connect(); err != nil {
-		return nil
+		return nil, err
 	}
 	cl := &CommitLog{
-		stream:    stream,
-		streamID:  streamID,
-		inputCh:   make(chan LogCommand, 32),
-		stopper:   utils.NewStopper(),
-		seqReader: stream.NewSeQReader(),
+		stream:   stream,
+		streamID: streamID,
+		inputCh:  make(chan LogCommand, 32),
+		stopper:  utils.NewStopper(),
 	}
 
 	cl.stopper.RunWorker(cl.reorder)
 	cl.stopper.RunWorker(cl.getEvents) //run callbacks
-	return cl
+	return cl, nil
 }
 
 func (cl *CommitLog) getEvents() {
@@ -262,19 +261,25 @@ func (cl *CommitLog) Read(ctx context.Context, extentID uint64, offset uint32, i
 	return &entry, nil
 }
 
-//SeqRead read commit log stream
-//TODO: 大概只需要一个SeqReader
-func (cl *CommitLog) SeqRead() ([]*pspb.LogEntry, error) {
-	blocks, err := cl.seqReader.Read(context.Background())
-	if err != nil {
+type LogIter struct {
+	*streamclient.SeqReader
+}
+
+func (cl *CommitLog) NewLogIter() LogIter {
+	return LogIter{cl.stream.NewSeqReader()}
+}
+
+//LogIter.Read could return [entires, io.EOF], be carefull with this
+func (iter LogIter) Read() ([]*pspb.LogEntry, error) {
+	blocks, err := iter.SeqReader.Read(context.Background())
+	if err != nil && err != io.EOF {
 		return nil, err
 	}
 	var ret []*pspb.LogEntry
 	for i := range blocks {
-		extractLogEntry(blocks[i])
 		ret = append(ret, extractLogEntry(blocks[i])...)
 	}
-	return ret, nil
+	return ret, err
 }
 
 func extractLogEntry(block *pb.Block) []*pspb.LogEntry {

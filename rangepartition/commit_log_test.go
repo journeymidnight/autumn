@@ -3,8 +3,8 @@ package rangepartition
 import (
 	"context"
 	"fmt"
+	"io"
 	"testing"
-	"time"
 
 	"github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/proto/pspb"
@@ -24,7 +24,9 @@ func TestCommitLog(t *testing.T) {
 	err := sm.Connect()
 	assert.Nil(t, err)
 
-	commitLog := NewCommitLog(63, sm)
+	commitLog, err := NewCommitLog(3, sm)
+
+	assert.Nil(t, err)
 
 	stopper := utils.NewStopper()
 
@@ -45,8 +47,21 @@ func TestCommitLog(t *testing.T) {
 			})
 			<-ch
 		})
-
 	}
-	time.Sleep(time.Second)
+
 	stopper.Wait()
+	iter := commitLog.NewLogIter()
+	//read out
+	numOfLogs := 0
+	for {
+		entries, err := iter.Read()
+		if err != nil && err != io.EOF {
+			assert.Nil(t, err)
+		}
+		numOfLogs = len(entries)
+		if err == io.EOF {
+			break
+		}
+	}
+	assert.Equal(t, 20, numOfLogs)
 }

@@ -261,11 +261,11 @@ func (ex *Extent) Seal(commit uint32) error {
 func (ex *Extent) IsSeal() bool {
 	return atomic.LoadInt32(&ex.isSeal) == 1
 }
-func (ex *Extent) GetReader(offset uint32) (io.Reader, error) {
+func (ex *Extent) GetReader(offset uint32) io.Reader {
 	return &extentBlockReader{
 		extent:   ex,
 		position: offset,
-	}, nil
+	}
 
 }
 
@@ -276,28 +276,45 @@ func (ex *Extent) Close() {
 	ex.file.Close()
 }
 
+var (
+	EndOfExtent = errors.Errorf("EndOfExtent")
+	EndOfStream = errors.Errorf("EndOfStream")
+)
+
 func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize uint32) ([]*pb.Block, error) {
 
 	var ret []*pb.Block
 	//TODO: fix block number
 	current := atomic.LoadUint32(&ex.commitLength)
 	if current <= offset {
-		return nil, io.EOF
+		if ex.IsSeal() {
+			return nil, EndOfExtent
+		} else {
+			return nil, EndOfStream
+		}
 	}
-	size := uint32(0)
+	size := uint32(0)	
 	for i := uint32(0); i < maxNumOfBlocks; i++ {
-		r, err := ex.GetReader(offset)
-		if err != nil {
-			return nil, err
-		}
+		r := ex.GetReader(offset)
+
 		block, err := readBlock(r)
+
+		if err == io.EOF {
+			if ex.IsSeal() {
+				return ret, EndOfExtent
+			} else {
+				return ret, EndOfStream
+			}
+		}
+
 		if err != nil {
 			return nil, err
 		}
+
 		ret = append(ret, &block)
 		offset += block.BlockLength + 512
 		size += block.BlockLength + 512
-		if size > maxTotalSize {
+		if size > maxTotalSize || err == io.EOF {
 			break
 		}
 	}
@@ -388,20 +405,22 @@ func readBlock(reader io.Reader) (pb.Block, error) {
 		UserData = buf[12 : 12+len]
 	}
 
-	if !align(uint64(blockLength)) {
-		return pb.Block{}, errors.Errorf("block is not aligned %d", blockLength)
-	}
-
 	data := make([]byte, blockLength, blockLength)
 	_, err = io.ReadFull(reader, data)
 
-	if err != nil && err != io.EOF {
+	if err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
 		return pb.Block{}, err
 	}
 
 	//checkSum
 	if utils.AdlerCheckSum(data) != checkSum {
 		return pb.Block{}, errors.Errorf("alder32 checksum not match")
+	}
+	if !align(uint64(blockLength)) {
+		return pb.Block{}, errors.Errorf("block is not aligned %d", blockLength)
 	}
 
 	return pb.Block{
