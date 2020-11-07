@@ -17,7 +17,6 @@ package node
 import (
 	"context"
 	"fmt"
-	"io"
 	"path"
 	"time"
 
@@ -122,7 +121,7 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 		} else {
 			retChan <- Result{Error: err}
 		}
-		xlog.Logger.Debugf("write primary done: %v", ret, err)
+		xlog.Logger.Debugf("write primary done: %v, %v", ret, err)
 	})
 	//secondary
 
@@ -166,23 +165,35 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 	}, nil
 }
 
+func errorToCode(err error) pb.Code {
+	switch err {
+	case extent.EndOfStream:
+		return pb.Code_EndOfStream
+	case extent.EndOfExtent:
+		return pb.Code_EndOfExtent
+	case nil:
+		return pb.Code_OK
+	default:
+		xlog.Logger.Fatalf("unknown err met %v", err)
+		return pb.Code_ERROR
+	}
+}
 func (en *ExtentNode) ReadBlocks(ctx context.Context, req *pb.ReadBlocksRequest) (*pb.ReadBlocksResponse, error) {
 	ex := en.getExtent(req.ExtentID)
 	if ex == nil {
 		return nil, errors.Errorf("no such extent")
 	}
 	blocks, err := ex.ReadBlocks(req.Offset, req.NumOfBlocks, (32 << 20))
-	if err != nil && err != io.EOF {
+	if err != nil && err != extent.EndOfStream && err != extent.EndOfExtent {
+		xlog.Logger.Infof("request extentID: %d, offset: %d, numOfBlocks: %d: %v", req.ExtentID, req.Offset, req.NumOfBlocks, err)
 		return nil, err
 	}
-	var code pb.Code
-	if err == io.EOF {
-		code = pb.Code_EOF
-	} else {
-		code = pb.Code_OK
-	}
+
+	xlog.Logger.Debugf("request extentID: %d, offset: %d, numOfBlocks: %d, response len(%d), %v ", req.ExtentID, req.Offset, req.NumOfBlocks,
+		len(blocks), err)
+
 	return &pb.ReadBlocksResponse{
-		Code:   code,
+		Code:   errorToCode(err),
 		Blocks: blocks,
 	}, nil
 }
