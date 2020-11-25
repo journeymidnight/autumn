@@ -2,7 +2,6 @@ package rangepartition
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"time"
 
@@ -90,17 +89,19 @@ func (rp *RangePartition) Connect() error {
 //k,v,blob
 //services
 func (rp *RangePartition) WriteRPC(key, value string) error {
-	ch := make(chan struct{})
-	callback := func(entry *pspb.LogEntry, extendId uint64, offset uint32, innerOffset uint32, err error) {
-		fmt.Printf("extentID: %d, offset: %d, innerOffset: %d, err :%v\n", extendId, offset, innerOffset, err)
-		rp.memStore, _, _ = rp.memStore.Insert([]byte(key), value)
-		close(ch)
-	}
-	rp.commitLog.Append(&pspb.LogEntry{
-		Key:   key,
-		Value: []byte(value),
-	}, callback)
-	//block until finished
-	<-ch
+	/*
+		ch := make(chan struct{})
+		callback := func(entry *pspb.LogEntry, extendId uint64, offset uint32, innerOffset uint32, err error) {
+			fmt.Printf("extentID: %d, offset: %d, innerOffset: %d, err :%v\n", extendId, offset, innerOffset, err)
+			rp.memStore, _, _ = rp.memStore.Insert([]byte(key), value)
+			close(ch)
+		}
+		rp.commitLog.Append(&pspb.LogEntry{
+			Key:   key,
+			Value: []byte(value),
+		}, callback)
+		//block until finished
+		<-ch
+	*/
 	return nil
 }

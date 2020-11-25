@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/journeymidnight/autumn/conn"
@@ -24,43 +25,60 @@ type StreamClient struct {
 	extentInfo   map[uint64]*pb.ExtentInfo
 	streamID     uint64
 	writeCh      chan *Op
-	completeCh   chan AppendResult
 	stopper      *utils.Stopper
 	iodepth      int
+	done         int32
 }
 
 var (
-	batchSize     = 4
 	maxExtentSize = uint32(2 << 30)
+	opPool        = sync.Pool{
+		New: func() interface{} {
+			return new(Op)
+		},
+	}
 )
 
 func NewStreamClient(sm *smclient.SMClient, streamID uint64, iodepth int) *StreamClient {
 	utils.AssertTrue(xlog.Logger != nil)
-	utils.AssertTrue(iodepth > batchSize)
 	return &StreamClient{
-		smClient:   sm,
-		streamID:   streamID,
-		writeCh:    make(chan *Op, iodepth),
-		completeCh: make(chan AppendResult, iodepth),
-		stopper:    utils.NewStopper(),
-		iodepth:    iodepth,
+		smClient: sm,
+		streamID: streamID,
+		writeCh:  make(chan *Op, iodepth),
+		stopper:  utils.NewStopper(),
+		iodepth:  iodepth,
+		done:     0,
 	}
 }
 
-type AppendResult struct {
-	ExtentID    uint64
-	Offsets     []uint32
-	NumOfBlocks int
-	Err         error
-	UserData    interface{}
-}
-
 type Op struct {
-	blocks   []*pb.Block
-	userData interface{}
+	blocks []*pb.Block
+	wg     sync.WaitGroup
+
+	//
+	UserData interface{}
+
+	//return value
+	ExtentID uint64
+	Offsets  []uint32
+	Err      error
+	done     int32
 }
 
-func (op Op) Size() uint32 {
+func (op *Op) IsComplete() bool {
+	return atomic.LoadInt32(&op.done) == 1
+}
+
+func (op *Op) Free() {
+	op.blocks = nil
+	op.UserData = nil
+	opPool.Put(op)
+}
+func (op *Op) Wait() {
+	op.wg.Wait()
+}
+
+func (op *Op) Size() uint32 {
 	ret := uint32(0)
 	for i := range op.blocks {
 		ret += op.blocks[i].BlockLength
@@ -98,7 +116,7 @@ func (sc *StreamClient) getExtentConnFromIndex(extendIdIndex int) (*grpc.ClientC
 	}
 	nodeInfo := sc.smClient.LookupNode(extentInfo.Replicates[0])
 	if nodeInfo == nil {
-		return nil, id, errors.Errorf("not found node address %s", extentInfo.Replicates[0])
+		return nil, id, errors.Errorf("not found node address %d", extentInfo.Replicates[0])
 	}
 
 	pool := conn.GetPools().Connect(nodeInfo.Address)
@@ -152,6 +170,11 @@ func (sc *StreamClient) streamBlocks() {
 	for {
 		select {
 		case <-sc.stopper.ShouldStop():
+			for op := range sc.writeCh {
+				op.Err = errors.Errorf("closed")
+				atomic.StoreInt32(&op.done, 1)
+				op.wg.Done()
+			}
 			return
 		case op := <-sc.writeCh:
 			size := uint32(0)
@@ -187,30 +210,18 @@ func (sc *StreamClient) streamBlocks() {
 			//FIXME
 			if err == context.DeadlineExceeded { //timeout
 				sc.mustAllocNewExtent(extentID)
-				/*
-					var newExInfo *pb.ExtentInfo
-					for err != nil {
-						//loop forever to seal and alloc new extent
-						xlog.Logger.Warn(err.Error())
-						newExInfo, err = sc.smClient.StreamAllocExtent(ctx, sc.streamID, extentID)
-					}
-					sc.Lock()
-					sc.streamInfo.ExtentIDs = append(sc.streamInfo.ExtentIDs, newExInfo.ExtentID)
-					sc.extentInfo[newExInfo.ExtentID] = newExInfo
-					sc.Unlock()
-				*/
 				goto retry
 			} else {
 				i := 0
 				for _, op := range ops {
 					opBlocks := len(op.blocks)
 					opStart := i
-					if err != nil {
-						sc.completeCh <- AppendResult{Err: err, UserData: op.userData}
-					} else {
-						sc.completeCh <- AppendResult{extentID, res.Offsets[opStart : opStart+opBlocks], len(op.blocks), err, op.userData}
 
-					}
+					op.Err = err
+					op.ExtentID = extentID
+					op.Offsets = res.Offsets[opStart : opStart+opBlocks]
+					atomic.StoreInt32(&op.done, 1)
+					op.wg.Done()
 					i += len(op.blocks)
 				}
 				//检查offset结果, 如果已经超过2GB, 调用StreamAllocExtent
@@ -238,75 +249,42 @@ func (sc *StreamClient) Connect() error {
 }
 
 func (sc *StreamClient) Close() {
+	atomic.StoreInt32(&sc.done, 1)
+	close(sc.writeCh)
 	sc.stopper.Stop()
 }
 
-func (sc *StreamClient) GetComplete() chan AppendResult {
-	return sc.completeCh
-}
-
-func (sc *StreamClient) InfightIO() int {
-	return len(sc.writeCh)
-}
-
-//TryComplete will block when writeCh is full
-func (sc *StreamClient) TryComplete() []AppendResult {
-	var result []AppendResult
-	if len(sc.writeCh) == sc.iodepth {
-		for len(sc.writeCh)+batchSize >= sc.iodepth {
-			select {
-			case ret := <-sc.completeCh:
-				result = append(result, ret)
-			}
-		}
-		return result
-	}
-
-slurpLoop:
-	for {
-		select {
-		case ret := <-sc.completeCh:
-			for {
-				result = append(result, ret)
-				select {
-				case ret = <-sc.completeCh:
-				default:
-					break slurpLoop
-				}
-			}
-		default:
-			break slurpLoop
-		}
-	}
-	return result
-
-}
-
 //TODO: add urgent flag
-func (sc *StreamClient) Append(ctx context.Context, blocks []*pb.Block, userData interface{}) error {
+func (sc *StreamClient) Append(ctx context.Context, blocks []*pb.Block, userData interface{}) (*Op, error) {
+
+	if atomic.LoadInt32(&sc.done) == 1 {
+		return nil, errors.Errorf("closed")
+	}
+
 	if len(blocks) == 0 {
-		return errors.Errorf("blocks can not be nil")
+		return nil, errors.Errorf("blocks can not be nil")
 	}
 	for i := range blocks {
 		if len(blocks[i].Data)%4096 != 0 {
-			return errors.Errorf("not aligned")
+			return nil, errors.Errorf("not aligned")
 		}
 	}
 	//TODO: get op from sync.Pool
-	op := Op{
-		blocks:   blocks,
-		userData: userData,
-	}
-	select {
-	case <-ctx.Done():
-		return context.Canceled
-	case sc.writeCh <- &op:
-		return nil
-	}
+	op := opPool.Get().(*Op)
+	op.blocks = blocks
+	op.UserData = userData
+	op.wg.Add(1)
+	op.done = 0
+
+	sc.writeCh <- op
+	return op, nil
 }
 
 //Read is random read inside a block
 func (sc *StreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, error) {
+	if atomic.LoadInt32(&sc.done) == 1 {
+		return nil, errors.Errorf("closed")
+	}
 	conn := sc.getExtentConn(extentID)
 	if conn == nil {
 		return nil, errors.Errorf("no such extent")
