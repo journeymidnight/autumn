@@ -30,7 +30,8 @@ type StreamClient struct {
 }
 
 var (
-	batchSize = 4
+	batchSize     = 4
+	maxExtentSize = uint32(2 << 30)
 )
 
 func NewStreamClient(sm *smclient.SMClient, streamID uint64, iodepth int) *StreamClient {
@@ -128,6 +129,24 @@ func (sc *StreamClient) getLastExtentConn() (uint64, *grpc.ClientConn) {
 	return extentID, pool.Get()
 }
 
+func (sc *StreamClient) mustAllocNewExtent(oldExtentID uint64) {
+	var newExInfo *pb.ExtentInfo
+	var err error
+	for {
+		//loop forever to seal and alloc new extent
+		newExInfo, err = sc.smClient.StreamAllocExtent(context.Background(), sc.streamID, oldExtentID)
+		if err == nil {
+			break
+		}
+		xlog.Logger.Warn(err.Error())
+		time.Sleep(100 * time.Millisecond)
+	}
+	sc.Lock()
+	sc.streamInfo.ExtentIDs = append(sc.streamInfo.ExtentIDs, newExInfo.ExtentID)
+	sc.extentInfo[newExInfo.ExtentID] = newExInfo
+	sc.Unlock()
+}
+
 //TODO: 有可能需要append是幂等的
 func (sc *StreamClient) streamBlocks() {
 	for {
@@ -167,16 +186,19 @@ func (sc *StreamClient) streamBlocks() {
 
 			//FIXME
 			if err == context.DeadlineExceeded { //timeout
-				var newExInfo *pb.ExtentInfo
-				for err != nil {
-					//loop forever to seal and alloc new extent
-					xlog.Logger.Warn(err.Error())
-					newExInfo, err = sc.smClient.StreamAllocExtent(ctx, sc.streamID, extentID)
-				}
-				sc.Lock()
-				sc.streamInfo.ExtentIDs = append(sc.streamInfo.ExtentIDs, newExInfo.ExtentID)
-				sc.extentInfo[newExInfo.ExtentID] = newExInfo
-				sc.Unlock()
+				sc.mustAllocNewExtent(extentID)
+				/*
+					var newExInfo *pb.ExtentInfo
+					for err != nil {
+						//loop forever to seal and alloc new extent
+						xlog.Logger.Warn(err.Error())
+						newExInfo, err = sc.smClient.StreamAllocExtent(ctx, sc.streamID, extentID)
+					}
+					sc.Lock()
+					sc.streamInfo.ExtentIDs = append(sc.streamInfo.ExtentIDs, newExInfo.ExtentID)
+					sc.extentInfo[newExInfo.ExtentID] = newExInfo
+					sc.Unlock()
+				*/
 				goto retry
 			} else {
 				i := 0
@@ -190,6 +212,10 @@ func (sc *StreamClient) streamBlocks() {
 
 					}
 					i += len(op.blocks)
+				}
+				//检查offset结果, 如果已经超过2GB, 调用StreamAllocExtent
+				if res.Offsets[len(res.Offsets)-1] > maxExtentSize {
+					sc.mustAllocNewExtent(extentID)
 				}
 			}
 		}
@@ -325,7 +351,7 @@ func (reader *SeqReader) Read(ctx context.Context) ([]*pb.Block, error) {
 		return nil, err
 	}
 
-	fmt.Printf("res code is %v\n", res.Code)
+	fmt.Printf("res code is %v, len of blocks %d\n", res.Code, len(res.Blocks))
 	switch res.Code {
 	case pb.Code_OK:
 		reader.currentOffset += utils.SizeOfBlocks(res.Blocks)

@@ -19,7 +19,7 @@ func init() {
 }
 
 func TestCommitLog(t *testing.T) {
-	//assume have cluster
+	//already have the cluster
 	sm := smclient.NewSMClient([]string{"127.0.0.1:3401"})
 	err := sm.Connect()
 	assert.Nil(t, err)
@@ -50,6 +50,7 @@ func TestCommitLog(t *testing.T) {
 	}
 
 	stopper.Wait()
+
 	iter := commitLog.NewLogIter()
 	//read out
 	numOfLogs := 0
@@ -58,7 +59,7 @@ func TestCommitLog(t *testing.T) {
 		if err != nil && err != io.EOF {
 			assert.Nil(t, err)
 		}
-		numOfLogs = len(entries)
+		numOfLogs += len(entries)
 		if err == io.EOF {
 			break
 		}

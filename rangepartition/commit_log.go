@@ -296,8 +296,11 @@ func extractLogEntry(block *pb.Block) []*pspb.LogEntry {
 	return ret
 }
 
-/*
+//FIXME
 func (cl *CommitLog) Truncate() {
-
+	//block所有append
+	//drain所有inflight
+	//发请求到sm
+	//1. 把所有extent移动到data stream, 并且新建extent
+	//2. 删除当前的stream下的extent, 并且新建extent
 }
-*/
