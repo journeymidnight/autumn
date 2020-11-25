@@ -17,6 +17,7 @@ import (
 	"github.com/journeymidnight/autumn/streamclient"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
+	"github.com/phf/go-queue/queue"
 	"github.com/pkg/errors"
 	"github.com/urfave/cli/v2"
 	"go.uber.org/zap/zapcore"
@@ -103,6 +104,7 @@ func benchmark(smAddr []string, op BenchType, threadNum int, duration int, size 
 			stopper.RunWorker(func() {
 				var ctx context.Context
 				var cancel context.CancelFunc
+				inFlightIO := queue.New()
 				for {
 					select {
 					case <-stopper.ShouldStop():
@@ -112,17 +114,18 @@ func benchmark(smAddr []string, op BenchType, threadNum int, duration int, size 
 						return
 					default:
 						write := func(t int) {
-							ctx, cancel = context.WithCancel(context.Background())
-							if err := scs[t].Append(ctx, blocks, time.Now()); err != nil {
+							ctx, _ = context.WithCancel(context.Background())
+							op, err := scs[t].Append(ctx, blocks, time.Now())
+							if err != nil {
 								fmt.Println(err)
 								return
 							}
-							cancel()
+							inFlightIO.PushBack(op)
 
 							end := time.Now()
-							ios := scs[t].TryComplete()
-
-							for _, io := range ios {
+							for inFlightIO.Len() > 0 && inFlightIO.Front().(*streamclient.Op).IsComplete() {
+								io := inFlightIO.PopFront().(*streamclient.Op)
+								io.Wait()
 								if io.Err != nil {
 									fmt.Println(io.Err)
 									continue
@@ -141,6 +144,11 @@ func benchmark(smAddr []string, op BenchType, threadNum int, duration int, size 
 								atomic.AddUint64(&totalSize, uint64(size))
 								atomic.AddUint64(&count, 1)
 								loop++
+							}
+							//block
+							if inFlightIO.Len() > 32 {
+								io := inFlightIO.Front().(*streamclient.Op)
+								io.Wait()
 							}
 
 						}

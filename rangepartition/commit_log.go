@@ -48,10 +48,12 @@ commitLog在1ms的时间窗口内, 重新排序输入的log, size小的在前, �
 type AppendCallback func(entry *pspb.LogEntry, extendId uint64, offset uint32, innerOffset uint32, err error)
 
 type CommitLog struct {
-	stream   *streamclient.StreamClient
-	streamID uint64
-	inputCh  chan LogCommand
-	stopper  *utils.Stopper
+	stream         *streamclient.StreamClient
+	streamID       uint64
+	inputCh        chan LogCommand
+	reorderStopper *utils.Stopper
+	eventsStopper  *utils.Stopper
+	ops            chan *streamclient.Op
 }
 
 func NewCommitLog(streamID uint64, sm *smclient.SMClient) (*CommitLog, error) {
@@ -62,36 +64,54 @@ func NewCommitLog(streamID uint64, sm *smclient.SMClient) (*CommitLog, error) {
 		return nil, err
 	}
 	cl := &CommitLog{
-		stream:   stream,
-		streamID: streamID,
-		inputCh:  make(chan LogCommand, 32),
-		stopper:  utils.NewStopper(),
+		stream:         stream,
+		streamID:       streamID,
+		inputCh:        make(chan LogCommand, 32),
+		reorderStopper: utils.NewStopper(),
+		eventsStopper:  utils.NewStopper(),
+		ops:            make(chan *streamclient.Op, 32),
 	}
 
-	cl.stopper.RunWorker(cl.reorder)
-	cl.stopper.RunWorker(cl.getEvents) //run callbacks
+	cl.reorderStopper.RunWorker(cl.reorder)
+	cl.eventsStopper.RunWorker(cl.getEvents) //run callbacks
 	return cl, nil
+}
+
+func (cl *CommitLog) Close() {
+	cl.reorderStopper.Stop()
+	close(cl.ops)
+	cl.eventsStopper.Stop()
 }
 
 func (cl *CommitLog) getEvents() {
 	for {
 		select {
-		case <-cl.stopper.ShouldStop():
+		case <-cl.eventsStopper.ShouldStop():
 			//drain all inflightIO
-			for cl.stream.InfightIO() > 0 {
-				<-cl.stream.GetComplete()
+			for op := range cl.ops {
+				op.Wait()
+				logCmds := op.UserData.([]LogCommand)
+				for _, logCmd := range logCmds {
+					if op.Err != nil {
+						logCmd.f(logCmd.entry, 0, 0, 0, op.Err)
+					} else {
+						logCmd.f(logCmd.entry, op.ExtentID, op.Offsets[logCmd.blockNum], logCmd.innerOffset, nil)
+					}
+				}
+				op.Free()
 			}
 			return
-		case result := <-cl.stream.GetComplete():
-			logCmds := result.UserData.([]LogCommand)
+		case op := <-cl.ops:
+			op.Wait()
+			logCmds := op.UserData.([]LogCommand)
 			for _, logCmd := range logCmds {
-				if result.Err != nil {
-					logCmd.f(logCmd.entry, 0, 0, 0, result.Err)
+				if op.Err != nil {
+					logCmd.f(logCmd.entry, 0, 0, 0, op.Err)
 				} else {
-					logCmd.f(logCmd.entry, result.ExtentID, result.Offsets[logCmd.blockNum], logCmd.innerOffset, nil)
+					logCmd.f(logCmd.entry, op.ExtentID, op.Offsets[logCmd.blockNum], logCmd.innerOffset, nil)
 				}
 			}
-
+			op.Free()
 		}
 	}
 }
@@ -155,7 +175,7 @@ func (mb *mixedBlock) ToBlock() *pb.Block {
 func (cl *CommitLog) reorder() {
 	for {
 		select {
-		case <-cl.stopper.ShouldStop():
+		case <-cl.reorderStopper.ShouldStop():
 			return
 		case entry := <-cl.inputCh:
 			var logCmds []LogCommand
@@ -221,8 +241,9 @@ func (cl *CommitLog) reorder() {
 				logCmds[i].blockNum = len(blocks) - 1
 			}
 
-			err := cl.stream.Append(context.Background(), blocks, logCmds)
+			op, err := cl.stream.Append(context.Background(), blocks, logCmds)
 			utils.Check(err)
+			cl.ops <- op
 		}
 
 	}
@@ -230,6 +251,7 @@ func (cl *CommitLog) reorder() {
 
 //non-Block IO
 func (cl *CommitLog) Append(entry *pspb.LogEntry, f AppendCallback) {
+	//if cl is closed
 	cl.inputCh <- LogCommand{
 		entry: entry,
 		f:     f,
