@@ -293,7 +293,7 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 			return nil, EndOfStream
 		}
 	}
-	size := uint32(0)	
+	size := uint32(0)
 	for i := uint32(0); i < maxNumOfBlocks; i++ {
 		r := ex.GetReader(offset)
 
