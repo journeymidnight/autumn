@@ -359,7 +359,7 @@ func (ex *Extent) AppendBlocks(blocks []*pb.Block, lastCommit uint32) (ret []uin
 func writeBlock(w io.Writer, block *pb.Block) (err error) {
 
 	if !align(uint64(block.BlockLength)) {
-		return errors.Errorf("block is not  aligned %d", block.BlockLength)
+		return errors.Errorf("block is not aligned %d", block.BlockLength)
 	}
 	//checkSum
 

@@ -279,6 +279,7 @@ nodes    map[uint64]*NodeStatus
 14. extent也有很大的优化空间, AppendBlock发到每块硬盘的队列上, 然后取队列, 写数据, 再sync,可以减少单块硬盘上的sync次数. 但是: 如果有SSD
 journal的话, 这些优化可能都不需要
 15. streamclient增加自动Seal的功能
+16. extent层用mmap,提升读性能
 
 ## partion layer
 

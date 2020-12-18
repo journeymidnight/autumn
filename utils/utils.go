@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/gogo/protobuf/proto"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
@@ -108,4 +109,14 @@ func SizeOfBlocks(blocks []*pb.Block) (ret uint32) {
 		ret += blocks[i].BlockLength + 512
 	}
 	return
+}
+
+func MustMarshal(msg proto.Message) []byte {
+	data, err := proto.Marshal(msg)
+	Check(err)
+	return data
+}
+
+func MustUnMarshal(data []byte, msg proto.Message) {
+	Check(proto.Unmarshal(data, msg))
 }

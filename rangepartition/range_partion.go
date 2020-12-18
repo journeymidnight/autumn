@@ -20,14 +20,12 @@ type RangePartition struct {
 	sm         *smclient.SMClient
 	commitLog  *CommitLog
 	tableType  string
-	memStore   *MemoryTable //一个ColumnFamily对应一个memStore, 这个实现只有一个ColumnFamily
 }
 
 func NewRangePartition(sm *smclient.SMClient, tableType string, metaStreamID uint64) *RangePartition {
 	metaStream := streamclient.NewStreamClient(sm, metaStreamID, 1)
 	return &RangePartition{
 		metaStream: metaStream,
-		memStore:   NewMemoryTable(),
 		sm:         sm,
 	}
 }
@@ -76,13 +74,7 @@ func (rp *RangePartition) Connect() error {
 	}
 
 	//connect to blobStream
-	if meta.TableType == pspb.TableType_BlobTable {
-		rp.blobStream = streamclient.NewStreamClient(rp.sm, meta.BlobStreamID, 16)
-		if err = rp.blobStream.Connect(); err != nil {
-			return err
 
-		}
-	}
 	return nil
 }
 
