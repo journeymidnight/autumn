@@ -57,8 +57,8 @@ type node struct {
 	value uint64
 
 	// A byte slice is 24 bytes. We are trying to save space here.
-	keyOffset uint32 // Immutable. No need to lock to access kevalue.
-	keySize   uint16 // Immutable. No need to lock to access kevalue.
+	keyOffset uint32 // Immutable. No need to lock to access key.
+	keySize   uint16 // Immutable. No need to lock to access key.
 
 	// Height of the tower.
 	height uint16
@@ -158,7 +158,7 @@ func (s *node) casNextOffset(h int, old, val uint32) bool {
 	return atomic.CompareAndSwapUint32(&s.tower[h], old, val)
 }
 
-// Returns true if key is strictly > n.kevalue.
+// Returns true if key is strictly > n.key.
 // If n is nil, this is an "end" marker and we return false.
 //func (s *Skiplist) keyIsAfterNode(key []byte, n *node) bool {
 //	value.AssertTrue(n != s.head)
@@ -177,17 +177,17 @@ func (s *Skiplist) getNext(nd *node, height int) *node {
 	return s.arena.getNode(nd.getNextOffset(height))
 }
 
-// findNear finds the node near to kevalue.
+// findNear finds the node near to key.
 // If less=true, it finds rightmost node such that node.key < key (if allowEqual=false) or
 // node.key <= key (if allowEqual=true).
 // If less=false, it finds leftmost node such that node.key > key (if allowEqual=false) or
 // node.key >= key (if allowEqual=true).
-// Returns the node found. The bool returned is true if the node has key equal to given kevalue.
+// Returns the node found. The bool returned is true if the node has key equal to given key.
 func (s *Skiplist) findNear(key []byte, less bool, allowEqual bool) (*node, bool) {
 	x := s.head
 	level := int(s.getHeight() - 1)
 	for {
-		// Assume x.key < kevalue.
+		// Assume x.key < key
 		next := s.getNext(x, level)
 		if next == nil {
 			// x.key < key < END OF LIST
@@ -210,12 +210,12 @@ func (s *Skiplist) findNear(key []byte, less bool, allowEqual bool) (*node, bool
 		nextKey := next.key(s.arena)
 		cmp := y.CompareKeys(key, nextKey)
 		if cmp > 0 {
-			// x.key < next.key < kevalue. We can continue to move right.
+			// x.key < next.key < key. We can continue to move right.
 			x = next
 			continue
 		}
 		if cmp == 0 {
-			// x.key < key == next.kevalue.
+			// x.key < key == next.key.
 			if allowEqual {
 				return next, true
 			}
@@ -251,13 +251,13 @@ func (s *Skiplist) findNear(key []byte, less bool, allowEqual bool) (*node, bool
 	}
 }
 
-// findSpliceForLevel returns (outBefore, outAfter) with outBefore.key <= key <= outAfter.kevalue.
+// findSpliceForLevel returns (outBefore, outAfter) with outBefore.key <= key <= outAfter.key.
 // The input "before" tells us where to start looking.
 // If we found a node with the same key, then we return outBefore = outAfter.
-// Otherwise, outBefore.key < key < outAfter.kevalue.
+// Otherwise, outBefore.key < key < outAfter.key.
 func (s *Skiplist) findSpliceForLevel(key []byte, before *node, level int) (*node, *node) {
 	for {
-		// Assume before.key < kevalue.
+		// Assume before.key < key.
 		next := s.getNext(before, level)
 		if next == nil {
 			return before, next
@@ -269,7 +269,7 @@ func (s *Skiplist) findSpliceForLevel(key []byte, before *node, level int) (*nod
 			return next, next
 		}
 		if cmp < 0 {
-			// before.key < key < next.kevalue. We are done for this level.
+			// before.key < key < next.key. We are done for this level.
 			return before, next
 		}
 		before = next // Keep moving right on this level.
@@ -371,8 +371,8 @@ func (s *Skiplist) findLast() *node {
 	}
 }
 
-// Get gets the value associated with the kevalue. It returns a valid value if it finds equal or earlier
-// version of the same kevalue.
+// Get gets the value associated with the key. It returns a valid value if it finds equal or earlier
+// version of the same key.
 func (s *Skiplist) Get(key []byte) y.ValueStruct {
 	n, _ := s.findNear(key, false, true) // findGreaterOrEqual.
 	if n == nil {

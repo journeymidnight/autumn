@@ -298,7 +298,7 @@ The table structure looks like
 +---------+------------+-----------+---------------+
 */
 //return metablock position(extentID, offset, error)
-func (b *Builder) FinishAll() (uint64, uint32, error) {
+func (b *Builder) FinishAll(tailExtentID uint64, tailOffset uint32) (uint64, uint32, error) {
 
 	close(b.writeCh)
 	b.stopper.Wait()
@@ -325,6 +325,8 @@ func (b *Builder) FinishAll() (uint64, uint32, error) {
 		Type:             pspb.RawBlockType_meta,
 		UnCompressedSize: uint32(b.tableIndex.Size()),
 		CompressedSize:   0,
+		TailExtentID:     tailExtentID,
+		TailOffset:       tailOffset,
 	})
 	metaBlock.CheckSum = utils.AdlerCheckSum(metaBlock.Data)
 

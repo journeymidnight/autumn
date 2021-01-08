@@ -19,6 +19,7 @@ package skiplist
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"math/rand"
 	"strconv"
 	"sync"
@@ -379,6 +380,20 @@ func TestIteratorPrev(t *testing.T) {
 		it.Prev()
 	}
 	require.False(t, it.Valid())
+}
+
+func TestGetWork(t *testing.T) {
+	l := NewSkiplist(arenaSize)
+	defer l.DecrRef()
+
+	l.Put(y.KeyWithTs([]byte("a"), 0), y.ValueStruct{})
+	l.Put(y.KeyWithTs([]byte("b"), 0), y.ValueStruct{})
+	l.Put(y.KeyWithTs([]byte("c"), 0), y.ValueStruct{})
+	l.Put(y.KeyWithTs([]byte("a"), 100), y.ValueStruct{})
+
+	x := l.Get(y.KeyWithTs([]byte("a"), math.MaxUint64))
+	require.Equal(t, uint64(100), x.Version)
+
 }
 
 // TestIteratorSeek tests Seek and SeekForPrev.
