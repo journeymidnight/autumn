@@ -46,6 +46,7 @@ func (t *Table) IncrRef() {
 
 // DecrRef decrements the refcount and possibly deletes the table
 func (t *Table) DecrRef() error {
+	//FIXME:
 	return nil
 }
 

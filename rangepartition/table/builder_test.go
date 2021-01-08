@@ -71,7 +71,7 @@ func TestTableIndex(t *testing.T) {
 	}
 
 	builder.FinishBlock()
-	id, offset, err := builder.FinishAll()
+	id, offset, err := builder.FinishAll(0, 0)
 	fmt.Printf("%d, %d, %v\n", id, offset, err)
 	table, err := OpenTable(stream, id, offset)
 	assert.Nil(t, err)

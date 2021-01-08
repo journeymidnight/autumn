@@ -21,9 +21,9 @@ import (
 	"io"
 	"sort"
 
-	"github.com/dgraph-io/badger/v2/y"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/proto/pspb"
+	"github.com/journeymidnight/autumn/rangepartition/y"
 	"github.com/journeymidnight/autumn/utils"
 )
 
