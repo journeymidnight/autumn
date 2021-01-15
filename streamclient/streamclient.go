@@ -17,8 +17,19 @@ import (
 	"google.golang.org/grpc"
 )
 
+type SeqReader interface {
+	Read(ctx context.Context) ([]*pb.Block, error)
+}
+type StreamClient interface {
+	Connect() error
+	Close()
+	Append(ctx context.Context, blocks []*pb.Block, userData interface{}) (*Op, error)
+	Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, error)
+	//NewSeqReader() SeqReader
+}
+
 //for single stream
-type StreamClient struct {
+type AutumnStreamClient struct {
 	smClient     *smclient.SMClient
 	sync.RWMutex //protect streamInfo/extentInfo when called in read/write
 	streamInfo   *pb.StreamInfo
@@ -39,9 +50,9 @@ var (
 	}
 )
 
-func NewStreamClient(sm *smclient.SMClient, streamID uint64, iodepth int) *StreamClient {
+func NewStreamClient(sm *smclient.SMClient, streamID uint64, iodepth int) *AutumnStreamClient {
 	utils.AssertTrue(xlog.Logger != nil)
-	return &StreamClient{
+	return &AutumnStreamClient{
 		smClient: sm,
 		streamID: streamID,
 		writeCh:  make(chan *Op, iodepth),
@@ -69,6 +80,13 @@ func (op *Op) IsComplete() bool {
 	return atomic.LoadInt32(&op.done) == 1
 }
 
+func (op *Op) Reset(blocks []*pb.Block, userData interface{}) {
+	op.blocks = blocks
+	op.UserData = userData
+	op.wg = sync.WaitGroup{}
+	op.wg.Add(1)
+	op.done = 0
+}
 func (op *Op) Free() {
 	op.blocks = nil
 	op.UserData = nil
@@ -86,7 +104,7 @@ func (op *Op) Size() uint32 {
 	return ret
 }
 
-func (sc *StreamClient) getPeers(extentID uint64) []string {
+func (sc *AutumnStreamClient) getPeers(extentID uint64) []string {
 	sc.RLock()
 	defer sc.RUnlock()
 	extentInfo := sc.extentInfo[extentID]
@@ -99,7 +117,7 @@ func (sc *StreamClient) getPeers(extentID uint64) []string {
 	return ret
 }
 
-func (sc *StreamClient) getExtentConnFromIndex(extendIdIndex int) (*grpc.ClientConn, uint64, error) {
+func (sc *AutumnStreamClient) getExtentConnFromIndex(extendIdIndex int) (*grpc.ClientConn, uint64, error) {
 	sc.RLock()
 	defer sc.RUnlock()
 	if extendIdIndex == len(sc.streamInfo.ExtentIDs) {
@@ -126,7 +144,7 @@ func (sc *StreamClient) getExtentConnFromIndex(extendIdIndex int) (*grpc.ClientC
 
 }
 
-func (sc *StreamClient) getExtentConn(extentID uint64) *grpc.ClientConn {
+func (sc *AutumnStreamClient) getExtentConn(extentID uint64) *grpc.ClientConn {
 	sc.RLock()
 	defer sc.RUnlock()
 	extentInfo := sc.extentInfo[extentID]
@@ -136,7 +154,7 @@ func (sc *StreamClient) getExtentConn(extentID uint64) *grpc.ClientConn {
 	return pool.Get()
 }
 
-func (sc *StreamClient) getLastExtentConn() (uint64, *grpc.ClientConn) {
+func (sc *AutumnStreamClient) getLastExtentConn() (uint64, *grpc.ClientConn) {
 	sc.RLock()
 	defer sc.RUnlock()
 	extentID := sc.streamInfo.ExtentIDs[len(sc.streamInfo.ExtentIDs)-1] //last extentd
@@ -147,7 +165,7 @@ func (sc *StreamClient) getLastExtentConn() (uint64, *grpc.ClientConn) {
 	return extentID, pool.Get()
 }
 
-func (sc *StreamClient) mustAllocNewExtent(oldExtentID uint64) {
+func (sc *AutumnStreamClient) mustAllocNewExtent(oldExtentID uint64) {
 	var newExInfo *pb.ExtentInfo
 	var err error
 	for {
@@ -166,7 +184,7 @@ func (sc *StreamClient) mustAllocNewExtent(oldExtentID uint64) {
 }
 
 //TODO: 有可能需要append是幂等的
-func (sc *StreamClient) streamBlocks() {
+func (sc *AutumnStreamClient) streamBlocks() {
 	for {
 		select {
 		case <-sc.stopper.ShouldStop():
@@ -233,7 +251,7 @@ func (sc *StreamClient) streamBlocks() {
 	}
 }
 
-func (sc *StreamClient) Connect() error {
+func (sc *AutumnStreamClient) Connect() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	s, e, err := sc.smClient.StreamInfo(ctx, []uint64{sc.streamID})
 	cancel()
@@ -248,14 +266,14 @@ func (sc *StreamClient) Connect() error {
 	return nil
 }
 
-func (sc *StreamClient) Close() {
+func (sc *AutumnStreamClient) Close() {
 	atomic.StoreInt32(&sc.done, 1)
 	close(sc.writeCh)
 	sc.stopper.Stop()
 }
 
 //TODO: add urgent flag
-func (sc *StreamClient) Append(ctx context.Context, blocks []*pb.Block, userData interface{}) (*Op, error) {
+func (sc *AutumnStreamClient) Append(ctx context.Context, blocks []*pb.Block, userData interface{}) (*Op, error) {
 
 	if atomic.LoadInt32(&sc.done) == 1 {
 		return nil, errors.Errorf("closed")
@@ -269,19 +287,16 @@ func (sc *StreamClient) Append(ctx context.Context, blocks []*pb.Block, userData
 			return nil, errors.Errorf("not aligned")
 		}
 	}
-	//TODO: get op from sync.Pool
+
 	op := opPool.Get().(*Op)
-	op.blocks = blocks
-	op.UserData = userData
-	op.wg.Add(1)
-	op.done = 0
+	op.Reset(blocks, userData)
 
 	sc.writeCh <- op
 	return op, nil
 }
 
 //Read is random read inside a block
-func (sc *StreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, error) {
+func (sc *AutumnStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, error) {
 	if atomic.LoadInt32(&sc.done) == 1 {
 		return nil, errors.Errorf("closed")
 	}
@@ -298,8 +313,8 @@ func (sc *StreamClient) Read(ctx context.Context, extentID uint64, offset uint32
 	return res.Blocks, err
 }
 
-type SeqReader struct {
-	sc                 *StreamClient
+type AutumnSeqReader struct {
+	sc                 *AutumnStreamClient
 	currentExtentIndex int
 	currentOffset      uint32
 }
@@ -310,7 +325,7 @@ type SeqReader struct {
 3. (blocks, nil)
 4. (nil, Other Error)
 */
-func (reader *SeqReader) Read(ctx context.Context) ([]*pb.Block, error) {
+func (reader *AutumnSeqReader) Read(ctx context.Context) ([]*pb.Block, error) {
 	conn, extentID, err := reader.sc.getExtentConnFromIndex(reader.currentExtentIndex)
 	if err != nil {
 		return nil, err
@@ -349,7 +364,7 @@ func (reader *SeqReader) Read(ctx context.Context) ([]*pb.Block, error) {
 }
 
 //SeqRead read all the blocks in stream
-func (sc *StreamClient) NewSeqReader() *SeqReader {
+func (sc *AutumnStreamClient) NewSeqReader() SeqReader {
 	/*
 		sc.RLock()
 		defer sc.RUnlock()
@@ -357,7 +372,7 @@ func (sc *StreamClient) NewSeqReader() *SeqReader {
 			return nil, errors.Errorf("stream is nil")
 		}
 	*/
-	return &SeqReader{
+	return &AutumnSeqReader{
 		sc:                 sc,
 		currentExtentIndex: 0,
 		currentOffset:      512, //skip extent header

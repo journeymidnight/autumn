@@ -261,7 +261,7 @@ func (ex *Extent) Seal(commit uint32) error {
 func (ex *Extent) IsSeal() bool {
 	return atomic.LoadInt32(&ex.isSeal) == 1
 }
-func (ex *Extent) GetReader(offset uint32) io.Reader {
+func (ex *Extent) getReader(offset uint32) io.Reader {
 	return &extentBlockReader{
 		extent:   ex,
 		position: offset,
@@ -295,7 +295,7 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 	}
 	size := uint32(0)
 	for i := uint32(0); i < maxNumOfBlocks; i++ {
-		r := ex.GetReader(offset)
+		r := ex.getReader(offset)
 
 		block, err := readBlock(r)
 
@@ -325,7 +325,7 @@ func (ex *Extent) CommitLength() uint32 {
 	return atomic.LoadUint32(&ex.commitLength)
 }
 
-func (ex *Extent) AppendBlocks(blocks []*pb.Block, lastCommit uint32) (ret []uint32, err error) {
+func (ex *Extent) AppendBlocks(blocks []*pb.Block, lastCommit *uint32) (ret []uint32, err error) {
 	ex.AssertLock()
 
 	if atomic.LoadInt32(&ex.isSeal) == 1 {
@@ -333,7 +333,7 @@ func (ex *Extent) AppendBlocks(blocks []*pb.Block, lastCommit uint32) (ret []uin
 	}
 
 	//for secondary extents, it must check lastCommit.
-	if lastCommit != 0 && lastCommit != ex.CommitLength() {
+	if lastCommit != nil && *lastCommit != ex.CommitLength() {
 		return nil, errors.Errorf("offset not match...")
 	}
 	/*
@@ -417,7 +417,7 @@ func readBlock(reader io.Reader) (pb.Block, error) {
 
 	//checkSum
 	if utils.AdlerCheckSum(data) != checkSum {
-		return pb.Block{}, errors.Errorf("alder32 checksum not match")
+		return pb.Block{}, errors.Errorf("alder32 checksum not match, %d vs %d", utils.AdlerCheckSum(data), checkSum)
 	}
 	if !align(uint64(blockLength)) {
 		return pb.Block{}, errors.Errorf("block is not aligned %d", blockLength)

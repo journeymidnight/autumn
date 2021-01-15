@@ -117,7 +117,7 @@ func TestAppendReadFile(t *testing.T) {
 	defer os.Remove("localtest.ext")
 	assert.Nil(t, err)
 	extent.Lock()
-	ret, err := extent.AppendBlocks(cases, 0)
+	ret, err := extent.AppendBlocks(cases, nil)
 	extent.Unlock()
 	assert.Nil(t, err)
 
@@ -172,7 +172,7 @@ func TestReplayExtent(t *testing.T) {
 	defer os.Remove(extentName)
 	assert.Nil(t, err)
 	extent.Lock()
-	_, err = extent.AppendBlocks(cases, 0)
+	_, err = extent.AppendBlocks(cases, nil)
 	extent.Unlock()
 	assert.Nil(t, err)
 
@@ -186,7 +186,7 @@ func TestReplayExtent(t *testing.T) {
 
 	//write new cases
 	ex.Lock()
-	_, err = ex.AppendBlocks(cases, 0)
+	_, err = ex.AppendBlocks(cases, nil)
 	ex.Unlock()
 	assert.Nil(t, err)
 	commit := ex.CommitLength()
@@ -238,7 +238,7 @@ func BenchmarkExtent(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_, err = extent.AppendBlocks([]*pb.Block{
 			block,
-		}, commit)
+		}, &commit)
 
 		if err != nil {
 			panic(err.Error())

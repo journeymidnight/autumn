@@ -41,9 +41,9 @@ var (
 
 type RangePartition struct {
 	//metaStream *streamclient.StreamClient //设定metadata结构
-	rowStream    *streamclient.StreamClient //设定checkpoint结构
+	rowStream    *streamclient.AutumnStreamClient //设定checkpoint结构
 	sm           *smclient.SMClient
-	logStream    *streamclient.StreamClient
+	logStream    *streamclient.AutumnStreamClient
 	logRotates   int32
 	writeCh      chan *request
 	mt           *skiplist.Skiplist
@@ -319,8 +319,9 @@ func (rp *RangePartition) writeLog(reqs []*request) (valuePointer, error) {
 
 	//merge small reqs into on block
 	for ; i < len(reqs); i++ {
-		rp.shouldWriteValueToLSM(&reqs[i].Entry)
-
+		if !shouldWriteValueToLSM(&reqs[i].Entry) {
+			break
+		}
 		if mblock == nil {
 			mblock = NewMixedBlock()
 		}
@@ -428,7 +429,7 @@ func (rp *RangePartition) writeRequests(reqs []*request) error {
 	return nil
 }
 
-func (rp *RangePartition) shouldWriteValueToLSM(e *pspb.Entry) bool {
+func shouldWriteValueToLSM(e *pspb.Entry) bool {
 	return len(e.Value) < ValueThreshold
 }
 
@@ -438,7 +439,7 @@ func getLowerByte(a uint32) byte {
 
 func (rp *RangePartition) writeToLSM(req *request) error {
 	entry := &req.Entry
-	if rp.shouldWriteValueToLSM(&req.Entry) { // Will include deletion / tombstone case.
+	if shouldWriteValueToLSM(&req.Entry) { // Will include deletion / tombstone case.
 		rp.mt.Put(entry.Key,
 			y.ValueStruct{
 				Value:     entry.Value,
@@ -588,8 +589,9 @@ func (rp *RangePartition) getTablesForKey(userKey []byte) ([]*table.Table, func(
 	}
 }
 
-func (rp *RangePartition) yieldValue(userKey []byte) ([]byte, error) {
-	vs := rp.get(userKey)
+func (rp *RangePartition) yieldValue(userKey []byte, version uint64) ([]byte, error) {
+	vs := rp.get(userKey, version)
+
 	if vs.Version == 0 {
 		return nil, errNotFound
 	} else if vs.Meta&bitDelete > 0 {
@@ -600,9 +602,15 @@ func (rp *RangePartition) yieldValue(userKey []byte) ([]byte, error) {
 
 		var vp valuePointer
 		vp.Decode(vs.Value)
-		
-		vp.extentID
-		vp.offset
+
+		blocks, err := rp.logStream.Read(context.Background(), vp.extentID, vp.offset, 1)
+		utils.Check(err)
+		var mix pspb.MixedLog
+		utils.MustUnMarshal(blocks[0].UserData, &mix)
+		eSize := mix.Offsets[0]
+		var entry pspb.Entry
+		utils.MustUnMarshal(blocks[0].Data[:eSize], &entry)
+		return entry.Value, nil
 		//read value and decode
 	}
 	return vs.Value, nil
@@ -610,27 +618,32 @@ func (rp *RangePartition) yieldValue(userKey []byte) ([]byte, error) {
 }
 
 //internal APIs
-func (rp *RangePartition) get(userKey []byte) y.ValueStruct {
+func (rp *RangePartition) get(userKey []byte, version *uint64) y.ValueStruct {
 	mtables, decr := rp.getMemTables()
 	defer decr()
 
-	internalKey := y.KeyWithTs(userKey, atomic.LoadUint64(&rp.seqNumber))
+	var internalKey []byte
+	if version == nil {
+		internalKey = y.KeyWithTs(userKey, atomic.LoadUint64(&rp.seqNumber))
+	} else {
+		internalKey = y.KeyWithTs(userKey, *version)
 
+	}
 	//search in rp.mt and rp.imm
 	for i := 0; i < len(mtables); i++ {
+		//samekey and the vs is the smallest bigger than req's version
 		vs := mtables[i].Get(internalKey)
-		if vs.Version == 0 {
+		if vs.Meta == 0 && vs.Value == nil {
 			//not found, userKey not match
 			continue
-		} else {
-			return vs
 		}
+		return vs
 	}
 
+	var maxVs y.ValueStruct
 	tables, decr := rp.getTablesForKey(userKey)
 	defer decr()
 	hash := farm.Fingerprint64(userKey)
-	var maxVs y.ValueStruct
 	//search each tables to find element which has the max version
 	for _, th := range tables {
 		if th.DoesNotHave(hash) {
@@ -644,7 +657,7 @@ func (rp *RangePartition) get(userKey []byte) y.ValueStruct {
 		}
 
 		if y.SameKey(userKey, iter.Key()) {
-			if version := y.ParseTs(iter.Key()); maxVs.Version < version {
+			if version := y.ParseTs(iter.Key()); version > maxVs.Version {
 				maxVs = iter.ValueCopy()
 				maxVs.Version = version
 			}

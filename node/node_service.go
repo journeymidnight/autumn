@@ -60,7 +60,7 @@ func (en *ExtentNode) ReplicateBlocks(ctx context.Context, req *pb.ReplicateBloc
 	}
 	ex.Lock()
 	defer ex.Unlock()
-	ret, err := ex.AppendBlocks(req.Blocks, req.Commit)
+	ret, err := ex.AppendBlocks(req.Blocks, &req.Commit)
 	if err != nil {
 		return nil, err
 	}
@@ -113,7 +113,7 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 	//primary
 	stopper.RunWorker(func() {
 		//start := time.Now()
-		ret, err := ex.AppendBlocks(req.Blocks, offset)
+		ret, err := ex.AppendBlocks(req.Blocks, &offset)
 		//fmt.Printf("len %d, %v\n", len(req.Blocks), time.Now().Sub(start))
 
 		if ret != nil {

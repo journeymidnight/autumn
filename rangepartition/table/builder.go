@@ -74,13 +74,13 @@ type Builder struct {
 	entryOffsets []uint32 // Offsets of entries present in current block.
 	tableIndex   *pspb.TableIndex
 	keyHashes    []uint64 // Used for building the bloomfilter.
-	stream       *streamclient.StreamClient
+	stream       streamclient.StreamClient
 	writeCh      chan writeBlock
 	stopper      *utils.Stopper
 }
 
 // NewTableBuilder makes a new TableBuilder.
-func NewTableBuilder(stream *streamclient.StreamClient) *Builder {
+func NewTableBuilder(stream streamclient.StreamClient) *Builder {
 	b := &Builder{
 		tableIndex: &pspb.TableIndex{},
 		keyHashes:  make([]uint64, 0, 1024), // Avoid some malloc calls.
@@ -165,18 +165,30 @@ type blockWriteReq struct {
 	b pb.Block
 }
 
+func blockGrow(block *pb.Block, n uint32) {
+	newSize := utils.Ceil(block.BlockLength+n, 512)
+	newBuf := make([]byte, newSize)
+	copy(newBuf, block.Data)
+	block.BlockLength = newSize
+	block.Data = newBuf
+}
+
 //append data to current block
 func (b *Builder) append(data []byte) {
 	if b.currentBlock == nil {
 		b.currentBlock = &pb.Block{
-			Data:        make([]byte, 64*KB, 64*KB),
+			Data:        make([]byte, 64*KB),
 			BlockLength: 64 * KB,
+			//BlockLength: uint32(size),
 		}
 		b.blocks = append(b.blocks, b.currentBlock)
 	}
+	// Ensure we have enough space to store new data.
+	if b.currentBlock.BlockLength < b.sz+uint32(len(data)) {
+		blockGrow(b.currentBlock, uint32(len(data)))
+	}
 	copy(b.currentBlock.Data[b.sz:], data)
 	b.sz += uint32(len(data))
-	utils.AssertTrue(b.sz < 64*KB)
 }
 
 func (b *Builder) addHelper(key []byte, v y.ValueStruct) {
@@ -206,6 +218,9 @@ func (b *Builder) addHelper(key []byte, v y.ValueStruct) {
 	b.append(h.Encode())
 	b.append(diffKey)
 
+	if b.currentBlock.BlockLength < b.sz+v.EncodedSize() {
+		blockGrow(b.currentBlock, v.EncodedSize())
+	}
 	b.sz += v.Encode(b.currentBlock.Data[b.sz:])
 
 	// Size of KV on SST.
@@ -268,7 +283,7 @@ func (b *Builder) shouldFinishBlock(key []byte, value y.ValueStruct) bool {
 	entriesOffsetsSize := uint32(len(b.entryOffsets)*4 + 4) //size of list
 	estimatedSize := uint32(b.sz) + uint32(headerSize) +
 		uint32(len(key)) + uint32(value.EncodedSize()) + entriesOffsetsSize
-	return estimatedSize > 64*KB
+	return estimatedSize > 64*KB || len(b.entryOffsets) > 100
 }
 
 // Add adds a key-value pair to the block.
@@ -280,7 +295,7 @@ func (b *Builder) Add(key []byte, value y.ValueStruct) {
 		b.baseKey = []byte{}
 		b.currentBlock = nil
 		b.sz = 0
-		utils.AssertTrue(uint32(b.sz) < math.MaxUint32)
+		utils.AssertTrue(uint32(b.sz) <= math.MaxUint32)
 		b.entryOffsets = b.entryOffsets[:0]
 	}
 	b.addHelper(key, value)
@@ -298,6 +313,8 @@ The table structure looks like
 +---------+------------+-----------+---------------+
 */
 //return metablock position(extentID, offset, error)
+//tailExtentID和tailOffset表示当前commitLog对应的结尾, 在打开commitlog后, 从(tailExtentID, tailOffset)开始的
+//block读数据, 生成mt
 func (b *Builder) FinishAll(tailExtentID uint64, tailOffset uint32) (uint64, uint32, error) {
 
 	close(b.writeCh)
@@ -331,6 +348,7 @@ func (b *Builder) FinishAll(tailExtentID uint64, tailOffset uint32) (uint64, uin
 	metaBlock.CheckSum = utils.AdlerCheckSum(metaBlock.Data)
 
 	op, err := b.stream.Append(context.Background(), []*pb.Block{metaBlock}, nil)
+	defer op.Free()
 	if err != nil {
 		return 0, 0, err
 	}

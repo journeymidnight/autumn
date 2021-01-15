@@ -25,6 +25,7 @@ import (
 	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/rangepartition/y"
 	"github.com/journeymidnight/autumn/utils"
+	"github.com/pkg/errors"
 )
 
 /*
@@ -242,6 +243,7 @@ func (itr *Iterator) seekHelper(blockIdx int, key []byte) {
 
 // seekFrom brings us to a key that is >= input key.
 func (itr *Iterator) seekFrom(key []byte, whence int) {
+	utils.AssertTrue(len(key) >= 8)
 	itr.err = nil
 	switch whence {
 	case origin:
@@ -396,4 +398,139 @@ func (itr *Iterator) Seek(key []byte) {
 	} else {
 		itr.seekForPrev(key)
 	}
+}
+
+// ConcatIterator concatenates the sequences defined by several iterators.  (It only works with
+// TableIterators, probably just because it's faster to not be so generic.)
+type ConcatIterator struct {
+	idx      int // Which iterator is active now.
+	cur      *Iterator
+	iters    []*Iterator // Corresponds to tables.
+	tables   []*Table    // Disregarding reversed, this is in ascending order.
+	reversed bool
+}
+
+// NewConcatIterator creates a new concatenated iterator
+func NewConcatIterator(tbls []*Table, reversed bool) *ConcatIterator {
+	iters := make([]*Iterator, len(tbls))
+	for i := 0; i < len(tbls); i++ {
+		// Increment the reference count. Since, we're not creating the iterator right now.
+		// Here, We'll hold the reference of the tables, till the lifecycle of the iterator.
+		tbls[i].IncrRef()
+
+		// Save cycles by not initializing the iterators until needed.
+		// iters[i] = tbls[i].NewIterator(reversed)
+	}
+	return &ConcatIterator{
+		reversed: reversed,
+		iters:    iters,
+		tables:   tbls,
+		idx:      -1, // Not really necessary because s.it.Valid()=false, but good to have.
+	}
+}
+
+func (s *ConcatIterator) setIdx(idx int) {
+	s.idx = idx
+	if idx < 0 || idx >= len(s.iters) {
+		s.cur = nil
+		return
+	}
+	if s.iters[idx] == nil {
+		s.iters[idx] = s.tables[idx].NewIterator(s.reversed)
+	}
+	s.cur = s.iters[s.idx]
+}
+
+// Rewind implements y.Interface
+func (s *ConcatIterator) Rewind() {
+	if len(s.iters) == 0 {
+		return
+	}
+	if !s.reversed {
+		s.setIdx(0)
+	} else {
+		s.setIdx(len(s.iters) - 1)
+	}
+	s.cur.Rewind()
+}
+
+// Valid implements y.Interface
+func (s *ConcatIterator) Valid() bool {
+	return s.cur != nil && s.cur.Valid()
+}
+
+// Key implements y.Interface
+func (s *ConcatIterator) Key() []byte {
+	return s.cur.Key()
+}
+
+// Value implements y.Interface
+func (s *ConcatIterator) Value() y.ValueStruct {
+	return s.cur.Value()
+}
+
+// Seek brings us to element >= key if reversed is false. Otherwise, <= key.
+func (s *ConcatIterator) Seek(key []byte) {
+	var idx int
+	if !s.reversed {
+		idx = sort.Search(len(s.tables), func(i int) bool {
+			return y.CompareKeys(s.tables[i].Biggest(), key) >= 0
+		})
+	} else {
+		n := len(s.tables)
+		idx = n - 1 - sort.Search(n, func(i int) bool {
+			return y.CompareKeys(s.tables[n-1-i].Smallest(), key) <= 0
+		})
+	}
+	if idx >= len(s.tables) || idx < 0 {
+		s.setIdx(-1)
+		return
+	}
+	// For reversed=false, we know s.tables[i-1].Biggest() < key. Thus, the
+	// previous table cannot possibly contain key.
+	s.setIdx(idx)
+	s.cur.Seek(key)
+}
+
+// Next advances our concat iterator.
+func (s *ConcatIterator) Next() {
+	s.cur.Next()
+	if s.cur.Valid() {
+		// Nothing to do. Just stay with the current table.
+		return
+	}
+	for { // In case there are empty tables.
+		if !s.reversed {
+			s.setIdx(s.idx + 1)
+		} else {
+			s.setIdx(s.idx - 1)
+		}
+		if s.cur == nil {
+			// End of list. Valid will become false.
+			return
+		}
+		s.cur.Rewind()
+		if s.cur.Valid() {
+			break
+		}
+	}
+}
+
+// Close implements y.Interface.
+func (s *ConcatIterator) Close() error {
+	for _, t := range s.tables {
+		// DeReference the tables while closing the iterator.
+		if err := t.DecrRef(); err != nil {
+			return err
+		}
+	}
+	for _, it := range s.iters {
+		if it == nil {
+			continue
+		}
+		if err := it.Close(); err != nil {
+			return errors.Wrap(err, "ConcatIterator")
+		}
+	}
+	return nil
 }
