@@ -26,7 +26,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zapcore"
 
-	"github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/rangepartition/y"
 	"github.com/journeymidnight/autumn/streamclient"
 	"github.com/journeymidnight/autumn/xlog"
@@ -44,13 +43,18 @@ func TestTableIndex(t *testing.T) {
 	require.NoError(t, err)
 
 	//already have the cluster
-	sm := smclient.NewSMClient([]string{"127.0.0.1:3401"})
-	err = sm.Connect()
-	assert.Nil(t, err)
+	/*
+		sm := smclient.NewSMClient([]string{"127.0.0.1:3401"})
+		err = sm.Connect()
+		assert.Nil(t, err)
 
-	stream := streamclient.NewStreamClient(sm, 3, 32)
-	err = stream.Connect()
-	assert.Nil(t, err)
+		stream := streamclient.NewStreamClient(sm, 3, 32)
+		err = stream.Connect()
+		assert.Nil(t, err)
+	*/
+
+	stream := streamclient.NewMockStreamClient("test.tmp", 100)
+	defer stream.Close()
 
 	builder := NewTableBuilder(stream)
 
@@ -72,7 +76,6 @@ func TestTableIndex(t *testing.T) {
 
 	builder.FinishBlock()
 	id, offset, err := builder.FinishAll(0, 0)
-	fmt.Printf("%d, %d, %v\n", id, offset, err)
 	table, err := OpenTable(stream, id, offset)
 	assert.Nil(t, err)
 	//fmt.Printf("big %s, small %s\n", table.biggest, table.smallest)

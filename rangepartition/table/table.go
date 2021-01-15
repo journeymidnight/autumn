@@ -25,7 +25,7 @@ type TableInterface interface {
 
 type Table struct {
 	sync.Mutex
-	stream     *streamclient.StreamClient
+	stream     streamclient.StreamClient
 	blockIndex []*pspb.BlockOffset
 	ref        int32 // For file garbage collection. Atomic.
 
@@ -50,7 +50,7 @@ func (t *Table) DecrRef() error {
 	return nil
 }
 
-func OpenTable(stream *streamclient.StreamClient,
+func OpenTable(stream streamclient.StreamClient,
 	extentID uint64, offset uint32) (*Table, error) {
 
 	utils.AssertTrue(xlog.Logger != nil)

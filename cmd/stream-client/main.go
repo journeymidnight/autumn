@@ -44,7 +44,7 @@ func benchmark(smAddr []string, op BenchType, threadNum int, duration int, size 
 		return err
 	}
 	stopper := utils.NewStopper()
-	var scs []*streamclient.StreamClient
+	var scs []*streamclient.AutumnStreamClient
 	for i := 0; i < threadNum; i++ {
 		s, _, err := sm.CreateStream(context.Background())
 		if err != nil {
