@@ -19,6 +19,8 @@ package y
 import (
 	"bytes"
 	"encoding/binary"
+
+	"github.com/journeymidnight/autumn/utils"
 )
 
 // ValueStruct represents the value info that can be associated with a key, but also the internal
@@ -32,15 +34,16 @@ type ValueStruct struct {
 	Version uint64 // This field is not serialized. Only for internal usage.
 }
 
-func sizeVarint(x uint64) (n int) {
-	for {
-		n++
-		x >>= 7
-		if x == 0 {
-			break
-		}
-	}
-	return n
+// EncodeTo should be kept in sync with the Encode function above. The reason
+// this function exists is to avoid creating byte arrays per key-value pair in
+// table/builder.go.
+func (v *ValueStruct) Write(buf *bytes.Buffer) {
+	buf.WriteByte(v.Meta)
+	buf.WriteByte(v.UserMeta)
+	var enc [binary.MaxVarintLen64]byte
+	sz := binary.PutUvarint(enc[:], v.ExpiresAt)
+	buf.Write(enc[:sz])
+	buf.Write(v.Value)
 }
 
 // EncodedSize is the size of the ValueStruct when encoded
@@ -50,7 +53,7 @@ func (v *ValueStruct) EncodedSize() uint32 {
 		return uint32(sz + 1)
 	}
 
-	enc := sizeVarint(v.ExpiresAt)
+	enc := utils.SizeVarint(v.ExpiresAt)
 	return uint32(sz + enc)
 }
 

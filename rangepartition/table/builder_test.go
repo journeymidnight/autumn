@@ -75,7 +75,7 @@ func TestTableIndex(t *testing.T) {
 	}
 
 	builder.FinishBlock()
-	id, offset, err := builder.FinishAll(0, 0)
+	id, offset, err := builder.FinishAll(100, 200)
 	table, err := OpenTable(stream, id, offset)
 	assert.Nil(t, err)
 	//fmt.Printf("big %s, small %s\n", table.biggest, table.smallest)

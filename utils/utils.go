@@ -120,3 +120,14 @@ func MustMarshal(msg proto.Message) []byte {
 func MustUnMarshal(data []byte, msg proto.Message) {
 	Check(proto.Unmarshal(data, msg))
 }
+
+func SizeVarint(x uint64) (n int) {
+	for {
+		n++
+		x >>= 7
+		if x == 0 {
+			break
+		}
+	}
+	return n
+}
