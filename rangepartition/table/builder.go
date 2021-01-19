@@ -283,7 +283,7 @@ func (b *Builder) shouldFinishBlock(key []byte, value y.ValueStruct) bool {
 	entriesOffsetsSize := uint32(len(b.entryOffsets)*4 + 4) //size of list
 	estimatedSize := uint32(b.sz) + uint32(headerSize) +
 		uint32(len(key)) + uint32(value.EncodedSize()) + entriesOffsetsSize
-	return estimatedSize > 64*KB || len(b.entryOffsets) > 100
+	return estimatedSize > 64*KB || len(b.entryOffsets) > 1000
 }
 
 // Add adds a key-value pair to the block.
@@ -315,7 +315,7 @@ The table structure looks like
 //return metablock position(extentID, offset, error)
 //tailExtentID和tailOffset表示当前commitLog对应的结尾, 在打开commitlog后, 从(tailExtentID, tailOffset)开始的
 //block读数据, 生成mt
-func (b *Builder) FinishAll(tailExtentID uint64, tailOffset uint32) (uint64, uint32, error) {
+func (b *Builder) FinishAll(headExtentID uint64, headOffset uint32) (uint64, uint32, error) {
 
 	close(b.writeCh)
 	b.stopper.Wait()
@@ -342,8 +342,8 @@ func (b *Builder) FinishAll(tailExtentID uint64, tailOffset uint32) (uint64, uin
 		Type:             pspb.RawBlockType_meta,
 		UnCompressedSize: uint32(b.tableIndex.Size()),
 		CompressedSize:   0,
-		TailExtentID:     tailExtentID,
-		TailOffset:       tailOffset,
+		TailExtentID:     headExtentID,
+		TailOffset:       headOffset,
 	})
 	metaBlock.CheckSum = utils.AdlerCheckSum(metaBlock.Data)
 

@@ -10,7 +10,6 @@ import (
 	"unsafe"
 
 	"github.com/dgryski/go-farm"
-	"github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/rangepartition/skiplist"
@@ -25,13 +24,15 @@ import (
 const (
 	KB                = 1024
 	MB                = KB * 1024
-	ValueThreshold    = 1 * MB
+	ValueThreshold    = 4 * KB
 	maxEntriesInBlock = 100
 	maxMixedBlockSize = 4 * KB
 
 	//meta
 	bitDelete       byte = 1 << 0 // Set if the key has been deleted.
 	bitValuePointer byte = 1 << 1 // Set if the value is NOT stored directly next to key.
+
+	maxSkipList = 2 * KB
 )
 
 var (
@@ -41,25 +42,33 @@ var (
 
 type RangePartition struct {
 	//metaStream *streamclient.StreamClient //设定metadata结构
-	rowStream    *streamclient.AutumnStreamClient //设定checkpoint结构
-	sm           *smclient.SMClient
-	logStream    *streamclient.AutumnStreamClient
-	logRotates   int32
-	writeCh      chan *request
-	mt           *skiplist.Skiplist
-	imm          *skiplist.Skiplist
-	sync.RWMutex //protect mt,imm when swapping mt, imm
+	rowStream  streamclient.StreamClient //设定checkpoint结构
+	logStream  streamclient.StreamClient
+	logRotates int32
+	writeCh    chan *request
+	mt         *skiplist.Skiplist
+	imm        []*skiplist.Skiplist
+	utils.SafeMutex
+	//sync.RWMutex //protect mt,imm when swapping mt, imm
 	flushStopper *utils.Stopper
 	flushChan    chan flushTask
+	writeStopper *utils.Stopper
 	tableLock    sync.RWMutex //protect tables
 	tables       []*table.Table
 	seqNumber    uint64
 }
 
-func NewRangePartition(sm *smclient.SMClient, metaStreamID uint64) *RangePartition {
-	return &RangePartition{
-		sm: sm,
+func OpenRangePartition(rowStream streamclient.StreamClient, logStream streamclient.StreamClient) *RangePartition {
+	rp := &RangePartition{
+		rowStream:  rowStream,
+		logStream:  logStream,
+		logRotates: 0,
+		mt:         skiplist.NewSkiplist(maxSkipList),
+		imm:        nil,
 	}
+	rp.startMemoryFlush()
+	rp.startWriteLoop()
+	return rp
 }
 
 type flushTask struct {
@@ -67,14 +76,19 @@ type flushTask struct {
 	vptr valuePointer
 }
 
+func (rp *RangePartition) startWriteLoop() {
+	rp.writeStopper = utils.NewStopper()
+	rp.writeCh = make(chan *request, 16)
+
+	rp.writeStopper.RunWorker(rp.doWrites)
+
+}
 func (rp *RangePartition) startMemoryFlush() {
 	// Start memory fluhser.
 	//if db.closers.memtable != nil {
 	rp.flushChan = make(chan flushTask, 1)
 	flushStopper := utils.NewStopper()
-	flushStopper.RunWorker(func() {
-		rp.flushMemtable()
-	})
+	flushStopper.RunWorker(rp.flushMemtable)
 }
 
 // handleFlushTask must be run serially.
@@ -85,25 +99,29 @@ func (rp *RangePartition) handleFlushTask(ft flushTask) error {
 		return nil
 	}
 
-	// Store badger head even if vptr is zero, need it for readTs
-	xlog.Logger.Debugf("Storing value log tail: %+v\n", ft.vptr)
-
 	iter := ft.mt.NewIterator()
 	defer iter.Close()
 	b := table.NewTableBuilder(rp.rowStream)
 	defer b.Close()
 
-	var vp valuePointer
-
+	//var vp valuePointer
+	var first []byte
+	var last []byte
 	for iter.SeekToFirst(); iter.Valid(); iter.Next() {
-
-		vs := iter.Value()
-		if vs.Meta&bitValuePointer > 0 {
-			vp.Decode(vs.Value)
+		if first == nil {
+			first = iter.Key()
 		}
-
+		/*
+			vs := iter.Value()
+			if vs.Meta&bitValuePointer > 0 {
+				vp.Decode(vs.Value)
+			}
+		*/
+		//fmt.Printf("%s:%s\n", string(iter.Key()), iter.Value().Value)
 		b.Add(iter.Key(), iter.Value())
+		last = iter.Key()
 	}
+
 	b.FinishBlock()
 	id, offset, err := b.FinishAll(ft.vptr.extentID, ft.vptr.offset)
 	if err != nil {
@@ -125,6 +143,7 @@ func (rp *RangePartition) handleFlushTask(ft flushTask) error {
 	rp.tables = append(rp.tables, tbl)
 	rp.tableLock.Unlock()
 	//
+	xlog.Logger.Debugf("Flushed from %s to %s on vlog %+v\n", first, last, ft.vptr)
 	return nil
 }
 
@@ -132,20 +151,18 @@ func (rp *RangePartition) getMemTables() ([]*skiplist.Skiplist, func()) {
 	rp.RLock()
 	defer rp.RUnlock()
 
-	if rp.imm == nil {
-		tmp := rp.mt
-		return []*skiplist.Skiplist{rp.mt}, func() {
-			tmp.DecrRef()
-		}
-	}
-
-	tables := make([]*skiplist.Skiplist, 2)
+	tables := make([]*skiplist.Skiplist, len(rp.imm)+1)
 
 	// Get mutable memtable.
 	tables[0] = rp.mt
 	tables[0].IncrRef()
-	tables[1] = rp.imm
-	tables[1].IncrRef()
+	last := len(rp.imm) - 1
+
+	// reverse insert into tables
+	for i := range rp.imm {
+		tables[i+1] = rp.imm[last-i]
+		tables[i+1].IncrRef()
+	}
 	return tables, func() {
 		for _, tbl := range tables {
 			tbl.DecrRef()
@@ -155,7 +172,7 @@ func (rp *RangePartition) getMemTables() ([]*skiplist.Skiplist, func()) {
 
 // flushMemtable must keep running until we send it an empty flushTask. If there
 // are errors during handling the flush task, we'll retry indefinitely.
-func (rp *RangePartition) flushMemtable() error {
+func (rp *RangePartition) flushMemtable() {
 	for ft := range rp.flushChan {
 		if ft.mt == nil {
 			// We close db.flushChan now, instead of sending a nil ft.mt.
@@ -166,16 +183,11 @@ func (rp *RangePartition) flushMemtable() error {
 			if err == nil {
 				// Update s.imm. Need a lock.
 				rp.Lock()
-				// This is a single-threaded operation. ft.mt corresponds to the head of
-				// db.imm list. Once we flush it, we advance db.imm. The next ft.mt
-				// which would arrive here would match db.imm[0], because we acquire a
-				// lock over DB when pushing to flushChan.
-				// TODO: This logic is dirty AF. Any change and this could easily break.
-				utils.AssertTrue(ft.mt == rp.imm)
-				rp.imm = nil
+
+				utils.AssertTrue(ft.mt == rp.imm[0])
+				rp.imm = rp.imm[1:]
 				ft.mt.DecrRef() // Return memory.
 				rp.Unlock()
-
 				break
 			}
 			// Encountered error. Retry indefinitely.
@@ -183,7 +195,6 @@ func (rp *RangePartition) flushMemtable() error {
 			time.Sleep(time.Second)
 		}
 	}
-	return nil
 }
 
 //read metaStream, connect commitlog, rowDataStreamand blobDataStream
@@ -226,15 +237,34 @@ type request struct {
 	pspb.Entry
 
 	// Output values and wait group stuff below
-
 	wg  sync.WaitGroup
 	vp  valuePointer
 	Err error
 	ref int32
 }
 
+//key + valueStruct
+func estimatedSizeInSkl(r *request) int {
+	sz := len(r.Entry.Key)
+	if shouldWriteValueToLSM(&r.Entry) {
+		sz += len(r.Entry.Value) + 2 // Meta, UserMeta
+	} else {
+		sz += int(vptrSize) + 2 // vptrSize for ValuePointer, 2 for metas.
+	}
+
+	if r.ExpiresAt == 0 {
+		sz += 1
+	} else {
+		sz += utils.SizeVarint(r.ExpiresAt)
+
+	}
+	sz += skiplist.MaxNodeSize + 8 //8 is nodeAlign
+	return sz
+}
+
+//size in log
 func (r *request) Size() int {
-	return r.Size()
+	return r.Entry.Size()
 }
 
 func (req *request) reset() {
@@ -371,11 +401,12 @@ func (rp *RangePartition) writeLog(reqs []*request) (valuePointer, error) {
 		}
 	}
 	utils.AssertTrue(len(op.Offsets) == len(blocks))
-	endOfStream := op.Offsets[len(op.Offsets)-1] + blocks[len(blocks)-1].BlockLength
-	//return end of stream
+	utils.AssertTrue(len(op.Offsets) > 0)
+	//endOfStream := op.Offsets[len(op.Offsets)-1] + blocks[len(blocks)-1].BlockLength
+	//return head of this op on commitlog
 	return valuePointer{
 		op.ExtentID,
-		endOfStream,
+		op.Offsets[0],
 	}, nil
 }
 
@@ -392,25 +423,17 @@ func (rp *RangePartition) writeRequests(reqs []*request) error {
 		}
 	}
 
-	xlog.Logger.Info("writeRequests called. Writing to log")
+	xlog.Logger.Infof("writeRequests called. Writing to log, len[%d]", len(reqs))
 
-	logTail, err := rp.writeLog(reqs)
+	head, err := rp.writeLog(reqs)
 	if err != nil {
 		done(err)
 		return err
 	}
+
 	xlog.Logger.Info("Writing to memtable")
-
-	//write to LSM
-	for _, b := range reqs {
-		if err := rp.writeToLSM(b); err != nil {
-			done(err)
-			return errors.Wrap(err, "writeRequests")
-		}
-	}
-
 	i := 0
-	for err = rp.ensureRoomForFutureWrite(logTail); err == errNoRoom; err = rp.ensureRoomForFutureWrite(logTail) {
+	for err = rp.ensureRoomForWrite(reqs, head); err == errNoRoom; err = rp.ensureRoomForWrite(reqs, head) {
 		i++
 		if i%100 == 0 {
 			xlog.Logger.Infof("Making room for writes")
@@ -420,9 +443,18 @@ func (rp *RangePartition) writeRequests(reqs []*request) error {
 		// you will get a deadlock.
 		time.Sleep(10 * time.Millisecond)
 	}
+
 	if err != nil {
 		done(err)
 		return errors.Wrap(err, "writeRequests")
+	}
+
+	//write to LSM
+	for _, b := range reqs {
+		if err := rp.writeToLSM(b); err != nil {
+			done(err)
+			return errors.Wrap(err, "writeRequests")
+		}
 	}
 
 	done(nil)
@@ -460,7 +492,7 @@ func (rp *RangePartition) writeToLSM(req *request) error {
 	return nil
 }
 
-func (rp *RangePartition) doWrites(stopper *utils.Stopper) {
+func (rp *RangePartition) doWrites() {
 	//defer lc.Done()
 
 	pendingCh := make(chan struct{}, 1)
@@ -488,7 +520,7 @@ func (rp *RangePartition) doWrites(stopper *utils.Stopper) {
 		size = 0
 		select {
 		case r = <-rp.writeCh:
-		case <-stopper.ShouldStop():
+		case <-rp.writeStopper.ShouldStop():
 			goto closedCase
 		}
 
@@ -509,7 +541,7 @@ func (rp *RangePartition) doWrites(stopper *utils.Stopper) {
 			case r = <-rp.writeCh:
 			case pendingCh <- struct{}{}:
 				goto writeCase
-			case <-stopper.ShouldStop():
+			case <-rp.writeStopper.ShouldStop():
 				goto closedCase
 			}
 		}
@@ -540,9 +572,17 @@ func (rp *RangePartition) doWrites(stopper *utils.Stopper) {
 	}
 }
 
-func (rp *RangePartition) ensureRoomForFutureWrite(logTail valuePointer) error {
+func (rp *RangePartition) ensureRoomForWrite(reqs []*request, head valuePointer) error {
+
+	rp.Lock()
+	defer rp.Unlock()
+
 	forceFlush := atomic.LoadInt32(&rp.logRotates) >= 1
-	if !forceFlush && rp.mt.MemSize() < (120<<20) {
+	n := int64(0)
+	for i := range reqs {
+		n += int64(estimatedSizeInSkl(reqs[i]))
+	}
+	if !forceFlush && rp.mt.MemSize()+n < maxSkipList {
 		return nil
 	}
 	utils.AssertTrue(rp.mt != nil)
@@ -550,7 +590,7 @@ func (rp *RangePartition) ensureRoomForFutureWrite(logTail valuePointer) error {
 
 	//non-block, block if flushChan is full,
 	select {
-	case rp.flushChan <- flushTask{mt: rp.mt, vptr: logTail}:
+	case rp.flushChan <- flushTask{mt: rp.mt, vptr: head}:
 		// After every memtable flush, let's reset the counter.
 		atomic.StoreInt32(&rp.logRotates, 0)
 
@@ -558,11 +598,11 @@ func (rp *RangePartition) ensureRoomForFutureWrite(logTail valuePointer) error {
 
 		xlog.Logger.Debugf("Flushing memtable, mt.size=%d size of flushChan: %d\n",
 			rp.mt.MemSize(), len(rp.flushChan))
-		rp.Lock()
-		defer rp.Unlock()
-		rp.imm = rp.mt
-		rp.mt = skiplist.NewSkiplist(128 * MB)
+		rp.imm = append(rp.imm, rp.mt)
+
+		rp.mt = skiplist.NewSkiplist(maxSkipList)
 		// New memtable is empty. We certainly have room.
+
 		return nil
 	default:
 		// We need to do this to unlock and allow the flusher to modify imm.
@@ -589,8 +629,9 @@ func (rp *RangePartition) getTablesForKey(userKey []byte) ([]*table.Table, func(
 	}
 }
 
-func (rp *RangePartition) yieldValue(userKey []byte, version uint64) ([]byte, error) {
-	vs := rp.get(userKey, version)
+func (rp *RangePartition) get(userKey []byte, version uint64) ([]byte, error) {
+
+	vs := rp.getValueStruct(userKey, version)
 
 	if vs.Version == 0 {
 		return nil, errNotFound
@@ -617,22 +658,23 @@ func (rp *RangePartition) yieldValue(userKey []byte, version uint64) ([]byte, er
 
 }
 
-//internal APIs
-func (rp *RangePartition) get(userKey []byte, version *uint64) y.ValueStruct {
+//internal APIs/block
+func (rp *RangePartition) getValueStruct(userKey []byte, version uint64) y.ValueStruct {
 	mtables, decr := rp.getMemTables()
 	defer decr()
 
 	var internalKey []byte
-	if version == nil {
+	if version == 0 {
 		internalKey = y.KeyWithTs(userKey, atomic.LoadUint64(&rp.seqNumber))
 	} else {
-		internalKey = y.KeyWithTs(userKey, *version)
+		internalKey = y.KeyWithTs(userKey, version)
 
 	}
 	//search in rp.mt and rp.imm
 	for i := 0; i < len(mtables); i++ {
 		//samekey and the vs is the smallest bigger than req's version
 		vs := mtables[i].Get(internalKey)
+
 		if vs.Meta == 0 && vs.Value == nil {
 			//not found, userKey not match
 			continue
@@ -656,7 +698,7 @@ func (rp *RangePartition) get(userKey []byte, version *uint64) y.ValueStruct {
 			continue
 		}
 
-		if y.SameKey(userKey, iter.Key()) {
+		if y.SameKey(internalKey, iter.Key()) {
 			if version := y.ParseTs(iter.Key()); version > maxVs.Version {
 				maxVs = iter.ValueCopy()
 				maxVs.Version = version
@@ -666,17 +708,35 @@ func (rp *RangePartition) get(userKey []byte, version *uint64) y.ValueStruct {
 	return maxVs
 }
 
-//services
+func (rp *RangePartition) Close() error {
+	return nil
+}
+
+func (rp *RangePartition) writeAsync(key, value []byte, f func(error)) {
+	req := rp.sendToWriteCh(key, value)
+	go func() {
+		err := req.Wait()
+		// Write is complete. Let's call the callback function now.
+		f(err)
+	}()
+}
+
 func (rp *RangePartition) write(key, value []byte) error {
+	req := rp.sendToWriteCh(key, value)
+	return req.Wait()
+}
+
+//block API
+func (rp *RangePartition) sendToWriteCh(key, value []byte) *request {
 	req := requestPool.Get().(*request)
 	req.reset()
-	defer requestPool.Put(req)
 
 	newSeqNumber := atomic.AddUint64(&rp.seqNumber, 1)
+
 	req.Key = y.KeyWithTs(key, newSeqNumber)
 	req.Value = value
+	req.wg.Add(1)
+	req.IncrRef()
 	rp.writeCh <- req
-	req.wg.Wait()
-
-	return req.Err
+	return req
 }
