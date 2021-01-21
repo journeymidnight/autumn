@@ -315,7 +315,7 @@ The table structure looks like
 //return metablock position(extentID, offset, error)
 //tailExtentID和tailOffset表示当前commitLog对应的结尾, 在打开commitlog后, 从(tailExtentID, tailOffset)开始的
 //block读数据, 生成mt
-func (b *Builder) FinishAll(headExtentID uint64, headOffset uint32) (uint64, uint32, error) {
+func (b *Builder) FinishAll(headExtentID uint64, headOffset uint32, seqNum uint64) (uint64, uint32, error) {
 
 	close(b.writeCh)
 	b.stopper.Wait()
@@ -342,8 +342,9 @@ func (b *Builder) FinishAll(headExtentID uint64, headOffset uint32) (uint64, uin
 		Type:             pspb.RawBlockType_meta,
 		UnCompressedSize: uint32(b.tableIndex.Size()),
 		CompressedSize:   0,
-		TailExtentID:     headExtentID,
-		TailOffset:       headOffset,
+		HeadExtentID:     headExtentID,
+		HeadOffset:       headOffset,
+		SeqNum:           seqNum,
 	})
 	metaBlock.CheckSum = utils.AdlerCheckSum(metaBlock.Data)
 

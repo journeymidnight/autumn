@@ -61,8 +61,8 @@ func buildTable(t *testing.T, keyValues [][]string) (streamclient.StreamClient, 
 		utils.AssertTrue(len(kv) == 2)
 		b.Add(y.KeyWithTs([]byte(kv[0]), 0), y.ValueStruct{Value: []byte(kv[1]), Meta: 'A'})
 	}
-	b.FinishBlock()                      //finish current block
-	ex, offset, err := b.FinishAll(0, 0) //finish all table
+	b.FinishBlock()                          //finish current block
+	ex, offset, err := b.FinishAll(0, 0, 10) //finish all table
 	assert.Nil(t, err)
 	return stream, ex, offset
 }
@@ -694,7 +694,7 @@ func TestTableBigValues(t *testing.T) {
 		builder.Add(key, vs)
 	}
 	builder.FinishBlock()
-	id, offset, err := builder.FinishAll(0, 0)
+	id, offset, err := builder.FinishAll(0, 0, 0)
 	require.NoError(t, err)
 
 	tbl, err := OpenTable(stream, id, offset)

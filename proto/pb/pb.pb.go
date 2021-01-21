@@ -6,7 +6,7 @@ package pb
 import (
 	context "context"
 	fmt "fmt"
-	proto "github.com/golang/protobuf/proto"
+	proto "github.com/gogo/protobuf/proto"
 	grpc "google.golang.org/grpc"
 	codes "google.golang.org/grpc/codes"
 	status "google.golang.org/grpc/status"
@@ -24,7 +24,7 @@ var _ = math.Inf
 // is compatible with the proto package it is being compiled against.
 // A compilation error at this line likely means your copy of the
 // proto package needs to be updated.
-const _ = proto.ProtoPackageIsVersion3 // please upgrade the proto package
+const _ = proto.GoGoProtoPackageIsVersion3 // please upgrade the proto package
 
 type Code int32
 
@@ -89,13 +89,12 @@ func (BlockType) EnumDescriptor() ([]byte, []int) {
 }
 
 type Block struct {
-	CheckSum             uint32   `protobuf:"varint,1,opt,name=checkSum,proto3" json:"checkSum,omitempty"`
-	BlockLength          uint32   `protobuf:"varint,2,opt,name=blockLength,proto3" json:"blockLength,omitempty"`
-	UserData             []byte   `protobuf:"bytes,3,opt,name=userData,proto3" json:"userData,omitempty"`
-	Data                 []byte   `protobuf:"bytes,4,opt,name=data,proto3" json:"data,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	CheckSum    uint32 `protobuf:"varint,1,opt,name=checkSum,proto3" json:"checkSum,omitempty"`
+	BlockLength uint32 `protobuf:"varint,2,opt,name=blockLength,proto3" json:"blockLength,omitempty"`
+	Lazy        uint32 `protobuf:"varint,3,opt,name=lazy,proto3" json:"lazy,omitempty"`
+	UserData    []byte `protobuf:"bytes,4,opt,name=userData,proto3" json:"userData,omitempty"`
+	//-- 512 --
+	Data []byte `protobuf:"bytes,5,opt,name=data,proto3" json:"data,omitempty"`
 }
 
 func (m *Block) Reset()         { *m = Block{} }
@@ -145,6 +144,13 @@ func (m *Block) GetBlockLength() uint32 {
 	return 0
 }
 
+func (m *Block) GetLazy() uint32 {
+	if m != nil {
+		return m.Lazy
+	}
+	return 0
+}
+
 func (m *Block) GetUserData() []byte {
 	if m != nil {
 		return m.UserData
@@ -160,12 +166,9 @@ func (m *Block) GetData() []byte {
 }
 
 type AppendRequest struct {
-	ExtentID             uint64   `protobuf:"varint,1,opt,name=extentID,proto3" json:"extentID,omitempty"`
-	Blocks               []*Block `protobuf:"bytes,2,rep,name=blocks,proto3" json:"blocks,omitempty"`
-	Peers                []string `protobuf:"bytes,3,rep,name=peers,proto3" json:"peers,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	ExtentID uint64   `protobuf:"varint,1,opt,name=extentID,proto3" json:"extentID,omitempty"`
+	Blocks   []*Block `protobuf:"bytes,2,rep,name=blocks,proto3" json:"blocks,omitempty"`
+	Peers    []string `protobuf:"bytes,3,rep,name=peers,proto3" json:"peers,omitempty"`
 }
 
 func (m *AppendRequest) Reset()         { *m = AppendRequest{} }
@@ -223,11 +226,8 @@ func (m *AppendRequest) GetPeers() []string {
 }
 
 type AppendResponse struct {
-	Code                 Code     `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
-	Offsets              []uint32 `protobuf:"varint,2,rep,packed,name=offsets,proto3" json:"offsets,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	Code    Code     `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
+	Offsets []uint32 `protobuf:"varint,2,rep,packed,name=offsets,proto3" json:"offsets,omitempty"`
 }
 
 func (m *AppendResponse) Reset()         { *m = AppendResponse{} }
@@ -278,10 +278,7 @@ func (m *AppendResponse) GetOffsets() []uint32 {
 }
 
 type CreateExtentRequest struct {
-	StreamID             uint64   `protobuf:"varint,1,opt,name=streamID,proto3" json:"streamID,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	StreamID uint64 `protobuf:"varint,1,opt,name=streamID,proto3" json:"streamID,omitempty"`
 }
 
 func (m *CreateExtentRequest) Reset()         { *m = CreateExtentRequest{} }
@@ -325,11 +322,8 @@ func (m *CreateExtentRequest) GetStreamID() uint64 {
 }
 
 type CreateExtentResponse struct {
-	Code                 Code     `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
-	ExtentID             uint64   `protobuf:"varint,2,opt,name=extentID,proto3" json:"extentID,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	Code     Code   `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
+	ExtentID uint64 `protobuf:"varint,2,opt,name=extentID,proto3" json:"extentID,omitempty"`
 }
 
 func (m *CreateExtentResponse) Reset()         { *m = CreateExtentResponse{} }
@@ -380,12 +374,9 @@ func (m *CreateExtentResponse) GetExtentID() uint64 {
 }
 
 type ReadBlocksRequest struct {
-	ExtentID             uint64   `protobuf:"varint,1,opt,name=extentID,proto3" json:"extentID,omitempty"`
-	Offset               uint32   `protobuf:"varint,2,opt,name=offset,proto3" json:"offset,omitempty"`
-	NumOfBlocks          uint32   `protobuf:"varint,3,opt,name=numOfBlocks,proto3" json:"numOfBlocks,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	ExtentID    uint64 `protobuf:"varint,1,opt,name=extentID,proto3" json:"extentID,omitempty"`
+	Offset      uint32 `protobuf:"varint,2,opt,name=offset,proto3" json:"offset,omitempty"`
+	NumOfBlocks uint32 `protobuf:"varint,3,opt,name=numOfBlocks,proto3" json:"numOfBlocks,omitempty"`
 }
 
 func (m *ReadBlocksRequest) Reset()         { *m = ReadBlocksRequest{} }
@@ -443,11 +434,8 @@ func (m *ReadBlocksRequest) GetNumOfBlocks() uint32 {
 }
 
 type ReadBlocksResponse struct {
-	Code                 Code     `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
-	Blocks               []*Block `protobuf:"bytes,2,rep,name=blocks,proto3" json:"blocks,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	Code   Code     `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
+	Blocks []*Block `protobuf:"bytes,2,rep,name=blocks,proto3" json:"blocks,omitempty"`
 }
 
 func (m *ReadBlocksResponse) Reset()         { *m = ReadBlocksResponse{} }
@@ -498,10 +486,7 @@ func (m *ReadBlocksResponse) GetBlocks() []*Block {
 }
 
 type Payload struct {
-	Data                 []byte   `protobuf:"bytes,1,opt,name=Data,proto3" json:"Data,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	Data []byte `protobuf:"bytes,1,opt,name=Data,proto3" json:"Data,omitempty"`
 }
 
 func (m *Payload) Reset()         { *m = Payload{} }
@@ -545,10 +530,7 @@ func (m *Payload) GetData() []byte {
 }
 
 type CommitLengthRequest struct {
-	ExtentID             uint64   `protobuf:"varint,1,opt,name=extentID,proto3" json:"extentID,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	ExtentID uint64 `protobuf:"varint,1,opt,name=extentID,proto3" json:"extentID,omitempty"`
 }
 
 func (m *CommitLengthRequest) Reset()         { *m = CommitLengthRequest{} }
@@ -592,11 +574,8 @@ func (m *CommitLengthRequest) GetExtentID() uint64 {
 }
 
 type CommitLengthResponse struct {
-	Code                 Code     `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
-	Length               uint32   `protobuf:"varint,2,opt,name=length,proto3" json:"length,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	Code   Code   `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
+	Length uint32 `protobuf:"varint,2,opt,name=length,proto3" json:"length,omitempty"`
 }
 
 func (m *CommitLengthResponse) Reset()         { *m = CommitLengthResponse{} }
@@ -647,11 +626,8 @@ func (m *CommitLengthResponse) GetLength() uint32 {
 }
 
 type SealRequest struct {
-	ExtentID             uint64   `protobuf:"varint,1,opt,name=extentID,proto3" json:"extentID,omitempty"`
-	CommitLength         uint32   `protobuf:"varint,2,opt,name=commitLength,proto3" json:"commitLength,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	ExtentID     uint64 `protobuf:"varint,1,opt,name=extentID,proto3" json:"extentID,omitempty"`
+	CommitLength uint32 `protobuf:"varint,2,opt,name=commitLength,proto3" json:"commitLength,omitempty"`
 }
 
 func (m *SealRequest) Reset()         { *m = SealRequest{} }
@@ -702,10 +678,7 @@ func (m *SealRequest) GetCommitLength() uint32 {
 }
 
 type SealResponse struct {
-	Code                 Code     `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	Code Code `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
 }
 
 func (m *SealResponse) Reset()         { *m = SealResponse{} }
@@ -749,12 +722,9 @@ func (m *SealResponse) GetCode() Code {
 }
 
 type ReplicateBlocksRequest struct {
-	ExtentID             uint64   `protobuf:"varint,1,opt,name=extentID,proto3" json:"extentID,omitempty"`
-	Commit               uint32   `protobuf:"varint,2,opt,name=commit,proto3" json:"commit,omitempty"`
-	Blocks               []*Block `protobuf:"bytes,3,rep,name=blocks,proto3" json:"blocks,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	ExtentID uint64   `protobuf:"varint,1,opt,name=extentID,proto3" json:"extentID,omitempty"`
+	Commit   uint32   `protobuf:"varint,2,opt,name=commit,proto3" json:"commit,omitempty"`
+	Blocks   []*Block `protobuf:"bytes,3,rep,name=blocks,proto3" json:"blocks,omitempty"`
 }
 
 func (m *ReplicateBlocksRequest) Reset()         { *m = ReplicateBlocksRequest{} }
@@ -812,11 +782,8 @@ func (m *ReplicateBlocksRequest) GetBlocks() []*Block {
 }
 
 type ReplicateBlocksResponse struct {
-	Code                 Code     `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
-	Offsets              []uint32 `protobuf:"varint,2,rep,packed,name=offsets,proto3" json:"offsets,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	Code    Code     `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
+	Offsets []uint32 `protobuf:"varint,2,rep,packed,name=offsets,proto3" json:"offsets,omitempty"`
 }
 
 func (m *ReplicateBlocksResponse) Reset()         { *m = ReplicateBlocksResponse{} }
@@ -867,10 +834,7 @@ func (m *ReplicateBlocksResponse) GetOffsets() []uint32 {
 }
 
 type AllocExtentRequest struct {
-	ExtentID             uint64   `protobuf:"varint,1,opt,name=extentID,proto3" json:"extentID,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	ExtentID uint64 `protobuf:"varint,1,opt,name=extentID,proto3" json:"extentID,omitempty"`
 }
 
 func (m *AllocExtentRequest) Reset()         { *m = AllocExtentRequest{} }
@@ -914,10 +878,7 @@ func (m *AllocExtentRequest) GetExtentID() uint64 {
 }
 
 type AllocExtentResponse struct {
-	Code                 Code     `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	Code Code `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
 }
 
 func (m *AllocExtentResponse) Reset()         { *m = AllocExtentResponse{} }
@@ -961,11 +922,8 @@ func (m *AllocExtentResponse) GetCode() Code {
 }
 
 type StreamAllocExtentRequest struct {
-	StreamID             uint64   `protobuf:"varint,1,opt,name=streamID,proto3" json:"streamID,omitempty"`
-	ExtentToSeal         uint64   `protobuf:"varint,2,opt,name=extentToSeal,proto3" json:"extentToSeal,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	StreamID     uint64 `protobuf:"varint,1,opt,name=streamID,proto3" json:"streamID,omitempty"`
+	ExtentToSeal uint64 `protobuf:"varint,2,opt,name=extentToSeal,proto3" json:"extentToSeal,omitempty"`
 }
 
 func (m *StreamAllocExtentRequest) Reset()         { *m = StreamAllocExtentRequest{} }
@@ -1016,11 +974,8 @@ func (m *StreamAllocExtentRequest) GetExtentToSeal() uint64 {
 }
 
 type StreamAllocExtentResponse struct {
-	StreamID             uint64      `protobuf:"varint,1,opt,name=streamID,proto3" json:"streamID,omitempty"`
-	Extent               *ExtentInfo `protobuf:"bytes,2,opt,name=extent,proto3" json:"extent,omitempty"`
-	XXX_NoUnkeyedLiteral struct{}    `json:"-"`
-	XXX_unrecognized     []byte      `json:"-"`
-	XXX_sizecache        int32       `json:"-"`
+	StreamID uint64      `protobuf:"varint,1,opt,name=streamID,proto3" json:"streamID,omitempty"`
+	Extent   *ExtentInfo `protobuf:"bytes,2,opt,name=extent,proto3" json:"extent,omitempty"`
 }
 
 func (m *StreamAllocExtentResponse) Reset()         { *m = StreamAllocExtentResponse{} }
@@ -1071,10 +1026,7 @@ func (m *StreamAllocExtentResponse) GetExtent() *ExtentInfo {
 }
 
 type StreamInfoRequest struct {
-	StreamIDs            []uint64 `protobuf:"varint,1,rep,packed,name=streamIDs,proto3" json:"streamIDs,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	StreamIDs []uint64 `protobuf:"varint,1,rep,packed,name=streamIDs,proto3" json:"streamIDs,omitempty"`
 }
 
 func (m *StreamInfoRequest) Reset()         { *m = StreamInfoRequest{} }
@@ -1118,12 +1070,9 @@ func (m *StreamInfoRequest) GetStreamIDs() []uint64 {
 }
 
 type StreamInfoResponse struct {
-	Code                 Code                   `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
-	Streams              map[uint64]*StreamInfo `protobuf:"bytes,2,rep,name=streams,proto3" json:"streams,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
-	Extents              map[uint64]*ExtentInfo `protobuf:"bytes,3,rep,name=extents,proto3" json:"extents,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
-	XXX_NoUnkeyedLiteral struct{}               `json:"-"`
-	XXX_unrecognized     []byte                 `json:"-"`
-	XXX_sizecache        int32                  `json:"-"`
+	Code    Code                   `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
+	Streams map[uint64]*StreamInfo `protobuf:"bytes,2,rep,name=streams,proto3" json:"streams,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+	Extents map[uint64]*ExtentInfo `protobuf:"bytes,3,rep,name=extents,proto3" json:"extents,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
 }
 
 func (m *StreamInfoResponse) Reset()         { *m = StreamInfoResponse{} }
@@ -1181,10 +1130,7 @@ func (m *StreamInfoResponse) GetExtents() map[uint64]*ExtentInfo {
 }
 
 type ExtentInfoRequest struct {
-	Extents              []uint64 `protobuf:"varint,1,rep,packed,name=extents,proto3" json:"extents,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	Extents []uint64 `protobuf:"varint,1,rep,packed,name=extents,proto3" json:"extents,omitempty"`
 }
 
 func (m *ExtentInfoRequest) Reset()         { *m = ExtentInfoRequest{} }
@@ -1228,11 +1174,8 @@ func (m *ExtentInfoRequest) GetExtents() []uint64 {
 }
 
 type ExtentInfoResponse struct {
-	Code                 Code                   `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
-	Extents              map[uint64]*ExtentInfo `protobuf:"bytes,2,rep,name=extents,proto3" json:"extents,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
-	XXX_NoUnkeyedLiteral struct{}               `json:"-"`
-	XXX_unrecognized     []byte                 `json:"-"`
-	XXX_sizecache        int32                  `json:"-"`
+	Code    Code                   `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
+	Extents map[uint64]*ExtentInfo `protobuf:"bytes,2,rep,name=extents,proto3" json:"extents,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
 }
 
 func (m *ExtentInfoResponse) Reset()         { *m = ExtentInfoResponse{} }
@@ -1283,9 +1226,6 @@ func (m *ExtentInfoResponse) GetExtents() map[uint64]*ExtentInfo {
 }
 
 type NodesInfoRequest struct {
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
 }
 
 func (m *NodesInfoRequest) Reset()         { *m = NodesInfoRequest{} }
@@ -1322,11 +1262,8 @@ func (m *NodesInfoRequest) XXX_DiscardUnknown() {
 var xxx_messageInfo_NodesInfoRequest proto.InternalMessageInfo
 
 type NodesInfoResponse struct {
-	Code                 Code                 `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
-	Nodes                map[uint64]*NodeInfo `protobuf:"bytes,2,rep,name=nodes,proto3" json:"nodes,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
-	XXX_NoUnkeyedLiteral struct{}             `json:"-"`
-	XXX_unrecognized     []byte               `json:"-"`
-	XXX_sizecache        int32                `json:"-"`
+	Code  Code                 `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
+	Nodes map[uint64]*NodeInfo `protobuf:"bytes,2,rep,name=nodes,proto3" json:"nodes,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
 }
 
 func (m *NodesInfoResponse) Reset()         { *m = NodesInfoResponse{} }
@@ -1377,10 +1314,7 @@ func (m *NodesInfoResponse) GetNodes() map[uint64]*NodeInfo {
 }
 
 type RegisterNodeRequest struct {
-	Addr                 string   `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	Addr string `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"`
 }
 
 func (m *RegisterNodeRequest) Reset()         { *m = RegisterNodeRequest{} }
@@ -1424,11 +1358,8 @@ func (m *RegisterNodeRequest) GetAddr() string {
 }
 
 type RegisterNodeResponse struct {
-	Code                 Code     `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
-	NodeId               uint64   `protobuf:"varint,2,opt,name=nodeId,proto3" json:"nodeId,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	Code   Code   `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
+	NodeId uint64 `protobuf:"varint,2,opt,name=nodeId,proto3" json:"nodeId,omitempty"`
 }
 
 func (m *RegisterNodeResponse) Reset()         { *m = RegisterNodeResponse{} }
@@ -1479,9 +1410,6 @@ func (m *RegisterNodeResponse) GetNodeId() uint64 {
 }
 
 type CreateStreamRequest struct {
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
 }
 
 func (m *CreateStreamRequest) Reset()         { *m = CreateStreamRequest{} }
@@ -1518,12 +1446,9 @@ func (m *CreateStreamRequest) XXX_DiscardUnknown() {
 var xxx_messageInfo_CreateStreamRequest proto.InternalMessageInfo
 
 type CreateStreamResponse struct {
-	Code                 Code        `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
-	Stream               *StreamInfo `protobuf:"bytes,2,opt,name=stream,proto3" json:"stream,omitempty"`
-	Extent               *ExtentInfo `protobuf:"bytes,3,opt,name=extent,proto3" json:"extent,omitempty"`
-	XXX_NoUnkeyedLiteral struct{}    `json:"-"`
-	XXX_unrecognized     []byte      `json:"-"`
-	XXX_sizecache        int32       `json:"-"`
+	Code   Code        `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
+	Stream *StreamInfo `protobuf:"bytes,2,opt,name=stream,proto3" json:"stream,omitempty"`
+	Extent *ExtentInfo `protobuf:"bytes,3,opt,name=extent,proto3" json:"extent,omitempty"`
 }
 
 func (m *CreateStreamResponse) Reset()         { *m = CreateStreamResponse{} }
@@ -1582,12 +1507,9 @@ func (m *CreateStreamResponse) GetExtent() *ExtentInfo {
 
 //used in Etcd Campaign
 type SMMemberValue struct {
-	ID                   uint64   `protobuf:"varint,1,opt,name=ID,proto3" json:"ID,omitempty"`
-	Name                 string   `protobuf:"bytes,2,opt,name=Name,proto3" json:"Name,omitempty"`
-	GrpcURL              string   `protobuf:"bytes,3,opt,name=GrpcURL,proto3" json:"GrpcURL,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	ID      uint64 `protobuf:"varint,1,opt,name=ID,proto3" json:"ID,omitempty"`
+	Name    string `protobuf:"bytes,2,opt,name=Name,proto3" json:"Name,omitempty"`
+	GrpcURL string `protobuf:"bytes,3,opt,name=GrpcURL,proto3" json:"GrpcURL,omitempty"`
 }
 
 func (m *SMMemberValue) Reset()         { *m = SMMemberValue{} }
@@ -1645,11 +1567,8 @@ func (m *SMMemberValue) GetGrpcURL() string {
 }
 
 type ExtentInfo struct {
-	ExtentID             uint64   `protobuf:"varint,1,opt,name=extentID,proto3" json:"extentID,omitempty"`
-	Replicates           []uint64 `protobuf:"varint,2,rep,packed,name=replicates,proto3" json:"replicates,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	ExtentID   uint64   `protobuf:"varint,1,opt,name=extentID,proto3" json:"extentID,omitempty"`
+	Replicates []uint64 `protobuf:"varint,2,rep,packed,name=replicates,proto3" json:"replicates,omitempty"`
 }
 
 func (m *ExtentInfo) Reset()         { *m = ExtentInfo{} }
@@ -1700,11 +1619,8 @@ func (m *ExtentInfo) GetReplicates() []uint64 {
 }
 
 type StreamInfo struct {
-	StreamID             uint64   `protobuf:"varint,1,opt,name=streamID,proto3" json:"streamID,omitempty"`
-	ExtentIDs            []uint64 `protobuf:"varint,2,rep,packed,name=extentIDs,proto3" json:"extentIDs,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	StreamID  uint64   `protobuf:"varint,1,opt,name=streamID,proto3" json:"streamID,omitempty"`
+	ExtentIDs []uint64 `protobuf:"varint,2,rep,packed,name=extentIDs,proto3" json:"extentIDs,omitempty"`
 }
 
 func (m *StreamInfo) Reset()         { *m = StreamInfo{} }
@@ -1755,11 +1671,8 @@ func (m *StreamInfo) GetExtentIDs() []uint64 {
 }
 
 type NodeInfo struct {
-	NodeID               uint64   `protobuf:"varint,1,opt,name=nodeID,proto3" json:"nodeID,omitempty"`
-	Address              string   `protobuf:"bytes,2,opt,name=address,proto3" json:"address,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	NodeID  uint64 `protobuf:"varint,1,opt,name=nodeID,proto3" json:"nodeID,omitempty"`
+	Address string `protobuf:"bytes,2,opt,name=address,proto3" json:"address,omitempty"`
 }
 
 func (m *NodeInfo) Reset()         { *m = NodeInfo{} }
@@ -1853,83 +1766,84 @@ func init() {
 func init() { proto.RegisterFile("pb.proto", fileDescriptor_f80abaa17e25ccc8) }
 
 var fileDescriptor_f80abaa17e25ccc8 = []byte{
-	// 1209 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xac, 0x57, 0xdd, 0x6e, 0xe3, 0x44,
-	0x14, 0x8e, 0xf3, 0xb7, 0xf5, 0x49, 0xd2, 0xba, 0xd3, 0xbf, 0x60, 0xba, 0x55, 0x18, 0xd0, 0xaa,
-	0xbb, 0x40, 0xb5, 0xed, 0x4a, 0x08, 0xad, 0xa8, 0x44, 0xb7, 0xcd, 0xd2, 0x40, 0xd3, 0x96, 0x69,
-	0x8b, 0x00, 0x21, 0xad, 0x9c, 0x78, 0xda, 0xad, 0x9a, 0xc4, 0xc6, 0x76, 0x56, 0xf4, 0x9e, 0x87,
-	0xe0, 0x29, 0x90, 0x78, 0x00, 0xee, 0xf7, 0x92, 0x47, 0x40, 0xe5, 0x45, 0xd0, 0xfc, 0xd9, 0xe3,
-	0x38, 0x29, 0x46, 0x70, 0xe7, 0x73, 0x66, 0xce, 0x77, 0x7e, 0xe7, 0x9c, 0x63, 0x98, 0xf3, 0x7b,
-	0x5b, 0x7e, 0xe0, 0x45, 0x1e, 0x2a, 0xfa, 0x3d, 0x3c, 0x86, 0xca, 0x8b, 0x81, 0xd7, 0xbf, 0x41,
-	0x36, 0xcc, 0xf5, 0x5f, 0xd3, 0xfe, 0xcd, 0xd9, 0x78, 0xd8, 0x34, 0x5a, 0xc6, 0x66, 0x83, 0xc4,
-	0x34, 0x6a, 0x41, 0xad, 0xc7, 0x2e, 0x1d, 0xd1, 0xd1, 0x55, 0xf4, 0xba, 0x59, 0xe4, 0xc7, 0x3a,
-	0x8b, 0x49, 0x8f, 0x43, 0x1a, 0x1c, 0x38, 0x91, 0xd3, 0x2c, 0xb5, 0x8c, 0xcd, 0x3a, 0x89, 0x69,
-	0x84, 0xa0, 0xec, 0x32, 0x7e, 0x99, 0xf3, 0xf9, 0x37, 0x76, 0xa1, 0xb1, 0xe7, 0xfb, 0x74, 0xe4,
-	0x12, 0xfa, 0xe3, 0x98, 0x86, 0x11, 0x03, 0xa0, 0x3f, 0x45, 0x74, 0x14, 0x75, 0x0e, 0xb8, 0xfa,
-	0x32, 0x89, 0x69, 0xf4, 0x1e, 0x54, 0xb9, 0xae, 0xb0, 0x59, 0x6c, 0x95, 0x36, 0x6b, 0x3b, 0xe6,
-	0x96, 0xdf, 0xdb, 0xe2, 0x56, 0x13, 0x79, 0x80, 0x96, 0xa1, 0xe2, 0x53, 0x1a, 0x84, 0xcd, 0x52,
-	0xab, 0xb4, 0x69, 0x12, 0x41, 0xe0, 0x43, 0x98, 0x57, 0x5a, 0x42, 0xdf, 0x1b, 0x85, 0x14, 0xad,
-	0x43, 0xb9, 0xef, 0xb9, 0x94, 0xab, 0x98, 0xdf, 0x99, 0x63, 0x40, 0xfb, 0x9e, 0x4b, 0x09, 0xe7,
-	0xa2, 0x26, 0x3c, 0xf0, 0x2e, 0x2f, 0x43, 0x1a, 0x09, 0x4d, 0x0d, 0xa2, 0x48, 0xbc, 0x0d, 0x4b,
-	0xfb, 0x01, 0x75, 0x22, 0xda, 0xe6, 0x46, 0x69, 0x56, 0x87, 0x51, 0x40, 0x9d, 0x61, 0x62, 0xb5,
-	0xa2, 0xf1, 0x29, 0x2c, 0xa7, 0x45, 0x72, 0x99, 0xa0, 0xc7, 0xa1, 0x98, 0x8e, 0x03, 0xbe, 0x86,
-	0x45, 0x42, 0x1d, 0x97, 0x7b, 0x1e, 0xe6, 0x09, 0xdc, 0x2a, 0x54, 0x85, 0x03, 0x32, 0x65, 0x92,
-	0x62, 0xf9, 0x1c, 0x8d, 0x87, 0x27, 0x97, 0x02, 0x89, 0x27, 0xac, 0x41, 0x74, 0x16, 0xbe, 0x00,
-	0xa4, 0xab, 0xca, 0x65, 0xfa, 0x3f, 0xa7, 0x09, 0x3f, 0x84, 0x07, 0xa7, 0xce, 0xed, 0xc0, 0x73,
-	0x5c, 0x56, 0x15, 0xbc, 0x5a, 0x0c, 0x51, 0x15, 0xec, 0x9b, 0x47, 0xd9, 0x1b, 0x0e, 0xaf, 0x23,
-	0x51, 0x55, 0x39, 0x5c, 0xc4, 0x47, 0xb0, 0x9c, 0x16, 0xc9, 0x65, 0xea, 0x2a, 0x54, 0x07, 0x7a,
-	0x2d, 0x4b, 0x0a, 0x77, 0xa1, 0x76, 0x46, 0x9d, 0x41, 0x9e, 0xd8, 0x62, 0xa8, 0xf7, 0x35, 0xc5,
-	0x12, 0x28, 0xc5, 0xc3, 0x1f, 0x41, 0x5d, 0xc0, 0xe5, 0x31, 0x0a, 0x7b, 0xb0, 0x4a, 0xa8, 0x3f,
-	0xb8, 0xee, 0x3b, 0x11, 0xfd, 0x57, 0x39, 0x16, 0x3a, 0x95, 0x2b, 0x82, 0xd2, 0xb2, 0x51, 0x9a,
-	0x95, 0x8d, 0xaf, 0x61, 0x2d, 0xa3, 0xf0, 0x3f, 0xbe, 0x93, 0xa7, 0x80, 0xf6, 0x06, 0x03, 0xaf,
-	0x9f, 0x79, 0x26, 0x33, 0x13, 0xf8, 0x0c, 0x96, 0x52, 0x12, 0xb9, 0x42, 0xf5, 0x3d, 0x34, 0xcf,
-	0xf8, 0x3b, 0x9b, 0xae, 0x6c, 0xd6, 0x9b, 0x64, 0x49, 0x13, 0x8a, 0xcf, 0x3d, 0x96, 0x18, 0xf9,
-	0xc2, 0x52, 0x3c, 0xfc, 0x0a, 0xde, 0x99, 0x82, 0x2d, 0xcd, 0xba, 0x0f, 0xfc, 0x11, 0x54, 0x05,
-	0x10, 0x87, 0xad, 0xed, 0xcc, 0x33, 0xa3, 0x85, 0x7c, 0x67, 0x74, 0xe9, 0x11, 0x79, 0x8a, 0xb7,
-	0x61, 0x51, 0x28, 0xe0, 0x5c, 0x69, 0xf5, 0x3a, 0x98, 0x0a, 0x28, 0x6c, 0x1a, 0xad, 0xd2, 0x66,
-	0x99, 0x24, 0x0c, 0xfc, 0xb6, 0x08, 0x48, 0x97, 0xc9, 0x95, 0xa5, 0x5d, 0x78, 0x20, 0x10, 0xd4,
-	0x83, 0x7c, 0x9f, 0x5d, 0xc8, 0xc2, 0x48, 0x56, 0xd8, 0x1e, 0x45, 0xc1, 0x2d, 0x51, 0x32, 0x4c,
-	0x5c, 0x18, 0xac, 0x2a, 0x68, 0x96, 0xb8, 0x70, 0x51, 0x89, 0x4b, 0x19, 0xfb, 0x4b, 0xa8, 0xeb,
-	0xb8, 0xc8, 0x82, 0xd2, 0x0d, 0xbd, 0x95, 0x41, 0x63, 0x9f, 0xe8, 0x03, 0xa8, 0xbc, 0x71, 0x06,
-	0x63, 0xaa, 0x87, 0x4b, 0x83, 0x17, 0x87, 0xcf, 0x8b, 0x9f, 0x1a, 0x0c, 0x4b, 0x57, 0x92, 0x13,
-	0x4b, 0x0b, 0x7d, 0x82, 0x85, 0x3f, 0x86, 0x45, 0xed, 0x40, 0x46, 0xbf, 0x99, 0xf8, 0x2a, 0x62,
-	0xaf, 0x48, 0xfc, 0xbb, 0x01, 0x48, 0xbf, 0x9f, 0x37, 0xf2, 0x0a, 0x4e, 0x8b, 0x7c, 0x16, 0x66,
-	0x76, 0xe8, 0xfe, 0x37, 0x77, 0x11, 0x58, 0xc7, 0x9e, 0x4b, 0x43, 0xcd, 0x5b, 0xfc, 0x9b, 0x01,
-	0x8b, 0x1a, 0x33, 0x97, 0x4b, 0x9f, 0x40, 0x65, 0xc4, 0x44, 0xa4, 0x43, 0x2d, 0x76, 0x9c, 0xc1,
-	0x10, 0x1c, 0xe1, 0x8d, 0xb8, 0x6e, 0xbf, 0x04, 0x48, 0x98, 0x53, 0x3c, 0xc1, 0x69, 0x4f, 0xea,
-	0x0a, 0x77, 0xd2, 0x8f, 0xc7, 0xb0, 0x44, 0xe8, 0xd5, 0x75, 0x18, 0xd1, 0x80, 0x1d, 0xab, 0xc4,
-	0x21, 0x28, 0x3b, 0xae, 0x1b, 0x70, 0x44, 0x93, 0xf0, 0x6f, 0x36, 0x12, 0xd2, 0x57, 0xf3, 0x8e,
-	0x04, 0x66, 0x71, 0xc7, 0x95, 0x4d, 0x41, 0x52, 0x78, 0x45, 0x4d, 0x7e, 0x51, 0x9a, 0x2a, 0x86,
-	0x3f, 0x1b, 0x6a, 0xbc, 0x2b, 0x7e, 0x2e, 0x2d, 0x8f, 0xa0, 0x2a, 0xde, 0xd7, 0x8c, 0xa2, 0x97,
-	0xa7, 0x5a, 0x2f, 0x29, 0xdd, 0xdb, 0x4b, 0xba, 0xd0, 0x38, 0xeb, 0x76, 0xe9, 0xb0, 0x47, 0x83,
-	0x6f, 0x58, 0xac, 0xd0, 0x3c, 0x14, 0xe3, 0xd6, 0x54, 0xec, 0x1c, 0xb0, 0x00, 0x1d, 0x3b, 0x43,
-	0x11, 0x5e, 0x93, 0xf0, 0x6f, 0x56, 0xed, 0x5f, 0x04, 0x7e, 0xff, 0x82, 0x1c, 0x71, 0x74, 0x93,
-	0x28, 0x12, 0x1f, 0x02, 0x24, 0x4a, 0xee, 0x1d, 0x3b, 0x1b, 0x00, 0x81, 0x9a, 0x1d, 0xa2, 0x28,
-	0xca, 0x44, 0xe3, 0xe0, 0x97, 0x00, 0x89, 0x5b, 0xf7, 0xb6, 0xcd, 0x75, 0x30, 0x15, 0xaa, 0x02,
-	0x4a, 0x18, 0xf8, 0x33, 0x98, 0x53, 0xe5, 0x10, 0xa7, 0x48, 0x61, 0x48, 0x8a, 0xf9, 0xc3, 0x12,
-	0x4f, 0xc3, 0x50, 0xba, 0xa9, 0xc8, 0x27, 0x3f, 0x40, 0x99, 0x05, 0x1f, 0x55, 0xa1, 0x78, 0xf2,
-	0x95, 0x55, 0x40, 0xf3, 0x00, 0xc7, 0x27, 0xe7, 0xaf, 0x8e, 0xda, 0x7b, 0x07, 0x6d, 0x62, 0x19,
-	0x68, 0x01, 0x6a, 0x8c, 0x3e, 0x25, 0x9d, 0xee, 0x1e, 0xf9, 0xce, 0x2a, 0x22, 0x13, 0x2a, 0x6d,
-	0x42, 0x4e, 0x88, 0x55, 0x62, 0x67, 0xed, 0x91, 0x7b, 0x72, 0x29, 0x02, 0x62, 0x95, 0x63, 0x86,
-	0xf0, 0xcb, 0xaa, 0x3c, 0x69, 0x81, 0xc9, 0xc7, 0xe6, 0xf9, 0xad, 0x4f, 0x99, 0x64, 0xb7, 0xf3,
-	0x6d, 0xfb, 0xc0, 0x2a, 0xa0, 0x39, 0x28, 0x9f, 0x5e, 0x90, 0xb6, 0x65, 0xec, 0xfc, 0x5a, 0x82,
-	0x86, 0x90, 0x3f, 0xa3, 0xc1, 0x9b, 0xeb, 0x3e, 0x45, 0xdb, 0x50, 0x15, 0x2b, 0x29, 0x5a, 0x64,
-	0x29, 0x4d, 0x2d, 0xc1, 0x36, 0xd2, 0x59, 0xa2, 0x9e, 0x70, 0x01, 0xed, 0x02, 0x24, 0xbb, 0x18,
-	0x5a, 0x61, 0x77, 0x32, 0x6b, 0xa0, 0xbd, 0x3a, 0xc9, 0x8e, 0xc5, 0x3f, 0x84, 0x32, 0x9b, 0x6b,
-	0x68, 0x81, 0x97, 0x5a, 0xb2, 0xdd, 0xd8, 0x56, 0xc2, 0x88, 0x2f, 0xef, 0x43, 0x5d, 0x5f, 0xa7,
-	0xd0, 0x9a, 0xa8, 0xdf, 0xcc, 0x4e, 0x66, 0x37, 0xb3, 0x07, 0x31, 0xc8, 0x63, 0x30, 0x0f, 0xa9,
-	0x13, 0x44, 0x3d, 0xea, 0x44, 0xa8, 0xc6, 0x2e, 0xca, 0xa5, 0xcf, 0xd6, 0x09, 0x5c, 0x78, 0x6a,
-	0xa0, 0x23, 0x58, 0x98, 0x58, 0x41, 0x90, 0x2d, 0x3c, 0x99, 0xb6, 0x08, 0xd9, 0xef, 0x4e, 0x3d,
-	0x8b, 0x15, 0x7f, 0x0e, 0x35, 0x6d, 0x68, 0x23, 0x1e, 0x93, 0xec, 0x86, 0x60, 0xaf, 0x65, 0xf8,
-	0x0a, 0x81, 0x25, 0x6c, 0x59, 0xe4, 0xb7, 0xeb, 0x8c, 0x9c, 0x2b, 0x1a, 0xa8, 0xbc, 0xed, 0xa6,
-	0xea, 0x79, 0x65, 0x72, 0x14, 0x6a, 0x49, 0xc8, 0x4e, 0x48, 0x91, 0x43, 0xed, 0x61, 0xad, 0x4c,
-	0x8e, 0x03, 0x4d, 0x3c, 0x3b, 0x25, 0x70, 0x01, 0x3d, 0x07, 0x33, 0x6e, 0xb6, 0x68, 0x79, 0xa2,
-	0xf7, 0x0a, 0xe1, 0x95, 0xa9, 0x1d, 0x19, 0x17, 0x10, 0x51, 0xeb, 0x86, 0x1e, 0x9a, 0xf5, 0xc4,
-	0xd2, 0x29, 0x01, 0x7a, 0x38, 0xe3, 0x34, 0x55, 0x26, 0x5a, 0xf3, 0x93, 0x65, 0x92, 0x6d, 0x93,
-	0xb2, 0x4c, 0xa6, 0xf4, 0x49, 0x01, 0xa2, 0xf7, 0x69, 0x01, 0x32, 0xa5, 0xc9, 0x0b, 0x90, 0x69,
-	0x2d, 0x1d, 0x17, 0x5e, 0x58, 0x6f, 0xef, 0x36, 0x8c, 0x3f, 0xee, 0x36, 0x8c, 0x3f, 0xef, 0x36,
-	0x8c, 0x5f, 0xfe, 0xda, 0x28, 0xf4, 0xaa, 0xfc, 0xe7, 0xf6, 0xd9, 0xdf, 0x01, 0x00, 0x00, 0xff,
-	0xff, 0x9e, 0xbf, 0x14, 0xa4, 0xe8, 0x0e, 0x00, 0x00,
+	// 1231 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xac, 0x57, 0x5b, 0x6f, 0xe3, 0xc4,
+	0x17, 0x8f, 0x73, 0xdb, 0xe6, 0x24, 0xed, 0xba, 0xd3, 0x9b, 0xff, 0xfe, 0x77, 0xa3, 0x30, 0xa0,
+	0x55, 0x77, 0x81, 0x6a, 0xdb, 0x95, 0x10, 0x5a, 0x51, 0x89, 0x6e, 0x9b, 0xa5, 0x81, 0xa6, 0x2d,
+	0xd3, 0x16, 0x01, 0x42, 0x5a, 0x39, 0xf1, 0xb4, 0x5b, 0x35, 0x89, 0x8d, 0xed, 0xae, 0x28, 0xcf,
+	0xbc, 0xf0, 0xc6, 0x27, 0x41, 0xe2, 0x03, 0xf0, 0xbe, 0x8f, 0xfb, 0xc8, 0x23, 0x6a, 0xbf, 0x08,
+	0x9a, 0x9b, 0x3d, 0x8e, 0x93, 0x62, 0x04, 0x6f, 0x3e, 0xe7, 0xcc, 0xf9, 0x9d, 0xeb, 0x9c, 0x33,
+	0x86, 0x19, 0xbf, 0xb7, 0xee, 0x07, 0x5e, 0xe4, 0xa1, 0xa2, 0xdf, 0xc3, 0x3f, 0x1b, 0x50, 0x79,
+	0x3e, 0xf0, 0xfa, 0x97, 0xc8, 0x86, 0x99, 0xfe, 0x2b, 0xda, 0xbf, 0x3c, 0xbe, 0x1a, 0x5a, 0x46,
+	0xcb, 0x58, 0x9b, 0x25, 0x31, 0x8d, 0x5a, 0x50, 0xef, 0xb1, 0x43, 0xfb, 0x74, 0x74, 0x1e, 0xbd,
+	0xb2, 0x8a, 0x5c, 0xac, 0xb3, 0x10, 0x82, 0xf2, 0xc0, 0xf9, 0xf1, 0xda, 0x2a, 0x71, 0x11, 0xff,
+	0x66, 0x88, 0x57, 0x21, 0x0d, 0x76, 0x9d, 0xc8, 0xb1, 0xca, 0x2d, 0x63, 0xad, 0x41, 0x62, 0x9a,
+	0x9d, 0x77, 0x19, 0xbf, 0xc2, 0xf9, 0xfc, 0x1b, 0xbb, 0x30, 0xbb, 0xed, 0xfb, 0x74, 0xe4, 0x12,
+	0xfa, 0xfd, 0x15, 0x0d, 0x23, 0x06, 0x40, 0x7f, 0x88, 0xe8, 0x28, 0xea, 0xec, 0x72, 0x97, 0xca,
+	0x24, 0xa6, 0xd1, 0x3b, 0x50, 0xe5, 0xf6, 0x43, 0xab, 0xd8, 0x2a, 0xad, 0xd5, 0x37, 0x6b, 0xeb,
+	0x7e, 0x6f, 0x9d, 0x47, 0x42, 0xa4, 0x00, 0x2d, 0x42, 0xc5, 0xa7, 0x34, 0x08, 0xad, 0x52, 0xab,
+	0xb4, 0x56, 0x23, 0x82, 0xc0, 0x7b, 0x30, 0xa7, 0xac, 0x84, 0xbe, 0x37, 0x0a, 0x29, 0x5a, 0x85,
+	0x72, 0xdf, 0x73, 0x29, 0x37, 0x31, 0xb7, 0x39, 0xc3, 0x80, 0x76, 0x3c, 0x97, 0x12, 0xce, 0x45,
+	0x16, 0xdc, 0xf3, 0xce, 0xce, 0x42, 0x1a, 0x09, 0x4b, 0xb3, 0x44, 0x91, 0x78, 0x03, 0x16, 0x76,
+	0x02, 0xea, 0x44, 0xb4, 0xcd, 0x9d, 0xd2, 0xbc, 0x0e, 0xa3, 0x80, 0x3a, 0xc3, 0xc4, 0x6b, 0x45,
+	0xe3, 0x23, 0x58, 0x4c, 0xab, 0xe4, 0x72, 0x41, 0xcf, 0x43, 0x31, 0x9d, 0x07, 0x7c, 0x01, 0xf3,
+	0x84, 0x3a, 0x2e, 0x8f, 0x3c, 0xcc, 0x93, 0xb8, 0x65, 0xa8, 0x8a, 0x00, 0x64, 0x19, 0x25, 0xc5,
+	0x6a, 0x3c, 0xba, 0x1a, 0x1e, 0x9e, 0x09, 0x24, 0x59, 0x48, 0x9d, 0x85, 0x4f, 0x01, 0xe9, 0xa6,
+	0x72, 0xb9, 0xfe, 0xf7, 0x65, 0xc2, 0x0f, 0xe0, 0xde, 0x91, 0x73, 0x3d, 0xf0, 0x1c, 0x97, 0x75,
+	0x05, 0xef, 0x16, 0x43, 0x74, 0x05, 0xfb, 0xe6, 0x59, 0xf6, 0x86, 0xc3, 0x8b, 0x48, 0x74, 0x5a,
+	0x8e, 0x10, 0xf1, 0x3e, 0x2c, 0xa6, 0x55, 0x72, 0xb9, 0xba, 0x0c, 0xd5, 0x81, 0xde, 0xdf, 0x92,
+	0xc2, 0x5d, 0xa8, 0x1f, 0x53, 0x67, 0x90, 0x27, 0xb7, 0x18, 0x1a, 0x7d, 0xcd, 0xb0, 0x04, 0x4a,
+	0xf1, 0xf0, 0x07, 0xd0, 0x10, 0x70, 0x79, 0x9c, 0xc2, 0x1e, 0x2c, 0x13, 0xea, 0x0f, 0x2e, 0xfa,
+	0x4e, 0x44, 0xff, 0x51, 0x8d, 0x85, 0x4d, 0x15, 0x8a, 0xa0, 0xb4, 0x6a, 0x94, 0xa6, 0x55, 0xe3,
+	0x4b, 0x58, 0xc9, 0x18, 0xfc, 0x97, 0xf7, 0xe4, 0x09, 0xa0, 0xed, 0xc1, 0xc0, 0xeb, 0x67, 0xae,
+	0xc9, 0xd4, 0x02, 0x3e, 0x85, 0x85, 0x94, 0x46, 0xae, 0x54, 0x7d, 0x0b, 0xd6, 0x31, 0xbf, 0x67,
+	0x93, 0x8d, 0x4d, 0xbb, 0x93, 0xac, 0x68, 0xc2, 0xf0, 0x89, 0xc7, 0x0a, 0x23, 0x6f, 0x58, 0x8a,
+	0x87, 0x5f, 0xc2, 0xff, 0x26, 0x60, 0x4b, 0xb7, 0xee, 0x02, 0x7f, 0x08, 0x55, 0x01, 0xc4, 0x61,
+	0xeb, 0x9b, 0x73, 0xcc, 0x69, 0xa1, 0xdf, 0x19, 0x9d, 0x79, 0x44, 0x4a, 0xf1, 0x06, 0xcc, 0x0b,
+	0x03, 0x9c, 0x2b, 0xbd, 0x5e, 0x85, 0x9a, 0x02, 0x0a, 0x2d, 0xa3, 0x55, 0x5a, 0x2b, 0x93, 0x84,
+	0x81, 0xdf, 0x14, 0x01, 0xe9, 0x3a, 0xb9, 0xaa, 0xb4, 0x05, 0xf7, 0x04, 0x82, 0xba, 0x90, 0xef,
+	0xb2, 0x03, 0x59, 0x18, 0xc9, 0x0a, 0xdb, 0xa3, 0x28, 0xb8, 0x26, 0x4a, 0x87, 0xa9, 0x0b, 0x87,
+	0x55, 0x07, 0x4d, 0x53, 0x17, 0x21, 0x2a, 0x75, 0xa9, 0x63, 0x7f, 0x0e, 0x0d, 0x1d, 0x17, 0x99,
+	0x50, 0xba, 0xa4, 0xd7, 0x32, 0x69, 0xec, 0x13, 0xbd, 0x07, 0x95, 0xd7, 0xce, 0xe0, 0x8a, 0xea,
+	0xe9, 0xd2, 0xe0, 0x85, 0xf0, 0x59, 0xf1, 0x63, 0x83, 0x61, 0xe9, 0x46, 0x72, 0x62, 0x69, 0xa9,
+	0x4f, 0xb0, 0xf0, 0x87, 0x30, 0xaf, 0x09, 0x64, 0xf6, 0xad, 0x24, 0x56, 0x91, 0x7b, 0x45, 0xe2,
+	0xdf, 0x0d, 0x40, 0xfa, 0xf9, 0xbc, 0x99, 0x57, 0x70, 0x5a, 0xe6, 0xb3, 0x30, 0xd3, 0x53, 0xf7,
+	0x9f, 0x85, 0x8b, 0xc0, 0x3c, 0xf0, 0x5c, 0x1a, 0x6a, 0xd1, 0xe2, 0xdf, 0x0c, 0x98, 0xd7, 0x98,
+	0xb9, 0x42, 0xfa, 0x08, 0x2a, 0x23, 0xa6, 0x22, 0x03, 0x6a, 0x31, 0x71, 0x06, 0x43, 0x70, 0x44,
+	0x34, 0xe2, 0xb8, 0xfd, 0x02, 0x20, 0x61, 0x4e, 0x88, 0x04, 0xa7, 0x23, 0x69, 0x28, 0xdc, 0xf1,
+	0x38, 0x1e, 0xc1, 0x02, 0xa1, 0xe7, 0x17, 0x61, 0x44, 0x03, 0x26, 0x56, 0x85, 0x43, 0x50, 0x76,
+	0x5c, 0x37, 0xe0, 0x88, 0x35, 0xc2, 0xbf, 0xd9, 0x4a, 0x48, 0x1f, 0xcd, 0xbb, 0x12, 0x98, 0xc7,
+	0x1d, 0x57, 0x0e, 0x05, 0x49, 0xe1, 0x25, 0xb5, 0xf9, 0x45, 0x6b, 0xaa, 0x1c, 0xfe, 0x64, 0xa8,
+	0xf5, 0xae, 0xf8, 0xb9, 0xac, 0x3c, 0x84, 0xaa, 0xb8, 0x5f, 0x53, 0x9a, 0x5e, 0x4a, 0xb5, 0x59,
+	0x52, 0xba, 0x73, 0x96, 0x74, 0x61, 0xf6, 0xb8, 0xdb, 0xa5, 0xc3, 0x1e, 0x0d, 0xbe, 0x62, 0xb9,
+	0x42, 0x73, 0x50, 0x8c, 0x47, 0x53, 0xb1, 0xb3, 0xcb, 0x12, 0x74, 0xe0, 0x0c, 0x45, 0x7a, 0x6b,
+	0x84, 0x7f, 0xb3, 0x6e, 0xff, 0x2c, 0xf0, 0xfb, 0xa7, 0x64, 0x9f, 0xa3, 0xd7, 0x88, 0x22, 0xf1,
+	0x1e, 0x40, 0x62, 0xe4, 0xce, 0xb5, 0xd3, 0x04, 0x08, 0xd4, 0xee, 0x10, 0x4d, 0x51, 0x26, 0x1a,
+	0x07, 0xbf, 0x00, 0x48, 0xc2, 0xba, 0x73, 0x6c, 0xae, 0x42, 0x4d, 0xa1, 0x2a, 0xa0, 0x84, 0x81,
+	0x3f, 0x81, 0x19, 0xd5, 0x0e, 0x71, 0x89, 0x14, 0x86, 0xa4, 0x58, 0x3c, 0xac, 0xf0, 0x34, 0x0c,
+	0x65, 0x98, 0x8a, 0x7c, 0xfc, 0x1d, 0x94, 0x59, 0xf2, 0x51, 0x15, 0x8a, 0x87, 0x5f, 0x98, 0x05,
+	0x34, 0x07, 0x70, 0x70, 0x78, 0xf2, 0x72, 0xbf, 0xbd, 0xbd, 0xdb, 0x26, 0xa6, 0x81, 0xee, 0x43,
+	0x9d, 0xd1, 0x47, 0xa4, 0xd3, 0xdd, 0x26, 0xdf, 0x98, 0x45, 0x54, 0x83, 0x4a, 0x9b, 0x90, 0x43,
+	0x62, 0x96, 0x98, 0xac, 0x3d, 0x72, 0x0f, 0xcf, 0x44, 0x42, 0xcc, 0x72, 0xcc, 0x10, 0x71, 0x99,
+	0x95, 0xc7, 0x2d, 0xa8, 0xf1, 0xb5, 0x79, 0x72, 0xed, 0x53, 0xa6, 0xd9, 0xed, 0x7c, 0xdd, 0xde,
+	0x35, 0x0b, 0x68, 0x06, 0xca, 0x47, 0xa7, 0xa4, 0x6d, 0x1a, 0x9b, 0xbf, 0x96, 0x60, 0x56, 0xe8,
+	0x1f, 0xd3, 0xe0, 0xf5, 0x45, 0x9f, 0xa2, 0x0d, 0xa8, 0x8a, 0x27, 0x29, 0x9a, 0x67, 0x25, 0x4d,
+	0x3d, 0x82, 0x6d, 0xa4, 0xb3, 0x44, 0x3f, 0xe1, 0x02, 0xda, 0x02, 0x48, 0xde, 0x62, 0x68, 0x89,
+	0x9d, 0xc9, 0x3c, 0x03, 0xed, 0xe5, 0x71, 0x76, 0xac, 0xfe, 0x3e, 0x94, 0xd9, 0x5e, 0x43, 0xf7,
+	0x79, 0xab, 0x25, 0xaf, 0x1b, 0xdb, 0x4c, 0x18, 0xf1, 0xe1, 0x1d, 0x68, 0xe8, 0xcf, 0x29, 0xb4,
+	0x22, 0xfa, 0x37, 0xf3, 0x26, 0xb3, 0xad, 0xac, 0x20, 0x06, 0x79, 0x04, 0xb5, 0x3d, 0xea, 0x04,
+	0x51, 0x8f, 0x3a, 0x11, 0xaa, 0xb3, 0x83, 0xf2, 0xd1, 0x67, 0xeb, 0x04, 0x2e, 0x3c, 0x31, 0xd0,
+	0x3e, 0xdc, 0x1f, 0x7b, 0x82, 0x20, 0x5b, 0x44, 0x32, 0xe9, 0x21, 0x64, 0xff, 0x7f, 0xa2, 0x2c,
+	0x36, 0xfc, 0x29, 0xd4, 0xb5, 0xa5, 0x8d, 0x78, 0x4e, 0xb2, 0x2f, 0x04, 0x7b, 0x25, 0xc3, 0x57,
+	0x08, 0xac, 0x60, 0x8b, 0xa2, 0xbe, 0x5d, 0x67, 0xe4, 0x9c, 0xd3, 0x40, 0xd5, 0x6d, 0x2b, 0xd5,
+	0xcf, 0x4b, 0xe3, 0xab, 0x50, 0x2b, 0x42, 0x76, 0x43, 0x8a, 0x1a, 0x6a, 0x17, 0x6b, 0x69, 0x7c,
+	0x1d, 0x68, 0xea, 0xd9, 0x2d, 0x81, 0x0b, 0xe8, 0x19, 0xd4, 0xe2, 0x61, 0x8b, 0x16, 0xc7, 0x66,
+	0xaf, 0x50, 0x5e, 0x9a, 0x38, 0x91, 0x71, 0x01, 0x11, 0xf5, 0xdc, 0xd0, 0x53, 0xb3, 0x9a, 0x78,
+	0x3a, 0x21, 0x41, 0x0f, 0xa6, 0x48, 0x53, 0x6d, 0xa2, 0x0d, 0x3f, 0xd9, 0x26, 0xd9, 0x31, 0x29,
+	0xdb, 0x64, 0xc2, 0x9c, 0x14, 0x20, 0xfa, 0x9c, 0x16, 0x20, 0x13, 0x86, 0xbc, 0x00, 0x99, 0x34,
+	0xd2, 0x71, 0xe1, 0xb9, 0xf5, 0xe6, 0xa6, 0x69, 0xbc, 0xbd, 0x69, 0x1a, 0x7f, 0xde, 0x34, 0x8d,
+	0x5f, 0x6e, 0x9b, 0x85, 0xb7, 0xb7, 0xcd, 0xc2, 0x1f, 0xb7, 0xcd, 0x42, 0xaf, 0xca, 0xff, 0x7c,
+	0x9f, 0xfe, 0x15, 0x00, 0x00, 0xff, 0xff, 0x94, 0xbd, 0x40, 0x4b, 0x05, 0x0f, 0x00, 0x00,
 }
 
 // Reference imports to suppress errors if they are not otherwise used.
@@ -2528,23 +2442,24 @@ func (m *Block) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if len(m.Data) > 0 {
 		i -= len(m.Data)
 		copy(dAtA[i:], m.Data)
 		i = encodeVarintPb(dAtA, i, uint64(len(m.Data)))
 		i--
-		dAtA[i] = 0x22
+		dAtA[i] = 0x2a
 	}
 	if len(m.UserData) > 0 {
 		i -= len(m.UserData)
 		copy(dAtA[i:], m.UserData)
 		i = encodeVarintPb(dAtA, i, uint64(len(m.UserData)))
 		i--
-		dAtA[i] = 0x1a
+		dAtA[i] = 0x22
+	}
+	if m.Lazy != 0 {
+		i = encodeVarintPb(dAtA, i, uint64(m.Lazy))
+		i--
+		dAtA[i] = 0x18
 	}
 	if m.BlockLength != 0 {
 		i = encodeVarintPb(dAtA, i, uint64(m.BlockLength))
@@ -2579,10 +2494,6 @@ func (m *AppendRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if len(m.Peers) > 0 {
 		for iNdEx := len(m.Peers) - 1; iNdEx >= 0; iNdEx-- {
 			i -= len(m.Peers[iNdEx])
@@ -2634,10 +2545,6 @@ func (m *AppendResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if len(m.Offsets) > 0 {
 		dAtA2 := make([]byte, len(m.Offsets)*10)
 		var j1 int
@@ -2684,10 +2591,6 @@ func (m *CreateExtentRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if m.StreamID != 0 {
 		i = encodeVarintPb(dAtA, i, uint64(m.StreamID))
 		i--
@@ -2716,10 +2619,6 @@ func (m *CreateExtentResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if m.ExtentID != 0 {
 		i = encodeVarintPb(dAtA, i, uint64(m.ExtentID))
 		i--
@@ -2753,10 +2652,6 @@ func (m *ReadBlocksRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if m.NumOfBlocks != 0 {
 		i = encodeVarintPb(dAtA, i, uint64(m.NumOfBlocks))
 		i--
@@ -2795,10 +2690,6 @@ func (m *ReadBlocksResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if len(m.Blocks) > 0 {
 		for iNdEx := len(m.Blocks) - 1; iNdEx >= 0; iNdEx-- {
 			{
@@ -2841,10 +2732,6 @@ func (m *Payload) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if len(m.Data) > 0 {
 		i -= len(m.Data)
 		copy(dAtA[i:], m.Data)
@@ -2875,10 +2762,6 @@ func (m *CommitLengthRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if m.ExtentID != 0 {
 		i = encodeVarintPb(dAtA, i, uint64(m.ExtentID))
 		i--
@@ -2907,10 +2790,6 @@ func (m *CommitLengthResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if m.Length != 0 {
 		i = encodeVarintPb(dAtA, i, uint64(m.Length))
 		i--
@@ -2944,10 +2823,6 @@ func (m *SealRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if m.CommitLength != 0 {
 		i = encodeVarintPb(dAtA, i, uint64(m.CommitLength))
 		i--
@@ -2981,10 +2856,6 @@ func (m *SealResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if m.Code != 0 {
 		i = encodeVarintPb(dAtA, i, uint64(m.Code))
 		i--
@@ -3013,10 +2884,6 @@ func (m *ReplicateBlocksRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) 
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if len(m.Blocks) > 0 {
 		for iNdEx := len(m.Blocks) - 1; iNdEx >= 0; iNdEx-- {
 			{
@@ -3064,10 +2931,6 @@ func (m *ReplicateBlocksResponse) MarshalToSizedBuffer(dAtA []byte) (int, error)
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if len(m.Offsets) > 0 {
 		dAtA4 := make([]byte, len(m.Offsets)*10)
 		var j3 int
@@ -3114,10 +2977,6 @@ func (m *AllocExtentRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if m.ExtentID != 0 {
 		i = encodeVarintPb(dAtA, i, uint64(m.ExtentID))
 		i--
@@ -3146,10 +3005,6 @@ func (m *AllocExtentResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if m.Code != 0 {
 		i = encodeVarintPb(dAtA, i, uint64(m.Code))
 		i--
@@ -3178,10 +3033,6 @@ func (m *StreamAllocExtentRequest) MarshalToSizedBuffer(dAtA []byte) (int, error
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if m.ExtentToSeal != 0 {
 		i = encodeVarintPb(dAtA, i, uint64(m.ExtentToSeal))
 		i--
@@ -3215,10 +3066,6 @@ func (m *StreamAllocExtentResponse) MarshalToSizedBuffer(dAtA []byte) (int, erro
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if m.Extent != nil {
 		{
 			size, err := m.Extent.MarshalToSizedBuffer(dAtA[:i])
@@ -3259,10 +3106,6 @@ func (m *StreamInfoRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if len(m.StreamIDs) > 0 {
 		dAtA7 := make([]byte, len(m.StreamIDs)*10)
 		var j6 int
@@ -3304,10 +3147,6 @@ func (m *StreamInfoResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if len(m.Extents) > 0 {
 		for k := range m.Extents {
 			v := m.Extents[k]
@@ -3384,10 +3223,6 @@ func (m *ExtentInfoRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if len(m.Extents) > 0 {
 		dAtA11 := make([]byte, len(m.Extents)*10)
 		var j10 int
@@ -3429,10 +3264,6 @@ func (m *ExtentInfoResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if len(m.Extents) > 0 {
 		for k := range m.Extents {
 			v := m.Extents[k]
@@ -3485,10 +3316,6 @@ func (m *NodesInfoRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	return len(dAtA) - i, nil
 }
 
@@ -3512,10 +3339,6 @@ func (m *NodesInfoResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if len(m.Nodes) > 0 {
 		for k := range m.Nodes {
 			v := m.Nodes[k]
@@ -3568,10 +3391,6 @@ func (m *RegisterNodeRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if len(m.Addr) > 0 {
 		i -= len(m.Addr)
 		copy(dAtA[i:], m.Addr)
@@ -3602,10 +3421,6 @@ func (m *RegisterNodeResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if m.NodeId != 0 {
 		i = encodeVarintPb(dAtA, i, uint64(m.NodeId))
 		i--
@@ -3639,10 +3454,6 @@ func (m *CreateStreamRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	return len(dAtA) - i, nil
 }
 
@@ -3666,10 +3477,6 @@ func (m *CreateStreamResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if m.Extent != nil {
 		{
 			size, err := m.Extent.MarshalToSizedBuffer(dAtA[:i])
@@ -3722,10 +3529,6 @@ func (m *SMMemberValue) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if len(m.GrpcURL) > 0 {
 		i -= len(m.GrpcURL)
 		copy(dAtA[i:], m.GrpcURL)
@@ -3768,10 +3571,6 @@ func (m *ExtentInfo) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if len(m.Replicates) > 0 {
 		dAtA17 := make([]byte, len(m.Replicates)*10)
 		var j16 int
@@ -3818,10 +3617,6 @@ func (m *StreamInfo) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if len(m.ExtentIDs) > 0 {
 		dAtA19 := make([]byte, len(m.ExtentIDs)*10)
 		var j18 int
@@ -3868,10 +3663,6 @@ func (m *NodeInfo) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		i -= len(m.XXX_unrecognized)
-		copy(dAtA[i:], m.XXX_unrecognized)
-	}
 	if len(m.Address) > 0 {
 		i -= len(m.Address)
 		copy(dAtA[i:], m.Address)
@@ -3910,6 +3701,9 @@ func (m *Block) Size() (n int) {
 	if m.BlockLength != 0 {
 		n += 1 + sovPb(uint64(m.BlockLength))
 	}
+	if m.Lazy != 0 {
+		n += 1 + sovPb(uint64(m.Lazy))
+	}
 	l = len(m.UserData)
 	if l > 0 {
 		n += 1 + l + sovPb(uint64(l))
@@ -3917,9 +3711,6 @@ func (m *Block) Size() (n int) {
 	l = len(m.Data)
 	if l > 0 {
 		n += 1 + l + sovPb(uint64(l))
-	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
 	}
 	return n
 }
@@ -3945,9 +3736,6 @@ func (m *AppendRequest) Size() (n int) {
 			n += 1 + l + sovPb(uint64(l))
 		}
 	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
-	}
 	return n
 }
 
@@ -3967,9 +3755,6 @@ func (m *AppendResponse) Size() (n int) {
 		}
 		n += 1 + sovPb(uint64(l)) + l
 	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
-	}
 	return n
 }
 
@@ -3981,9 +3766,6 @@ func (m *CreateExtentRequest) Size() (n int) {
 	_ = l
 	if m.StreamID != 0 {
 		n += 1 + sovPb(uint64(m.StreamID))
-	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
 	}
 	return n
 }
@@ -3999,9 +3781,6 @@ func (m *CreateExtentResponse) Size() (n int) {
 	}
 	if m.ExtentID != 0 {
 		n += 1 + sovPb(uint64(m.ExtentID))
-	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
 	}
 	return n
 }
@@ -4021,9 +3800,6 @@ func (m *ReadBlocksRequest) Size() (n int) {
 	if m.NumOfBlocks != 0 {
 		n += 1 + sovPb(uint64(m.NumOfBlocks))
 	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
-	}
 	return n
 }
 
@@ -4042,9 +3818,6 @@ func (m *ReadBlocksResponse) Size() (n int) {
 			n += 1 + l + sovPb(uint64(l))
 		}
 	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
-	}
 	return n
 }
 
@@ -4058,9 +3831,6 @@ func (m *Payload) Size() (n int) {
 	if l > 0 {
 		n += 1 + l + sovPb(uint64(l))
 	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
-	}
 	return n
 }
 
@@ -4072,9 +3842,6 @@ func (m *CommitLengthRequest) Size() (n int) {
 	_ = l
 	if m.ExtentID != 0 {
 		n += 1 + sovPb(uint64(m.ExtentID))
-	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
 	}
 	return n
 }
@@ -4091,9 +3858,6 @@ func (m *CommitLengthResponse) Size() (n int) {
 	if m.Length != 0 {
 		n += 1 + sovPb(uint64(m.Length))
 	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
-	}
 	return n
 }
 
@@ -4109,9 +3873,6 @@ func (m *SealRequest) Size() (n int) {
 	if m.CommitLength != 0 {
 		n += 1 + sovPb(uint64(m.CommitLength))
 	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
-	}
 	return n
 }
 
@@ -4123,9 +3884,6 @@ func (m *SealResponse) Size() (n int) {
 	_ = l
 	if m.Code != 0 {
 		n += 1 + sovPb(uint64(m.Code))
-	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
 	}
 	return n
 }
@@ -4148,9 +3906,6 @@ func (m *ReplicateBlocksRequest) Size() (n int) {
 			n += 1 + l + sovPb(uint64(l))
 		}
 	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
-	}
 	return n
 }
 
@@ -4170,9 +3925,6 @@ func (m *ReplicateBlocksResponse) Size() (n int) {
 		}
 		n += 1 + sovPb(uint64(l)) + l
 	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
-	}
 	return n
 }
 
@@ -4185,9 +3937,6 @@ func (m *AllocExtentRequest) Size() (n int) {
 	if m.ExtentID != 0 {
 		n += 1 + sovPb(uint64(m.ExtentID))
 	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
-	}
 	return n
 }
 
@@ -4199,9 +3948,6 @@ func (m *AllocExtentResponse) Size() (n int) {
 	_ = l
 	if m.Code != 0 {
 		n += 1 + sovPb(uint64(m.Code))
-	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
 	}
 	return n
 }
@@ -4217,9 +3963,6 @@ func (m *StreamAllocExtentRequest) Size() (n int) {
 	}
 	if m.ExtentToSeal != 0 {
 		n += 1 + sovPb(uint64(m.ExtentToSeal))
-	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
 	}
 	return n
 }
@@ -4237,9 +3980,6 @@ func (m *StreamAllocExtentResponse) Size() (n int) {
 		l = m.Extent.Size()
 		n += 1 + l + sovPb(uint64(l))
 	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
-	}
 	return n
 }
 
@@ -4255,9 +3995,6 @@ func (m *StreamInfoRequest) Size() (n int) {
 			l += sovPb(uint64(e))
 		}
 		n += 1 + sovPb(uint64(l)) + l
-	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
 	}
 	return n
 }
@@ -4297,9 +4034,6 @@ func (m *StreamInfoResponse) Size() (n int) {
 			n += mapEntrySize + 1 + sovPb(uint64(mapEntrySize))
 		}
 	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
-	}
 	return n
 }
 
@@ -4315,9 +4049,6 @@ func (m *ExtentInfoRequest) Size() (n int) {
 			l += sovPb(uint64(e))
 		}
 		n += 1 + sovPb(uint64(l)) + l
-	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
 	}
 	return n
 }
@@ -4344,9 +4075,6 @@ func (m *ExtentInfoResponse) Size() (n int) {
 			n += mapEntrySize + 1 + sovPb(uint64(mapEntrySize))
 		}
 	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
-	}
 	return n
 }
 
@@ -4356,9 +4084,6 @@ func (m *NodesInfoRequest) Size() (n int) {
 	}
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
-	}
 	return n
 }
 
@@ -4384,9 +4109,6 @@ func (m *NodesInfoResponse) Size() (n int) {
 			n += mapEntrySize + 1 + sovPb(uint64(mapEntrySize))
 		}
 	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
-	}
 	return n
 }
 
@@ -4399,9 +4121,6 @@ func (m *RegisterNodeRequest) Size() (n int) {
 	l = len(m.Addr)
 	if l > 0 {
 		n += 1 + l + sovPb(uint64(l))
-	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
 	}
 	return n
 }
@@ -4418,9 +4137,6 @@ func (m *RegisterNodeResponse) Size() (n int) {
 	if m.NodeId != 0 {
 		n += 1 + sovPb(uint64(m.NodeId))
 	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
-	}
 	return n
 }
 
@@ -4430,9 +4146,6 @@ func (m *CreateStreamRequest) Size() (n int) {
 	}
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
-	}
 	return n
 }
 
@@ -4452,9 +4165,6 @@ func (m *CreateStreamResponse) Size() (n int) {
 	if m.Extent != nil {
 		l = m.Extent.Size()
 		n += 1 + l + sovPb(uint64(l))
-	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
 	}
 	return n
 }
@@ -4476,9 +4186,6 @@ func (m *SMMemberValue) Size() (n int) {
 	if l > 0 {
 		n += 1 + l + sovPb(uint64(l))
 	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
-	}
 	return n
 }
 
@@ -4497,9 +4204,6 @@ func (m *ExtentInfo) Size() (n int) {
 			l += sovPb(uint64(e))
 		}
 		n += 1 + sovPb(uint64(l)) + l
-	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
 	}
 	return n
 }
@@ -4520,9 +4224,6 @@ func (m *StreamInfo) Size() (n int) {
 		}
 		n += 1 + sovPb(uint64(l)) + l
 	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
-	}
 	return n
 }
 
@@ -4538,9 +4239,6 @@ func (m *NodeInfo) Size() (n int) {
 	l = len(m.Address)
 	if l > 0 {
 		n += 1 + l + sovPb(uint64(l))
-	}
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
 	}
 	return n
 }
@@ -4619,6 +4317,25 @@ func (m *Block) Unmarshal(dAtA []byte) error {
 				}
 			}
 		case 3:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Lazy", wireType)
+			}
+			m.Lazy = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Lazy |= uint32(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 4:
 			if wireType != 2 {
 				return fmt.Errorf("proto: wrong wireType = %d for field UserData", wireType)
 			}
@@ -4652,7 +4369,7 @@ func (m *Block) Unmarshal(dAtA []byte) error {
 				m.UserData = []byte{}
 			}
 			iNdEx = postIndex
-		case 4:
+		case 5:
 			if wireType != 2 {
 				return fmt.Errorf("proto: wrong wireType = %d for field Data", wireType)
 			}
@@ -4701,7 +4418,6 @@ func (m *Block) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -4840,7 +4556,6 @@ func (m *AppendRequest) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -4989,7 +4704,6 @@ func (m *AppendResponse) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -5062,7 +4776,6 @@ func (m *CreateExtentRequest) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -5154,7 +4867,6 @@ func (m *CreateExtentResponse) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -5265,7 +4977,6 @@ func (m *ReadBlocksRequest) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -5372,7 +5083,6 @@ func (m *ReadBlocksResponse) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -5460,7 +5170,6 @@ func (m *Payload) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -5533,7 +5242,6 @@ func (m *CommitLengthRequest) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -5625,7 +5333,6 @@ func (m *CommitLengthResponse) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -5717,7 +5424,6 @@ func (m *SealRequest) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -5790,7 +5496,6 @@ func (m *SealResponse) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -5916,7 +5621,6 @@ func (m *ReplicateBlocksRequest) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -6065,7 +5769,6 @@ func (m *ReplicateBlocksResponse) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -6138,7 +5841,6 @@ func (m *AllocExtentRequest) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -6211,7 +5913,6 @@ func (m *AllocExtentResponse) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -6303,7 +6004,6 @@ func (m *StreamAllocExtentRequest) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -6412,7 +6112,6 @@ func (m *StreamAllocExtentResponse) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -6542,7 +6241,6 @@ func (m *StreamInfoRequest) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -6845,7 +6543,6 @@ func (m *StreamInfoResponse) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -6975,7 +6672,6 @@ func (m *ExtentInfoRequest) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -7163,7 +6859,6 @@ func (m *ExtentInfoResponse) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -7217,7 +6912,6 @@ func (m *NodesInfoRequest) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -7405,7 +7099,6 @@ func (m *NodesInfoResponse) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -7491,7 +7184,6 @@ func (m *RegisterNodeRequest) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -7583,7 +7275,6 @@ func (m *RegisterNodeResponse) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -7637,7 +7328,6 @@ func (m *CreateStreamRequest) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -7782,7 +7472,6 @@ func (m *CreateStreamResponse) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -7919,7 +7608,6 @@ func (m *SMMemberValue) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -8068,7 +7756,6 @@ func (m *ExtentInfo) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -8217,7 +7904,6 @@ func (m *StreamInfo) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}
@@ -8322,7 +8008,6 @@ func (m *NodeInfo) Unmarshal(dAtA []byte) error {
 			if (iNdEx + skippy) > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
 			iNdEx += skippy
 		}
 	}

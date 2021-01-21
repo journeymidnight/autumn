@@ -122,3 +122,44 @@ func TestWriteRead(t *testing.T) {
 
 	})
 }
+
+func TestUpdateRead(t *testing.T) {
+	runRPTest(t, func(t *testing.T, rp *RangePartition) {
+		var wg sync.WaitGroup
+		for i := 0; i < 100; i++ {
+			wg.Add(1)
+			rp.writeAsync([]byte("key"), []byte(fmt.Sprintf("val%d", i)), func(e error) {
+				wg.Done()
+			})
+		}
+		wg.Wait()
+
+		value, err := rp.get([]byte("key"), 0)
+		require.NoError(t, err)
+		require.Equal(t, []byte(fmt.Sprintf("val%d", 99)), value)
+
+	})
+}
+
+func TestGetBig(t *testing.T) {
+	runRPTest(t, func(t *testing.T, rp *RangePartition) {
+		//txnSet(t, db, []byte("key1"), []byte("val1"), 0x08)
+		bigValue := []byte(fmt.Sprintf("%01048576d", 10))
+		err := rp.write([]byte("key1"), bigValue)
+		require.NoError(t, err)
+
+		v, err := rp.get([]byte("key1"), 0)
+
+		require.NoError(t, err)
+		require.Equal(t, bigValue, v)
+
+	})
+
+}
+
+/*
+1. replay
+2. compact
+3. big iterator
+4. test
+*/
