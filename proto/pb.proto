@@ -36,8 +36,10 @@ enum BlockType {
 message Block {
 	uint32 checkSum = 1;   //4
 	uint32 blockLength = 2;//4
-	bytes userData = 3;
-	bytes data = 4;
+	uint32 lazy = 3; //4
+	bytes userData = 4;//所以userData不能超过500字节
+	//-- 512 --
+	bytes data = 5;
 }
 
 message AppendRequest {

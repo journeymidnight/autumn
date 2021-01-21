@@ -60,3 +60,12 @@ func (client *MockStreamClient) Connect() error {
 func (client *MockStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, error) {
 	return client.ex.ReadBlocks(offset, numOfBlocks, (32 << 20))
 }
+
+type MocSeqReader struct {
+	sc            *MockStreamClient
+	currentOffset uint32
+}
+
+func (client *MockStreamClient) NewSeqReader(opt ReaderOption) SeqReader {
+
+}

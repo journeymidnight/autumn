@@ -199,7 +199,7 @@ func OpenExtent(fileName string) (*Extent, error) {
 	offset := uint32(512)
 
 	for offset < currentSize {
-		b, err := readBlock(f)
+		b, err := readBlock(f, true)
 		if err != nil {
 			//this block is corrupt, so, truncate extent to current offset
 			if err = f.Truncate(int64(offset)); err != nil {
@@ -227,6 +227,17 @@ func OpenExtent(fileName string) (*Extent, error) {
 type extentBlockReader struct {
 	extent   *Extent
 	position uint32
+}
+
+func (r *extentBlockReader) Seek(offset int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekCurrent:
+		r.position += uint32(offset)
+	default:
+		return 0, errors.New("bytes.Reader.Seek: only support SeekCurrent")
+	}
+	return int64(r.position), nil
+
 }
 
 func (r *extentBlockReader) Read(p []byte) (n int, err error) {
@@ -261,7 +272,7 @@ func (ex *Extent) Seal(commit uint32) error {
 func (ex *Extent) IsSeal() bool {
 	return atomic.LoadInt32(&ex.isSeal) == 1
 }
-func (ex *Extent) getReader(offset uint32) io.Reader {
+func (ex *Extent) getReader(offset uint32) io.ReadSeeker {
 	return &extentBlockReader{
 		extent:   ex,
 		position: offset,
@@ -281,7 +292,7 @@ var (
 	EndOfStream = errors.Errorf("EndOfStream")
 )
 
-func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize uint32) ([]*pb.Block, error) {
+func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize uint32, readAll bool) ([]*pb.Block, error) {
 
 	var ret []*pb.Block
 	//TODO: fix block number
@@ -297,7 +308,7 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 	for i := uint32(0); i < maxNumOfBlocks; i++ {
 		r := ex.getReader(offset)
 
-		block, err := readBlock(r)
+		block, err := readBlock(r, readAll)
 
 		if err == io.EOF {
 			if ex.IsSeal() {
@@ -313,7 +324,13 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 
 		ret = append(ret, &block)
 		offset += block.BlockLength + 512
-		size += block.BlockLength + 512
+
+		if !readAll && block.Lazy > 0 {
+			size += 512
+		} else {
+			size += block.BlockLength + 512
+		}
+
 		if size > maxTotalSize || err == io.EOF {
 			break
 		}
@@ -369,16 +386,33 @@ func writeBlock(w io.Writer, block *pb.Block) (err error) {
 
 	var buf [512]byte
 
-	if 512 < (4 + 4 + 4 + len(block.UserData)) {
-		return errors.Errorf("user data is too big %d", block.UserData)
-	}
+	sz := 0
 	binary.BigEndian.PutUint32(buf[:], block.CheckSum)
-	binary.BigEndian.PutUint32(buf[4:], block.BlockLength)
-	if len(block.UserData) != 0 {
-		binary.BigEndian.PutUint32(buf[8:], uint32(len(block.UserData)))
-		//w.Write(block.UserData)
-		copy(buf[12:], block.UserData)
+	sz += 4
+
+	sz += binary.PutUvarint(buf[sz:], uint64(block.BlockLength))
+	sz += binary.PutUvarint(buf[sz:], uint64(block.Lazy))
+	if len(block.UserData) > 0 {
+		sz += binary.PutUvarint(buf[sz:], uint64(len(block.UserData)))
+		if sz+len(block.UserData) > 512 {
+			return errors.Errorf("user data is too big %d", block.UserData)
+		}
+		copy(buf[sz:], block.UserData)
 	}
+
+	/*
+		if 512 < (4 + 4 + 4 + 2 + len(block.UserData)) {
+			return errors.Errorf("user data is too big %d", block.UserData)
+		}
+		binary.BigEndian.PutUint32(buf[:], block.CheckSum)
+		binary.BigEndian.PutUint32(buf[4:], block.BlockLength)
+		binary.BigEndian.PutUint16(buf[8:], uint16(block.Lazy))
+		if len(block.UserData) != 0 {
+			binary.BigEndian.PutUint32(buf[10:], uint32(len(block.UserData)))
+			//w.Write(block.UserData)
+			copy(buf[14:], block.UserData)
+		}
+	*/
 
 	w.Write(buf[:])
 
@@ -387,7 +421,7 @@ func writeBlock(w io.Writer, block *pb.Block) (err error) {
 	return err
 }
 
-func readBlock(reader io.Reader) (pb.Block, error) {
+func readBlock(reader io.ReadSeeker, readAll bool) (pb.Block, error) {
 
 	var buf [512]byte
 
@@ -397,14 +431,46 @@ func readBlock(reader io.Reader) (pb.Block, error) {
 		return pb.Block{}, err
 	}
 
+	/*
+		checkSum := binary.BigEndian.Uint32(buf[:4])
+		blockLength := binary.BigEndian.Uint32(buf[4:8])
+		lazy := binary.BigEndian.Uint16(buf[4:10])
+		len := binary.BigEndian.Uint32(buf[10:14])
+
+		var UserData []byte
+		if len > 0 && len < 512 {
+			UserData = buf[14 : 14+len]
+		}
+	*/
 	checkSum := binary.BigEndian.Uint32(buf[:4])
-	blockLength := binary.BigEndian.Uint32(buf[4:8])
-	len := binary.BigEndian.Uint32(buf[8:12])
+	index := 4
+	blockLength, n := binary.Uvarint(buf[index:])
+	index += n
+	lazy, n := binary.Uvarint(buf[index:])
+	index += n
+	len, n := binary.Uvarint(buf[index:])
+	index += n
+
+	if int(len)+index > 512 {
+		return pb.Block{}, errors.Errorf("user data is too big %d", int(len)+index)
+	}
 	var UserData []byte
-	if len > 0 && len < 512 {
-		UserData = buf[12 : 12+len]
+	if len > 0 {
+		UserData = buf[index : index+int(len)]
 	}
 
+	//如果数据量很大,属于lazy, 在上层replay的时候,不会被读上去
+	if !readAll && lazy > 0 {
+		reader.Seek(int64(blockLength), io.SeekCurrent)
+		return pb.Block{
+			CheckSum:    checkSum,
+			BlockLength: uint32(blockLength),
+			Lazy:        uint32(lazy),
+			Data:        nil,
+			UserData:    UserData,
+		}, nil
+
+	}
 	data := make([]byte, blockLength, blockLength)
 	_, err = io.ReadFull(reader, data)
 
@@ -425,7 +491,7 @@ func readBlock(reader io.Reader) (pb.Block, error) {
 
 	return pb.Block{
 		CheckSum:    checkSum,
-		BlockLength: blockLength,
+		BlockLength: uint32(blockLength),
 		Data:        data,
 		UserData:    UserData,
 	}, nil

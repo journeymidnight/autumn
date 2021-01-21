@@ -17,15 +17,52 @@ import (
 	"google.golang.org/grpc"
 )
 
+//read from start
+//or
+//read from offset
+
+//read critical blocks
+//read all blockss
+
+//有2个要决定, 1, 从stream哪里开始, 2, 是否只读关键blocks,是否读关键blocks
+//如果当前是关键Block
+//就读出block_meta + block_data(全量)
+//如果不是关键block
+//就只读出block_meta
+
+type ReaderOption struct {
+	ReadFromStart bool
+	OnlyCritical  bool
+	ExtentID      uint64
+	Offset        uint32
+}
+
+func (opt ReaderOption) WithReadFromStart() ReaderOption {
+	opt.ReadFromStart = true
+	return opt
+}
+
+func (opt ReaderOption) WithReadFrom(extentID uint64, offset uint32) ReaderOption {
+	opt.ReadFromStart = false
+	opt.ExtentID = extentID
+	opt.Offset = offset
+	return opt
+}
+
+func (opt ReaderOption) WithOnlyCritical(a bool) {
+	opt.OnlyCritical = a
+}
+
 type SeqReader interface {
 	Read(ctx context.Context) ([]*pb.Block, error)
 }
+
 type StreamClient interface {
 	Connect() error
 	Close()
 	Append(ctx context.Context, blocks []*pb.Block, userData interface{}) (*Op, error)
 	Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, error)
-	//NewSeqReader() SeqReader
+	NewSeqReader(opt ReaderOption) SeqReader
 }
 
 //for single stream
@@ -283,7 +320,7 @@ func (sc *AutumnStreamClient) Append(ctx context.Context, blocks []*pb.Block, us
 		return nil, errors.Errorf("blocks can not be nil")
 	}
 	for i := range blocks {
-		if len(blocks[i].Data)%4096 != 0 {
+		if len(blocks[i].Data)%512 != 0 {
 			return nil, errors.Errorf("not aligned")
 		}
 	}
@@ -364,14 +401,7 @@ func (reader *AutumnSeqReader) Read(ctx context.Context) ([]*pb.Block, error) {
 }
 
 //SeqRead read all the blocks in stream
-func (sc *AutumnStreamClient) NewSeqReader() SeqReader {
-	/*
-		sc.RLock()
-		defer sc.RUnlock()
-		if len(sc.streamInfo.ExtentIDs) == 0 {
-			return nil, errors.Errorf("stream is nil")
-		}
-	*/
+func (sc *AutumnStreamClient) NewSeqReader(opt ReaderOption) SeqReader {
 	return &AutumnSeqReader{
 		sc:                 sc,
 		currentExtentIndex: 0,

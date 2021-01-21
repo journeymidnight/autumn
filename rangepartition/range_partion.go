@@ -36,18 +36,24 @@ const (
 )
 
 var (
-	errNoRoom   = errors.New("No room for write")
-	errNotFound = errors.New("not found")
+	errNoRoom        = errors.New("No room for write")
+	errNotFound      = errors.New("not found")
+	ErrBlockedWrites = errors.New("Writes are blocked, possibly due to DropAll or Close")
 )
+
+func MaxBlockUserDataSize() int {
+	unsafe.Sizeof(pb.Block{})
+}
 
 type RangePartition struct {
 	//metaStream *streamclient.StreamClient //设定metadata结构
-	rowStream  streamclient.StreamClient //设定checkpoint结构
-	logStream  streamclient.StreamClient
-	logRotates int32
-	writeCh    chan *request
-	mt         *skiplist.Skiplist
-	imm        []*skiplist.Skiplist
+	rowStream   streamclient.StreamClient //设定checkpoint结构
+	logStream   streamclient.StreamClient
+	logRotates  int32
+	writeCh     chan *request
+	blockWrites int32
+	mt          *skiplist.Skiplist
+	imm         []*skiplist.Skiplist
 	utils.SafeMutex
 	//sync.RWMutex //protect mt,imm when swapping mt, imm
 	flushStopper *utils.Stopper
@@ -60,11 +66,12 @@ type RangePartition struct {
 
 func OpenRangePartition(rowStream streamclient.StreamClient, logStream streamclient.StreamClient) *RangePartition {
 	rp := &RangePartition{
-		rowStream:  rowStream,
-		logStream:  logStream,
-		logRotates: 0,
-		mt:         skiplist.NewSkiplist(maxSkipList),
-		imm:        nil,
+		rowStream:   rowStream,
+		logStream:   logStream,
+		logRotates:  0,
+		mt:          skiplist.NewSkiplist(maxSkipList),
+		imm:         nil,
+		blockWrites: 0,
 	}
 	rp.startMemoryFlush()
 	rp.startWriteLoop()
@@ -72,8 +79,9 @@ func OpenRangePartition(rowStream streamclient.StreamClient, logStream streamcli
 }
 
 type flushTask struct {
-	mt   *skiplist.Skiplist
-	vptr valuePointer
+	mt     *skiplist.Skiplist
+	vptr   valuePointer
+	seqNum uint64
 }
 
 func (rp *RangePartition) startWriteLoop() {
@@ -85,10 +93,11 @@ func (rp *RangePartition) startWriteLoop() {
 }
 func (rp *RangePartition) startMemoryFlush() {
 	// Start memory fluhser.
-	//if db.closers.memtable != nil {
+
+	rp.flushStopper = utils.NewStopper()
 	rp.flushChan = make(chan flushTask, 1)
-	flushStopper := utils.NewStopper()
-	flushStopper.RunWorker(rp.flushMemtable)
+
+	rp.flushStopper.RunWorker(rp.flushMemtable)
 }
 
 // handleFlushTask must be run serially.
@@ -123,7 +132,7 @@ func (rp *RangePartition) handleFlushTask(ft flushTask) error {
 	}
 
 	b.FinishBlock()
-	id, offset, err := b.FinishAll(ft.vptr.extentID, ft.vptr.offset)
+	id, offset, err := b.FinishAll(ft.vptr.extentID, ft.vptr.offset, ft.seqNum)
 	if err != nil {
 		xlog.Logger.Errorf("ERROR while build table: %v", err)
 		return err
@@ -337,6 +346,9 @@ func (mb *mixedBlock) ToBlock() *pb.Block {
 
 func (rp *RangePartition) writeLog(reqs []*request) (valuePointer, error) {
 
+	if atomic.LoadInt32(&rp.blockWrites) == 1 {
+		return valuePointer{}, ErrBlockedWrites
+	}
 	utils.AssertTrue(len(reqs) != 0)
 	//sort
 	sort.Slice(reqs, func(i, j int) bool {
@@ -430,10 +442,11 @@ func (rp *RangePartition) writeRequests(reqs []*request) error {
 		done(err)
 		return err
 	}
+	seqNum := y.ParseTs(reqs[len(reqs)-1].Key)
 
 	xlog.Logger.Info("Writing to memtable")
 	i := 0
-	for err = rp.ensureRoomForWrite(reqs, head); err == errNoRoom; err = rp.ensureRoomForWrite(reqs, head) {
+	for err = rp.ensureRoomForWrite(reqs, head, seqNum); err == errNoRoom; err = rp.ensureRoomForWrite(reqs, head, seqNum) {
 		i++
 		if i%100 == 0 {
 			xlog.Logger.Infof("Making room for writes")
@@ -572,7 +585,7 @@ func (rp *RangePartition) doWrites() {
 	}
 }
 
-func (rp *RangePartition) ensureRoomForWrite(reqs []*request, head valuePointer) error {
+func (rp *RangePartition) ensureRoomForWrite(reqs []*request, head valuePointer, seqNum uint64) error {
 
 	rp.Lock()
 	defer rp.Unlock()
@@ -590,7 +603,7 @@ func (rp *RangePartition) ensureRoomForWrite(reqs []*request, head valuePointer)
 
 	//non-block, block if flushChan is full,
 	select {
-	case rp.flushChan <- flushTask{mt: rp.mt, vptr: head}:
+	case rp.flushChan <- flushTask{mt: rp.mt, vptr: head, seqNum: seqNum}:
 		// After every memtable flush, let's reset the counter.
 		atomic.StoreInt32(&rp.logRotates, 0)
 
@@ -709,25 +722,47 @@ func (rp *RangePartition) getValueStruct(userKey []byte, version uint64) y.Value
 }
 
 func (rp *RangePartition) Close() error {
+	xlog.Logger.Infof("Closing database")
+	atomic.StoreInt32(&rp.blockWrites, 1)
+
+	rp.writeStopper.Stop()
+	close(rp.writeCh)
+
+	//FIXME lost data in mt/imm
+
+	close(rp.flushChan)
+	rp.flushStopper.Wait()
 	return nil
 }
 
 func (rp *RangePartition) writeAsync(key, value []byte, f func(error)) {
-	req := rp.sendToWriteCh(key, value)
+	req, err := rp.sendToWriteCh(key, value)
+	if err != nil {
+		f(err)
+		return
+	}
 	go func() {
 		err := req.Wait()
 		// Write is complete. Let's call the callback function now.
 		f(err)
 	}()
+
 }
 
 func (rp *RangePartition) write(key, value []byte) error {
-	req := rp.sendToWriteCh(key, value)
+	req, err := rp.sendToWriteCh(key, value)
+	if err != nil {
+		return err
+	}
 	return req.Wait()
 }
 
 //block API
-func (rp *RangePartition) sendToWriteCh(key, value []byte) *request {
+func (rp *RangePartition) sendToWriteCh(key, value []byte) (*request, error) {
+	if atomic.LoadInt32(&rp.blockWrites) == 1 {
+		return nil, ErrBlockedWrites
+	}
+
 	req := requestPool.Get().(*request)
 	req.reset()
 
@@ -738,5 +773,5 @@ func (rp *RangePartition) sendToWriteCh(key, value []byte) *request {
 	req.wg.Add(1)
 	req.IncrRef()
 	rp.writeCh <- req
-	return req
+	return req, nil
 }

@@ -66,8 +66,9 @@ message RawBlockMeta {
 	RawBlockType type = 1;
 	uint32  CompressedSize = 2;
 	uint32  UnCompressedSize  = 3;
-	uint64  tailExtentID = 4;
-	uint32  tailOffset = 5;
+	uint64  headExtentID = 4;
+	uint32  headOffset = 5;
+	uint64  seqNum = 6;
 }
 
 message BlockOffset {
