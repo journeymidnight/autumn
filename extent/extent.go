@@ -288,8 +288,8 @@ func (ex *Extent) Close() {
 }
 
 var (
-	EndOfExtent = errors.Errorf("EndOfExtent")
-	EndOfStream = errors.Errorf("EndOfStream")
+	EndOfExtent = errors.New("EndOfExtent")
+	EndOfStream = errors.New("EndOfStream")
 )
 
 func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize uint32, readAll bool) ([]*pb.Block, error) {
@@ -494,5 +494,6 @@ func readBlock(reader io.ReadSeeker, readAll bool) (pb.Block, error) {
 		BlockLength: uint32(blockLength),
 		Data:        data,
 		UserData:    UserData,
+		Lazy:        uint32(lazy),
 	}, nil
 }

@@ -32,7 +32,7 @@ import (
 
 type ReaderOption struct {
 	ReadFromStart bool
-	OnlyCritical  bool
+	ReadAll       bool
 	ExtentID      uint64
 	Offset        uint32
 }
@@ -49,13 +49,42 @@ func (opt ReaderOption) WithReadFrom(extentID uint64, offset uint32) ReaderOptio
 	return opt
 }
 
-func (opt ReaderOption) WithOnlyCritical(a bool) {
-	opt.OnlyCritical = a
+func (opt ReaderOption) WithReadAll(a bool) ReaderOption {
+	opt.ReadAll = a
+	return opt
 }
 
 type SeqReader interface {
-	Read(ctx context.Context) ([]*pb.Block, error)
+	Read(ctx context.Context) ([]*pb.Block, BlockBase, error)
 }
+
+type BlockBase struct {
+	ExtentID   uint64
+	baseOffset uint32
+}
+
+/*
+type FullBlock struct {
+	*pb.Block
+	//additional information
+	ExtentID uint64
+	Offset   uint32
+}
+
+func BuildFullBlocks(blocks []*pb.Block, extentID uint64, baseOffset uint32) []FullBlock {
+	ret := make([]FullBlock, len(blocks), len(blocks))
+	sz := baseOffset
+	for i, b := range blocks {
+		ret[i] = FullBlock{
+			Block:    b,
+			ExtentID: extentID,
+			Offset:   sz,
+		}
+		sz += b.BlockLength + 512
+	}
+	return ret
+}
+*/
 
 type StreamClient interface {
 	Connect() error
@@ -362,10 +391,10 @@ type AutumnSeqReader struct {
 3. (blocks, nil)
 4. (nil, Other Error)
 */
-func (reader *AutumnSeqReader) Read(ctx context.Context) ([]*pb.Block, error) {
+func (reader *AutumnSeqReader) Read(ctx context.Context) ([]*pb.Block, BlockBase, error) {
 	conn, extentID, err := reader.sc.getExtentConnFromIndex(reader.currentExtentIndex)
 	if err != nil {
-		return nil, err
+		return nil, BlockBase{}, err
 	}
 	fmt.Printf("read extentID %d, offset : %d\n", extentID, reader.currentOffset)
 	//FIXME: load balance read when connecton error
@@ -378,22 +407,22 @@ func (reader *AutumnSeqReader) Read(ctx context.Context) ([]*pb.Block, error) {
 	})
 
 	if err != nil {
-		return nil, err
+		return nil, BlockBase{}, err
 	}
-
+	bb := BlockBase{extentID, reader.currentOffset}
 	fmt.Printf("res code is %v, len of blocks %d\n", res.Code, len(res.Blocks))
 	switch res.Code {
 	case pb.Code_OK:
 		reader.currentOffset += utils.SizeOfBlocks(res.Blocks)
-		return res.Blocks, nil
+		return res.Blocks, bb, nil
 	case pb.Code_EndOfExtent:
 		reader.currentOffset = 512 //skip extent header
 		reader.currentExtentIndex++
-		return res.Blocks, nil
+		return res.Blocks, bb, nil
 	case pb.Code_EndOfStream:
-		return res.Blocks, io.EOF
+		return res.Blocks, bb, io.EOF
 	case pb.Code_ERROR:
-		return nil, err
+		return nil, BlockBase{}, err
 	default:
 		return nil, errors.Errorf("unexpected error")
 	}
@@ -401,6 +430,7 @@ func (reader *AutumnSeqReader) Read(ctx context.Context) ([]*pb.Block, error) {
 }
 
 //SeqRead read all the blocks in stream
+//FIXME:lookup currentExtentIndex from opt
 func (sc *AutumnStreamClient) NewSeqReader(opt ReaderOption) SeqReader {
 	return &AutumnSeqReader{
 		sc:                 sc,
@@ -408,3 +438,5 @@ func (sc *AutumnStreamClient) NewSeqReader(opt ReaderOption) SeqReader {
 		currentOffset:      512, //skip extent header
 	}
 }
+
+//Iterator all logEntries
