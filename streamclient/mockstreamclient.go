@@ -2,6 +2,7 @@ package streamclient
 
 import (
 	"context"
+	"io"
 	"os"
 
 	"github.com/journeymidnight/autumn/extent"
@@ -58,14 +59,44 @@ func (client *MockStreamClient) Connect() error {
 }
 
 func (client *MockStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, error) {
-	return client.ex.ReadBlocks(offset, numOfBlocks, (32 << 20))
+	blocks, err := client.ex.ReadBlocks(offset, numOfBlocks, (32 << 20), true)
+	if err == extent.EndOfExtent || err == extent.EndOfStream {
+		return blocks, io.EOF
+	}
+	if err != nil {
+		return nil, err
+	}
+	return blocks, err
 }
 
 type MocSeqReader struct {
 	sc            *MockStreamClient
 	currentOffset uint32
+	opt           ReaderOption
+}
+
+func (reader *MocSeqReader) Read(ctx context.Context) ([]*pb.Block, BlockBase, error) {
+	blocks, err := reader.sc.ex.ReadBlocks(reader.currentOffset, 8, (32 << 20), reader.opt.ReadAll)
+	bb := 
+	if err == extent.EndOfExtent || err == extent.EndOfStream {
+		return blocks, io.EOF
+	}
+	if err != nil {
+		return nil, err
+	}
+	reader.currentOffset += utils.SizeOfBlocks(blocks)
+	return blocks, nil
 }
 
 func (client *MockStreamClient) NewSeqReader(opt ReaderOption) SeqReader {
-
+	x := &MocSeqReader{
+		sc:  client,
+		opt: opt,
+	}
+	if opt.ReadFromStart {
+		x.currentOffset = 512 //skip extent header
+	} else {
+		x.currentOffset = opt.Offset
+	}
+	return x
 }

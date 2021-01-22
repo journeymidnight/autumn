@@ -9,6 +9,7 @@ import (
 
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
+	"github.com/pkg/errors"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -33,6 +34,16 @@ func newMemory(size int) *memory {
 		end:  0,
 		size: size,
 	}
+}
+
+func (f *memory) Seek(offset int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekCurrent:
+		f.pos += int(offset)
+	default:
+		return 0, errors.New("bytes.Reader.Seek: only support SeekCurrent")
+	}
+	return int64(f.pos), nil
 }
 
 func (f *memory) resetPos() {
@@ -248,4 +259,44 @@ func BenchmarkExtent(b *testing.B) {
 	}
 }
 
-//FIXME; test lazy situaion
+func TestLazyReadWriteBlockUserData(t *testing.T) {
+	data := make([]byte, 1024)
+	block := pb.Block{
+		CheckSum:    utils.AdlerCheckSum(data),
+		BlockLength: 1024,
+		Data:        data,
+		UserData:    []byte("hello"),
+	}
+	block1 := pb.Block{
+		CheckSum:    utils.AdlerCheckSum(data),
+		BlockLength: 1024,
+		Data:        data,
+		UserData:    []byte("world"),
+		Lazy:        1,
+	}
+	block2 := pb.Block{
+		CheckSum:    utils.AdlerCheckSum(data),
+		BlockLength: 1024,
+		Data:        data,
+		UserData:    []byte("test"),
+		Lazy:        1,
+	}
+
+	f := newMemory(4000)
+	writeBlock(f, &block)
+	writeBlock(f, &block1)
+	writeBlock(f, &block2)
+
+	f.resetPos()
+	rBlock, err := readBlock(f, false)
+	require.Nil(t, err)
+	require.Equal(t, block, rBlock)
+	rBlock1, err := readBlock(f, false)
+	require.Nil(t, err)
+	block1.Data = nil
+	require.Equal(t, block1, rBlock1)
+	rBlock2, err := readBlock(f, false)
+	block2.Data = nil
+	require.Equal(t, block2, rBlock2)
+
+}

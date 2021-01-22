@@ -394,6 +394,7 @@ func (rp *RangePartition) writeLog(reqs []*request) (valuePointer, error) {
 			UserData:    blockUserData,
 			Data:        data,
 			CheckSum:    utils.AdlerCheckSum(data),
+			Lazy:        1, //big block is lazy, when replaying the log, do not have to read/send lazy data
 		})
 	}
 
