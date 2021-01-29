@@ -15,10 +15,27 @@
 
 
 syntax = "proto3";
-
-
 package pb;
 
+import "gogoproto/gogo.proto";
+
+
+
+message Entry {
+	bytes  key = 1;
+	bytes  value = 2;
+	uint32 meta = 3;
+	uint32 UserMeta = 4;
+	uint64 ExpiresAt = 5;
+}
+
+message EntryInfo {
+	Entry log = 1;
+	//used when read bigger blocks log.value = nil, log.meta & bitValuePointer > 0 
+	uint64 extentID = 2;
+	uint32 offset = 3;
+	uint64 estimatedSize = 4;
+}
 enum Code {
 	OK = 0;
 	NOT_LEADER = 1;
@@ -36,10 +53,9 @@ enum BlockType {
 message Block {
 	uint32 checkSum = 1;   //4
 	uint32 blockLength = 2;//4
-	uint32 lazy = 3; //4
-	bytes userData = 4;//所以userData不能超过500字节
+	bytes userData = 3;//所以userData不能超过500字节
 	//-- 512 --
-	bytes data = 5;
+	bytes data = 4;
 }
 
 message AppendRequest {
@@ -97,10 +113,25 @@ message SealResponse {
 	Code code = 1;
 }
 
+
+message ReadEntriesRequest {
+	uint64 extentID = 1;
+	uint32 offset = 2;
+	uint32 replay = 3;
+}
+
+
+message ReadEntriesResponse{
+	Code code = 1;
+	repeated EntryInfo entries = 2;
+	uint32 endOffset = 3;
+}
+
 service ExtentService {
 	rpc Append(AppendRequest) returns (AppendResponse){}
 	rpc ReadBlocks(ReadBlocksRequest) returns(ReadBlocksResponse){}
-	//rpc ReadBytes(offset, size) returns(){} //stream
+	rpc ReadEntries(ReadEntriesRequest) returns (ReadEntriesResponse){}
+
 
 	rpc Seal(SealRequest) returns (SealResponse) {}
 	rpc CommitLength(CommitLengthRequest) returns (CommitLengthResponse) {}

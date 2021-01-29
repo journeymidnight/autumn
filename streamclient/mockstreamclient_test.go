@@ -2,7 +2,7 @@ package streamclient
 
 import (
 	"context"
-	"io"
+	"fmt"
 	"math/rand"
 	"testing"
 	"time"
@@ -17,110 +17,129 @@ func newTestBlock(size uint32) *pb.Block {
 	data := make([]byte, size)
 	utils.SetRandStringBytes(data)
 	rand.Seed(time.Now().UnixNano())
-	lazy := rand.Int63n(2)
 	return &pb.Block{
 		CheckSum:    utils.AdlerCheckSum(data),
 		BlockLength: size,
 		Data:        data,
-		Lazy:        uint32(lazy),
 	}
 }
 
-func TestAppendReadFile(t *testing.T) {
+func TestAppendReadBlocks(t *testing.T) {
 	b := newTestBlock(512)
 	client := NewMockStreamClient("test.tmp", 100)
+	bReader := client.(BlockReader)
 	defer client.Close()
-	op, err := client.Append(context.Background(), []*pb.Block{b}, nil)
+	_, offsets, err := client.Append(context.Background(), []*pb.Block{b})
 	assert.Nil(t, err)
-	defer op.Free()
-	op.Wait()
 
-	bs, err := client.Read(context.Background(), 100, op.Offsets[0], 1)
+	bs, err := bReader.Read(context.Background(), 100, offsets[0], 1)
 	assert.Nil(t, err)
 	assert.Equal(t, b.Data, bs[0].Data)
 }
 
-func TestSeqReadAll(t *testing.T) {
-	blocks := make([]*pb.Block, 40)
-	for i := range blocks {
-		blocks[i] = newTestBlock(512)
+func TestAppendReadEntries(t *testing.T) {
+	cases := []*pb.EntryInfo{
+		{
+			Log: &pb.Entry{
+				Key:   []byte("a"),
+				Value: []byte("xx"),
+			},
+		},
+		{
+			Log: &pb.Entry{
+				Key:   []byte("b"),
+				Value: []byte("xx"),
+			},
+		},
 	}
+
 	client := NewMockStreamClient("test.tmp", 100)
 	defer client.Close()
-	op, err := client.Append(context.Background(), blocks, nil)
-	defer op.Free()
-	op.Wait()
+	_, _, err := client.AppendEntries(context.Background(), cases)
+
 	require.NoError(t, err)
 
-	//reader from start
+	//GC read
+	iter := client.NewLogEntryIter(ReadOption{}.WithReadFromStart())
 
-	reader := client.NewSeqReader(ReaderOption{}.WithReadFromStart().WithReadAll(true))
-	var ret []*pb.Block
-	i := 0
+	//小value在GC时,一个block只返回自己的大小, 上面的entry全部可以GC
 	for {
-		ret, err = reader.Read(context.Background())
-		if err != nil && err != io.EOF {
-			require.NoError(t, err)
-		}
-		if len(ret) == 0 {
+		ok, err := iter.HasNext()
+		require.NoError(t, err)
+		if !ok {
 			break
 		}
-
-		require.Equal(t, blocks[i:i+len(ret)], ret)
-		i += len(ret)
+		ei := iter.Next()
+		require.Equal(t, []byte(nil), ei.Log.Key)
 	}
 
-	//read from some point
-	reader = client.NewSeqReader(ReaderOption{}.WithReadFrom(100, op.Offsets[20]).WithReadAll(true))
-	i = 20
-	for {
-		ret, err := reader.Read(context.Background())
-		if err != nil && err != io.EOF {
-			require.NoError(t, err)
-		}
-		l := len(ret)
+	iter = client.NewLogEntryIter(ReadOption{}.WithReadFromStart().WithReplay())
 
-		require.Equal(t, blocks[i:i+l], ret)
-		i += len(ret)
-		if err == io.EOF {
+	expectedKeys := [][]byte{
+		[]byte("a"),
+		[]byte("b"),
+	}
+
+	var ans [][]byte
+	for {
+		ok, err := iter.HasNext()
+		require.NoError(t, err)
+		if !ok {
 			break
 		}
+		ei := iter.Next()
+		ans = append(ans, ei.Log.Key)
 	}
+	require.Equal(t, expectedKeys, ans)
+
+	ans = nil
+	eID, offset, err := client.AppendEntries(context.Background(), cases)
+
+	iter = client.NewLogEntryIter(ReadOption{}.WithReadFromStart().WithReadFrom(eID, offset).WithReplay())
+	for {
+		ok, err := iter.HasNext()
+		require.NoError(t, err)
+		if !ok {
+			break
+		}
+		ei := iter.Next()
+		ans = append(ans, ei.Log.Key)
+	}
+	require.Equal(t, expectedKeys, ans)
 }
 
-func TestSeqLazyRead(t *testing.T) {
-	blocks := make([]*pb.Block, 40)
-	for i := range blocks {
-		blocks[i] = newTestBlock(512)
+func TestAppendReadBigBlocks(t *testing.T) {
+	cases := []*pb.EntryInfo{
+		{
+			Log: &pb.Entry{
+				Key:   []byte("a"),
+				Value: []byte("xx"),
+			},
+		},
+		{
+			Log: &pb.Entry{
+				Key:   []byte("b"),
+				Value: []byte(fmt.Sprintf("%01048576d", 10)),
+			},
+		},
 	}
 	client := NewMockStreamClient("test.tmp", 100)
 	defer client.Close()
-	op, err := client.Append(context.Background(), blocks, nil)
-	defer op.Free()
-	op.Wait()
+	_, _, err := client.AppendEntries(context.Background(), cases)
+
 	require.NoError(t, err)
 
-	//clean data for future compare [lazy read]
-	for _, b := range blocks {
-		if b.Lazy > 0 {
-			b.Data = nil
-		}
-	}
-
-	//reader from start
-	reader := client.NewSeqReader(ReaderOption{}.WithReadFromStart().WithReadAll(false))
-	var ret []*pb.Block
-	i := 0
+	iter := client.NewLogEntryIter(ReadOption{}.WithReadFromStart().WithReplay())
+	var ans [][]byte
 	for {
-		ret, err = reader.Read(context.Background())
-		if err != nil && err != io.EOF {
-			require.NoError(t, err)
-		}
-		if len(ret) == 0 {
+		ok, err := iter.HasNext()
+		require.NoError(t, err)
+		if !ok {
 			break
 		}
-
-		require.Equal(t, blocks[i:i+len(ret)], ret)
-		i += len(ret)
+		ei := iter.Next()
+		ans = append(ans, ei.Log.Key)
 	}
+	require.Equal(t, [][]byte{[]byte("a"), []byte("b")}, ans)
+
 }

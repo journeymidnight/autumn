@@ -2,7 +2,6 @@ package table
 
 import (
 	"context"
-	"sync"
 	"sync/atomic"
 
 	"github.com/dgraph-io/ristretto"
@@ -24,8 +23,8 @@ type TableInterface interface {
 }
 
 type Table struct {
-	sync.Mutex
-	stream     streamclient.StreamClient
+	utils.SafeMutex
+	stream     streamclient.BlockReader
 	blockIndex []*pspb.BlockOffset
 	ref        int32 // For file garbage collection. Atomic.
 
@@ -37,6 +36,11 @@ type Table struct {
 	bf            *z.Bloom
 	Cache         *ristretto.Cache
 	BfCache       *ristretto.Cache
+
+	Loc        pspb.TableLocation
+	LastSeq    uint64
+	VpExtentID uint64
+	VpOffset   uint32
 }
 
 // IncrRef increments the refcount (having to do with whether the file should be deleted)
@@ -78,6 +82,13 @@ func OpenTable(stream streamclient.StreamClient,
 		blockIndex:    make([]*pspb.BlockOffset, len(tableIndex.Offsets)),
 		stream:        stream,
 		estimatedSize: tableIndex.EstimatedSize,
+		Loc: pspb.TableLocation{
+			ExtentID: extentID,
+			Offset:   offset,
+		},
+		LastSeq:    metaBlock.SeqNum,
+		VpExtentID: metaBlock.VpExtentID,
+		VpOffset:   metaBlock.VpOffset,
 	}
 
 	//read bloom filter

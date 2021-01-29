@@ -28,6 +28,9 @@ import (
 	"github.com/pkg/xattr"
 
 	"github.com/journeymidnight/autumn/proto/pb"
+	"github.com/journeymidnight/autumn/proto/pspb"
+	"github.com/journeymidnight/autumn/rangepartition/y"
+
 	"github.com/journeymidnight/autumn/utils"
 )
 
@@ -199,7 +202,7 @@ func OpenExtent(fileName string) (*Extent, error) {
 	offset := uint32(512)
 
 	for offset < currentSize {
-		b, err := readBlock(f, true)
+		b, err := readBlock(f)
 		if err != nil {
 			//this block is corrupt, so, truncate extent to current offset
 			if err = f.Truncate(int64(offset)); err != nil {
@@ -229,6 +232,7 @@ type extentBlockReader struct {
 	position uint32
 }
 
+/*
 func (r *extentBlockReader) Seek(offset int64, whence int) (int64, error) {
 	switch whence {
 	case io.SeekCurrent:
@@ -239,7 +243,9 @@ func (r *extentBlockReader) Seek(offset int64, whence int) (int64, error) {
 	return int64(r.position), nil
 
 }
+*/
 
+//readfull
 func (r *extentBlockReader) Read(p []byte) (n int, err error) {
 	n, err = r.extent.file.ReadAt(p, int64(r.position))
 	if err != nil {
@@ -272,7 +278,7 @@ func (ex *Extent) Seal(commit uint32) error {
 func (ex *Extent) IsSeal() bool {
 	return atomic.LoadInt32(&ex.isSeal) == 1
 }
-func (ex *Extent) getReader(offset uint32) io.ReadSeeker {
+func (ex *Extent) getReader(offset uint32) io.Reader {
 	return &extentBlockReader{
 		extent:   ex,
 		position: offset,
@@ -292,7 +298,49 @@ var (
 	EndOfStream = errors.New("EndOfStream")
 )
 
-func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize uint32, readAll bool) ([]*pb.Block, error) {
+func (ex *Extent) ReadEntries(offset uint32, maxTotalSize uint32, replay bool) ([]*pb.EntryInfo, uint32, error) {
+
+	if offset == 0 {
+		return nil, 0, errors.New("offset can not be zero")
+	}
+	var ret []*pb.EntryInfo
+	current := atomic.LoadUint32(&ex.commitLength)
+
+	if current <= offset {
+		if ex.IsSeal() {
+			return nil, 0, EndOfExtent
+		} else {
+			return nil, 0, EndOfStream
+		}
+	}
+	//for i := uint32(0); i < maxNumOfBlocks; i++ {
+	size := 0
+	for {
+		r := ex.getReader(offset) //seek
+		entries, blockLength, err := readBlockEntries(r, ex.ID, offset, replay)
+
+		if err == io.EOF {
+			if ex.IsSeal() {
+				return ret, offset, EndOfExtent
+			} else {
+				return ret, offset, EndOfStream
+			}
+		}
+		ret = append(ret, entries...)
+		if err != nil {
+			return nil, 0, err
+		}
+		size += sizeOfEntries(entries)
+		offset += uint32(blockLength) + 512
+		if uint32(size) > maxTotalSize || err == io.EOF {
+			break
+		}
+	}
+
+	return ret, offset, nil
+}
+
+func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize uint32) ([]*pb.Block, error) {
 
 	var ret []*pb.Block
 	//TODO: fix block number
@@ -308,7 +356,7 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 	for i := uint32(0); i < maxNumOfBlocks; i++ {
 		r := ex.getReader(offset)
 
-		block, err := readBlock(r, readAll)
+		block, err := readBlock(r)
 
 		if err == io.EOF {
 			if ex.IsSeal() {
@@ -325,11 +373,7 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 		ret = append(ret, &block)
 		offset += block.BlockLength + 512
 
-		if !readAll && block.Lazy > 0 {
-			size += 512
-		} else {
-			size += block.BlockLength + 512
-		}
+		size += block.BlockLength + 512
 
 		if size > maxTotalSize || err == io.EOF {
 			break
@@ -353,13 +397,21 @@ func (ex *Extent) AppendBlocks(blocks []*pb.Block, lastCommit *uint32) (ret []ui
 	if lastCommit != nil && *lastCommit != ex.CommitLength() {
 		return nil, errors.Errorf("offset not match...")
 	}
+
 	/*
 		wrap <offset + blocks>
 		offset := ex.commitLength
 	*/
 	currentLength := atomic.LoadUint32(&ex.commitLength)
+
+	truncate := func() {
+		ex.file.Truncate(int64(currentLength))
+		ex.commitLength = currentLength
+	}
+
 	for _, block := range blocks {
 		if err = writeBlock(ex.file, block); err != nil {
+			defer truncate()
 			return nil, err
 		}
 		//if we have ssd journal, do not have to sync every time.
@@ -391,7 +443,6 @@ func writeBlock(w io.Writer, block *pb.Block) (err error) {
 	sz += 4
 
 	sz += binary.PutUvarint(buf[sz:], uint64(block.BlockLength))
-	sz += binary.PutUvarint(buf[sz:], uint64(block.Lazy))
 	if len(block.UserData) > 0 {
 		sz += binary.PutUvarint(buf[sz:], uint64(len(block.UserData)))
 		if sz+len(block.UserData) > 512 {
@@ -421,7 +472,90 @@ func writeBlock(w io.Writer, block *pb.Block) (err error) {
 	return err
 }
 
-func readBlock(reader io.ReadSeeker, readAll bool) (pb.Block, error) {
+func readBlockEntries(reader io.Reader, extentID uint64, offset uint32, replay bool) ([]*pb.EntryInfo, uint64, error) {
+	var buf [512]byte
+
+	_, err := io.ReadFull(reader, buf[:])
+
+	if err != nil {
+		return nil, 0, err
+	}
+
+	checkSum := binary.BigEndian.Uint32(buf[:4])
+	index := 4
+	blockLength, n := binary.Uvarint(buf[index:])
+	index += n
+	ulen, n := binary.Uvarint(buf[index:])
+	index += n
+
+	if int(ulen)+index > 512 {
+		return nil, 0, errors.Errorf("user data is too big %d", int(ulen)+index)
+	}
+	var UserData []byte
+	if ulen > 0 {
+		UserData = buf[index : index+int(ulen)]
+	}
+
+	data := make([]byte, blockLength, blockLength)
+	_, err = io.ReadFull(reader, data)
+
+	if err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+		return nil, 0, err
+	}
+
+	//checkSum
+	if utils.AdlerCheckSum(data) != checkSum {
+		return nil, 0, errors.Errorf("alder32 checksum not match, %d vs %d", utils.AdlerCheckSum(data), checkSum)
+	}
+	if !align(uint64(blockLength)) {
+		return nil, 0, errors.Errorf("block is not aligned %d", blockLength)
+	}
+
+	var mix pspb.MixedLog
+	utils.MustUnMarshal(UserData, &mix)
+
+	var ret []*pb.EntryInfo
+	//FIXME: offsets换成len, 表示end offset
+	for i := 0; i < len(mix.Offsets)-1; i++ {
+		length := mix.Offsets[i+1] - mix.Offsets[i]
+		entry := new(pb.Entry)
+		err := entry.Unmarshal(data[mix.Offsets[i] : mix.Offsets[i]+length])
+		utils.Check(err)
+
+		if y.ShouldWriteValueToLSM(entry) {
+			if replay { //replay read
+				ret = append(ret, &pb.EntryInfo{
+					Log:           entry,
+					EstimatedSize: uint64(entry.Size()),
+				})
+			} else { //gc read
+				ret = append(ret, &pb.EntryInfo{
+					Log:           &pb.Entry{},
+					EstimatedSize: blockLength + 512,
+				})
+				return ret, blockLength, nil
+			}
+		} else {
+			//big value
+			entry.Value = nil
+			entry.Meta |= uint32(y.BitValuePointer)
+			ret = append(ret, &pb.EntryInfo{
+				Log:           entry,
+				EstimatedSize: blockLength + 512,
+				ExtentID:      extentID,
+				Offset:        offset,
+			})
+			utils.AssertTrue(len(mix.Offsets) == 2)
+			return ret, blockLength, nil
+		}
+	}
+	return ret, blockLength, nil
+}
+
+func readBlock(reader io.Reader) (pb.Block, error) {
 
 	var buf [512]byte
 
@@ -431,22 +565,9 @@ func readBlock(reader io.ReadSeeker, readAll bool) (pb.Block, error) {
 		return pb.Block{}, err
 	}
 
-	/*
-		checkSum := binary.BigEndian.Uint32(buf[:4])
-		blockLength := binary.BigEndian.Uint32(buf[4:8])
-		lazy := binary.BigEndian.Uint16(buf[4:10])
-		len := binary.BigEndian.Uint32(buf[10:14])
-
-		var UserData []byte
-		if len > 0 && len < 512 {
-			UserData = buf[14 : 14+len]
-		}
-	*/
 	checkSum := binary.BigEndian.Uint32(buf[:4])
 	index := 4
 	blockLength, n := binary.Uvarint(buf[index:])
-	index += n
-	lazy, n := binary.Uvarint(buf[index:])
 	index += n
 	len, n := binary.Uvarint(buf[index:])
 	index += n
@@ -459,18 +580,6 @@ func readBlock(reader io.ReadSeeker, readAll bool) (pb.Block, error) {
 		UserData = buf[index : index+int(len)]
 	}
 
-	//如果数据量很大,属于lazy, 在上层replay的时候,不会被读上去
-	if !readAll && lazy > 0 {
-		reader.Seek(int64(blockLength), io.SeekCurrent)
-		return pb.Block{
-			CheckSum:    checkSum,
-			BlockLength: uint32(blockLength),
-			Lazy:        uint32(lazy),
-			Data:        nil,
-			UserData:    UserData,
-		}, nil
-
-	}
 	data := make([]byte, blockLength, blockLength)
 	_, err = io.ReadFull(reader, data)
 
@@ -494,6 +603,38 @@ func readBlock(reader io.ReadSeeker, readAll bool) (pb.Block, error) {
 		BlockLength: uint32(blockLength),
 		Data:        data,
 		UserData:    UserData,
-		Lazy:        uint32(lazy),
 	}, nil
+}
+
+/*
+func extractLog(block *pb.Block) []*pb.Entry {
+	var mix pspb.MixedLog
+	utils.Check(mix.Unmarshal(block.UserData))
+	ret := make([]*pb.Entry, len(mix.Offsets)-1, len(mix.Offsets)-1)
+	//FIXME: offsets换成len, 表示end offset
+	for i := 0; i < len(mix.Offsets)-1; i++ {
+		length := mix.Offsets[i+1] - mix.Offsets[i]
+		entry := new(pb.Entry)
+		err := entry.Unmarshal(block.Data[mix.Offsets[i] : mix.Offsets[i]+length])
+		utils.Check(err)
+		ret[i] = entry
+	}
+	return ret
+}
+*/
+
+func sizeOfEntries(entries []*pb.EntryInfo) int {
+	ret := 0
+	for i := range entries {
+		ret += entries[i].Size()
+	}
+	return ret
+}
+
+func sizeOfBlocks(blocks []*pb.Block) uint32 {
+	ret := uint32(0)
+	for i := range blocks {
+		ret += 512 + uint32(blocks[i].BlockLength)
+	}
+	return ret
 }

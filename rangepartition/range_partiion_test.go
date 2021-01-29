@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/journeymidnight/autumn/proto/pspb"
+	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/rangepartition/skiplist"
 	"github.com/journeymidnight/autumn/streamclient"
 	"github.com/journeymidnight/autumn/xlog"
@@ -25,39 +25,48 @@ func TestEstimateSize(t *testing.T) {
 	bigValue := []byte(fmt.Sprintf("%01048576d", 10)) //1MB
 	smallValue := []byte(fmt.Sprintf("%01048d", 10))  //1KB
 
-	cases := []request{
-		{
-			Entry: pspb.Entry{
-				Key:   y.KeyWithTs([]byte("hello"), 0),
-				Value: []byte("test"),
+	requests := []*request{
+		&request{
+			entries: []*pb.EntryInfo{{Log: &pb.Entry{Key: y.KeyWithTs([]byte("hello"), 0), Value: []byte("test")}}},
+		},
+		&request{
+			entries: []*pb.EntryInfo{
+				{
+					Log: &pb.Entry{
+						Key:   y.KeyWithTs([]byte("hello1"), 0),
+						Value: bigValue,
+					},
+				},
 			},
 		},
-		{
-			Entry: pspb.Entry{
-				Key:   y.KeyWithTs([]byte("hello1"), 0),
-				Value: bigValue,
+		&request{
+			entries: []*pb.EntryInfo{
+				{
+					Log: &pb.Entry{
+						Key:   y.KeyWithTs([]byte("hello2"), 0),
+						Value: smallValue,
+					},
+				},
 			},
 		},
-		{
-			Entry: pspb.Entry{
-				Key:   y.KeyWithTs([]byte("hello2"), 0),
-				Value: smallValue,
-			},
-		},
-		{
-			Entry: pspb.Entry{
-				Key:       y.KeyWithTs([]byte("hello3"), 0),
-				Value:     []byte("testasdfasdfasdfasdfasdfafafasdfasdfa"),
-				ExpiresAt: 1243434343434,
+		&request{
+			entries: []*pb.EntryInfo{
+				{
+					Log: &pb.Entry{
+						Key:       y.KeyWithTs([]byte("hello3"), 0),
+						Value:     []byte("testasdfasdfasdfasdfasdfafafasdfasdfa"),
+						ExpiresAt: 1243434343434,
+					},
+				},
 			},
 		},
 	}
 
 	x := skiplist.NewSkiplist(10 * MB)
 	pre := x.MemSize()
-	for i := range cases {
-		l := int64(estimatedSizeInSkl(&cases[i]))
-		writeToLSM(x, &cases[i])
+	for i := range requests {
+		l := int64(estimatedSizeInSkl(requests[i].entries))
+		_writeToLSM(x, requests[i])
 		fmt.Printf("%d <= %d\n", x.MemSize()-pre, l)
 		require.True(t, x.MemSize()-pre <= l)
 		pre = x.MemSize()
@@ -65,25 +74,33 @@ func TestEstimateSize(t *testing.T) {
 
 }
 
-func writeToLSM(skl *skiplist.Skiplist, req *request) int64 {
-	entry := &req.Entry
-	if shouldWriteValueToLSM(&req.Entry) { // Will include deletion / tombstone case.
-		skl.Put(entry.Key,
-			y.ValueStruct{
-				Value:     entry.Value,
-				Meta:      getLowerByte(entry.Meta),
-				UserMeta:  getLowerByte(entry.UserMeta),
-				ExpiresAt: entry.ExpiresAt,
-			})
-	} else {
-		skl.Put(entry.Key,
-			y.ValueStruct{
-				Value:     req.vp.Encode(),
-				Meta:      getLowerByte(entry.Meta) | bitValuePointer,
-				UserMeta:  getLowerByte(entry.UserMeta),
-				ExpiresAt: entry.ExpiresAt,
-			})
+//helper function for TestEstimateSize.
+
+func _writeToLSM(skl *skiplist.Skiplist, req *request) int64 {
+	for _, entry := range req.entries {
+		if y.ShouldWriteValueToLSM(entry.Log) { // Will include deletion / tombstone case.
+			skl.Put(entry.Log.Key,
+				y.ValueStruct{
+					Value:     entry.Log.Value,
+					Meta:      getLowerByte(entry.Log.Meta),
+					UserMeta:  getLowerByte(entry.Log.UserMeta),
+					ExpiresAt: entry.Log.ExpiresAt,
+				})
+		} else {
+			vp := valuePointer{
+				entry.ExtentID,
+				entry.Offset,
+			}
+			skl.Put(entry.Log.Key,
+				y.ValueStruct{
+					Value:     vp.Encode(),
+					Meta:      getLowerByte(entry.Log.Meta) | y.BitValuePointer,
+					UserMeta:  getLowerByte(entry.Log.UserMeta),
+					ExpiresAt: entry.Log.ExpiresAt,
+				})
+		}
 	}
+
 	return skl.MemSize()
 }
 
@@ -95,7 +112,7 @@ func runRPTest(t *testing.T, test func(t *testing.T, rp *RangePartition)) {
 
 	defer logStream.Close()
 	defer rowStream.Close()
-	rp := OpenRangePartition(rowStream, logStream)
+	rp := OpenRangePartition(rowStream, logStream, logStream.(streamclient.BlockReader))
 	defer func() {
 		require.NoError(t, rp.Close())
 	}()
@@ -151,15 +168,15 @@ func TestGetBig(t *testing.T) {
 		v, err := rp.get([]byte("key1"), 0)
 
 		require.NoError(t, err)
-		require.Equal(t, bigValue, v)
+		require.Equal(t, len(bigValue), len(v))
 
 	})
 
 }
 
 /*
-1. replay
-2. compact
-3. big iterator
-4. test
+0. interface for KV
+1. replay/compact
+2. big iterator
+3. test
 */

@@ -9,9 +9,11 @@ import (
 	"github.com/pkg/errors"
 )
 
+/*
 var (
 	versionKey = "AspiraVersionKey"
 )
+*/
 
 func EtcdSetKV(c *clientv3.Client, key string, val []byte, opts ...clientv3.OpOption) error {
 	kv := clientv3.NewKV(c)
