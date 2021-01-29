@@ -7,6 +7,7 @@ import (
 
 	"github.com/journeymidnight/autumn/extent"
 	"github.com/journeymidnight/autumn/proto/pb"
+	"github.com/journeymidnight/autumn/rangepartition/y"
 	"github.com/journeymidnight/autumn/utils"
 )
 
@@ -24,29 +25,31 @@ func NewMockStreamClient(fileName string, id uint64) StreamClient {
 	}
 }
 
-//single thread
-func (client *MockStreamClient) Append(ctx context.Context, blocks []*pb.Block, userData interface{}) (*Op, error) {
-
-	cmp := client.ex.CommitLength()
+//block API, entries has been batched
+func (client *MockStreamClient) AppendEntries(ctx context.Context, entries []*pb.EntryInfo) (uint64, uint32, error) {
+	commitLength := client.ex.CommitLength()
+	blocks, j, k := entriesToBlocks(entries, commitLength)
 	client.ex.Lock()
 	defer client.ex.Unlock()
-
-	offsets, err := client.ex.AppendBlocks(blocks, nil)
-	utils.Check(err)
-
-	for i := range blocks {
-		cmp += blocks[i].BlockLength + 512
+	offsets, err := client.ex.AppendBlocks(blocks, &commitLength)
+	if err != nil {
+		return 0, 0, err
 	}
-	utils.AssertTrue(cmp == client.ex.CommitLength())
+	for i := 0; i < len(entries)-j; i++ {
+		entries[j+i].ExtentID = 100
+		entries[j+i].Offset = offsets[k+i]
+	}
+	//change entries
+	return 100, commitLength, nil
+}
 
-	op := opPool.Get().(*Op)
-	op.Reset(blocks, userData)
-
-	op.wg.Done()
-	op.Wait()
-
-	op.Offsets = offsets
-	return op, nil
+//block API
+func (client *MockStreamClient) Append(ctx context.Context, blocks []*pb.Block) (uint64, []uint32, error) {
+	commitLength := client.ex.CommitLength()
+	client.ex.Lock()
+	offsets, err := client.ex.AppendBlocks(blocks, &commitLength)
+	client.ex.Unlock()
+	return 100, offsets, err
 }
 
 func (client *MockStreamClient) Close() {
@@ -59,7 +62,7 @@ func (client *MockStreamClient) Connect() error {
 }
 
 func (client *MockStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, error) {
-	blocks, err := client.ex.ReadBlocks(offset, numOfBlocks, (32 << 20), true)
+	blocks, err := client.ex.ReadBlocks(offset, numOfBlocks, (32 << 20))
 	if err == extent.EndOfExtent || err == extent.EndOfStream {
 		return blocks, io.EOF
 	}
@@ -69,27 +72,9 @@ func (client *MockStreamClient) Read(ctx context.Context, extentID uint64, offse
 	return blocks, err
 }
 
-type MocSeqReader struct {
-	sc            *MockStreamClient
-	currentOffset uint32
-	opt           ReaderOption
-}
+func (client *MockStreamClient) NewLogEntryIter(opt ReadOption) LogEntryIter {
 
-func (reader *MocSeqReader) Read(ctx context.Context) ([]*pb.Block, BlockBase, error) {
-	blocks, err := reader.sc.ex.ReadBlocks(reader.currentOffset, 8, (32 << 20), reader.opt.ReadAll)
-	bb := 
-	if err == extent.EndOfExtent || err == extent.EndOfStream {
-		return blocks, io.EOF
-	}
-	if err != nil {
-		return nil, err
-	}
-	reader.currentOffset += utils.SizeOfBlocks(blocks)
-	return blocks, nil
-}
-
-func (client *MockStreamClient) NewSeqReader(opt ReaderOption) SeqReader {
-	x := &MocSeqReader{
+	x := &MockLockEntryIter{
 		sc:  client,
 		opt: opt,
 	}
@@ -99,4 +84,81 @@ func (client *MockStreamClient) NewSeqReader(opt ReaderOption) SeqReader {
 		x.currentOffset = opt.Offset
 	}
 	return x
+}
+
+type MockLockEntryIter struct {
+	sc            *MockStreamClient
+	currentOffset uint32
+	opt           ReadOption
+	noMore        bool
+	cache         []*pb.EntryInfo
+}
+
+func (iter *MockLockEntryIter) HasNext() (bool, error) {
+	if len(iter.cache) == 0 {
+		if iter.noMore {
+			return false, nil
+		}
+		err := iter.receiveBlocks()
+		if err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+func (iter *MockLockEntryIter) receiveBlocks() error {
+	blocks, err := iter.sc.ex.ReadBlocks(iter.currentOffset, 8, (32 << 20))
+	if err != nil && err != extent.EndOfExtent && err != extent.EndOfStream {
+		return err
+	}
+
+	if err == extent.EndOfExtent || err == extent.EndOfStream {
+		iter.noMore = true
+	}
+	iter.cache = nil
+	offset := iter.currentOffset
+
+	for i := range blocks {
+		for _, entry := range y.ExtractLogEntry(blocks[i]) {
+			if ShouldWriteValueToLSM(entry) {
+				if iter.opt.Replay { //replay read
+					iter.cache = append(iter.cache, &pb.EntryInfo{
+						Log:           entry,
+						EstimatedSize: uint64(entry.Size()),
+					})
+				} else { //gc read
+					iter.cache = append(iter.cache, &pb.EntryInfo{
+						Log:           &pb.Entry{},
+						EstimatedSize: uint64(blocks[i].BlockLength) + 512,
+					})
+					break
+				}
+			} else {
+				//big value
+				entry.Value = nil
+				entry.Meta |= uint32(y.BitValuePointer)
+				iter.cache = append(iter.cache, &pb.EntryInfo{
+					Log:           entry,
+					EstimatedSize: uint64(blocks[i].BlockLength) + 512,
+					ExtentID:      100,
+					Offset:        offset,
+				})
+				//utils.AssertTrue(len(mix.Offsets) == 2)
+				break
+			}
+		}
+		offset += 512 + blocks[i].BlockLength
+	}
+	iter.currentOffset += SizeOfBlocks(blocks)
+	return nil
+}
+
+func (iter *MockLockEntryIter) Next() *pb.EntryInfo {
+	if ok, err := iter.HasNext(); !ok || err != nil {
+		return nil
+	}
+	ret := iter.cache[0]
+	iter.cache = iter.cache[1:]
+	return ret
 }

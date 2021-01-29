@@ -32,18 +32,34 @@ syntax = "proto3";
 
 package pspb;
 
-
-message Entry {
-	bytes  key = 1;
-	bytes  value = 2;
-	uint32 meta = 3;
-	uint32 UserMeta = 4;
-	uint64 ExpiresAt = 5;
-}
-
-
 message MixedLog {
 	repeated uint32 offsets = 1;
+}
+
+/*
+PART_%d/range => [startKey, endKey]
+PART_%d/blobStreams => [id,...,id]
+PART_%d/logStream => id
+PART_%d/rowStream => id
+PART_%d/tables => [(extentID,offset),...,(extentID,offset)]
+*/
+
+message Range {
+	bytes startKey = 1;
+	bytes endKey = 2;
+}
+
+message TableLocation {
+	uint64 extentID = 1;
+	uint32 offset = 2;
+}
+
+message PartitionMeta {
+	Range range = 1;
+	repeated uint64 blobStreams = 2;
+	uint64 logStream = 3;
+	uint64 rowStream = 4;
+	repeated TableLocation tables = 5;
 }
 
 message MetaStreamData {
@@ -59,15 +75,13 @@ enum RawBlockType {
 	meta = 1;
 }
 
-
-
 //BlockMeta will be marshaled into pb.Block.userdata
 message RawBlockMeta {
 	RawBlockType type = 1;
 	uint32  CompressedSize = 2;
 	uint32  UnCompressedSize  = 3;
-	uint64  headExtentID = 4;
-	uint32  headOffset = 5;
+	uint64  vpExtentID = 4;
+	uint32  vpOffset = 5;
 	uint64  seqNum = 6;
 }
 

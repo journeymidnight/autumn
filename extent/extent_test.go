@@ -84,7 +84,7 @@ func TestReadWriteBlockUserData(t *testing.T) {
 	assert.Nil(t, err)
 
 	f.resetPos()
-	block1, err := readBlock(f, true)
+	block1, err := readBlock(f)
 
 	assert.Equal(t, block, block1)
 }
@@ -102,7 +102,7 @@ func TestReadWriteBlock(t *testing.T) {
 	assert.Nil(t, err)
 
 	f.resetPos()
-	block1, err := readBlock(f, true)
+	block1, err := readBlock(f)
 
 	assert.Equal(t, block, block1)
 }
@@ -134,8 +134,7 @@ func TestAppendReadFile(t *testing.T) {
 	assert.Nil(t, err)
 
 	//single thread read
-	retBlocks, err := extent.ReadBlocks(ret[0], 4, (20 << 20), true)
-	assert.Nil(t, err)
+	retBlocks, err := extent.ReadBlocks(ret[0], 4, (20 << 20))
 
 	assert.Equal(t, cases, retBlocks)
 
@@ -151,9 +150,11 @@ func TestAppendReadFile(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		go func() {
 			for ele := range ch {
-				blocks, err := extent.ReadBlocks(ele.offset, 1, (20 << 20), true)
+				blocks, err := extent.ReadBlocks(ele.offset, 1, (20 << 20))
 				require.Nil(t, err)
+
 				require.Equal(t, cases[ele.caseIndex], blocks[0])
+
 				atomic.AddInt32(&complets, 1)
 				if atomic.LoadInt32(&complets) == int32(len(cases)) {
 					close(ch)
@@ -215,7 +216,8 @@ func TestReplayExtent(t *testing.T) {
 	assert.Equal(t, commit, ex.CommitLength())
 
 	//read test
-	blocks, err := ex.ReadBlocks(512, 1, (20 << 20), true) //read object1
+	blocks, err := ex.ReadBlocks(512, 1, (20 << 20)) //read object1
+
 	assert.Nil(t, err)
 	assert.Equal(t, cases[0], blocks[0])
 
@@ -257,46 +259,4 @@ func BenchmarkExtent(b *testing.B) {
 		}
 		commit += 512 + 4096
 	}
-}
-
-func TestLazyReadWriteBlockUserData(t *testing.T) {
-	data := make([]byte, 1024)
-	block := pb.Block{
-		CheckSum:    utils.AdlerCheckSum(data),
-		BlockLength: 1024,
-		Data:        data,
-		UserData:    []byte("hello"),
-	}
-	block1 := pb.Block{
-		CheckSum:    utils.AdlerCheckSum(data),
-		BlockLength: 1024,
-		Data:        data,
-		UserData:    []byte("world"),
-		Lazy:        1,
-	}
-	block2 := pb.Block{
-		CheckSum:    utils.AdlerCheckSum(data),
-		BlockLength: 1024,
-		Data:        data,
-		UserData:    []byte("test"),
-		Lazy:        1,
-	}
-
-	f := newMemory(4000)
-	writeBlock(f, &block)
-	writeBlock(f, &block1)
-	writeBlock(f, &block2)
-
-	f.resetPos()
-	rBlock, err := readBlock(f, false)
-	require.Nil(t, err)
-	require.Equal(t, block, rBlock)
-	rBlock1, err := readBlock(f, false)
-	require.Nil(t, err)
-	block1.Data = nil
-	require.Equal(t, block1, rBlock1)
-	rBlock2, err := readBlock(f, false)
-	block2.Data = nil
-	require.Equal(t, block2, rBlock2)
-
 }

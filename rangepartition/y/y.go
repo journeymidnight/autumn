@@ -19,14 +19,15 @@ package y
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"reflect"
 	"unsafe"
+
+	"github.com/journeymidnight/autumn/proto/pb"
+	"github.com/journeymidnight/autumn/proto/pspb"
+	"github.com/journeymidnight/autumn/utils"
 )
-
-
-
-
 
 // KeyWithTs generates a new key by appending ts to key.
 func KeyWithTs(key []byte, ts uint64) []byte {
@@ -41,6 +42,12 @@ func CompareKeys(key1, key2 []byte) int {
 		return cmp
 	}
 	return bytes.Compare(key1[len(key1)-8:], key2[len(key2)-8:])
+}
+
+func FormatKey(key []byte) string {
+	ts := ParseTs(key)
+	k := ParseKey(key)
+	return fmt.Sprintf("%s~%d", k, ts)
 }
 
 // ParseKey parses the actual key from the key bytes.
@@ -116,4 +123,28 @@ func BytesToU32Slice(b []byte) []uint32 {
 	hdr.Cap = hdr.Len
 	hdr.Data = uintptr(unsafe.Pointer(&b[0]))
 	return u32s
+}
+
+const (
+	BitDelete       byte = 1 << 0 // Set if the key has been deleted.
+	BitValuePointer byte = 1 << 1 // Set if the value is NOT stored directly next to key.
+)
+
+func ShouldWriteValueToLSM(e *pb.Entry) bool {
+	return e.Meta&uint32(BitValuePointer) == 0 && len(e.Value) <= (4<<10)
+}
+
+func ExtractLogEntry(block *pb.Block) []*pb.Entry {
+	var mix pspb.MixedLog
+	utils.Check(mix.Unmarshal(block.UserData))
+	ret := make([]*pb.Entry, len(mix.Offsets)-1, len(mix.Offsets)-1)
+	//FIXME: offsets换成len, 表示end offset
+	for i := 0; i < len(mix.Offsets)-1; i++ {
+		length := mix.Offsets[i+1] - mix.Offsets[i]
+		entry := new(pb.Entry)
+		err := entry.Unmarshal(block.Data[mix.Offsets[i] : mix.Offsets[i]+length])
+		utils.Check(err)
+		ret[i] = entry
+	}
+	return ret
 }

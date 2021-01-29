@@ -283,3 +283,15 @@ journal的话, 这些优化可能都不需要
 
 ## partion layer
 
+ETCD存储结构in PM(Partition Manager)
+
+```
+PART_%d/range => [startKey, endKey]
+PART_%d/blobStreams => [id,...,id]
+PART_%d/logStream => id
+PART_%d/rowStream => id
+PART_%d/tables => [(extentID,offset),...,(extentID,offset)]
+```
+
+GetTables
+SetTables

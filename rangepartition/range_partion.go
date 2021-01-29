@@ -3,13 +3,13 @@ package rangepartition
 import (
 	"bytes"
 	"context"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
 	"github.com/dgryski/go-farm"
+	"github.com/journeymidnight/autumn/manager/pmclient"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/rangepartition/skiplist"
@@ -24,13 +24,7 @@ import (
 const (
 	KB                = 1024
 	MB                = KB * 1024
-	ValueThreshold    = 4 * KB
 	maxEntriesInBlock = 100
-	maxMixedBlockSize = 4 * KB
-
-	//meta
-	bitDelete       byte = 1 << 0 // Set if the key has been deleted.
-	bitValuePointer byte = 1 << 1 // Set if the value is NOT stored directly next to key.
 
 	maxSkipList = 2 * KB
 )
@@ -41,40 +35,95 @@ var (
 	ErrBlockedWrites = errors.New("Writes are blocked, possibly due to DropAll or Close")
 )
 
-func MaxBlockUserDataSize() int {
-	unsafe.Sizeof(pb.Block{})
-}
-
 type RangePartition struct {
 	//metaStream *streamclient.StreamClient //设定metadata结构
-	rowStream   streamclient.StreamClient //设定checkpoint结构
+	blobStreams []streamclient.StreamClient
 	logStream   streamclient.StreamClient
-	logRotates  int32
-	writeCh     chan *request
-	blockWrites int32
-	mt          *skiplist.Skiplist
-	imm         []*skiplist.Skiplist
-	utils.SafeMutex
-	//sync.RWMutex //protect mt,imm when swapping mt, imm
+	//从ValueStruct中得到的地址, 用blockReader读出来, 因为它可能在[logStream, []blobStreams]里面
+	//我们不需要读每个stream
+	blockReader streamclient.BlockReader
+
+	rowStream       streamclient.StreamClient
+	logRotates      int32
+	writeCh         chan *request
+	blockWrites     int32
+	mt              *skiplist.Skiplist
+	imm             []*skiplist.Skiplist
+	utils.SafeMutex //protect mt,imm when swapping mt, imm
+
 	flushStopper *utils.Stopper
 	flushChan    chan flushTask
 	writeStopper *utils.Stopper
-	tableLock    sync.RWMutex //protect tables
+	tableLock    utils.SafeMutex //protect tables
 	tables       []*table.Table
 	seqNumber    uint64
+
+	PARTID   uint64
+	startKey []byte
+	endKey   []byte
+	pmClient pmclient.PMClient
 }
 
-func OpenRangePartition(rowStream streamclient.StreamClient, logStream streamclient.StreamClient) *RangePartition {
+//TODO
+//interface KV save some values
+
+func OpenRangePartition(rowStream streamclient.StreamClient,
+	logStream streamclient.StreamClient, blockReader streamclient.BlockReader,
+	startKey []byte, endKey []byte, tableLocs []*pspb.TableLocation, blobStreams []streamclient.StreamClient,
+	pmclient pmclient.PMClient) *RangePartition {
 	rp := &RangePartition{
 		rowStream:   rowStream,
 		logStream:   logStream,
+		blockReader: blockReader,
 		logRotates:  0,
 		mt:          skiplist.NewSkiplist(maxSkipList),
 		imm:         nil,
 		blockWrites: 0,
+		startKey:    startKey,
+		endKey:      endKey,
+		pmClient:    pmclient,
+		blobStreams: blobStreams,
 	}
 	rp.startMemoryFlush()
+
 	rp.startWriteLoop()
+
+	//replay log
+	//open tables
+	for _, tLoc := range tableLocs {
+	retry:
+		tbl, err := table.OpenTable(rp.rowStream, tLoc.ExtentID, tLoc.Offset)
+		if err != nil {
+			xlog.Logger.Error(err)
+			time.Sleep(1 * time.Second)
+			goto retry
+		}
+		rp.tables = append(rp.tables, tbl)
+	}
+
+	//search all tables, find the table who has the most lasted seqNum
+	seq := uint64(0)
+	var lastTable *table.Table
+	for _, table := range rp.tables {
+		if table.LastSeq > seq {
+			seq = table.LastSeq
+			lastTable = table
+		}
+	}
+
+	replay := func(ei *pb.EntryInfo) bool {
+
+	}
+
+	if lastTable == nil {
+		replayLog(rp.logStream, 0, 0, replay)
+	} else {
+		replayLog(rp.logStream, lastTable.VpExtentID, lastTable.VpOffset, replay)
+	}
+
+	//set Newest SeqNum
+
+	//start real write
 	return rp
 }
 
@@ -151,8 +200,10 @@ func (rp *RangePartition) handleFlushTask(ft flushTask) error {
 	rp.tableLock.Lock()
 	rp.tables = append(rp.tables, tbl)
 	rp.tableLock.Unlock()
+
+	xlog.Logger.Debugf("Flushed from %s to %s on vlog %+v\n", y.FormatKey(first), y.FormatKey(last), ft.vptr)
+
 	//
-	xlog.Logger.Debugf("Flushed from %s to %s on vlog %+v\n", first, last, ft.vptr)
 	return nil
 }
 
@@ -187,6 +238,7 @@ func (rp *RangePartition) flushMemtable() {
 			// We close db.flushChan now, instead of sending a nil ft.mt.
 			continue
 		}
+		//save to rowStream
 		for {
 			err := rp.handleFlushTask(ft)
 			if err == nil {
@@ -203,6 +255,24 @@ func (rp *RangePartition) flushMemtable() {
 			xlog.Logger.Errorf("Failure while flushing memtable to disk: %v. Retrying...", err)
 			time.Sleep(time.Second)
 		}
+
+		//save table offset in PM
+		var tableLocs []*pspb.TableLocation
+		rp.tableLock.RLock()
+		for _, t := range rp.tables {
+			tableLocs = append(tableLocs, &t.Loc)
+		}
+		rp.tableLock.RUnlock()
+
+		for {
+			err := rp.pmClient.SetTables(rp.PARTID, tableLocs)
+			if err != nil {
+				xlog.Logger.Errorf("failed to set tableLocs for %d, retry...", rp.PARTID)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			break
+		}
 	}
 }
 
@@ -212,29 +282,6 @@ func (rp *RangePartition) Connect() error {
 	return err
 }
 
-const vptrSize = unsafe.Sizeof(valuePointer{})
-
-type valuePointer struct {
-	extentID uint64
-	offset   uint32
-}
-
-// Encode encodes Pointer into byte buffer.
-func (p valuePointer) Encode() []byte {
-	b := make([]byte, vptrSize)
-	// Copy over the content from p to b.
-	*(*valuePointer)(unsafe.Pointer(&b[0])) = p
-	return b
-}
-
-// Decode decodes the value pointer into the provided byte buffer.
-func (p *valuePointer) Decode(b []byte) {
-	// Copy over data from b into p. Using *p=unsafe.pointer(...) leads to
-	// pointer alignment issues. See https://github.com/dgraph-io/badger/issues/1096
-	// and comment https://github.com/dgraph-io/badger/pull/1097#pullrequestreview-307361714
-	copy(((*[vptrSize]byte)(unsafe.Pointer(p))[:]), b[:vptrSize])
-}
-
 var requestPool = sync.Pool{
 	New: func() interface{} {
 		return new(request)
@@ -242,42 +289,50 @@ var requestPool = sync.Pool{
 }
 
 type request struct {
-	// Input values
-	pspb.Entry
+	// Input values, 这个以后可能有多个Entry..., 比如一个request里面
+	//A = "x", A:time = "y", A:md5 = "asdfasdf"
+	entries []*pb.EntryInfo
 
 	// Output values and wait group stuff below
 	wg  sync.WaitGroup
-	vp  valuePointer
 	Err error
 	ref int32
 }
 
+func estimatedSizeInSkl(es []*pb.EntryInfo) int {
+	size := 0
+	for i := range es {
+		size += _estimatedSizeInSkl(es[i].Log)
+	}
+	return size
+}
+
 //key + valueStruct
-func estimatedSizeInSkl(r *request) int {
-	sz := len(r.Entry.Key)
-	if shouldWriteValueToLSM(&r.Entry) {
-		sz += len(r.Entry.Value) + 2 // Meta, UserMeta
+func _estimatedSizeInSkl(e *pb.Entry) int {
+	sz := len(e.Key)
+	if y.ShouldWriteValueToLSM(e) {
+		sz += len(e.Value) + 2 // Meta, UserMeta
 	} else {
-		sz += int(vptrSize) + 2 // vptrSize for ValuePointer, 2 for metas.
+		sz += int(vptrSize) + 2 // vptrSize for valuePointer, 2 for metas.
 	}
 
-	if r.ExpiresAt == 0 {
-		sz += 1
-	} else {
-		sz += utils.SizeVarint(r.ExpiresAt)
+	sz += utils.SizeVarint(e.ExpiresAt)
 
-	}
 	sz += skiplist.MaxNodeSize + 8 //8 is nodeAlign
 	return sz
 }
 
 //size in log
 func (r *request) Size() int {
-	return r.Entry.Size()
+	size := 0
+	for i := range r.entries {
+		size += r.entries[i].Log.Size()
+	}
+	return size
 }
 
 func (req *request) reset() {
-	req.Entry.Reset()
+	req.entries = nil
 	req.wg = sync.WaitGroup{}
 	req.Err = nil
 	req.ref = 0
@@ -302,125 +357,13 @@ func (req *request) Wait() error {
 	return err
 }
 
-type mixedBlock struct {
-	offsets *pspb.MixedLog
-	data    []byte
-	tail    int
-}
-
-func NewMixedBlock() *mixedBlock {
-	return &mixedBlock{
-		offsets: new(pspb.MixedLog),
-		data:    make([]byte, maxMixedBlockSize, maxMixedBlockSize),
-		tail:    0,
-	}
-}
-
-func (mb *mixedBlock) CanFill(entry *pspb.Entry) bool {
-	if mb.tail+entry.Size() > maxMixedBlockSize || len(mb.offsets.Offsets) >= maxEntriesInBlock {
-		return false
-	}
-	return true
-}
-
-func (mb *mixedBlock) Fill(entry *pspb.Entry) uint32 {
-	mb.offsets.Offsets = append(mb.offsets.Offsets, uint32(mb.tail))
-	entry.MarshalTo(mb.data[mb.tail:])
-	offset := mb.tail
-	mb.tail += entry.Size()
-	return uint32(offset)
-}
-
-func (mb *mixedBlock) ToBlock() *pb.Block {
-	mb.offsets.Offsets = append(mb.offsets.Offsets, uint32(mb.tail))
-	userData, err := mb.offsets.Marshal()
-	utils.Check(err)
-	block := &pb.Block{
-		BlockLength: uint32(maxMixedBlockSize),
-		UserData:    userData,
-		CheckSum:    utils.AdlerCheckSum(mb.data),
-		Data:        mb.data,
-	}
-	return block
-}
-
 func (rp *RangePartition) writeLog(reqs []*request) (valuePointer, error) {
-
 	if atomic.LoadInt32(&rp.blockWrites) == 1 {
 		return valuePointer{}, ErrBlockedWrites
 	}
 	utils.AssertTrue(len(reqs) != 0)
-	//sort
-	sort.Slice(reqs, func(i, j int) bool {
-		return len(reqs[i].Value) < len(reqs[j].Value)
-	})
 
-	var blocks []*pb.Block
-	var mblock *mixedBlock = nil
-	i := 0
-
-	//merge small reqs into on block
-	for ; i < len(reqs); i++ {
-		if !shouldWriteValueToLSM(&reqs[i].Entry) {
-			break
-		}
-		if mblock == nil {
-			mblock = NewMixedBlock()
-		}
-		if !mblock.CanFill(&reqs[i].Entry) {
-			blocks = append(blocks, mblock.ToBlock())
-			mblock = NewMixedBlock()
-		}
-		mblock.Fill(&reqs[i].Entry)
-	}
-
-	if mblock != nil {
-		blocks = append(blocks, mblock.ToBlock())
-	}
-
-	j := i //j is start of Bigger Block
-	//append bigger blocks, valuePointer points to a block
-	for ; i < len(reqs); i++ {
-		blockLength := utils.Ceil(uint32(reqs[i].Size()), 512)
-		data := make([]byte, blockLength)
-		reqs[i].Entry.MarshalTo(data)
-		var mix pspb.MixedLog
-		mix.Offsets = []uint32{uint32(reqs[i].Size())}
-		blockUserData, err := mix.Marshal()
-		utils.Check(err)
-
-		blocks = append(blocks, &pb.Block{
-			BlockLength: blockLength,
-			UserData:    blockUserData,
-			Data:        data,
-			CheckSum:    utils.AdlerCheckSum(data),
-			Lazy:        1, //big block is lazy, when replaying the log, do not have to read/send lazy data
-		})
-	}
-
-	op, err := rp.logStream.Append(context.Background(), blocks, nil)
-	defer op.Free()
-	if err != nil {
-		return valuePointer{}, err
-	}
-	op.Wait()
-	if op.Err != nil {
-		return valuePointer{}, op.Err
-	}
-	for ; j < len(reqs); j++ {
-		reqs[j].vp = valuePointer{
-			op.ExtentID,
-			op.Offsets[j],
-		}
-	}
-	utils.AssertTrue(len(op.Offsets) == len(blocks))
-	utils.AssertTrue(len(op.Offsets) > 0)
-	//endOfStream := op.Offsets[len(op.Offsets)-1] + blocks[len(blocks)-1].BlockLength
-	//return head of this op on commitlog
-	return valuePointer{
-		op.ExtentID,
-		op.Offsets[0],
-	}, nil
+	return writeValueLog(rp.logStream, reqs)
 }
 
 // writeRequests is called serially by only one goroutine.
@@ -443,7 +386,11 @@ func (rp *RangePartition) writeRequests(reqs []*request) error {
 		done(err)
 		return err
 	}
-	seqNum := y.ParseTs(reqs[len(reqs)-1].Key)
+
+	//lastReq := reqs[len(reqs)-1]
+	//e := lastReq.entries[len(lastReq.entries)-1]
+	//seqNum := y.ParseTs(e.Log.Key)
+	seqNum := atomic.AddUint64(&rp.seqNumber, 1)
 
 	xlog.Logger.Info("Writing to memtable")
 	i := 0
@@ -475,34 +422,34 @@ func (rp *RangePartition) writeRequests(reqs []*request) error {
 	return nil
 }
 
-func shouldWriteValueToLSM(e *pspb.Entry) bool {
-	return len(e.Value) < ValueThreshold
-}
-
 func getLowerByte(a uint32) byte {
 	return byte(a & 0x000000FF)
 }
 
 func (rp *RangePartition) writeToLSM(req *request) error {
-	entry := &req.Entry
-	if shouldWriteValueToLSM(&req.Entry) { // Will include deletion / tombstone case.
-		rp.mt.Put(entry.Key,
-			y.ValueStruct{
-				Value:     entry.Value,
-				Meta:      getLowerByte(entry.Meta),
-				UserMeta:  getLowerByte(entry.UserMeta),
-				ExpiresAt: entry.ExpiresAt,
-			})
-	} else {
-		rp.mt.Put(entry.Key,
-			y.ValueStruct{
-				Value:     req.vp.Encode(),
-				Meta:      getLowerByte(entry.Meta) | bitValuePointer,
-				UserMeta:  getLowerByte(entry.UserMeta),
-				ExpiresAt: entry.ExpiresAt,
-			})
+	for _, entry := range req.entries {
+		if y.ShouldWriteValueToLSM(entry.Log) { // Will include deletion / tombstone case.
+			rp.mt.Put(entry.Log.Key,
+				y.ValueStruct{
+					Value:     entry.Log.Value,
+					Meta:      getLowerByte(entry.Log.Meta),
+					UserMeta:  getLowerByte(entry.Log.UserMeta),
+					ExpiresAt: entry.Log.ExpiresAt,
+				})
+		} else {
+			vp := valuePointer{
+				entry.ExtentID,
+				entry.Offset,
+			}
+			rp.mt.Put(entry.Log.Key,
+				y.ValueStruct{
+					Value:     vp.Encode(),
+					Meta:      getLowerByte(entry.Log.Meta) | y.BitValuePointer,
+					UserMeta:  getLowerByte(entry.Log.UserMeta),
+					ExpiresAt: entry.Log.ExpiresAt,
+				})
+		}
 	}
-
 	return nil
 }
 
@@ -594,7 +541,7 @@ func (rp *RangePartition) ensureRoomForWrite(reqs []*request, head valuePointer,
 	forceFlush := atomic.LoadInt32(&rp.logRotates) >= 1
 	n := int64(0)
 	for i := range reqs {
-		n += int64(estimatedSizeInSkl(reqs[i]))
+		n += int64(estimatedSizeInSkl(reqs[i].entries))
 	}
 	if !forceFlush && rp.mt.MemSize()+n < maxSkipList {
 		return nil
@@ -649,24 +596,33 @@ func (rp *RangePartition) get(userKey []byte, version uint64) ([]byte, error) {
 
 	if vs.Version == 0 {
 		return nil, errNotFound
-	} else if vs.Meta&bitDelete > 0 {
+	} else if vs.Meta&y.BitDelete > 0 {
 		return nil, errNotFound
 	}
 
-	if vs.Meta&bitValuePointer > 0 {
+	if vs.Meta&y.BitValuePointer > 0 {
 
 		var vp valuePointer
 		vp.Decode(vs.Value)
 
-		blocks, err := rp.logStream.Read(context.Background(), vp.extentID, vp.offset, 1)
-		utils.Check(err)
-		var mix pspb.MixedLog
-		utils.MustUnMarshal(blocks[0].UserData, &mix)
-		eSize := mix.Offsets[0]
-		var entry pspb.Entry
-		utils.MustUnMarshal(blocks[0].Data[:eSize], &entry)
-		return entry.Value, nil
-		//read value and decode
+		blocks, err := rp.blockReader.Read(context.Background(), vp.extentID, vp.offset, 1)
+		if err != nil {
+			return nil, err
+		}
+
+		entries := y.ExtractLogEntry(blocks[0])
+		return entries[0].Value, nil
+		/*
+			utils.Check(err)
+			var mix pspb.MixedLog
+			utils.MustUnMarshal(blocks[0].UserData, &mix)
+			eSize := mix.Offsets[0]
+			var entry pb.Entry
+			utils.MustUnMarshal(blocks[0].Data[:eSize], &entry)
+			return entry.Value, nil
+
+			//read value and decode
+		*/
 	}
 	return vs.Value, nil
 
@@ -737,7 +693,17 @@ func (rp *RangePartition) Close() error {
 }
 
 func (rp *RangePartition) writeAsync(key, value []byte, f func(error)) {
-	req, err := rp.sendToWriteCh(key, value)
+
+	newSeqNumber := atomic.AddUint64(&rp.seqNumber, 1)
+
+	e := &pb.EntryInfo{
+		Log: &pb.Entry{
+			Key:   y.KeyWithTs(key, newSeqNumber),
+			Value: value,
+		},
+	}
+
+	req, err := rp.sendToWriteCh([]*pb.EntryInfo{e})
 	if err != nil {
 		f(err)
 		return
@@ -750,8 +716,17 @@ func (rp *RangePartition) writeAsync(key, value []byte, f func(error)) {
 
 }
 
+//req.Wait will free the request
 func (rp *RangePartition) write(key, value []byte) error {
-	req, err := rp.sendToWriteCh(key, value)
+	newSeqNumber := atomic.AddUint64(&rp.seqNumber, 1)
+
+	e := &pb.EntryInfo{
+		Log: &pb.Entry{
+			Key:   y.KeyWithTs(key, newSeqNumber),
+			Value: value,
+		},
+	}
+	req, err := rp.sendToWriteCh([]*pb.EntryInfo{e})
 	if err != nil {
 		return err
 	}
@@ -759,7 +734,7 @@ func (rp *RangePartition) write(key, value []byte) error {
 }
 
 //block API
-func (rp *RangePartition) sendToWriteCh(key, value []byte) (*request, error) {
+func (rp *RangePartition) sendToWriteCh(entries []*pb.EntryInfo) (*request, error) {
 	if atomic.LoadInt32(&rp.blockWrites) == 1 {
 		return nil, ErrBlockedWrites
 	}
@@ -767,12 +742,37 @@ func (rp *RangePartition) sendToWriteCh(key, value []byte) (*request, error) {
 	req := requestPool.Get().(*request)
 	req.reset()
 
-	newSeqNumber := atomic.AddUint64(&rp.seqNumber, 1)
+	req.entries = entries
 
-	req.Key = y.KeyWithTs(key, newSeqNumber)
-	req.Value = value
 	req.wg.Add(1)
 	req.IncrRef()
 	rp.writeCh <- req
 	return req, nil
+}
+
+const vptrSize = unsafe.Sizeof(valuePointer{})
+
+type valuePointer struct {
+	extentID uint64
+	offset   uint32
+}
+
+func (p valuePointer) Empty() bool {
+	return p.extentID == 0 && p.offset == 0
+}
+
+// Encode encodes Pointer into byte buffer.
+func (p valuePointer) Encode() []byte {
+	b := make([]byte, vptrSize)
+	// Copy over the content from p to b.
+	*(*valuePointer)(unsafe.Pointer(&b[0])) = p
+	return b
+}
+
+// Decode decodes the value pointer into the provided byte buffer.
+func (p *valuePointer) Decode(b []byte) {
+	// Copy over data from b into p. Using *p=unsafe.pointer(...) leads to
+	// pointer alignment issues. See https://github.com/dgraph-io/badger/issues/1096
+	// and comment https://github.com/dgraph-io/badger/pull/1097#pullrequestreview-307361714
+	copy(((*[vptrSize]byte)(unsafe.Pointer(p))[:]), b[:vptrSize])
 }

@@ -58,7 +58,7 @@ func TestBasicNode(t *testing.T) {
 		Data:        data,
 	}
 
-	nodes[0].setReplicates(100, []string{"127.0.0.1:3302", "127.0.0.1:3303"})
+	//nodes[0].setReplicates(100, []string{"127.0.0.1:3302", "127.0.0.1:3303"})
 	res, err := nodes[0].Append(context.Background(), &pb.AppendRequest{
 		ExtentID: 100,
 		Blocks:   []*pb.Block{block},

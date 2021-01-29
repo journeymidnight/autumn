@@ -244,3 +244,25 @@ func (en *ExtentNode) CommitLength(ctx context.Context, req *pb.CommitLengthRequ
 	}, nil
 
 }
+
+func (en *ExtentNode) ReadEntries(ctx context.Context, req *pb.ReadEntriesRequest) (*pb.ReadEntriesResponse, error) {
+	ex := en.getExtent(req.ExtentID)
+	if ex == nil {
+		return nil, errors.Errorf("no such extent")
+	}
+	replay := false
+	if req.Replay > 0 {
+		replay = true
+	}
+	ei, endOffset, err := ex.ReadEntries(req.Offset, (16 << 20), replay)
+	if err != nil && err != extent.EndOfStream && err != extent.EndOfExtent {
+		xlog.Logger.Infof("request ReadEntires extentID: %d, offset: %d, : %v", req.ExtentID, req.Offset, err)
+		return nil, err
+	}
+
+	return &pb.ReadEntriesResponse{
+		Code:      errorToCode(err),
+		Entries:   ei,
+		EndOffset: endOffset,
+	}, nil
+}

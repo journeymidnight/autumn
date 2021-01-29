@@ -123,12 +123,11 @@ func NewTableBuilder(stream streamclient.StreamClient) *Builder {
 					return
 				}
 
-				op, err := b.stream.Append(context.Background(), blocks, nil)
+				extentID, offsets, err := b.stream.Append(context.Background(), blocks)
 				utils.Check(err)
-				op.Wait()
 
-				for i, offset := range op.Offsets {
-					b.addBlockToIndex(baseKeys[i], op.ExtentID, offset)
+				for i, offset := range offsets {
+					b.addBlockToIndex(baseKeys[i], extentID, offset)
 				}
 				blocks = nil
 				size = 0
@@ -342,17 +341,15 @@ func (b *Builder) FinishAll(headExtentID uint64, headOffset uint32, seqNum uint6
 		Type:             pspb.RawBlockType_meta,
 		UnCompressedSize: uint32(b.tableIndex.Size()),
 		CompressedSize:   0,
-		HeadExtentID:     headExtentID,
-		HeadOffset:       headOffset,
+		VpExtentID:       headExtentID,
+		VpOffset:         headOffset,
 		SeqNum:           seqNum,
 	})
 	metaBlock.CheckSum = utils.AdlerCheckSum(metaBlock.Data)
 
-	op, err := b.stream.Append(context.Background(), []*pb.Block{metaBlock}, nil)
-	defer op.Free()
+	extentID, offsets, err := b.stream.Append(context.Background(), []*pb.Block{metaBlock})
 	if err != nil {
 		return 0, 0, err
 	}
-	op.Wait()
-	return op.ExtentID, op.Offsets[0], nil
+	return extentID, offsets[0], nil
 }
