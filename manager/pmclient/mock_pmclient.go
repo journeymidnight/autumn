@@ -4,11 +4,12 @@ import (
 	"github.com/journeymidnight/autumn/proto/pspb"
 )
 
-
 type MockPMClient struct {
+	Tables []*pspb.TableLocation
 }
 
-func (c *MockPMClient) SetTables(uint64, []*pspb.TableLocation) error {
+func (c *MockPMClient) SetTables(id uint64, tables []*pspb.TableLocation) error {
+	c.Tables = tables
 	return nil
 }
 

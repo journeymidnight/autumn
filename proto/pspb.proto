@@ -12,6 +12,7 @@
  * limitations under the License.
  */
 
+
  /*
  * Copyright (C) 2017 Dgraph Labs, Inc. and Contributors
  *
@@ -43,7 +44,6 @@ PART_%d/logStream => id
 PART_%d/rowStream => id
 PART_%d/tables => [(extentID,offset),...,(extentID,offset)]
 */
-
 message Range {
 	bytes startKey = 1;
 	bytes endKey = 2;

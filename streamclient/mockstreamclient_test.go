@@ -55,9 +55,11 @@ func TestAppendReadEntries(t *testing.T) {
 
 	client := NewMockStreamClient("test.tmp", 100)
 	defer client.Close()
-	_, _, err := client.AppendEntries(context.Background(), cases)
+	exID, tail, err := client.AppendEntries(context.Background(), cases)
 
 	require.NoError(t, err)
+	require.Equal(t, uint64(100), exID)
+	require.Equal(t, uint32(512+512+4096), tail)
 
 	//GC read
 	iter := client.NewLogEntryIter(ReadOption{}.WithReadFromStart())
@@ -93,9 +95,9 @@ func TestAppendReadEntries(t *testing.T) {
 	require.Equal(t, expectedKeys, ans)
 
 	ans = nil
-	eID, offset, err := client.AppendEntries(context.Background(), cases)
+	eID, _, err := client.AppendEntries(context.Background(), cases)
 
-	iter = client.NewLogEntryIter(ReadOption{}.WithReadFromStart().WithReadFrom(eID, offset).WithReplay())
+	iter = client.NewLogEntryIter(ReadOption{}.WithReadFromStart().WithReadFrom(eID, tail).WithReplay())
 	for {
 		ok, err := iter.HasNext()
 		require.NoError(t, err)

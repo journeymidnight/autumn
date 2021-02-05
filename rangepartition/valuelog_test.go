@@ -55,12 +55,16 @@ func TestLogReplay(t *testing.T) {
 				Key:   []byte("a"),
 				Value: val1,
 			},
+			ExtentID:      100,
+			Offset:        512,
 			EstimatedSize: 38},
 		{
 			Log: &pb.Entry{
 				Key:   []byte("a1"), //key is one byte bigger than previous
 				Value: val1,
 			},
+			ExtentID:      100,
+			Offset:        512,
 			EstimatedSize: 39},
 		{
 			Log: &pb.Entry{
@@ -74,7 +78,7 @@ func TestLogReplay(t *testing.T) {
 		},
 	}
 	i := 0
-	replayLog(logStream, valuePointer{extentID, offset}, func(ei *pb.EntryInfo) bool {
+	replayLog(logStream, extentID, offset, func(ei *pb.EntryInfo) bool {
 		fmt.Printf("%s\n", ei.Log.Key)
 		require.Equal(t, expecteEI[i], ei)
 		i++
