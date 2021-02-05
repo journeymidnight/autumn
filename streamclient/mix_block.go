@@ -72,7 +72,7 @@ func entriesToBlocks(entries []*pb.EntryInfo, lastCommit uint32) ([]*pb.Block, i
 
 	//merge small reqs into block
 	for ; i < len(entries); i++ {
-		if !ShouldWriteValueToLSM(entries[i].Log) {
+		if !y.ShouldWriteValueToLSM(entries[i].Log) {
 			break
 		}
 		if mblock == nil {

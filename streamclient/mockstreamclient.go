@@ -27,11 +27,11 @@ func NewMockStreamClient(fileName string, id uint64) StreamClient {
 
 //block API, entries has been batched
 func (client *MockStreamClient) AppendEntries(ctx context.Context, entries []*pb.EntryInfo) (uint64, uint32, error) {
+	client.ex.Lock()
 	commitLength := client.ex.CommitLength()
 	blocks, j, k := entriesToBlocks(entries, commitLength)
-	client.ex.Lock()
 	defer client.ex.Unlock()
-	offsets, err := client.ex.AppendBlocks(blocks, &commitLength)
+	offsets, err := client.ex.AppendBlocks(blocks, nil)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -40,7 +40,7 @@ func (client *MockStreamClient) AppendEntries(ctx context.Context, entries []*pb
 		entries[j+i].Offset = offsets[k+i]
 	}
 	//change entries
-	return 100, commitLength, nil
+	return 100, client.ex.CommitLength(), nil
 }
 
 //block API
@@ -104,7 +104,7 @@ func (iter *MockLockEntryIter) HasNext() (bool, error) {
 			return false, err
 		}
 	}
-	return true, nil
+	return len(iter.cache) > 0, nil
 }
 
 func (iter *MockLockEntryIter) receiveBlocks() error {
@@ -126,11 +126,15 @@ func (iter *MockLockEntryIter) receiveBlocks() error {
 					iter.cache = append(iter.cache, &pb.EntryInfo{
 						Log:           entry,
 						EstimatedSize: uint64(entry.Size()),
+						ExtentID:      100,
+						Offset:        offset,
 					})
 				} else { //gc read
 					iter.cache = append(iter.cache, &pb.EntryInfo{
 						Log:           &pb.Entry{},
 						EstimatedSize: uint64(blocks[i].BlockLength) + 512,
+						ExtentID:      100,
+						Offset:        offset,
 					})
 					break
 				}

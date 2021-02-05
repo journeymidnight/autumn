@@ -6,9 +6,11 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/journeymidnight/autumn/manager/pmclient"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/rangepartition/skiplist"
 	"github.com/journeymidnight/autumn/streamclient"
+	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
 
 	"go.uber.org/zap/zapcore"
@@ -25,48 +27,18 @@ func TestEstimateSize(t *testing.T) {
 	bigValue := []byte(fmt.Sprintf("%01048576d", 10)) //1MB
 	smallValue := []byte(fmt.Sprintf("%01048d", 10))  //1KB
 
-	requests := []*request{
-		&request{
-			entries: []*pb.EntryInfo{{Log: &pb.Entry{Key: y.KeyWithTs([]byte("hello"), 0), Value: []byte("test")}}},
-		},
-		&request{
-			entries: []*pb.EntryInfo{
-				{
-					Log: &pb.Entry{
-						Key:   y.KeyWithTs([]byte("hello1"), 0),
-						Value: bigValue,
-					},
-				},
-			},
-		},
-		&request{
-			entries: []*pb.EntryInfo{
-				{
-					Log: &pb.Entry{
-						Key:   y.KeyWithTs([]byte("hello2"), 0),
-						Value: smallValue,
-					},
-				},
-			},
-		},
-		&request{
-			entries: []*pb.EntryInfo{
-				{
-					Log: &pb.Entry{
-						Key:       y.KeyWithTs([]byte("hello3"), 0),
-						Value:     []byte("testasdfasdfasdfasdfasdfafafasdfasdfa"),
-						ExpiresAt: 1243434343434,
-					},
-				},
-			},
-		},
+	entries := []*pb.EntryInfo{
+		{Log: &pb.Entry{Key: y.KeyWithTs([]byte("hello"), 0), Value: []byte("test")}},
+		{Log: &pb.Entry{Key: y.KeyWithTs([]byte("hello1"), 0), Value: bigValue}},
+		{Log: &pb.Entry{Key: y.KeyWithTs([]byte("hello2"), 0), Value: smallValue}},
+		{Log: &pb.Entry{Key: y.KeyWithTs([]byte("hello3"), 0), Value: []byte("testasdfasdfasdfasdfasdfafafasdfasdfa"), ExpiresAt: 1243434343434}},
 	}
 
 	x := skiplist.NewSkiplist(10 * MB)
 	pre := x.MemSize()
-	for i := range requests {
-		l := int64(estimatedSizeInSkl(requests[i].entries))
-		_writeToLSM(x, requests[i])
+	for i := range entries {
+		l := int64(estimatedSizeInSkl(entries[i].Log))
+		_writeToLSM(x, []*pb.EntryInfo{entries[i]})
 		fmt.Printf("%d <= %d\n", x.MemSize()-pre, l)
 		require.True(t, x.MemSize()-pre <= l)
 		pre = x.MemSize()
@@ -76,8 +48,8 @@ func TestEstimateSize(t *testing.T) {
 
 //helper function for TestEstimateSize.
 
-func _writeToLSM(skl *skiplist.Skiplist, req *request) int64 {
-	for _, entry := range req.entries {
+func _writeToLSM(skl *skiplist.Skiplist, entires []*pb.EntryInfo) int64 {
+	for _, entry := range entires {
 		if y.ShouldWriteValueToLSM(entry.Log) { // Will include deletion / tombstone case.
 			skl.Put(entry.Log.Key,
 				y.ValueStruct{
@@ -104,7 +76,6 @@ func _writeToLSM(skl *skiplist.Skiplist, req *request) int64 {
 	return skl.MemSize()
 }
 
-// Opens a badger db and runs a a test on it.
 func runRPTest(t *testing.T, test func(t *testing.T, rp *RangePartition)) {
 
 	logStream := streamclient.NewMockStreamClient(fmt.Sprintf("%d.vlog", rand.Uint32()), 10)
@@ -112,7 +83,9 @@ func runRPTest(t *testing.T, test func(t *testing.T, rp *RangePartition)) {
 
 	defer logStream.Close()
 	defer rowStream.Close()
-	rp := OpenRangePartition(rowStream, logStream, logStream.(streamclient.BlockReader))
+	pmclient := new(pmclient.MockPMClient)
+	rp := OpenRangePartition(3, rowStream, logStream, logStream.(streamclient.BlockReader),
+		[]byte(""), []byte(""), nil, nil, pmclient)
 	defer func() {
 		require.NoError(t, rp.Close())
 	}()
@@ -174,9 +147,79 @@ func TestGetBig(t *testing.T) {
 
 }
 
-/*
-0. interface for KV
-1. replay/compact
-2. big iterator
-3. test
-*/
+func TestReopenRangePartition(t *testing.T) {
+	logStream := streamclient.NewMockStreamClient(fmt.Sprintf("%d.vlog", rand.Uint32()), 10)
+	rowStream := streamclient.NewMockStreamClient(fmt.Sprintf("%d.sst", rand.Uint32()), 12)
+
+	defer logStream.Close()
+	defer rowStream.Close()
+	pmclient := new(pmclient.MockPMClient)
+	rp := OpenRangePartition(3, rowStream, logStream, logStream.(streamclient.BlockReader),
+		[]byte(""), []byte(""), nil, nil, pmclient)
+
+	var wg sync.WaitGroup
+	for i := 10; i < 100; i++ {
+		wg.Add(1)
+		rp.writeAsync([]byte(fmt.Sprintf("key%d", i)), []byte(fmt.Sprintf("val%d", i)), func(e error) {
+			wg.Done()
+		})
+	}
+	wg.Wait()
+	rp.Close()
+
+	//reopen with tables
+	rp = OpenRangePartition(3, rowStream, logStream, logStream.(streamclient.BlockReader),
+		[]byte(""), []byte(""), pmclient.Tables, nil, pmclient)
+
+	for i := 10; i < 100; i++ {
+		v, err := rp.get([]byte(fmt.Sprintf("key%d", i)), 300)
+		if err == errNotFound {
+			fmt.Printf("key%d failed\n", i)
+			continue
+		}
+		//require.NoErrorf(t, err, "key%d failed", i)
+		require.Equal(t, []byte(fmt.Sprintf("val%d", i)), v)
+	}
+	rp.Close()
+}
+
+func TestReopenRangePartitionWithBig(t *testing.T) {
+	logStream := streamclient.NewMockStreamClient(fmt.Sprintf("%d.vlog", rand.Uint32()), 10)
+	rowStream := streamclient.NewMockStreamClient(fmt.Sprintf("%d.sst", rand.Uint32()), 12)
+
+	defer logStream.Close()
+	defer rowStream.Close()
+	pmclient := new(pmclient.MockPMClient)
+	rp := OpenRangePartition(3, rowStream, logStream, logStream.(streamclient.BlockReader),
+		[]byte(""), []byte(""), nil, nil, pmclient)
+
+	var expectedValue [][]byte
+	var wg sync.WaitGroup
+	for i := 10; i < 100; i++ {
+		wg.Add(1)
+		n := 2048 + rand.Int31n(100)
+		val := make([]byte, n)
+		utils.SetRandStringBytes(val)
+		expectedValue = append(expectedValue, val)
+		rp.writeAsync([]byte(fmt.Sprintf("key%d", i)), val, func(e error) {
+			wg.Done()
+		})
+	}
+	wg.Wait()
+	rp.close(false)
+
+	//reopen with tables
+	rp = OpenRangePartition(3, rowStream, logStream, logStream.(streamclient.BlockReader),
+		[]byte(""), []byte(""), pmclient.Tables, nil, pmclient)
+
+	for i := 10; i < 100; i++ {
+		v, err := rp.get([]byte(fmt.Sprintf("key%d", i)), 300)
+		if err == errNotFound {
+			fmt.Printf("key%d failed\n", i)
+			continue
+		}
+		//require.NoErrorf(t, err, "key%d failed", i)
+		require.Equal(t, expectedValue[i-10], v)
+	}
+	rp.Close()
+}

@@ -3,6 +3,7 @@ package rangepartition
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,13 +27,15 @@ const (
 	MB                = KB * 1024
 	maxEntriesInBlock = 100
 
-	maxSkipList = 2 * KB
+	//4 * KB for test
+	maxSkipList = 4 * KB
 )
 
 var (
 	errNoRoom        = errors.New("No room for write")
 	errNotFound      = errors.New("not found")
 	ErrBlockedWrites = errors.New("Writes are blocked, possibly due to DropAll or Close")
+	maxEntriesOnce   = maxSkipList / (y.ValueThrottle + 20)
 )
 
 type RangePartition struct {
@@ -62,12 +65,15 @@ type RangePartition struct {
 	startKey []byte
 	endKey   []byte
 	pmClient pmclient.PMClient
+
+	closeOnce sync.Once    // For closing DB only once.
+	vhead     valuePointer //vhead前的都在mt中
 }
 
 //TODO
 //interface KV save some values
 
-func OpenRangePartition(rowStream streamclient.StreamClient,
+func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	logStream streamclient.StreamClient, blockReader streamclient.BlockReader,
 	startKey []byte, endKey []byte, tableLocs []*pspb.TableLocation, blobStreams []streamclient.StreamClient,
 	pmclient pmclient.PMClient) *RangePartition {
@@ -83,10 +89,9 @@ func OpenRangePartition(rowStream streamclient.StreamClient,
 		endKey:      endKey,
 		pmClient:    pmclient,
 		blobStreams: blobStreams,
+		PARTID:      id,
 	}
 	rp.startMemoryFlush()
-
-	rp.startWriteLoop()
 
 	//replay log
 	//open tables
@@ -101,29 +106,63 @@ func OpenRangePartition(rowStream streamclient.StreamClient,
 		rp.tables = append(rp.tables, tbl)
 	}
 
-	//search all tables, find the table who has the most lasted seqNum
+	//search all tables, find the table who has the most latest seqNum
 	seq := uint64(0)
 	var lastTable *table.Table
 	for _, table := range rp.tables {
+		fmt.Printf("read table  from [%s] to [%s]: seq[%d], vp[%d]\n", y.ParseKey(table.Smallest()), y.ParseKey(table.Biggest()), table.LastSeq, table.VpOffset)
 		if table.LastSeq > seq {
 			seq = table.LastSeq
 			lastTable = table
 		}
 	}
+	rp.seqNumber = seq
 
+	//FIXME:poor performace: prefetch read will be better
+	replayedLog := 0
 	replay := func(ei *pb.EntryInfo) bool {
+		replayedLog++
+		//fmt.Printf("from log %v\n", ei)
+		//build ValueStruct from EntryInfo
+		entriesReady := []*pb.EntryInfo{ei}
 
+		head := valuePointer{ei.ExtentID, ei.Offset}
+
+		if y.ParseTs(ei.Log.Key) > rp.seqNumber {
+			rp.seqNumber++
+		}
+
+		i := 0
+		/*
+		*
+		* 有一种特殊情况, block里面有3个entries, 其中第3个entry
+		* 放不到mt里面,会强制刷memtable, 而这个table的vp, 指向block的offset
+		* 并且刷出来的table只有前2个entry, 总之结果就是有2个table有overlap的key的情况
+		 */
+		for err := rp.ensureRoomForWrite(entriesReady, head); err == errNoRoom; err = rp.ensureRoomForWrite(entriesReady, head) {
+			i++
+			if i%100 == 0 {
+				xlog.Logger.Infof("Making room for writes")
+			}
+			// We need to poll a bit because both hasRoomForWrite and the flusher need access to s.imm.
+			// When flushChan is full and you are blocked there, and the flusher is trying to update s.imm,
+			// you will get a deadlock.
+			time.Sleep(10 * time.Millisecond)
+		}
+		rp.writeToLSM([]*pb.EntryInfo{ei})
+		return true
 	}
 
 	if lastTable == nil {
 		replayLog(rp.logStream, 0, 0, replay)
 	} else {
+		fmt.Printf("replay log from vp offset [%d]\n", lastTable.VpOffset)
 		replayLog(rp.logStream, lastTable.VpExtentID, lastTable.VpOffset, replay)
 	}
-
-	//set Newest SeqNum
-
+	fmt.Printf("replayed log number: %d\n", replayedLog)
 	//start real write
+
+	rp.startWriteLoop()
 	return rp
 }
 
@@ -201,9 +240,8 @@ func (rp *RangePartition) handleFlushTask(ft flushTask) error {
 	rp.tables = append(rp.tables, tbl)
 	rp.tableLock.Unlock()
 
-	xlog.Logger.Debugf("Flushed from %s to %s on vlog %+v\n", y.FormatKey(first), y.FormatKey(last), ft.vptr)
+	xlog.Logger.Debugf("flushed table %s to %s seq[%d], head %d\n", y.ParseKey(first), y.ParseKey(last), tbl.LastSeq, tbl.VpOffset)
 
-	//
 	return nil
 }
 
@@ -299,6 +337,7 @@ type request struct {
 	ref int32
 }
 
+/*
 func estimatedSizeInSkl(es []*pb.EntryInfo) int {
 	size := 0
 	for i := range es {
@@ -306,9 +345,10 @@ func estimatedSizeInSkl(es []*pb.EntryInfo) int {
 	}
 	return size
 }
+*/
 
 //key + valueStruct
-func _estimatedSizeInSkl(e *pb.Entry) int {
+func estimatedSizeInSkl(e *pb.Entry) int {
 	sz := len(e.Key)
 	if y.ShouldWriteValueToLSM(e) {
 		sz += len(e.Value) + 2 // Meta, UserMeta
@@ -357,9 +397,9 @@ func (req *request) Wait() error {
 	return err
 }
 
-func (rp *RangePartition) writeLog(reqs []*request) (valuePointer, error) {
+func (rp *RangePartition) writeLog(reqs []*request) ([]*pb.EntryInfo, valuePointer, error) {
 	if atomic.LoadInt32(&rp.blockWrites) == 1 {
-		return valuePointer{}, ErrBlockedWrites
+		return nil, valuePointer{}, ErrBlockedWrites
 	}
 	utils.AssertTrue(len(reqs) != 0)
 
@@ -381,7 +421,7 @@ func (rp *RangePartition) writeRequests(reqs []*request) error {
 
 	xlog.Logger.Infof("writeRequests called. Writing to log, len[%d]", len(reqs))
 
-	head, err := rp.writeLog(reqs)
+	entriesReady, head, err := rp.writeLog(reqs)
 	if err != nil {
 		done(err)
 		return err
@@ -390,11 +430,10 @@ func (rp *RangePartition) writeRequests(reqs []*request) error {
 	//lastReq := reqs[len(reqs)-1]
 	//e := lastReq.entries[len(lastReq.entries)-1]
 	//seqNum := y.ParseTs(e.Log.Key)
-	seqNum := atomic.AddUint64(&rp.seqNumber, 1)
 
 	xlog.Logger.Info("Writing to memtable")
 	i := 0
-	for err = rp.ensureRoomForWrite(reqs, head, seqNum); err == errNoRoom; err = rp.ensureRoomForWrite(reqs, head, seqNum) {
+	for err = rp.ensureRoomForWrite(entriesReady, rp.vhead); err == errNoRoom; err = rp.ensureRoomForWrite(entriesReady, rp.vhead) {
 		i++
 		if i%100 == 0 {
 			xlog.Logger.Infof("Making room for writes")
@@ -412,12 +451,13 @@ func (rp *RangePartition) writeRequests(reqs []*request) error {
 
 	//write to LSM
 	for _, b := range reqs {
-		if err := rp.writeToLSM(b); err != nil {
+		if err := rp.writeToLSM(b.entries); err != nil {
 			done(err)
 			return errors.Wrap(err, "writeRequests")
 		}
 	}
 
+	rp.vhead = head
 	done(nil)
 	return nil
 }
@@ -426,8 +466,8 @@ func getLowerByte(a uint32) byte {
 	return byte(a & 0x000000FF)
 }
 
-func (rp *RangePartition) writeToLSM(req *request) error {
-	for _, entry := range req.entries {
+func (rp *RangePartition) writeToLSM(entries []*pb.EntryInfo) error {
+	for _, entry := range entries {
 		if y.ShouldWriteValueToLSM(entry.Log) { // Will include deletion / tombstone case.
 			rp.mt.Put(entry.Log.Key,
 				y.ValueStruct{
@@ -453,6 +493,20 @@ func (rp *RangePartition) writeToLSM(req *request) error {
 	return nil
 }
 
+func isReqsTooBig(reqs []*request) bool {
+	//grpc limit
+	size := 0 //network size in grpc
+	if (len(reqs)) > 10 {
+		return true
+	}
+	for _, req := range reqs {
+		size += req.Size()
+		if size > 20*MB {
+			return true
+		}
+	}
+	return false
+}
 func (rp *RangePartition) doWrites() {
 	//defer lc.Done()
 
@@ -475,10 +529,9 @@ func (rp *RangePartition) doWrites() {
 	//y.PendingWrites.Set(db.opt.Dir, reqLen)
 
 	reqs := make([]*request, 0, 10)
-	var size int
 	for {
 		var r *request
-		size = 0
+
 		select {
 		case r = <-rp.writeCh:
 		case <-rp.writeStopper.ShouldStop():
@@ -487,12 +540,7 @@ func (rp *RangePartition) doWrites() {
 
 		for {
 			reqs = append(reqs, r)
-			size += r.Size()
-			if size > 20*MB {
-				pendingCh <- struct{}{} // blocking.
-				goto writeCase
-			}
-			if len(reqs) >= 10 {
+			if isReqsTooBig(reqs) {
 				pendingCh <- struct{}{} // blocking.
 				goto writeCase
 			}
@@ -510,16 +558,16 @@ func (rp *RangePartition) doWrites() {
 	closedCase:
 		// All the pending request are drained.
 		// Don't close the writeCh, because it has be used in several places.
-		size = 0
 		for {
 			select {
 			case r = <-rp.writeCh:
 				reqs = append(reqs, r)
-				size += r.Size()
-				if size > 20*MB {
+
+				if isReqsTooBig(reqs) {
 					pendingCh <- struct{}{} // blocking.
 					goto writeCase
 				}
+
 			default:
 				pendingCh <- struct{}{} // Push to pending before doing a write.
 				writeRequests(reqs)
@@ -533,22 +581,26 @@ func (rp *RangePartition) doWrites() {
 	}
 }
 
-func (rp *RangePartition) ensureRoomForWrite(reqs []*request, head valuePointer, seqNum uint64) error {
+func (rp *RangePartition) ensureRoomForWrite(entries []*pb.EntryInfo, head valuePointer) error {
 
 	rp.Lock()
 	defer rp.Unlock()
 
 	forceFlush := atomic.LoadInt32(&rp.logRotates) >= 1
 	n := int64(0)
-	for i := range reqs {
-		n += int64(estimatedSizeInSkl(reqs[i].entries))
+	for i := range entries {
+		n += int64(estimatedSizeInSkl(entries[i].Log))
 	}
+
+	utils.AssertTrue(n <= maxSkipList)
+
 	if !forceFlush && rp.mt.MemSize()+n < maxSkipList {
 		return nil
 	}
 	utils.AssertTrue(rp.mt != nil)
 	xlog.Logger.Debugf("Flushing memtable, mt.size=%d", rp.mt.MemSize())
 
+	seqNum := atomic.AddUint64(&rp.seqNumber, 1)
 	//non-block, block if flushChan is full,
 	select {
 	case rp.flushChan <- flushTask{mt: rp.mt, vptr: head, seqNum: seqNum}:
@@ -679,16 +731,54 @@ func (rp *RangePartition) getValueStruct(userKey []byte, version uint64) y.Value
 }
 
 func (rp *RangePartition) Close() error {
+	var err error
+	rp.closeOnce.Do(func() {
+		err = rp.close(true)
+	})
+	return err
+}
+
+func (rp *RangePartition) close(gracefull bool) error {
 	xlog.Logger.Infof("Closing database")
 	atomic.StoreInt32(&rp.blockWrites, 1)
 
 	rp.writeStopper.Stop()
 	close(rp.writeCh)
 
-	//FIXME lost data in mt/imm
+	//FIXME lost data in mt/imm, will have to replay log
+	//doWrite在返回前,会调用最后一次writeRequest并且等待返回, 所以这里
+	//mt和rp.vhead都是只读的
+	if gracefull && !rp.mt.Empty() {
+		for {
+			pushedFlushTask := func() bool {
+				rp.Lock()
+				defer rp.Unlock()
+				utils.AssertTrue(rp.mt != nil)
+				select {
+				case rp.flushChan <- flushTask{mt: rp.mt, vptr: rp.vhead, seqNum: rp.seqNumber + 1}:
+					fmt.Printf("submitted to chan vp %d\n", rp.vhead)
+					rp.imm = append(rp.imm, rp.mt) // Flusher will attempt to remove this from s.imm.
+					rp.mt = nil                    // Will segfault if we try writing!
+					return true
+				default:
+					// If we fail to push, we need to unlock and wait for a short while.
+					// The flushing operation needs to update s.imm. Otherwise, we have a deadlock.
+					// TODO: Think about how to do this more cleanly, maybe without any locks.
+				}
+				return false
+			}()
+			if pushedFlushTask {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 
 	close(rp.flushChan)
+	//只有读到rp.flushChan close的时候,才退出, 可以保证
+	//flushChan里面的任何都已经执行完了
 	rp.flushStopper.Wait()
+
 	return nil
 }
 

@@ -126,12 +126,13 @@ func BytesToU32Slice(b []byte) []uint32 {
 }
 
 const (
-	BitDelete       byte = 1 << 0 // Set if the key has been deleted.
-	BitValuePointer byte = 1 << 1 // Set if the value is NOT stored directly next to key.
+	BitDelete       byte = 1 << 0    // Set if the key has been deleted.
+	BitValuePointer byte = 1 << 1    // Set if the value is NOT stored directly next to key.
+	ValueThrottle        = (2 << 10) // 2 *KB
 )
 
 func ShouldWriteValueToLSM(e *pb.Entry) bool {
-	return e.Meta&uint32(BitValuePointer) == 0 && len(e.Value) <= (4<<10)
+	return e.Meta&uint32(BitValuePointer) == 0 && len(e.Value) <= ValueThrottle
 }
 
 func ExtractLogEntry(block *pb.Block) []*pb.Entry {

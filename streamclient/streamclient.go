@@ -200,7 +200,7 @@ func (iter *AutumnLogEntryIter) HasNext() (bool, error) {
 			return false, err
 		}
 	}
-	return true, nil
+	return len(iter.cache) > 0, nil
 }
 
 func (iter *AutumnLogEntryIter) Next() *pb.EntryInfo {
@@ -434,7 +434,8 @@ retry:
 		if res.Offsets[len(res.Offsets)-1] > MaxExtentSize {
 			sc.mustAllocNewExtent(extentID)
 		}
-		return extentID, res.Offsets[0], nil
+		endOffset := res.Offsets[len(res.Offsets)-1] + blocks[len(blocks)-1].BlockLength + 512
+		return extentID, endOffset, nil
 	}
 }
 

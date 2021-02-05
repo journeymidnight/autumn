@@ -421,6 +421,7 @@ func (ex *Extent) AppendBlocks(blocks []*pb.Block, lastCommit *uint32) (ret []ui
 		currentLength += block.BlockLength + 512
 	}
 	ex.file.Sync()
+
 	atomic.StoreUint32(&ex.commitLength, currentLength)
 	return
 }
@@ -530,11 +531,15 @@ func readBlockEntries(reader io.Reader, extentID uint64, offset uint32, replay b
 				ret = append(ret, &pb.EntryInfo{
 					Log:           entry,
 					EstimatedSize: uint64(entry.Size()),
+					ExtentID:      extentID,
+					Offset:        offset,
 				})
 			} else { //gc read
 				ret = append(ret, &pb.EntryInfo{
 					Log:           &pb.Entry{},
 					EstimatedSize: blockLength + 512,
+					ExtentID:      extentID,
+					Offset:        offset,
 				})
 				return ret, blockLength, nil
 			}
