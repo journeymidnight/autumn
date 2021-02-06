@@ -418,6 +418,11 @@ func (sm *StreamManager) StreamInfo(ctx context.Context, req *pb.StreamInfoReque
 
 }
 
+//FIXME:TODO
+func (sm *StreamManager) Truncate(context.Context, *pb.TruncateRequest) (*pb.TruncateResponse, error) {
+	return nil, nil
+}
+
 func (sm *StreamManager) getAppendExtentsAddr(streamID uint64) ([]NodeStatus, uint64, error) {
 	sm.streamLock.RLock()
 	s, ok := sm.streams[streamID]

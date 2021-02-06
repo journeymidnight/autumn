@@ -293,5 +293,8 @@ PART_%d/rowStream => id
 PART_%d/tables => [(extentID,offset),...,(extentID,offset)]
 ```
 
-GetTables
-SetTables
+1.增加Option便于测试
+2.grpc里面, res.Code代替err
+3.mockclient如何测试truncate
+4.sm_service增加truncate的API
+5.rp实现valuelog的truncate(*)

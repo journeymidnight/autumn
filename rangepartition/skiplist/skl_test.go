@@ -390,10 +390,16 @@ func TestGetWork(t *testing.T) {
 	l.Put(y.KeyWithTs([]byte("b"), 0), y.ValueStruct{})
 	l.Put(y.KeyWithTs([]byte("c"), 0), y.ValueStruct{})
 	l.Put(y.KeyWithTs([]byte("a"), 100), y.ValueStruct{})
+	l.Put(y.KeyWithTs([]byte("a"), 200), y.ValueStruct{})
 
 	x := l.Get(y.KeyWithTs([]byte("a"), math.MaxUint64))
+	require.Equal(t, uint64(200), x.Version)
+
+	x = l.Get(y.KeyWithTs([]byte("a"), 150))
 	require.Equal(t, uint64(100), x.Version)
 
+	x = l.Get(y.KeyWithTs([]byte("a"), 90))
+	require.Equal(t, uint64(0), x.Version)
 }
 
 // TestIteratorSeek tests Seek and SeekForPrev.

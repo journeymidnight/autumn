@@ -32,10 +32,10 @@ const (
 )
 
 var (
-	errNoRoom        = errors.New("No room for write")
-	errNotFound      = errors.New("not found")
-	ErrBlockedWrites = errors.New("Writes are blocked, possibly due to DropAll or Close")
-	maxEntriesOnce   = maxSkipList / (y.ValueThrottle + 20)
+	errNoRoom         = errors.New("No room for write")
+	errNotFound       = errors.New("not found")
+	ErrBlockedWrites  = errors.New("Writes are blocked, possibly due to DropAll or Close")
+	maxEntriesInQueue = maxSkipList / (y.ValueThrottle + 20) / 2
 )
 
 type RangePartition struct {
@@ -54,14 +54,15 @@ type RangePartition struct {
 	imm             []*skiplist.Skiplist
 	utils.SafeMutex //protect mt,imm when swapping mt, imm
 
-	flushStopper *utils.Stopper
-	flushChan    chan flushTask
-	writeStopper *utils.Stopper
-	tableLock    utils.SafeMutex //protect tables
-	tables       []*table.Table
-	seqNumber    uint64
+	flushStopper   *utils.Stopper
+	flushChan      chan flushTask
+	writeStopper   *utils.Stopper
+	compactStopper *utils.Stopper
+	tableLock      utils.SafeMutex //protect tables
+	tables         []*table.Table
+	seqNumber      uint64
 
-	PARTID   uint64
+	PartID   uint64
 	startKey []byte
 	endKey   []byte
 	pmClient pmclient.PMClient
@@ -89,12 +90,13 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		endKey:      endKey,
 		pmClient:    pmclient,
 		blobStreams: blobStreams,
-		PARTID:      id,
+		PartID:      id,
 	}
 	rp.startMemoryFlush()
 
 	//replay log
 	//open tables
+	//tableLocs的顺序就是在logStream里面的顺序
 	for _, tLoc := range tableLocs {
 	retry:
 		tbl, err := table.OpenTable(rp.rowStream, tLoc.ExtentID, tLoc.Offset)
@@ -167,9 +169,11 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 }
 
 type flushTask struct {
-	mt     *skiplist.Skiplist
-	vptr   valuePointer
-	seqNum uint64
+	mt        *skiplist.Skiplist
+	vptr      valuePointer
+	seqNum    uint64
+	isCompact bool          //如果是compact任务, 不需要修改rp.mt
+	resultCh  chan struct{} //也可以用wg, 但是防止未来还需要发数据
 }
 
 func (rp *RangePartition) startWriteLoop() {
@@ -177,13 +181,13 @@ func (rp *RangePartition) startWriteLoop() {
 	rp.writeCh = make(chan *request, 16)
 
 	rp.writeStopper.RunWorker(rp.doWrites)
-
 }
+
 func (rp *RangePartition) startMemoryFlush() {
 	// Start memory fluhser.
 
 	rp.flushStopper = utils.NewStopper()
-	rp.flushChan = make(chan flushTask, 1)
+	rp.flushChan = make(chan flushTask, 16)
 
 	rp.flushStopper.RunWorker(rp.flushMemtable)
 }
@@ -234,7 +238,6 @@ func (rp *RangePartition) handleFlushTask(ft flushTask) error {
 	}
 
 	// We own a ref on tbl.
-	//
 
 	rp.tableLock.Lock()
 	rp.tables = append(rp.tables, tbl)
@@ -280,13 +283,17 @@ func (rp *RangePartition) flushMemtable() {
 		for {
 			err := rp.handleFlushTask(ft)
 			if err == nil {
-				// Update s.imm. Need a lock.
-				rp.Lock()
+				if !ft.isCompact {
+					// Update s.imm. Need a lock.
+					rp.Lock()
 
-				utils.AssertTrue(ft.mt == rp.imm[0])
-				rp.imm = rp.imm[1:]
-				ft.mt.DecrRef() // Return memory.
-				rp.Unlock()
+					utils.AssertTrue(ft.mt == rp.imm[0])
+					rp.imm = rp.imm[1:]
+					ft.mt.DecrRef() // Return memory.
+					rp.Unlock()
+				} else { //如果是compact任务的build table, 不需要修改rp.imm
+					ft.mt.DecrRef()
+				}
 				break
 			}
 			// Encountered error. Retry indefinitely.
@@ -303,14 +310,18 @@ func (rp *RangePartition) flushMemtable() {
 		rp.tableLock.RUnlock()
 
 		for {
-			err := rp.pmClient.SetTables(rp.PARTID, tableLocs)
+			err := rp.pmClient.SetTables(rp.PartID, tableLocs)
 			if err != nil {
-				xlog.Logger.Errorf("failed to set tableLocs for %d, retry...", rp.PARTID)
-				time.Sleep(1 * time.Second)
+				xlog.Logger.Errorf("failed to set tableLocs for %d, retry...", rp.PartID)
+				time.Sleep(100 * time.Millisecond)
 				continue
 			}
 			break
 		}
+		if ft.isCompact {
+			ft.resultCh <- struct{}{}
+		}
+
 	}
 }
 
@@ -357,6 +368,19 @@ func estimatedSizeInSkl(e *pb.Entry) int {
 	}
 
 	sz += utils.SizeVarint(e.ExpiresAt)
+
+	sz += skiplist.MaxNodeSize + 8 //8 is nodeAlign
+	return sz
+}
+
+func estimatedVS(key []byte, vs y.ValueStruct) int {
+	sz := len(key)
+	if vs.Meta&y.BitValuePointer == 0 && len(vs.Value) <= y.ValueThrottle {
+		sz += len(vs.Value) + 2 // Meta, UserMeta
+	} else {
+		sz += int(vptrSize) + 2 // vptrSize for valuePointer, 2 for metas.
+	}
+	sz += utils.SizeVarint(vs.ExpiresAt)
 
 	sz += skiplist.MaxNodeSize + 8 //8 is nodeAlign
 	return sz
@@ -496,15 +520,18 @@ func (rp *RangePartition) writeToLSM(entries []*pb.EntryInfo) error {
 func isReqsTooBig(reqs []*request) bool {
 	//grpc limit
 	size := 0 //network size in grpc
-	if (len(reqs)) > 10 {
-		return true
-	}
+	n := 0
 	for _, req := range reqs {
 		size += req.Size()
 		if size > 20*MB {
 			return true
 		}
+		n += len(req.entries)
+		if n > maxEntriesInQueue {
+			return true
+		}
 	}
+
 	return false
 }
 func (rp *RangePartition) doWrites() {
@@ -603,7 +630,7 @@ func (rp *RangePartition) ensureRoomForWrite(entries []*pb.EntryInfo, head value
 	seqNum := atomic.AddUint64(&rp.seqNumber, 1)
 	//non-block, block if flushChan is full,
 	select {
-	case rp.flushChan <- flushTask{mt: rp.mt, vptr: head, seqNum: seqNum}:
+	case rp.flushChan <- flushTask{mt: rp.mt, vptr: head, seqNum: seqNum, isCompact: false}:
 		// After every memtable flush, let's reset the counter.
 		atomic.StoreInt32(&rp.logRotates, 0)
 

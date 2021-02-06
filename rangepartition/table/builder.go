@@ -139,7 +139,8 @@ func NewTableBuilder(stream streamclient.StreamClient) *Builder {
 	return b
 }
 
-// Close closes the TableBuilder.
+// Close closes the TableBuilder,
+//FinishAll will close go routine and wait
 func (b *Builder) Close() {}
 
 // Empty returns whether it's empty.
