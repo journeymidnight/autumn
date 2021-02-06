@@ -13,6 +13,14 @@ import (
 	"google.golang.org/grpc"
 )
 
+//FIXME, 统一error的形式,
+//pb.code表示逻辑错误
+//err表示网络错误
+
+var (
+	errTruncateNoMatch = errors.New("truncateNoMatch")
+)
+
 type SMClient struct {
 	conns []*grpc.ClientConn //protected by RWMUTEX
 	sync.RWMutex
@@ -280,4 +288,44 @@ func (client *SMClient) StreamInfo(ctx context.Context, streamIDs []uint64) (map
 		}
 	}
 	return nil, nil, errors.Errorf("timeout: StreamInfo failed")
+}
+
+func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, extentIDs []uint64) error {
+	client.RLock()
+	defer client.RUnlock()
+	last := atomic.LoadInt32(&client.lastLeader)
+	current := last
+	for loop := 0; loop < len(client.conns)*2; loop++ {
+		if client.conns != nil && client.conns[current] != nil {
+			c := pb.NewStreamManagerServiceClient(client.conns[current])
+			res, err := c.Truncate(ctx, &pb.TruncateRequest{
+				StreamID:  streamID,
+				ExtentIDs: extentIDs,
+			})
+			if err == context.Canceled || err == context.DeadlineExceeded {
+				return err
+			}
+			if err != nil {
+				xlog.Logger.Warnf(err.Error())
+				current = (current + 1) % int32(len(client.conns))
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+			switch res.Code {
+			case pb.Code_OK:
+				break
+			case pb.Code_TruncateNotMatch:
+				return errTruncateNoMatch
+			default:
+				return errors.New(res.Code.String())
+			}
+
+			if current != last {
+				atomic.StoreInt32(&client.lastLeader, current)
+			}
+			return nil
+		}
+	}
+	return errors.Errorf("timeout: StreamInfo failed")
+
 }

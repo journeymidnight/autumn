@@ -57,6 +57,7 @@ type StreamClient interface {
 	Append(ctx context.Context, blocks []*pb.Block) (extentID uint64, offsets []uint32, err error)
 	NewLogEntryIter(opt ReadOption) LogEntryIter
 	Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, error)
+	Truncate(ctx context.Context, extentID uint64) error
 }
 
 //random read block
@@ -280,6 +281,22 @@ func (sc *AutumnStreamClient) NewLogEntryIter(opt ReadOption) (LogEntryIter, err
 		}
 	}
 	return leIter, nil
+}
+
+func (sc *AutumnStreamClient) Truncate(ctx context.Context, extentID uint64) error {
+	sc.Lock()
+	defer sc.Unlock()
+	var i int
+	for i = range sc.streamInfo.ExtentIDs {
+		if sc.streamInfo.ExtentIDs[i] == extentID {
+			break
+		}
+	}
+	if i == 0 {
+		return nil
+	}
+	sc.streamInfo.ExtentIDs = sc.streamInfo.ExtentIDs[i:]
+	return sc.smClient.TruncateStream(ctx, sc.streamID, sc.streamInfo.ExtentIDs)
 }
 
 func (sc *AutumnStreamClient) getExtentIndexFromID(extentID uint64) int {

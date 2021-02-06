@@ -25,6 +25,10 @@ func NewMockStreamClient(fileName string, id uint64) StreamClient {
 	}
 }
 
+func (client *MockStreamClient) Truncate(ctx context.Context, extentID uint64) error {
+	return nil
+}
+
 //block API, entries has been batched
 func (client *MockStreamClient) AppendEntries(ctx context.Context, entries []*pb.EntryInfo) (uint64, uint32, error) {
 	client.ex.Lock()

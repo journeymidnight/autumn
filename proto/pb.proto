@@ -36,6 +36,7 @@ message EntryInfo {
 	uint32 offset = 3;
 	uint64 estimatedSize = 4;
 }
+
 enum Code {
 	OK = 0;
 	NOT_LEADER = 1;
@@ -43,6 +44,7 @@ enum Code {
 	ERROR = 3;
 	EndOfExtent = 4;
 	EndOfStream = 5;
+	TruncateNotMatch = 6;
 }
 
 enum BlockType {
@@ -217,13 +219,24 @@ message CreateStreamResponse {
 	ExtentInfo extent = 3; 
 }
 
+message TruncateRequest {
+	uint64 streamID = 1;
+	repeated uint64 extentIDs = 2;
+}
+
+message TruncateResponse {
+	Code code = 1;
+}
+
 service StreamManagerService {
 	rpc StreamInfo(StreamInfoRequest) returns (StreamInfoResponse) {}
 	rpc ExtentInfo(ExtentInfoRequest) returns (ExtentInfoResponse) {}
 	rpc NodesInfo(NodesInfoRequest) returns(NodesInfoResponse) {}
+
 	rpc StreamAllocExtent(StreamAllocExtentRequest) returns  (StreamAllocExtentResponse) {}
 	rpc CreateStream(CreateStreamRequest) returns  (CreateStreamResponse) {}
 	rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse) {}
+	rpc Truncate(TruncateRequest) returns (TruncateResponse) {}
 	//gabage colleciton
 	//1. 找到所有在stream里面不再引用的extent, rm//easy
 	//2. extent的三副本中, 如果任何一个不存在, 发relicate exent的操作
