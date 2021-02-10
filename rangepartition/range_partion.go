@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,10 +39,13 @@ var (
 	maxEntriesInQueue = maxSkipList / (y.ValueThrottle + 20) / 2
 )
 
+type OpenStreamFunc func(si pb.StreamInfo) streamclient.StreamClient
+type UpdateStreamFunc func([]pb.StreamInfo)
+
 type RangePartition struct {
+	discard *discardManager
 	//metaStream *streamclient.StreamClient //设定metadata结构
-	blobStreams []streamclient.StreamClient
-	logStream   streamclient.StreamClient
+	logStream streamclient.StreamClient
 	//从ValueStruct中得到的地址, 用blockReader读出来, 因为它可能在[logStream, []blobStreams]里面
 	//我们不需要读每个stream
 	blockReader streamclient.BlockReader
@@ -67,8 +71,10 @@ type RangePartition struct {
 	endKey   []byte
 	pmClient pmclient.PMClient
 
-	closeOnce sync.Once    // For closing DB only once.
-	vhead     valuePointer //vhead前的都在mt中
+	closeOnce    sync.Once    // For closing DB only once.
+	vhead        valuePointer //vhead前的都在mt中
+	openStream   OpenStreamFunc
+	updateStream UpdateStreamFunc
 }
 
 //TODO
@@ -76,21 +82,24 @@ type RangePartition struct {
 
 func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	logStream streamclient.StreamClient, blockReader streamclient.BlockReader,
-	startKey []byte, endKey []byte, tableLocs []*pspb.TableLocation, blobStreams []streamclient.StreamClient,
-	pmclient pmclient.PMClient) *RangePartition {
+	startKey []byte, endKey []byte, tableLocs []*pspb.TableLocation, blobStreams []uint64,
+	pmclient pmclient.PMClient,
+	openStream OpenStreamFunc, updateStream UpdateStreamFunc,
+) *RangePartition {
 	rp := &RangePartition{
-		rowStream:   rowStream,
-		logStream:   logStream,
-		blockReader: blockReader,
-		logRotates:  0,
-		mt:          skiplist.NewSkiplist(maxSkipList),
-		imm:         nil,
-		blockWrites: 0,
-		startKey:    startKey,
-		endKey:      endKey,
-		pmClient:    pmclient,
-		blobStreams: blobStreams,
-		PartID:      id,
+		rowStream:    rowStream,
+		logStream:    logStream,
+		blockReader:  blockReader,
+		logRotates:   0,
+		mt:           skiplist.NewSkiplist(maxSkipList),
+		imm:          nil,
+		blockWrites:  0,
+		startKey:     startKey,
+		endKey:       endKey,
+		pmClient:     pmclient,
+		PartID:       id,
+		openStream:   openStream,
+		updateStream: updateStream,
 	}
 	rp.startMemoryFlush()
 
@@ -122,13 +131,13 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 
 	//FIXME:poor performace: prefetch read will be better
 	replayedLog := 0
-	replay := func(ei *pb.EntryInfo) bool {
+	replay := func(ei *pb.EntryInfo) (bool, error) {
 		replayedLog++
 		//fmt.Printf("from log %v\n", ei)
 		//build ValueStruct from EntryInfo
 		entriesReady := []*pb.EntryInfo{ei}
 
-		head := valuePointer{ei.ExtentID, ei.Offset}
+		head := valuePointer{extentID: ei.ExtentID, offset: ei.Offset}
 
 		if y.ParseTs(ei.Log.Key) > rp.seqNumber {
 			rp.seqNumber++
@@ -152,18 +161,21 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 			time.Sleep(10 * time.Millisecond)
 		}
 		rp.writeToLSM([]*pb.EntryInfo{ei})
-		return true
+		return true, nil
+	}
+	rp.vhead = valuePointer{
+		extentID: lastTable.VpExtentID,
+		offset:   lastTable.VpOffset,
 	}
 
 	if lastTable == nil {
-		replayLog(rp.logStream, 0, 0, replay)
+		replayLog(rp.logStream, 0, 0, true, replay)
 	} else {
 		fmt.Printf("replay log from vp offset [%d]\n", lastTable.VpOffset)
-		replayLog(rp.logStream, lastTable.VpExtentID, lastTable.VpOffset, replay)
+		replayLog(rp.logStream, lastTable.VpExtentID, lastTable.VpOffset, true, replay)
 	}
 	fmt.Printf("replayed log number: %d\n", replayedLog)
 	//start real write
-
 	rp.startWriteLoop()
 	return rp
 }
@@ -348,16 +360,6 @@ type request struct {
 	ref int32
 }
 
-/*
-func estimatedSizeInSkl(es []*pb.EntryInfo) int {
-	size := 0
-	for i := range es {
-		size += _estimatedSizeInSkl(es[i].Log)
-	}
-	return size
-}
-*/
-
 //key + valueStruct
 func estimatedSizeInSkl(e *pb.Entry) int {
 	sz := len(e.Key)
@@ -421,6 +423,7 @@ func (req *request) Wait() error {
 	return err
 }
 
+/*
 func (rp *RangePartition) writeLog(reqs []*request) ([]*pb.EntryInfo, valuePointer, error) {
 	if atomic.LoadInt32(&rp.blockWrites) == 1 {
 		return nil, valuePointer{}, ErrBlockedWrites
@@ -429,6 +432,7 @@ func (rp *RangePartition) writeLog(reqs []*request) ([]*pb.EntryInfo, valuePoint
 
 	return writeValueLog(rp.logStream, reqs)
 }
+*/
 
 // writeRequests is called serially by only one goroutine.
 func (rp *RangePartition) writeRequests(reqs []*request) error {
@@ -445,7 +449,7 @@ func (rp *RangePartition) writeRequests(reqs []*request) error {
 
 	xlog.Logger.Infof("writeRequests called. Writing to log, len[%d]", len(reqs))
 
-	entriesReady, head, err := rp.writeLog(reqs)
+	entriesReady, head, err := rp.writeValueLog(reqs)
 	if err != nil {
 		done(err)
 		return err
@@ -504,6 +508,7 @@ func (rp *RangePartition) writeToLSM(entries []*pb.EntryInfo) error {
 			vp := valuePointer{
 				entry.ExtentID,
 				entry.Offset,
+				uint32(len(entry.Log.Value)),
 			}
 			rp.mt.Put(entry.Log.Key,
 				y.ValueStruct{
@@ -662,6 +667,12 @@ func (rp *RangePartition) getTablesForKey(userKey []byte) ([]*table.Table, func(
 			out = append(out, t)
 		}
 	}
+	//返回的tables安装.SeqNUm排序, SeqNum大的在前(新的table在前), 保证如果出现vesion相同
+	//的key的情况下, 总是找到新的key(为什么会出现version相同的key? 从valuelog gc而来
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].LastSeq > out[j].LastSeq
+	})
+
 	return out, func() {
 		for _, t := range out {
 			t.DecrRef()
@@ -691,17 +702,6 @@ func (rp *RangePartition) get(userKey []byte, version uint64) ([]byte, error) {
 
 		entries := y.ExtractLogEntry(blocks[0])
 		return entries[0].Value, nil
-		/*
-			utils.Check(err)
-			var mix pspb.MixedLog
-			utils.MustUnMarshal(blocks[0].UserData, &mix)
-			eSize := mix.Offsets[0]
-			var entry pb.Entry
-			utils.MustUnMarshal(blocks[0].Data[:eSize], &entry)
-			return entry.Value, nil
-
-			//read value and decode
-		*/
 	}
 	return vs.Value, nil
 
@@ -709,6 +709,7 @@ func (rp *RangePartition) get(userKey []byte, version uint64) ([]byte, error) {
 
 //internal APIs/block
 func (rp *RangePartition) getValueStruct(userKey []byte, version uint64) y.ValueStruct {
+
 	mtables, decr := rp.getMemTables()
 	defer decr()
 
@@ -872,10 +873,7 @@ const vptrSize = unsafe.Sizeof(valuePointer{})
 type valuePointer struct {
 	extentID uint64
 	offset   uint32
-}
-
-func (p valuePointer) Empty() bool {
-	return p.extentID == 0 && p.offset == 0
+	len      uint32
 }
 
 // Encode encodes Pointer into byte buffer.

@@ -3,15 +3,12 @@ package streamclient
 import (
 	"context"
 	"io"
-	"sort"
 	"sync"
 	"time"
 
 	"github.com/journeymidnight/autumn/conn"
 	"github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/proto/pb"
-	"github.com/journeymidnight/autumn/proto/pspb"
-	"github.com/journeymidnight/autumn/rangepartition/y"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
@@ -57,7 +54,7 @@ type StreamClient interface {
 	Append(ctx context.Context, blocks []*pb.Block) (extentID uint64, offsets []uint32, err error)
 	NewLogEntryIter(opt ReadOption) LogEntryIter
 	Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, error)
-	Truncate(ctx context.Context, extentID uint64) error
+	Truncate(ctx context.Context, extentID uint64) (pb.StreamInfo, pb.StreamInfo, error)
 }
 
 //random read block
@@ -218,7 +215,7 @@ func (iter *AutumnLogEntryIter) receiveEntries() error {
 retry:
 	conn, extentID, err := iter.sc.getExtentConnFromIndex(iter.currentExtentIndex)
 	if err != nil {
-		utils.AssertTrue(!iter.noMore)
+		//utils.AssertTrue(!iter.noMore)
 		return err
 	}
 
@@ -252,6 +249,10 @@ retry:
 	case pb.Code_EndOfExtent:
 		iter.currentOffset = 512 //skip extent header
 		iter.currentExtentIndex++
+		//如果stream是BlobStream, 最后一个extent也返回EndOfExtent
+		if iter.currentExtentIndex == len(iter.sc.streamInfo.ExtentIDs) {
+			iter.noMore = true
+		}
 		return nil
 	case pb.Code_EndOfStream:
 		iter.noMore = true
@@ -264,7 +265,7 @@ retry:
 
 }
 
-func (sc *AutumnStreamClient) NewLogEntryIter(opt ReadOption) (LogEntryIter, error) {
+func (sc *AutumnStreamClient) NewLogEntryIter(opt ReadOption) LogEntryIter {
 	leIter := &AutumnLogEntryIter{
 		sc:     sc,
 		opt:    opt,
@@ -276,14 +277,16 @@ func (sc *AutumnStreamClient) NewLogEntryIter(opt ReadOption) (LogEntryIter, err
 	} else {
 		leIter.currentOffset = opt.Offset
 		leIter.currentExtentIndex = sc.getExtentIndexFromID(opt.ExtentID)
-		if leIter.currentExtentIndex < 0 {
-			return nil, errors.Errorf("can not find extentID %d in stream %d", opt.ExtentID, sc.streamID)
-		}
+		/*
+			if leIter.currentExtentIndex < 0 {
+				return nil, errors.Errorf("can not find extentID %d in stream %d", opt.ExtentID, sc.streamID)
+			}
+		*/
 	}
-	return leIter, nil
+	return leIter
 }
 
-func (sc *AutumnStreamClient) Truncate(ctx context.Context, extentID uint64) error {
+func (sc *AutumnStreamClient) Truncate(ctx context.Context, extentID uint64) (pb.StreamInfo, pb.StreamInfo, error) {
 	sc.Lock()
 	defer sc.Unlock()
 	var i int
@@ -293,10 +296,14 @@ func (sc *AutumnStreamClient) Truncate(ctx context.Context, extentID uint64) err
 		}
 	}
 	if i == 0 {
-		return nil
+		return pb.StreamInfo{}, pb.StreamInfo{}, errNoTrucate
 	}
-	sc.streamInfo.ExtentIDs = sc.streamInfo.ExtentIDs[i:]
-	return sc.smClient.TruncateStream(ctx, sc.streamID, sc.streamInfo.ExtentIDs)
+	/*
+		sc.streamInfo.ExtentIDs = sc.streamInfo.ExtentIDs[i:]
+		return sc.smClient.TruncateStream(ctx, sc.streamID, sc.streamInfo.ExtentIDs)
+	*/
+	//FIXME:
+	return pb.StreamInfo{}, pb.StreamInfo{}, errNoTrucate
 }
 
 func (sc *AutumnStreamClient) getExtentIndexFromID(extentID uint64) int {
@@ -377,83 +384,18 @@ func (sc *AutumnStreamClient) AppendEntries(ctx context.Context, entries []*pb.E
 	if len(entries) == 0 {
 		return 0, 0, errors.Errorf("blocks can not be nil")
 	}
-
-	sort.Slice(entries, func(i, j int) bool {
-		return len(entries[i].Log.Value) < len(entries[j].Log.Value)
-	})
-
-	//merge entries into blocks
-
-	var blocks []*pb.Block
-	var mblock *mixedBlock = nil
-	i := 0
-
-	//merge small reqs into block
-	for ; i < len(entries); i++ {
-		if !y.ShouldWriteValueToLSM(entries[i].Log) {
-			break
-		}
-		if mblock == nil {
-			mblock = NewMixedBlock()
-		}
-		if !mblock.CanFill(entries[i].Log) {
-			blocks = append(blocks, mblock.ToBlock())
-			mblock = NewMixedBlock()
-		}
-		mblock.Fill(entries[i].Log)
+	blocks, j, k := entriesToBlocks(entries)
+	exID, offsets, err := sc.Append(ctx, blocks)
+	if err != nil {
+		return 0, 0, err
 	}
-
-	if mblock != nil {
-		blocks = append(blocks, mblock.ToBlock())
+	for i := 0; i < len(entries)-j; i++ {
+		entries[j+i].ExtentID = uint64(exID)
+		entries[j+i].Offset = offsets[k+i]
 	}
+	tail := offsets[len(offsets)-1] + blocks[len(blocks)-1].BlockLength + 512
 
-	j := i           //j is start of Value Block
-	k := len(blocks) //k is start of Value block
-
-	for ; i < len(entries); i++ {
-		blockLength := utils.Ceil(uint32(entries[i].Log.Size()), 512)
-		data := make([]byte, blockLength)
-		entries[i].Log.MarshalTo(data)
-		var mix pspb.MixedLog
-		mix.Offsets = []uint32{0, uint32(entries[i].Log.Size())}
-		blockUserData, err := mix.Marshal()
-		utils.Check(err)
-
-		blocks = append(blocks, &pb.Block{
-			BlockLength: blockLength,
-			UserData:    blockUserData,
-			Data:        data,
-			CheckSum:    utils.AdlerCheckSum(data),
-		})
-	}
-
-retry:
-	extentID, conn := sc.getLastExtentConn()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	c := pb.NewExtentServiceClient(conn)
-	res, err := c.Append(ctx, &pb.AppendRequest{
-		ExtentID: extentID,
-		Blocks:   blocks,
-		Peers:    sc.em.GetPeers(extentID), //sc.getPeers(extentID),
-	})
-	cancel()
-
-	//FIXME
-	if err == context.DeadlineExceeded { //timeout
-		sc.mustAllocNewExtent(extentID)
-		goto retry
-	} else {
-		for i := 0; i < len(entries)-j; i++ {
-			entries[j+i].ExtentID = extentID
-			entries[j+i].Offset = res.Offsets[k+i]
-		}
-		//检查offset结果, 如果已经超过2GB, 调用StreamAllocExtent
-		if res.Offsets[len(res.Offsets)-1] > MaxExtentSize {
-			sc.mustAllocNewExtent(extentID)
-		}
-		endOffset := res.Offsets[len(res.Offsets)-1] + blocks[len(blocks)-1].BlockLength + 512
-		return extentID, endOffset, nil
-	}
+	return uint64(exID), tail, nil
 }
 
 func (sc *AutumnStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, error) {

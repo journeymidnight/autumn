@@ -41,6 +41,7 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 			table.DecrRef()
 		}
 	}()
+	//tbls的顺序是在stream里面的顺序
 
 	var iters []y.Iterator
 	var maxSeq uint64
@@ -48,7 +49,7 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 	for _, table := range tbls {
 		if table.LastSeq > maxSeq {
 			maxSeq = table.LastSeq
-			head = valuePointer{table.VpExtentID, table.VpOffset}
+			head = valuePointer{extentID: table.VpExtentID, offset: table.VpOffset}
 		}
 		iters = append(iters, table.NewIterator(false))
 	}
@@ -58,6 +59,16 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 	defer it.Close()
 
 	it.Rewind()
+
+	//FIXME
+	discardStats := make(map[uint32]int64)
+	updateStats := func(vs y.ValueStruct) {
+		if vs.Meta&y.BitValuePointer > 0 { //big Value
+			var vp valuePointer
+			vp.Decode(vs.Value)
+			discardStats[uint32(vp.extentID)] += int64(vp.len)
+		}
+	}
 
 	var numBuilds int
 	resultCh := make(chan struct{})
@@ -71,6 +82,7 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 		for ; it.Valid(); it.Next() {
 			if len(skipKey) > 0 {
 				if y.SameKey(it.Key(), skipKey) {
+					updateStats(it.Value())
 					numSkips++
 					continue
 				} else {
@@ -83,6 +95,7 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 			skipKey = y.SafeCopy(skipKey, it.Key())
 
 			if major && isDeletedOrExpired(vs.Meta, vs.ExpiresAt) {
+				updateStats(it.Value())
 				numSkips++
 				continue
 			}
@@ -109,8 +122,12 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 	}
 
 	eID := tbls[len(tbls)-1].Loc.ExtentID
+
 	//last table's meta extentd
-	rp.rowStream.Truncate(context.Background(), eID)
+	_, _, _ = rp.rowStream.Truncate(context.Background(), eID)
+	if err == nil {
+		//FIXME: send frontStream/endStream to sm
+	}
 }
 
 func isDeletedOrExpired(meta byte, expiresAt uint64) bool {

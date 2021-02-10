@@ -1,17 +1,21 @@
 package rangepartition
 
 import (
+	"bytes"
 	"context"
 
 	"github.com/journeymidnight/autumn/proto/pb"
+	"github.com/journeymidnight/autumn/rangepartition/y"
 	"github.com/journeymidnight/autumn/streamclient"
+	"github.com/journeymidnight/autumn/utils"
+	"github.com/journeymidnight/autumn/xlog"
 )
 
 //replay valuelog
 //compact valuelog
 //FIXME, 读/写下降到streamlayer
 //如果request有多个Entry, 还需要修改/FIXME
-func writeValueLog(logStream streamclient.StreamClient, reqs []*request) ([]*pb.EntryInfo, valuePointer, error) {
+func (rp *RangePartition) writeValueLog(reqs []*request) ([]*pb.EntryInfo, valuePointer, error) {
 
 	var entries []*pb.EntryInfo
 
@@ -19,21 +23,24 @@ func writeValueLog(logStream streamclient.StreamClient, reqs []*request) ([]*pb.
 		entries = append(entries, req.entries...)
 	}
 
-	extentID, offset, err := logStream.AppendEntries(context.Background(), entries)
+	extentID, offset, err := rp.logStream.AppendEntries(context.Background(), entries)
 	if err != nil {
 		return nil, valuePointer{}, err
 	}
-	return entries, valuePointer{extentID, offset}, nil
+	return entries, valuePointer{extentID: extentID, offset: offset}, nil
 }
 
-func replayLog(logStream streamclient.StreamClient, startExtentID uint64, startOffset uint32, replayFunc func(*pb.EntryInfo) bool) error {
-	opt := streamclient.ReadOption{}.WithReplay()
+func replayLog(stream streamclient.StreamClient, startExtentID uint64, startOffset uint32, replay bool, replayFunc func(*pb.EntryInfo) (bool, error)) error {
+	var opt streamclient.ReadOption
+	if replay {
+		opt = opt.WithReplay()
+	}
 	if startOffset == 0 && startExtentID == 0 {
 		opt = opt.WithReadFromStart()
 	} else {
 		opt = opt.WithReadFrom(startExtentID, startOffset)
 	}
-	iter := logStream.NewLogEntryIter(opt)
+	iter := stream.NewLogEntryIter(opt)
 	for {
 		ok, err := iter.HasNext()
 		if err != nil {
@@ -43,9 +50,111 @@ func replayLog(logStream streamclient.StreamClient, startExtentID uint64, startO
 			break
 		}
 		ei := iter.Next()
-		if replayFunc(ei) == false {
+		next, err := replayFunc(ei)
+		if err != nil {
+			return err
+		}
+		if next == false {
 			break
 		}
+
 	}
 	return nil
+}
+
+//policy
+func (rp *RangePartition) pickLog(discardRatio float64) *pb.StreamInfo {
+	return rp.discard.MaxDiscard()
+
+}
+
+func discardEntry(ei *pb.EntryInfo, vs y.ValueStruct) bool {
+	if vs.Version != y.ParseTs(ei.Log.Key) {
+		// Version not found. Discard.
+		return true
+	}
+	if isDeletedOrExpired(vs.Meta, vs.ExpiresAt) {
+		return true
+	}
+	return false
+}
+
+func (rp *RangePartition) runGC(discardRatio float64) {
+	streamInfo := rp.pickLog(discardRatio)
+	if streamInfo == nil {
+		return
+	}
+
+	var candidate streamclient.StreamClient
+
+	candidate = rp.openStream(*streamInfo)
+
+	candidate.Connect()
+	var count, moved int
+	var freed uint64
+	var size uint64
+	wb := make([]*pb.EntryInfo, 0, 100)
+
+	fe := func(ei *pb.EntryInfo) (bool, error) {
+		count++
+		if count%100000 == 0 {
+			xlog.Logger.Debugf("Processing entry %d", count)
+		}
+
+		freed += ei.EstimatedSize
+		if ei.Log.Key == nil && ei.Log.Value == nil {
+			return true, nil
+		}
+
+		userKey := y.ParseKey(ei.Log.Key)
+
+		if bytes.Compare(userKey, rp.startKey) < 0 {
+			return true, nil
+		}
+		if len(rp.endKey) > 0 && bytes.Compare(rp.endKey, userKey) < 0 {
+			return true, nil
+		}
+
+		//startKey <=userKey <= endKey
+
+		vs := rp.getValueStruct(userKey, 0) //get the lasted version, do not support multiversion
+
+		if discardEntry(ei, vs) {
+			return true, nil
+		}
+
+		utils.AssertTrue(len(vs.Value) > 0)
+		var vp valuePointer
+		vp.Decode(vs.Value)
+		if vp.extentID == ei.ExtentID && vp.offset == ei.Offset {
+			moved++
+			//write ne to mt
+			//keep seqNum
+			ne := &pb.EntryInfo{
+				Log: &pb.Entry{
+					Key:   ei.Log.Key,
+					Value: ei.Log.Value,
+				},
+			}
+
+			//?batch?
+			if len(wb) > 4 || ei.EstimatedSize+size > 16*MB {
+				req, err := rp.sendToWriteCh(wb)
+				if err != nil {
+					return false, err
+				}
+				go func() {
+					//Wait() will release req
+					req.Wait()
+				}()
+			}
+			wb = append(wb, ne)
+			size += ei.EstimatedSize
+
+		}
+		return true, nil
+	}
+
+	replayLog(candidate, 0, 0, false, fe)
+
 }
