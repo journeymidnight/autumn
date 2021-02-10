@@ -57,7 +57,7 @@ func ShouldWriteValueToLSM(entry *pb.Entry) bool {
 }
 
 //sort,merge into blocks
-func entriesToBlocks(entries []*pb.EntryInfo, lastCommit uint32) ([]*pb.Block, int, int) {
+func entriesToBlocks(entries []*pb.EntryInfo) ([]*pb.Block, int, int) {
 
 	utils.AssertTrue(len(entries) != 0)
 

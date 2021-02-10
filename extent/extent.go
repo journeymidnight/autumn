@@ -545,7 +545,7 @@ func readBlockEntries(reader io.Reader, extentID uint64, offset uint32, replay b
 			}
 		} else {
 			//big value
-			entry.Value = nil
+			//keep entry.Value and make sure BitValuePointer
 			entry.Meta |= uint32(y.BitValuePointer)
 			ret = append(ret, &pb.EntryInfo{
 				Log:           entry,
