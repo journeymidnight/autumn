@@ -163,15 +163,17 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		rp.writeToLSM([]*pb.EntryInfo{ei})
 		return true, nil
 	}
-	rp.vhead = valuePointer{
-		extentID: lastTable.VpExtentID,
-		offset:   lastTable.VpOffset,
-	}
 
 	if lastTable == nil {
 		replayLog(rp.logStream, 0, 0, true, replay)
 	} else {
 		fmt.Printf("replay log from vp offset [%d]\n", lastTable.VpOffset)
+		/*
+			rp.vhead = valuePointer{
+				extentID: lastTable.VpExtentID,
+				offset:   lastTable.VpOffset,
+			}
+		*/
 		replayLog(rp.logStream, lastTable.VpExtentID, lastTable.VpOffset, true, replay)
 	}
 	fmt.Printf("replayed log number: %d\n", replayedLog)
@@ -447,7 +449,7 @@ func (rp *RangePartition) writeRequests(reqs []*request) error {
 		}
 	}
 
-	xlog.Logger.Infof("writeRequests called. Writing to log, len[%d]", len(reqs))
+	xlog.Logger.Debugf("writeRequests called. Writing to log, len[%d]", len(reqs))
 
 	entriesReady, head, err := rp.writeValueLog(reqs)
 	if err != nil {
@@ -531,8 +533,9 @@ func isReqsTooBig(reqs []*request) bool {
 		if size > 20*MB {
 			return true
 		}
+
 		n += len(req.entries)
-		if n > maxEntriesInQueue {
+		if n > 10 {
 			return true
 		}
 	}
