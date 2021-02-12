@@ -19,7 +19,6 @@ package table
 import (
 	"fmt"
 	"math"
-	"math/rand"
 	"sort"
 	"testing"
 
@@ -49,8 +48,7 @@ func buildTestTable(t *testing.T, prefix string, n int) (streamclient.StreamClie
 // keyValues is n by 2 where n is number of pairs.
 func buildTable(t *testing.T, keyValues [][]string) (streamclient.StreamClient, uint64, uint32) {
 	//open local stream
-	filename := fmt.Sprintf("%d.sst", rand.Uint32())
-	stream := streamclient.NewMockStreamClient(filename, 100)
+	stream := streamclient.NewMockStreamClient("log")
 	b := NewTableBuilder(stream)
 	defer b.Close()
 
@@ -681,8 +679,7 @@ func TestTableBigValues(t *testing.T) {
 		return []byte(fmt.Sprintf("%01048576d", i)) // Return 1MB value which is > math.MaxUint16.
 	}
 
-	filename := fmt.Sprintf("%d.sst", rand.Uint32())
-	stream := streamclient.NewMockStreamClient(filename, 100)
+	stream := streamclient.NewMockStreamClient("log")
 	defer stream.Close()
 
 	n := 100 // Insert 100 keys.

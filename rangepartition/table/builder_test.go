@@ -53,7 +53,7 @@ func TestTableIndex(t *testing.T) {
 		assert.Nil(t, err)
 	*/
 
-	stream := streamclient.NewMockStreamClient("test.tmp", 100)
+	stream := streamclient.NewMockStreamClient("log")
 	defer stream.Close()
 
 	builder := NewTableBuilder(stream)

@@ -3,7 +3,6 @@ package rangepartition
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"testing"
 
 	"github.com/journeymidnight/autumn/proto/pb"
@@ -44,7 +43,7 @@ func TestLogReplay(t *testing.T) {
 		},
 	}
 
-	logStream := streamclient.NewMockStreamClient(fmt.Sprintf("%d.vlog", rand.Uint32()), 10)
+	logStream := streamclient.NewMockStreamClient("log")
 	defer logStream.Close()
 
 	extentID, offset, err := logStream.AppendEntries(context.Background(), cases)
@@ -78,11 +77,11 @@ func TestLogReplay(t *testing.T) {
 		},
 	}
 	i := 0
-	replayLog(logStream, extentID, offset, func(ei *pb.EntryInfo) bool {
+	replayLog(logStream, extentID, offset, false, func(ei *pb.EntryInfo) (bool, error) {
 		fmt.Printf("%s\n", ei.Log.Key)
 		require.Equal(t, expecteEI[i], ei)
 		i++
-		return true
+		return true, nil
 	})
 
 }

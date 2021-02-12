@@ -2,7 +2,6 @@ package rangepartition
 
 import (
 	"fmt"
-	"math/rand"
 	"sync"
 	"testing"
 
@@ -12,15 +11,15 @@ import (
 )
 
 func TestCompaction(t *testing.T) {
-	logStream := streamclient.NewMockStreamClient(fmt.Sprintf("%d.vlog", rand.Uint32()), 10)
-	rowStream := streamclient.NewMockStreamClient(fmt.Sprintf("%d.sst", rand.Uint32()), 12)
+	logStream := streamclient.NewMockStreamClient("log")
+	rowStream := streamclient.NewMockStreamClient("sst")
 	pmclient := new(pmclient.MockPMClient)
 
 	defer logStream.Close()
 	defer rowStream.Close()
 
 	rp := OpenRangePartition(3, rowStream, logStream, logStream.(streamclient.BlockReader),
-		[]byte(""), []byte(""), nil, nil, pmclient)
+		[]byte(""), []byte(""), nil, nil, pmclient, streamclient.OpenMockStreamClient, streamclient.UpdateStreamMock)
 	defer rp.Close()
 
 	var wg sync.WaitGroup
@@ -33,6 +32,7 @@ func TestCompaction(t *testing.T) {
 		})
 	}
 	wg.Wait()
+
 	var tbls []*table.Table
 
 	rp.tableLock.RLock()

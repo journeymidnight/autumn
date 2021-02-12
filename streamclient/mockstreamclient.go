@@ -19,10 +19,11 @@ var (
 )
 
 type MockStreamClient struct {
-	exs    []*extent.Extent
-	names  []string
-	ID     uint64
-	suffix string
+	utils.SafeMutex //protect exs
+	exs             []*extent.Extent
+	names           []string
+	ID              uint64
+	suffix          string
 }
 
 /*
@@ -151,7 +152,9 @@ func (client *MockStreamClient) Append(ctx context.Context, blocks []*pb.Block) 
 		name := fileName(eID, client.suffix)
 		newEx, err := extent.CreateExtent(name, eID)
 		utils.Check(err)
+		client.Lock()
 		client.exs = append(client.exs, newEx)
+		client.Unlock()
 	}
 	return uint64(exID), offsets, err
 }
@@ -171,12 +174,14 @@ func (client *MockStreamClient) Connect() error {
 func (client *MockStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, error) {
 
 	var ex *extent.Extent
+	client.RLock()
 	for i := range client.exs {
 		if client.exs[i].ID == extentID {
 			ex = client.exs[i]
 			break
 		}
 	}
+	client.RUnlock()
 	if ex == nil {
 		return nil, errors.New("extentID not good")
 	}
