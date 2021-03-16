@@ -192,6 +192,8 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		Replicates: extractNodeId(nodes),
 	}
 
+	//set old
+
 	edata, err := extentInfo.Marshal()
 	utils.Check(err)
 
@@ -418,9 +420,55 @@ func (sm *StreamManager) StreamInfo(ctx context.Context, req *pb.StreamInfoReque
 
 }
 
-//FIXME:TODO
-func (sm *StreamManager) Truncate(context.Context, *pb.TruncateRequest) (*pb.TruncateResponse, error) {
-	return nil, nil
+func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) (*pb.TruncateResponse, error) {
+	if !sm.AmLeader() {
+		return nil, errors.Errorf("not a leader")
+	}
+	sm.streamLock.Lock()
+	defer sm.streamLock.Unlock()
+	streamInfo, ok := sm.streams[req.StreamID]
+	if !ok {
+		return &pb.TruncateResponse{
+			Code: pb.Code_TruncateNotMatch,
+		}, nil
+	}
+	var i int
+	for i = range streamInfo.ExtentIDs {
+		if streamInfo.ExtentIDs[i] == req.ExtentID {
+			break
+		}
+	}
+
+	if i == 0 {
+		return &pb.TruncateResponse{
+			Code: pb.Code_OK}, nil
+	}
+
+	//update ETCD
+	newExtentIDs := streamInfo.ExtentIDs[i:]
+	streamKey := formatStreamKey(req.StreamID)
+	newStreamInfo := pb.StreamInfo{
+		StreamID:  req.StreamID,
+		ExtentIDs: newExtentIDs,
+	}
+
+	sdata, err := newStreamInfo.Marshal()
+	utils.Check(err)
+
+	ops := []clientv3.Op{
+		clientv3.OpPut(streamKey, string(sdata)),
+	}
+	err = manager.EtctSetKVS(sm.client, []clientv3.Cmp{
+		clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
+	}, ops)
+
+	if err != nil {
+		return nil, err
+	}
+
+	sm.streams[req.StreamID] = &newStreamInfo
+	return &pb.TruncateResponse{
+		Code: pb.Code_OK}, nil
 }
 
 func (sm *StreamManager) getAppendExtentsAddr(streamID uint64) ([]NodeStatus, uint64, error) {
@@ -496,7 +544,6 @@ func formatExtentReplicate(ID uint64) string {
 }
 
 func parseKey(s string, prefix string) (uint64, error) {
-	//example: "stream_1" , "extent_1" , "node_1"
 
 	parts := strings.Split(s, "/")
 	if len(parts) != 2 {

@@ -55,6 +55,7 @@ type StreamClient interface {
 	NewLogEntryIter(opt ReadOption) LogEntryIter
 	Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, error)
 	Truncate(ctx context.Context, extentID uint64) (pb.StreamInfo, pb.StreamInfo, error)
+	//FIXME: stat => ([]extentID , offset)
 }
 
 //random read block
@@ -70,6 +71,13 @@ type LogEntryIter interface {
 type AutumnBlockReader struct {
 	em *AutumnExtentManager
 	sm *smclient.SMClient
+}
+
+func NewAutumnBlockReader(em *AutumnExtentManager, sm *smclient.SMClient) *AutumnBlockReader {
+	return &AutumnBlockReader{
+		em: em,
+		sm: sm,
+	}
 }
 
 func (br *AutumnBlockReader) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, error) {

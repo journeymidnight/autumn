@@ -106,7 +106,7 @@ func TestWriteRead(t *testing.T) {
 		var wg sync.WaitGroup
 		for i := 0; i < 100; i++ {
 			wg.Add(1)
-			rp.writeAsync([]byte(fmt.Sprintf("key%d", i)), []byte(fmt.Sprintf("val%d", i)), func(e error) {
+			rp.WriteAsync([]byte(fmt.Sprintf("key%d", i)), []byte(fmt.Sprintf("val%d", i)), func(e error) {
 				wg.Done()
 			})
 			//rp.write([]byte(fmt.Sprintf("key%d", i)), []byte(fmt.Sprintf("val%d", i)))
@@ -114,7 +114,7 @@ func TestWriteRead(t *testing.T) {
 		wg.Wait()
 
 		for i := 0; i < 100; i++ {
-			v, err := rp.get([]byte(fmt.Sprintf("key%d", i)), 300)
+			v, err := rp.Get([]byte(fmt.Sprintf("key%d", i)), 300)
 			require.NoError(t, err)
 			require.Equal(t, []byte(fmt.Sprintf("val%d", i)), v)
 		}
@@ -127,13 +127,13 @@ func TestUpdateRead(t *testing.T) {
 		var wg sync.WaitGroup
 		for i := 0; i < 100; i++ {
 			wg.Add(1)
-			rp.writeAsync([]byte("key"), []byte(fmt.Sprintf("val%d", i)), func(e error) {
+			rp.WriteAsync([]byte("key"), []byte(fmt.Sprintf("val%d", i)), func(e error) {
 				wg.Done()
 			})
 		}
 		wg.Wait()
 
-		value, err := rp.get([]byte("key"), 0)
+		value, err := rp.Get([]byte("key"), 0)
 		require.NoError(t, err)
 		require.Equal(t, []byte(fmt.Sprintf("val%d", 99)), value)
 
@@ -144,10 +144,10 @@ func TestGetBig(t *testing.T) {
 	runRPTest(t, func(t *testing.T, rp *RangePartition) {
 		//txnSet(t, db, []byte("key1"), []byte("val1"), 0x08)
 		bigValue := []byte(fmt.Sprintf("%01048576d", 10))
-		err := rp.write([]byte("key1"), bigValue)
+		err := rp.Write([]byte("key1"), bigValue)
 		require.NoError(t, err)
 
-		v, err := rp.get([]byte("key1"), 0)
+		v, err := rp.Get([]byte("key1"), 0)
 
 		require.NoError(t, err)
 		require.Equal(t, len(bigValue), len(v))
@@ -170,7 +170,7 @@ func TestReopenRangePartition(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := 10; i < 100; i++ {
 		wg.Add(1)
-		rp.writeAsync([]byte(fmt.Sprintf("key%d", i)), []byte(fmt.Sprintf("val%d", i)), func(e error) {
+		rp.WriteAsync([]byte(fmt.Sprintf("key%d", i)), []byte(fmt.Sprintf("val%d", i)), func(e error) {
 			wg.Done()
 		})
 	}
@@ -182,7 +182,7 @@ func TestReopenRangePartition(t *testing.T) {
 		[]byte(""), []byte(""), pmclient.Tables, nil, pmclient, streamclient.OpenMockStreamClient, streamclient.UpdateStreamMock)
 
 	for i := 10; i < 100; i++ {
-		v, err := rp.get([]byte(fmt.Sprintf("key%d", i)), 300)
+		v, err := rp.Get([]byte(fmt.Sprintf("key%d", i)), 300)
 		if err == errNotFound {
 			fmt.Printf("key%d failed\n", i)
 			continue
@@ -212,7 +212,7 @@ func TestReopenRangePartitionWithBig(t *testing.T) {
 		val := make([]byte, n)
 		utils.SetRandStringBytes(val)
 		expectedValue = append(expectedValue, val)
-		rp.writeAsync([]byte(fmt.Sprintf("key%d", i)), val, func(e error) {
+		rp.WriteAsync([]byte(fmt.Sprintf("key%d", i)), val, func(e error) {
 			wg.Done()
 		})
 	}
@@ -224,7 +224,7 @@ func TestReopenRangePartitionWithBig(t *testing.T) {
 		[]byte(""), []byte(""), pmclient.Tables, nil, pmclient, streamclient.OpenMockStreamClient, streamclient.UpdateStreamMock)
 
 	for i := 10; i < 100; i++ {
-		v, err := rp.get([]byte(fmt.Sprintf("key%d", i)), 300)
+		v, err := rp.Get([]byte(fmt.Sprintf("key%d", i)), 300)
 		if err == errNotFound {
 			fmt.Printf("key%d failed\n", i)
 			continue

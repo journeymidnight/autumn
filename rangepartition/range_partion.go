@@ -67,8 +67,8 @@ type RangePartition struct {
 	seqNumber      uint64
 
 	PartID   uint64
-	startKey []byte
-	endKey   []byte
+	StartKey []byte
+	EndKey   []byte
 	pmClient pmclient.PMClient
 
 	closeOnce    sync.Once    // For closing DB only once.
@@ -82,7 +82,7 @@ type RangePartition struct {
 
 func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	logStream streamclient.StreamClient, blockReader streamclient.BlockReader,
-	startKey []byte, endKey []byte, tableLocs []*pspb.TableLocation, blobStreams []uint64,
+	startKey []byte, endKey []byte, tableLocs []*pspb.Location, blobStreams []uint64,
 	pmclient pmclient.PMClient,
 	openStream OpenStreamFunc, updateStream UpdateStreamFunc,
 ) *RangePartition {
@@ -94,8 +94,8 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		mt:           skiplist.NewSkiplist(maxSkipList),
 		imm:          nil,
 		blockWrites:  0,
-		startKey:     startKey,
-		endKey:       endKey,
+		StartKey:     startKey,
+		EndKey:       endKey,
 		pmClient:     pmclient,
 		PartID:       id,
 		openStream:   openStream,
@@ -316,7 +316,7 @@ func (rp *RangePartition) flushMemtable() {
 		}
 
 		//save table offset in PM
-		var tableLocs []*pspb.TableLocation
+		var tableLocs []*pspb.Location
 		rp.tableLock.RLock()
 		for _, t := range rp.tables {
 			tableLocs = append(tableLocs, &t.Loc)
@@ -324,7 +324,7 @@ func (rp *RangePartition) flushMemtable() {
 		rp.tableLock.RUnlock()
 
 		for {
-			err := rp.pmClient.SetTables(rp.PartID, tableLocs)
+			err := rp.pmClient.SetRowStreamTables(rp.PartID, tableLocs)
 			if err != nil {
 				xlog.Logger.Errorf("failed to set tableLocs for %d, retry...", rp.PartID)
 				time.Sleep(100 * time.Millisecond)
@@ -683,7 +683,7 @@ func (rp *RangePartition) getTablesForKey(userKey []byte) ([]*table.Table, func(
 	}
 }
 
-func (rp *RangePartition) get(userKey []byte, version uint64) ([]byte, error) {
+func (rp *RangePartition) Get(userKey []byte, version uint64) ([]byte, error) {
 
 	vs := rp.getValueStruct(userKey, version)
 
@@ -813,7 +813,7 @@ func (rp *RangePartition) close(gracefull bool) error {
 	return nil
 }
 
-func (rp *RangePartition) writeAsync(key, value []byte, f func(error)) {
+func (rp *RangePartition) WriteAsync(key, value []byte, f func(error)) {
 
 	newSeqNumber := atomic.AddUint64(&rp.seqNumber, 1)
 
@@ -838,7 +838,7 @@ func (rp *RangePartition) writeAsync(key, value []byte, f func(error)) {
 }
 
 //req.Wait will free the request
-func (rp *RangePartition) write(key, value []byte) error {
+func (rp *RangePartition) Write(key, value []byte) error {
 	newSeqNumber := atomic.AddUint64(&rp.seqNumber, 1)
 
 	e := &pb.EntryInfo{

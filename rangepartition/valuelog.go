@@ -27,6 +27,9 @@ func (rp *RangePartition) writeValueLog(reqs []*request) ([]*pb.EntryInfo, value
 	if err != nil {
 		return nil, valuePointer{}, err
 	}
+
+	//FIXME
+	//if rp.logStream.Size() > 4GB then rp.logStream.Truncate()
 	return entries, valuePointer{extentID: extentID, offset: offset}, nil
 }
 
@@ -108,10 +111,10 @@ func (rp *RangePartition) runGC(discardRatio float64) {
 
 		userKey := y.ParseKey(ei.Log.Key)
 
-		if bytes.Compare(userKey, rp.startKey) < 0 {
+		if bytes.Compare(userKey, rp.StartKey) < 0 {
 			return true, nil
 		}
-		if len(rp.endKey) > 0 && bytes.Compare(rp.endKey, userKey) < 0 {
+		if len(rp.EndKey) > 0 && bytes.Compare(rp.EndKey, userKey) < 0 {
 			return true, nil
 		}
 

@@ -290,7 +290,7 @@ func (client *SMClient) StreamInfo(ctx context.Context, streamIDs []uint64) (map
 	return nil, nil, errors.Errorf("timeout: StreamInfo failed")
 }
 
-func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, extentIDs []uint64) error {
+func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, extentID uint64) error {
 	client.RLock()
 	defer client.RUnlock()
 	last := atomic.LoadInt32(&client.lastLeader)
@@ -299,8 +299,8 @@ func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, ext
 		if client.conns != nil && client.conns[current] != nil {
 			c := pb.NewStreamManagerServiceClient(client.conns[current])
 			res, err := c.Truncate(ctx, &pb.TruncateRequest{
-				StreamID:  streamID,
-				ExtentIDs: extentIDs,
+				StreamID: streamID,
+				ExtentID: extentID,
 			})
 			if err == context.Canceled || err == context.DeadlineExceeded {
 				return err
