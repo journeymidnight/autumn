@@ -62,6 +62,7 @@ func TestBasicNode(t *testing.T) {
 	res, err := nodes[0].Append(context.Background(), &pb.AppendRequest{
 		ExtentID: 100,
 		Blocks:   []*pb.Block{block},
+		Peers:    []string{"127.0.0.1:3301", "127.0.0.1:3302", "127.0.0.1:3303"},
 	})
 	assert.Nil(t, err)
 	assert.Equal(t, uint32(512), res.Offsets[0])
