@@ -143,7 +143,7 @@ func (ps *PartitionServer) registerPS() {
 	}
 
 	ps.PSID = id
-	if err = ioutil.WriteFile(storeIDPath, []byte(fmt.Sprintf("%d")), 0644); err != nil {
+	if err = ioutil.WriteFile(storeIDPath, []byte(fmt.Sprintf("%d", id)), 0644); err != nil {
 		xlog.Logger.Fatalf("try to write file %s, %d, but failed, try to save it manually", storeIDPath, id)
 	}
 	xlog.Logger.Infof("success to register to sm")
