@@ -4,8 +4,13 @@
 package pspb
 
 import (
+	context "context"
 	fmt "fmt"
 	proto "github.com/gogo/protobuf/proto"
+	pb "github.com/journeymidnight/autumn/proto/pb"
+	grpc "google.golang.org/grpc"
+	codes "google.golang.org/grpc/codes"
+	status "google.golang.org/grpc/status"
 	io "io"
 	math "math"
 	math_bits "math/bits"
@@ -91,12 +96,6 @@ func (m *MixedLog) GetOffsets() []uint32 {
 	return nil
 }
 
-//
-//PART_%d/range => [startKey, endKey]
-//PART_%d/blobStreams => [id,...,id]
-//PART_%d/logStream => id
-//PART_%d/rowStream => id
-//PART_%d/tables => [(extentID,offset),...,(extentID,offset)]
 type Range struct {
 	StartKey []byte `protobuf:"bytes,1,opt,name=startKey,proto3" json:"startKey,omitempty"`
 	EndKey   []byte `protobuf:"bytes,2,opt,name=endKey,proto3" json:"endKey,omitempty"`
@@ -149,23 +148,23 @@ func (m *Range) GetEndKey() []byte {
 	return nil
 }
 
-type TableLocation struct {
+type Location struct {
 	ExtentID uint64 `protobuf:"varint,1,opt,name=extentID,proto3" json:"extentID,omitempty"`
 	Offset   uint32 `protobuf:"varint,2,opt,name=offset,proto3" json:"offset,omitempty"`
 }
 
-func (m *TableLocation) Reset()         { *m = TableLocation{} }
-func (m *TableLocation) String() string { return proto.CompactTextString(m) }
-func (*TableLocation) ProtoMessage()    {}
-func (*TableLocation) Descriptor() ([]byte, []int) {
+func (m *Location) Reset()         { *m = Location{} }
+func (m *Location) String() string { return proto.CompactTextString(m) }
+func (*Location) ProtoMessage()    {}
+func (*Location) Descriptor() ([]byte, []int) {
 	return fileDescriptor_3e3c719c85d382a4, []int{2}
 }
-func (m *TableLocation) XXX_Unmarshal(b []byte) error {
+func (m *Location) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
 }
-func (m *TableLocation) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+func (m *Location) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
 	if deterministic {
-		return xxx_messageInfo_TableLocation.Marshal(b, m, deterministic)
+		return xxx_messageInfo_Location.Marshal(b, m, deterministic)
 	} else {
 		b = b[:cap(b)]
 		n, err := m.MarshalToSizedBuffer(b)
@@ -175,45 +174,136 @@ func (m *TableLocation) XXX_Marshal(b []byte, deterministic bool) ([]byte, error
 		return b[:n], nil
 	}
 }
-func (m *TableLocation) XXX_Merge(src proto.Message) {
-	xxx_messageInfo_TableLocation.Merge(m, src)
+func (m *Location) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_Location.Merge(m, src)
 }
-func (m *TableLocation) XXX_Size() int {
+func (m *Location) XXX_Size() int {
 	return m.Size()
 }
-func (m *TableLocation) XXX_DiscardUnknown() {
-	xxx_messageInfo_TableLocation.DiscardUnknown(m)
+func (m *Location) XXX_DiscardUnknown() {
+	xxx_messageInfo_Location.DiscardUnknown(m)
 }
 
-var xxx_messageInfo_TableLocation proto.InternalMessageInfo
+var xxx_messageInfo_Location proto.InternalMessageInfo
 
-func (m *TableLocation) GetExtentID() uint64 {
+func (m *Location) GetExtentID() uint64 {
 	if m != nil {
 		return m.ExtentID
 	}
 	return 0
 }
 
-func (m *TableLocation) GetOffset() uint32 {
+func (m *Location) GetOffset() uint32 {
 	if m != nil {
 		return m.Offset
 	}
 	return 0
 }
 
+type BlobStreams struct {
+	Blob []uint64 `protobuf:"varint,1,rep,packed,name=blob,proto3" json:"blob,omitempty"`
+}
+
+func (m *BlobStreams) Reset()         { *m = BlobStreams{} }
+func (m *BlobStreams) String() string { return proto.CompactTextString(m) }
+func (*BlobStreams) ProtoMessage()    {}
+func (*BlobStreams) Descriptor() ([]byte, []int) {
+	return fileDescriptor_3e3c719c85d382a4, []int{3}
+}
+func (m *BlobStreams) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *BlobStreams) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_BlobStreams.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *BlobStreams) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_BlobStreams.Merge(m, src)
+}
+func (m *BlobStreams) XXX_Size() int {
+	return m.Size()
+}
+func (m *BlobStreams) XXX_DiscardUnknown() {
+	xxx_messageInfo_BlobStreams.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_BlobStreams proto.InternalMessageInfo
+
+func (m *BlobStreams) GetBlob() []uint64 {
+	if m != nil {
+		return m.Blob
+	}
+	return nil
+}
+
+type TableLocations struct {
+	Locs []*Location `protobuf:"bytes,1,rep,name=locs,proto3" json:"locs,omitempty"`
+}
+
+func (m *TableLocations) Reset()         { *m = TableLocations{} }
+func (m *TableLocations) String() string { return proto.CompactTextString(m) }
+func (*TableLocations) ProtoMessage()    {}
+func (*TableLocations) Descriptor() ([]byte, []int) {
+	return fileDescriptor_3e3c719c85d382a4, []int{4}
+}
+func (m *TableLocations) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *TableLocations) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_TableLocations.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *TableLocations) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_TableLocations.Merge(m, src)
+}
+func (m *TableLocations) XXX_Size() int {
+	return m.Size()
+}
+func (m *TableLocations) XXX_DiscardUnknown() {
+	xxx_messageInfo_TableLocations.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_TableLocations proto.InternalMessageInfo
+
+func (m *TableLocations) GetLocs() []*Location {
+	if m != nil {
+		return m.Locs
+	}
+	return nil
+}
+
 type PartitionMeta struct {
-	Range       *Range           `protobuf:"bytes,1,opt,name=range,proto3" json:"range,omitempty"`
-	BlobStreams []uint64         `protobuf:"varint,2,rep,packed,name=blobStreams,proto3" json:"blobStreams,omitempty"`
-	LogStream   uint64           `protobuf:"varint,3,opt,name=logStream,proto3" json:"logStream,omitempty"`
-	RowStream   uint64           `protobuf:"varint,4,opt,name=rowStream,proto3" json:"rowStream,omitempty"`
-	Tables      []*TableLocation `protobuf:"bytes,5,rep,name=tables,proto3" json:"tables,omitempty"`
+	Blobs     *BlobStreams    `protobuf:"bytes,1,opt,name=blobs,proto3" json:"blobs,omitempty"`
+	LogStream uint64          `protobuf:"varint,2,opt,name=logStream,proto3" json:"logStream,omitempty"`
+	RowStream uint64          `protobuf:"varint,3,opt,name=rowStream,proto3" json:"rowStream,omitempty"`
+	Locs      *TableLocations `protobuf:"bytes,4,opt,name=locs,proto3" json:"locs,omitempty"`
+	Parent    uint64          `protobuf:"varint,5,opt,name=parent,proto3" json:"parent,omitempty"`
+	Discard   []byte          `protobuf:"bytes,6,opt,name=discard,proto3" json:"discard,omitempty"`
+	Rg        *Range          `protobuf:"bytes,7,opt,name=rg,proto3" json:"rg,omitempty"`
+	PartID    uint64          `protobuf:"varint,8,opt,name=PartID,proto3" json:"PartID,omitempty"`
 }
 
 func (m *PartitionMeta) Reset()         { *m = PartitionMeta{} }
 func (m *PartitionMeta) String() string { return proto.CompactTextString(m) }
 func (*PartitionMeta) ProtoMessage()    {}
 func (*PartitionMeta) Descriptor() ([]byte, []int) {
-	return fileDescriptor_3e3c719c85d382a4, []int{3}
+	return fileDescriptor_3e3c719c85d382a4, []int{5}
 }
 func (m *PartitionMeta) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -242,16 +332,9 @@ func (m *PartitionMeta) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_PartitionMeta proto.InternalMessageInfo
 
-func (m *PartitionMeta) GetRange() *Range {
+func (m *PartitionMeta) GetBlobs() *BlobStreams {
 	if m != nil {
-		return m.Range
-	}
-	return nil
-}
-
-func (m *PartitionMeta) GetBlobStreams() []uint64 {
-	if m != nil {
-		return m.BlobStreams
+		return m.Blobs
 	}
 	return nil
 }
@@ -270,31 +353,58 @@ func (m *PartitionMeta) GetRowStream() uint64 {
 	return 0
 }
 
-func (m *PartitionMeta) GetTables() []*TableLocation {
+func (m *PartitionMeta) GetLocs() *TableLocations {
 	if m != nil {
-		return m.Tables
+		return m.Locs
 	}
 	return nil
 }
 
-type MetaStreamData struct {
-	LogStreamID  uint64 `protobuf:"varint,1,opt,name=logStreamID,proto3" json:"logStreamID,omitempty"`
-	RawStreamID  uint64 `protobuf:"varint,2,opt,name=rawStreamID,proto3" json:"rawStreamID,omitempty"`
-	BlobStreamID uint64 `protobuf:"varint,3,opt,name=blobStreamID,proto3" json:"blobStreamID,omitempty"`
+func (m *PartitionMeta) GetParent() uint64 {
+	if m != nil {
+		return m.Parent
+	}
+	return 0
 }
 
-func (m *MetaStreamData) Reset()         { *m = MetaStreamData{} }
-func (m *MetaStreamData) String() string { return proto.CompactTextString(m) }
-func (*MetaStreamData) ProtoMessage()    {}
-func (*MetaStreamData) Descriptor() ([]byte, []int) {
-	return fileDescriptor_3e3c719c85d382a4, []int{4}
+func (m *PartitionMeta) GetDiscard() []byte {
+	if m != nil {
+		return m.Discard
+	}
+	return nil
 }
-func (m *MetaStreamData) XXX_Unmarshal(b []byte) error {
+
+func (m *PartitionMeta) GetRg() *Range {
+	if m != nil {
+		return m.Rg
+	}
+	return nil
+}
+
+func (m *PartitionMeta) GetPartID() uint64 {
+	if m != nil {
+		return m.PartID
+	}
+	return 0
+}
+
+type PSDetail struct {
+	PSID    uint64 `protobuf:"varint,1,opt,name=PSID,proto3" json:"PSID,omitempty"`
+	Address string `protobuf:"bytes,2,opt,name=address,proto3" json:"address,omitempty"`
+}
+
+func (m *PSDetail) Reset()         { *m = PSDetail{} }
+func (m *PSDetail) String() string { return proto.CompactTextString(m) }
+func (*PSDetail) ProtoMessage()    {}
+func (*PSDetail) Descriptor() ([]byte, []int) {
+	return fileDescriptor_3e3c719c85d382a4, []int{6}
+}
+func (m *PSDetail) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
 }
-func (m *MetaStreamData) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+func (m *PSDetail) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
 	if deterministic {
-		return xxx_messageInfo_MetaStreamData.Marshal(b, m, deterministic)
+		return xxx_messageInfo_PSDetail.Marshal(b, m, deterministic)
 	} else {
 		b = b[:cap(b)]
 		n, err := m.MarshalToSizedBuffer(b)
@@ -304,37 +414,98 @@ func (m *MetaStreamData) XXX_Marshal(b []byte, deterministic bool) ([]byte, erro
 		return b[:n], nil
 	}
 }
-func (m *MetaStreamData) XXX_Merge(src proto.Message) {
-	xxx_messageInfo_MetaStreamData.Merge(m, src)
+func (m *PSDetail) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_PSDetail.Merge(m, src)
 }
-func (m *MetaStreamData) XXX_Size() int {
+func (m *PSDetail) XXX_Size() int {
 	return m.Size()
 }
-func (m *MetaStreamData) XXX_DiscardUnknown() {
-	xxx_messageInfo_MetaStreamData.DiscardUnknown(m)
+func (m *PSDetail) XXX_DiscardUnknown() {
+	xxx_messageInfo_PSDetail.DiscardUnknown(m)
 }
 
-var xxx_messageInfo_MetaStreamData proto.InternalMessageInfo
+var xxx_messageInfo_PSDetail proto.InternalMessageInfo
 
-func (m *MetaStreamData) GetLogStreamID() uint64 {
+func (m *PSDetail) GetPSID() uint64 {
 	if m != nil {
-		return m.LogStreamID
+		return m.PSID
 	}
 	return 0
 }
 
-func (m *MetaStreamData) GetRawStreamID() uint64 {
+func (m *PSDetail) GetAddress() string {
 	if m != nil {
-		return m.RawStreamID
+		return m.Address
+	}
+	return ""
+}
+
+type RegionInfo struct {
+	Rg     *Range `protobuf:"bytes,1,opt,name=rg,proto3" json:"rg,omitempty"`
+	PartID uint64 `protobuf:"varint,2,opt,name=PartID,proto3" json:"PartID,omitempty"`
+	PSID   uint64 `protobuf:"varint,3,opt,name=PSID,proto3" json:"PSID,omitempty"`
+	Addr   string `protobuf:"bytes,4,opt,name=addr,proto3" json:"addr,omitempty"`
+}
+
+func (m *RegionInfo) Reset()         { *m = RegionInfo{} }
+func (m *RegionInfo) String() string { return proto.CompactTextString(m) }
+func (*RegionInfo) ProtoMessage()    {}
+func (*RegionInfo) Descriptor() ([]byte, []int) {
+	return fileDescriptor_3e3c719c85d382a4, []int{7}
+}
+func (m *RegionInfo) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *RegionInfo) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_RegionInfo.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *RegionInfo) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_RegionInfo.Merge(m, src)
+}
+func (m *RegionInfo) XXX_Size() int {
+	return m.Size()
+}
+func (m *RegionInfo) XXX_DiscardUnknown() {
+	xxx_messageInfo_RegionInfo.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_RegionInfo proto.InternalMessageInfo
+
+func (m *RegionInfo) GetRg() *Range {
+	if m != nil {
+		return m.Rg
+	}
+	return nil
+}
+
+func (m *RegionInfo) GetPartID() uint64 {
+	if m != nil {
+		return m.PartID
 	}
 	return 0
 }
 
-func (m *MetaStreamData) GetBlobStreamID() uint64 {
+func (m *RegionInfo) GetPSID() uint64 {
 	if m != nil {
-		return m.BlobStreamID
+		return m.PSID
 	}
 	return 0
+}
+
+func (m *RegionInfo) GetAddr() string {
+	if m != nil {
+		return m.Addr
+	}
+	return ""
 }
 
 //BlockMeta will be marshaled into pb.Block.userdata
@@ -351,7 +522,7 @@ func (m *RawBlockMeta) Reset()         { *m = RawBlockMeta{} }
 func (m *RawBlockMeta) String() string { return proto.CompactTextString(m) }
 func (*RawBlockMeta) ProtoMessage()    {}
 func (*RawBlockMeta) Descriptor() ([]byte, []int) {
-	return fileDescriptor_3e3c719c85d382a4, []int{5}
+	return fileDescriptor_3e3c719c85d382a4, []int{8}
 }
 func (m *RawBlockMeta) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -432,7 +603,7 @@ func (m *BlockOffset) Reset()         { *m = BlockOffset{} }
 func (m *BlockOffset) String() string { return proto.CompactTextString(m) }
 func (*BlockOffset) ProtoMessage()    {}
 func (*BlockOffset) Descriptor() ([]byte, []int) {
-	return fileDescriptor_3e3c719c85d382a4, []int{6}
+	return fileDescriptor_3e3c719c85d382a4, []int{9}
 }
 func (m *BlockOffset) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -484,8 +655,8 @@ func (m *BlockOffset) GetOffset() uint32 {
 
 type TableIndex struct {
 	Offsets       []*BlockOffset `protobuf:"bytes,1,rep,name=offsets,proto3" json:"offsets,omitempty"`
-	BloomFilter   []byte         `protobuf:"bytes,2,opt,name=bloom_filter,json=bloomFilter,proto3" json:"bloom_filter,omitempty"`
-	EstimatedSize uint64         `protobuf:"varint,3,opt,name=estimated_size,json=estimatedSize,proto3" json:"estimated_size,omitempty"`
+	BloomFilter   []byte         `protobuf:"bytes,2,opt,name=bloomFilter,proto3" json:"bloomFilter,omitempty"`
+	EstimatedSize uint64         `protobuf:"varint,3,opt,name=estimatedSize,proto3" json:"estimatedSize,omitempty"`
 	NumOfBlocks   uint32         `protobuf:"varint,4,opt,name=numOfBlocks,proto3" json:"numOfBlocks,omitempty"`
 }
 
@@ -493,7 +664,7 @@ func (m *TableIndex) Reset()         { *m = TableIndex{} }
 func (m *TableIndex) String() string { return proto.CompactTextString(m) }
 func (*TableIndex) ProtoMessage()    {}
 func (*TableIndex) Descriptor() ([]byte, []int) {
-	return fileDescriptor_3e3c719c85d382a4, []int{7}
+	return fileDescriptor_3e3c719c85d382a4, []int{10}
 }
 func (m *TableIndex) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -550,57 +721,1624 @@ func (m *TableIndex) GetNumOfBlocks() uint32 {
 	return 0
 }
 
+type GetPartitionMetaRequest struct {
+	PSID uint64 `protobuf:"varint,1,opt,name=PSID,proto3" json:"PSID,omitempty"`
+}
+
+func (m *GetPartitionMetaRequest) Reset()         { *m = GetPartitionMetaRequest{} }
+func (m *GetPartitionMetaRequest) String() string { return proto.CompactTextString(m) }
+func (*GetPartitionMetaRequest) ProtoMessage()    {}
+func (*GetPartitionMetaRequest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_3e3c719c85d382a4, []int{11}
+}
+func (m *GetPartitionMetaRequest) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *GetPartitionMetaRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_GetPartitionMetaRequest.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *GetPartitionMetaRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_GetPartitionMetaRequest.Merge(m, src)
+}
+func (m *GetPartitionMetaRequest) XXX_Size() int {
+	return m.Size()
+}
+func (m *GetPartitionMetaRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_GetPartitionMetaRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_GetPartitionMetaRequest proto.InternalMessageInfo
+
+func (m *GetPartitionMetaRequest) GetPSID() uint64 {
+	if m != nil {
+		return m.PSID
+	}
+	return 0
+}
+
+type GetPartitionMetaResponse struct {
+	Code pb.Code          `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
+	Meta []*PartitionMeta `protobuf:"bytes,2,rep,name=meta,proto3" json:"meta,omitempty"`
+}
+
+func (m *GetPartitionMetaResponse) Reset()         { *m = GetPartitionMetaResponse{} }
+func (m *GetPartitionMetaResponse) String() string { return proto.CompactTextString(m) }
+func (*GetPartitionMetaResponse) ProtoMessage()    {}
+func (*GetPartitionMetaResponse) Descriptor() ([]byte, []int) {
+	return fileDescriptor_3e3c719c85d382a4, []int{12}
+}
+func (m *GetPartitionMetaResponse) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *GetPartitionMetaResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_GetPartitionMetaResponse.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *GetPartitionMetaResponse) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_GetPartitionMetaResponse.Merge(m, src)
+}
+func (m *GetPartitionMetaResponse) XXX_Size() int {
+	return m.Size()
+}
+func (m *GetPartitionMetaResponse) XXX_DiscardUnknown() {
+	xxx_messageInfo_GetPartitionMetaResponse.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_GetPartitionMetaResponse proto.InternalMessageInfo
+
+func (m *GetPartitionMetaResponse) GetCode() pb.Code {
+	if m != nil {
+		return m.Code
+	}
+	return pb.Code_OK
+}
+
+func (m *GetPartitionMetaResponse) GetMeta() []*PartitionMeta {
+	if m != nil {
+		return m.Meta
+	}
+	return nil
+}
+
+type SetRowStreamTablesRequest struct {
+	PartitionID uint64          `protobuf:"varint,1,opt,name=partitionID,proto3" json:"partitionID,omitempty"`
+	Locs        *TableLocations `protobuf:"bytes,2,opt,name=locs,proto3" json:"locs,omitempty"`
+}
+
+func (m *SetRowStreamTablesRequest) Reset()         { *m = SetRowStreamTablesRequest{} }
+func (m *SetRowStreamTablesRequest) String() string { return proto.CompactTextString(m) }
+func (*SetRowStreamTablesRequest) ProtoMessage()    {}
+func (*SetRowStreamTablesRequest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_3e3c719c85d382a4, []int{13}
+}
+func (m *SetRowStreamTablesRequest) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *SetRowStreamTablesRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_SetRowStreamTablesRequest.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *SetRowStreamTablesRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_SetRowStreamTablesRequest.Merge(m, src)
+}
+func (m *SetRowStreamTablesRequest) XXX_Size() int {
+	return m.Size()
+}
+func (m *SetRowStreamTablesRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_SetRowStreamTablesRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_SetRowStreamTablesRequest proto.InternalMessageInfo
+
+func (m *SetRowStreamTablesRequest) GetPartitionID() uint64 {
+	if m != nil {
+		return m.PartitionID
+	}
+	return 0
+}
+
+func (m *SetRowStreamTablesRequest) GetLocs() *TableLocations {
+	if m != nil {
+		return m.Locs
+	}
+	return nil
+}
+
+type SetRowStreamTablesResponse struct {
+	Code pb.Code `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
+}
+
+func (m *SetRowStreamTablesResponse) Reset()         { *m = SetRowStreamTablesResponse{} }
+func (m *SetRowStreamTablesResponse) String() string { return proto.CompactTextString(m) }
+func (*SetRowStreamTablesResponse) ProtoMessage()    {}
+func (*SetRowStreamTablesResponse) Descriptor() ([]byte, []int) {
+	return fileDescriptor_3e3c719c85d382a4, []int{14}
+}
+func (m *SetRowStreamTablesResponse) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *SetRowStreamTablesResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_SetRowStreamTablesResponse.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *SetRowStreamTablesResponse) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_SetRowStreamTablesResponse.Merge(m, src)
+}
+func (m *SetRowStreamTablesResponse) XXX_Size() int {
+	return m.Size()
+}
+func (m *SetRowStreamTablesResponse) XXX_DiscardUnknown() {
+	xxx_messageInfo_SetRowStreamTablesResponse.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_SetRowStreamTablesResponse proto.InternalMessageInfo
+
+func (m *SetRowStreamTablesResponse) GetCode() pb.Code {
+	if m != nil {
+		return m.Code
+	}
+	return pb.Code_OK
+}
+
+type GetRegionsRequest struct {
+}
+
+func (m *GetRegionsRequest) Reset()         { *m = GetRegionsRequest{} }
+func (m *GetRegionsRequest) String() string { return proto.CompactTextString(m) }
+func (*GetRegionsRequest) ProtoMessage()    {}
+func (*GetRegionsRequest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_3e3c719c85d382a4, []int{15}
+}
+func (m *GetRegionsRequest) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *GetRegionsRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_GetRegionsRequest.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *GetRegionsRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_GetRegionsRequest.Merge(m, src)
+}
+func (m *GetRegionsRequest) XXX_Size() int {
+	return m.Size()
+}
+func (m *GetRegionsRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_GetRegionsRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_GetRegionsRequest proto.InternalMessageInfo
+
+type GetRegionsResponse struct {
+	Code    pb.Code       `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
+	Regions []*RegionInfo `protobuf:"bytes,2,rep,name=regions,proto3" json:"regions,omitempty"`
+}
+
+func (m *GetRegionsResponse) Reset()         { *m = GetRegionsResponse{} }
+func (m *GetRegionsResponse) String() string { return proto.CompactTextString(m) }
+func (*GetRegionsResponse) ProtoMessage()    {}
+func (*GetRegionsResponse) Descriptor() ([]byte, []int) {
+	return fileDescriptor_3e3c719c85d382a4, []int{16}
+}
+func (m *GetRegionsResponse) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *GetRegionsResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_GetRegionsResponse.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *GetRegionsResponse) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_GetRegionsResponse.Merge(m, src)
+}
+func (m *GetRegionsResponse) XXX_Size() int {
+	return m.Size()
+}
+func (m *GetRegionsResponse) XXX_DiscardUnknown() {
+	xxx_messageInfo_GetRegionsResponse.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_GetRegionsResponse proto.InternalMessageInfo
+
+func (m *GetRegionsResponse) GetCode() pb.Code {
+	if m != nil {
+		return m.Code
+	}
+	return pb.Code_OK
+}
+
+func (m *GetRegionsResponse) GetRegions() []*RegionInfo {
+	if m != nil {
+		return m.Regions
+	}
+	return nil
+}
+
+type RegisterPSRequest struct {
+	Addr string `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"`
+}
+
+func (m *RegisterPSRequest) Reset()         { *m = RegisterPSRequest{} }
+func (m *RegisterPSRequest) String() string { return proto.CompactTextString(m) }
+func (*RegisterPSRequest) ProtoMessage()    {}
+func (*RegisterPSRequest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_3e3c719c85d382a4, []int{17}
+}
+func (m *RegisterPSRequest) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *RegisterPSRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_RegisterPSRequest.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *RegisterPSRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_RegisterPSRequest.Merge(m, src)
+}
+func (m *RegisterPSRequest) XXX_Size() int {
+	return m.Size()
+}
+func (m *RegisterPSRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_RegisterPSRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_RegisterPSRequest proto.InternalMessageInfo
+
+func (m *RegisterPSRequest) GetAddr() string {
+	if m != nil {
+		return m.Addr
+	}
+	return ""
+}
+
+type RegisterPSResponse struct {
+	Code pb.Code `protobuf:"varint,1,opt,name=code,proto3,enum=pb.Code" json:"code,omitempty"`
+	Id   uint64  `protobuf:"varint,2,opt,name=id,proto3" json:"id,omitempty"`
+}
+
+func (m *RegisterPSResponse) Reset()         { *m = RegisterPSResponse{} }
+func (m *RegisterPSResponse) String() string { return proto.CompactTextString(m) }
+func (*RegisterPSResponse) ProtoMessage()    {}
+func (*RegisterPSResponse) Descriptor() ([]byte, []int) {
+	return fileDescriptor_3e3c719c85d382a4, []int{18}
+}
+func (m *RegisterPSResponse) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *RegisterPSResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_RegisterPSResponse.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *RegisterPSResponse) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_RegisterPSResponse.Merge(m, src)
+}
+func (m *RegisterPSResponse) XXX_Size() int {
+	return m.Size()
+}
+func (m *RegisterPSResponse) XXX_DiscardUnknown() {
+	xxx_messageInfo_RegisterPSResponse.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_RegisterPSResponse proto.InternalMessageInfo
+
+func (m *RegisterPSResponse) GetCode() pb.Code {
+	if m != nil {
+		return m.Code
+	}
+	return pb.Code_OK
+}
+
+func (m *RegisterPSResponse) GetId() uint64 {
+	if m != nil {
+		return m.Id
+	}
+	return 0
+}
+
+type GetPSInfoRequest struct {
+}
+
+func (m *GetPSInfoRequest) Reset()         { *m = GetPSInfoRequest{} }
+func (m *GetPSInfoRequest) String() string { return proto.CompactTextString(m) }
+func (*GetPSInfoRequest) ProtoMessage()    {}
+func (*GetPSInfoRequest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_3e3c719c85d382a4, []int{19}
+}
+func (m *GetPSInfoRequest) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *GetPSInfoRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_GetPSInfoRequest.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *GetPSInfoRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_GetPSInfoRequest.Merge(m, src)
+}
+func (m *GetPSInfoRequest) XXX_Size() int {
+	return m.Size()
+}
+func (m *GetPSInfoRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_GetPSInfoRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_GetPSInfoRequest proto.InternalMessageInfo
+
+type GetPSInfoResponse struct {
+	Servers []*PSDetail `protobuf:"bytes,1,rep,name=servers,proto3" json:"servers,omitempty"`
+}
+
+func (m *GetPSInfoResponse) Reset()         { *m = GetPSInfoResponse{} }
+func (m *GetPSInfoResponse) String() string { return proto.CompactTextString(m) }
+func (*GetPSInfoResponse) ProtoMessage()    {}
+func (*GetPSInfoResponse) Descriptor() ([]byte, []int) {
+	return fileDescriptor_3e3c719c85d382a4, []int{20}
+}
+func (m *GetPSInfoResponse) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *GetPSInfoResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_GetPSInfoResponse.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *GetPSInfoResponse) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_GetPSInfoResponse.Merge(m, src)
+}
+func (m *GetPSInfoResponse) XXX_Size() int {
+	return m.Size()
+}
+func (m *GetPSInfoResponse) XXX_DiscardUnknown() {
+	xxx_messageInfo_GetPSInfoResponse.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_GetPSInfoResponse proto.InternalMessageInfo
+
+func (m *GetPSInfoResponse) GetServers() []*PSDetail {
+	if m != nil {
+		return m.Servers
+	}
+	return nil
+}
+
+type PutRequest struct {
+	Key       []byte `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Value     []byte `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	ExpiresAt uint64 `protobuf:"varint,3,opt,name=ExpiresAt,proto3" json:"ExpiresAt,omitempty"`
+	Psversion uint64 `protobuf:"varint,4,opt,name=psversion,proto3" json:"psversion,omitempty"`
+	Partid    uint64 `protobuf:"varint,5,opt,name=partid,proto3" json:"partid,omitempty"`
+}
+
+func (m *PutRequest) Reset()         { *m = PutRequest{} }
+func (m *PutRequest) String() string { return proto.CompactTextString(m) }
+func (*PutRequest) ProtoMessage()    {}
+func (*PutRequest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_3e3c719c85d382a4, []int{21}
+}
+func (m *PutRequest) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *PutRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_PutRequest.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *PutRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_PutRequest.Merge(m, src)
+}
+func (m *PutRequest) XXX_Size() int {
+	return m.Size()
+}
+func (m *PutRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_PutRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_PutRequest proto.InternalMessageInfo
+
+func (m *PutRequest) GetKey() []byte {
+	if m != nil {
+		return m.Key
+	}
+	return nil
+}
+
+func (m *PutRequest) GetValue() []byte {
+	if m != nil {
+		return m.Value
+	}
+	return nil
+}
+
+func (m *PutRequest) GetExpiresAt() uint64 {
+	if m != nil {
+		return m.ExpiresAt
+	}
+	return 0
+}
+
+func (m *PutRequest) GetPsversion() uint64 {
+	if m != nil {
+		return m.Psversion
+	}
+	return 0
+}
+
+func (m *PutRequest) GetPartid() uint64 {
+	if m != nil {
+		return m.Partid
+	}
+	return 0
+}
+
+type PutResponse struct {
+	Key []byte `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+}
+
+func (m *PutResponse) Reset()         { *m = PutResponse{} }
+func (m *PutResponse) String() string { return proto.CompactTextString(m) }
+func (*PutResponse) ProtoMessage()    {}
+func (*PutResponse) Descriptor() ([]byte, []int) {
+	return fileDescriptor_3e3c719c85d382a4, []int{22}
+}
+func (m *PutResponse) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *PutResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_PutResponse.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *PutResponse) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_PutResponse.Merge(m, src)
+}
+func (m *PutResponse) XXX_Size() int {
+	return m.Size()
+}
+func (m *PutResponse) XXX_DiscardUnknown() {
+	xxx_messageInfo_PutResponse.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_PutResponse proto.InternalMessageInfo
+
+func (m *PutResponse) GetKey() []byte {
+	if m != nil {
+		return m.Key
+	}
+	return nil
+}
+
+type DeleteRequest struct {
+	Key       []byte `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Psversion uint64 `protobuf:"varint,2,opt,name=psversion,proto3" json:"psversion,omitempty"`
+	Partid    uint64 `protobuf:"varint,5,opt,name=partid,proto3" json:"partid,omitempty"`
+}
+
+func (m *DeleteRequest) Reset()         { *m = DeleteRequest{} }
+func (m *DeleteRequest) String() string { return proto.CompactTextString(m) }
+func (*DeleteRequest) ProtoMessage()    {}
+func (*DeleteRequest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_3e3c719c85d382a4, []int{23}
+}
+func (m *DeleteRequest) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *DeleteRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_DeleteRequest.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *DeleteRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_DeleteRequest.Merge(m, src)
+}
+func (m *DeleteRequest) XXX_Size() int {
+	return m.Size()
+}
+func (m *DeleteRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_DeleteRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_DeleteRequest proto.InternalMessageInfo
+
+func (m *DeleteRequest) GetKey() []byte {
+	if m != nil {
+		return m.Key
+	}
+	return nil
+}
+
+func (m *DeleteRequest) GetPsversion() uint64 {
+	if m != nil {
+		return m.Psversion
+	}
+	return 0
+}
+
+func (m *DeleteRequest) GetPartid() uint64 {
+	if m != nil {
+		return m.Partid
+	}
+	return 0
+}
+
+type DeleteResponse struct {
+	Key       []byte `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Psversion uint64 `protobuf:"varint,2,opt,name=psversion,proto3" json:"psversion,omitempty"`
+}
+
+func (m *DeleteResponse) Reset()         { *m = DeleteResponse{} }
+func (m *DeleteResponse) String() string { return proto.CompactTextString(m) }
+func (*DeleteResponse) ProtoMessage()    {}
+func (*DeleteResponse) Descriptor() ([]byte, []int) {
+	return fileDescriptor_3e3c719c85d382a4, []int{24}
+}
+func (m *DeleteResponse) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *DeleteResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_DeleteResponse.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *DeleteResponse) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_DeleteResponse.Merge(m, src)
+}
+func (m *DeleteResponse) XXX_Size() int {
+	return m.Size()
+}
+func (m *DeleteResponse) XXX_DiscardUnknown() {
+	xxx_messageInfo_DeleteResponse.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_DeleteResponse proto.InternalMessageInfo
+
+func (m *DeleteResponse) GetKey() []byte {
+	if m != nil {
+		return m.Key
+	}
+	return nil
+}
+
+func (m *DeleteResponse) GetPsversion() uint64 {
+	if m != nil {
+		return m.Psversion
+	}
+	return 0
+}
+
+type GetRequest struct {
+	Key       []byte `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Psversion uint64 `protobuf:"varint,2,opt,name=psversion,proto3" json:"psversion,omitempty"`
+	Partid    uint64 `protobuf:"varint,5,opt,name=partid,proto3" json:"partid,omitempty"`
+}
+
+func (m *GetRequest) Reset()         { *m = GetRequest{} }
+func (m *GetRequest) String() string { return proto.CompactTextString(m) }
+func (*GetRequest) ProtoMessage()    {}
+func (*GetRequest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_3e3c719c85d382a4, []int{25}
+}
+func (m *GetRequest) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *GetRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_GetRequest.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *GetRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_GetRequest.Merge(m, src)
+}
+func (m *GetRequest) XXX_Size() int {
+	return m.Size()
+}
+func (m *GetRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_GetRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_GetRequest proto.InternalMessageInfo
+
+func (m *GetRequest) GetKey() []byte {
+	if m != nil {
+		return m.Key
+	}
+	return nil
+}
+
+func (m *GetRequest) GetPsversion() uint64 {
+	if m != nil {
+		return m.Psversion
+	}
+	return 0
+}
+
+func (m *GetRequest) GetPartid() uint64 {
+	if m != nil {
+		return m.Partid
+	}
+	return 0
+}
+
+type GetResponse struct {
+	Key   []byte `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Value []byte `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+}
+
+func (m *GetResponse) Reset()         { *m = GetResponse{} }
+func (m *GetResponse) String() string { return proto.CompactTextString(m) }
+func (*GetResponse) ProtoMessage()    {}
+func (*GetResponse) Descriptor() ([]byte, []int) {
+	return fileDescriptor_3e3c719c85d382a4, []int{26}
+}
+func (m *GetResponse) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *GetResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_GetResponse.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *GetResponse) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_GetResponse.Merge(m, src)
+}
+func (m *GetResponse) XXX_Size() int {
+	return m.Size()
+}
+func (m *GetResponse) XXX_DiscardUnknown() {
+	xxx_messageInfo_GetResponse.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_GetResponse proto.InternalMessageInfo
+
+func (m *GetResponse) GetKey() []byte {
+	if m != nil {
+		return m.Key
+	}
+	return nil
+}
+
+func (m *GetResponse) GetValue() []byte {
+	if m != nil {
+		return m.Value
+	}
+	return nil
+}
+
+type RequestOp struct {
+	// Types that are valid to be assigned to Request:
+	//	*RequestOp_RequestPut
+	//	*RequestOp_RequestDelete
+	//	*RequestOp_RequestGet
+	Request isRequestOp_Request `protobuf_oneof:"request"`
+}
+
+func (m *RequestOp) Reset()         { *m = RequestOp{} }
+func (m *RequestOp) String() string { return proto.CompactTextString(m) }
+func (*RequestOp) ProtoMessage()    {}
+func (*RequestOp) Descriptor() ([]byte, []int) {
+	return fileDescriptor_3e3c719c85d382a4, []int{27}
+}
+func (m *RequestOp) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *RequestOp) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_RequestOp.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *RequestOp) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_RequestOp.Merge(m, src)
+}
+func (m *RequestOp) XXX_Size() int {
+	return m.Size()
+}
+func (m *RequestOp) XXX_DiscardUnknown() {
+	xxx_messageInfo_RequestOp.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_RequestOp proto.InternalMessageInfo
+
+type isRequestOp_Request interface {
+	isRequestOp_Request()
+	MarshalTo([]byte) (int, error)
+	Size() int
+}
+
+type RequestOp_RequestPut struct {
+	RequestPut *PutRequest `protobuf:"bytes,1,opt,name=request_put,json=requestPut,proto3,oneof" json:"request_put,omitempty"`
+}
+type RequestOp_RequestDelete struct {
+	RequestDelete *DeleteRequest `protobuf:"bytes,2,opt,name=request_delete,json=requestDelete,proto3,oneof" json:"request_delete,omitempty"`
+}
+type RequestOp_RequestGet struct {
+	RequestGet *GetRequest `protobuf:"bytes,3,opt,name=request_get,json=requestGet,proto3,oneof" json:"request_get,omitempty"`
+}
+
+func (*RequestOp_RequestPut) isRequestOp_Request()    {}
+func (*RequestOp_RequestDelete) isRequestOp_Request() {}
+func (*RequestOp_RequestGet) isRequestOp_Request()    {}
+
+func (m *RequestOp) GetRequest() isRequestOp_Request {
+	if m != nil {
+		return m.Request
+	}
+	return nil
+}
+
+func (m *RequestOp) GetRequestPut() *PutRequest {
+	if x, ok := m.GetRequest().(*RequestOp_RequestPut); ok {
+		return x.RequestPut
+	}
+	return nil
+}
+
+func (m *RequestOp) GetRequestDelete() *DeleteRequest {
+	if x, ok := m.GetRequest().(*RequestOp_RequestDelete); ok {
+		return x.RequestDelete
+	}
+	return nil
+}
+
+func (m *RequestOp) GetRequestGet() *GetRequest {
+	if x, ok := m.GetRequest().(*RequestOp_RequestGet); ok {
+		return x.RequestGet
+	}
+	return nil
+}
+
+// XXX_OneofWrappers is for the internal use of the proto package.
+func (*RequestOp) XXX_OneofWrappers() []interface{} {
+	return []interface{}{
+		(*RequestOp_RequestPut)(nil),
+		(*RequestOp_RequestDelete)(nil),
+		(*RequestOp_RequestGet)(nil),
+	}
+}
+
+type ResponseOp struct {
+	// Types that are valid to be assigned to Response:
+	//	*ResponseOp_ResponsePut
+	//	*ResponseOp_ResponseDelete
+	//	*ResponseOp_ResponseGet
+	Response isResponseOp_Response `protobuf_oneof:"response"`
+}
+
+func (m *ResponseOp) Reset()         { *m = ResponseOp{} }
+func (m *ResponseOp) String() string { return proto.CompactTextString(m) }
+func (*ResponseOp) ProtoMessage()    {}
+func (*ResponseOp) Descriptor() ([]byte, []int) {
+	return fileDescriptor_3e3c719c85d382a4, []int{28}
+}
+func (m *ResponseOp) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *ResponseOp) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_ResponseOp.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *ResponseOp) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_ResponseOp.Merge(m, src)
+}
+func (m *ResponseOp) XXX_Size() int {
+	return m.Size()
+}
+func (m *ResponseOp) XXX_DiscardUnknown() {
+	xxx_messageInfo_ResponseOp.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_ResponseOp proto.InternalMessageInfo
+
+type isResponseOp_Response interface {
+	isResponseOp_Response()
+	MarshalTo([]byte) (int, error)
+	Size() int
+}
+
+type ResponseOp_ResponsePut struct {
+	ResponsePut *PutResponse `protobuf:"bytes,1,opt,name=response_put,json=responsePut,proto3,oneof" json:"response_put,omitempty"`
+}
+type ResponseOp_ResponseDelete struct {
+	ResponseDelete *DeleteResponse `protobuf:"bytes,2,opt,name=response_delete,json=responseDelete,proto3,oneof" json:"response_delete,omitempty"`
+}
+type ResponseOp_ResponseGet struct {
+	ResponseGet *GetResponse `protobuf:"bytes,3,opt,name=response_get,json=responseGet,proto3,oneof" json:"response_get,omitempty"`
+}
+
+func (*ResponseOp_ResponsePut) isResponseOp_Response()    {}
+func (*ResponseOp_ResponseDelete) isResponseOp_Response() {}
+func (*ResponseOp_ResponseGet) isResponseOp_Response()    {}
+
+func (m *ResponseOp) GetResponse() isResponseOp_Response {
+	if m != nil {
+		return m.Response
+	}
+	return nil
+}
+
+func (m *ResponseOp) GetResponsePut() *PutResponse {
+	if x, ok := m.GetResponse().(*ResponseOp_ResponsePut); ok {
+		return x.ResponsePut
+	}
+	return nil
+}
+
+func (m *ResponseOp) GetResponseDelete() *DeleteResponse {
+	if x, ok := m.GetResponse().(*ResponseOp_ResponseDelete); ok {
+		return x.ResponseDelete
+	}
+	return nil
+}
+
+func (m *ResponseOp) GetResponseGet() *GetResponse {
+	if x, ok := m.GetResponse().(*ResponseOp_ResponseGet); ok {
+		return x.ResponseGet
+	}
+	return nil
+}
+
+// XXX_OneofWrappers is for the internal use of the proto package.
+func (*ResponseOp) XXX_OneofWrappers() []interface{} {
+	return []interface{}{
+		(*ResponseOp_ResponsePut)(nil),
+		(*ResponseOp_ResponseDelete)(nil),
+		(*ResponseOp_ResponseGet)(nil),
+	}
+}
+
+type BatchRequest struct {
+	Reqs []*RequestOp `protobuf:"bytes,1,rep,name=reqs,proto3" json:"reqs,omitempty"`
+}
+
+func (m *BatchRequest) Reset()         { *m = BatchRequest{} }
+func (m *BatchRequest) String() string { return proto.CompactTextString(m) }
+func (*BatchRequest) ProtoMessage()    {}
+func (*BatchRequest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_3e3c719c85d382a4, []int{29}
+}
+func (m *BatchRequest) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *BatchRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_BatchRequest.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *BatchRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_BatchRequest.Merge(m, src)
+}
+func (m *BatchRequest) XXX_Size() int {
+	return m.Size()
+}
+func (m *BatchRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_BatchRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_BatchRequest proto.InternalMessageInfo
+
+func (m *BatchRequest) GetReqs() []*RequestOp {
+	if m != nil {
+		return m.Reqs
+	}
+	return nil
+}
+
+type BatchResponse struct {
+	Res []*RequestOp `protobuf:"bytes,2,rep,name=res,proto3" json:"res,omitempty"`
+}
+
+func (m *BatchResponse) Reset()         { *m = BatchResponse{} }
+func (m *BatchResponse) String() string { return proto.CompactTextString(m) }
+func (*BatchResponse) ProtoMessage()    {}
+func (*BatchResponse) Descriptor() ([]byte, []int) {
+	return fileDescriptor_3e3c719c85d382a4, []int{30}
+}
+func (m *BatchResponse) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *BatchResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_BatchResponse.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *BatchResponse) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_BatchResponse.Merge(m, src)
+}
+func (m *BatchResponse) XXX_Size() int {
+	return m.Size()
+}
+func (m *BatchResponse) XXX_DiscardUnknown() {
+	xxx_messageInfo_BatchResponse.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_BatchResponse proto.InternalMessageInfo
+
+func (m *BatchResponse) GetRes() []*RequestOp {
+	if m != nil {
+		return m.Res
+	}
+	return nil
+}
+
 func init() {
 	proto.RegisterEnum("pspb.RawBlockType", RawBlockType_name, RawBlockType_value)
 	proto.RegisterType((*MixedLog)(nil), "pspb.MixedLog")
 	proto.RegisterType((*Range)(nil), "pspb.Range")
-	proto.RegisterType((*TableLocation)(nil), "pspb.TableLocation")
+	proto.RegisterType((*Location)(nil), "pspb.Location")
+	proto.RegisterType((*BlobStreams)(nil), "pspb.BlobStreams")
+	proto.RegisterType((*TableLocations)(nil), "pspb.TableLocations")
 	proto.RegisterType((*PartitionMeta)(nil), "pspb.PartitionMeta")
-	proto.RegisterType((*MetaStreamData)(nil), "pspb.MetaStreamData")
+	proto.RegisterType((*PSDetail)(nil), "pspb.PSDetail")
+	proto.RegisterType((*RegionInfo)(nil), "pspb.RegionInfo")
 	proto.RegisterType((*RawBlockMeta)(nil), "pspb.RawBlockMeta")
 	proto.RegisterType((*BlockOffset)(nil), "pspb.BlockOffset")
 	proto.RegisterType((*TableIndex)(nil), "pspb.TableIndex")
+	proto.RegisterType((*GetPartitionMetaRequest)(nil), "pspb.GetPartitionMetaRequest")
+	proto.RegisterType((*GetPartitionMetaResponse)(nil), "pspb.GetPartitionMetaResponse")
+	proto.RegisterType((*SetRowStreamTablesRequest)(nil), "pspb.SetRowStreamTablesRequest")
+	proto.RegisterType((*SetRowStreamTablesResponse)(nil), "pspb.SetRowStreamTablesResponse")
+	proto.RegisterType((*GetRegionsRequest)(nil), "pspb.GetRegionsRequest")
+	proto.RegisterType((*GetRegionsResponse)(nil), "pspb.GetRegionsResponse")
+	proto.RegisterType((*RegisterPSRequest)(nil), "pspb.RegisterPSRequest")
+	proto.RegisterType((*RegisterPSResponse)(nil), "pspb.RegisterPSResponse")
+	proto.RegisterType((*GetPSInfoRequest)(nil), "pspb.GetPSInfoRequest")
+	proto.RegisterType((*GetPSInfoResponse)(nil), "pspb.GetPSInfoResponse")
+	proto.RegisterType((*PutRequest)(nil), "pspb.PutRequest")
+	proto.RegisterType((*PutResponse)(nil), "pspb.PutResponse")
+	proto.RegisterType((*DeleteRequest)(nil), "pspb.DeleteRequest")
+	proto.RegisterType((*DeleteResponse)(nil), "pspb.DeleteResponse")
+	proto.RegisterType((*GetRequest)(nil), "pspb.GetRequest")
+	proto.RegisterType((*GetResponse)(nil), "pspb.GetResponse")
+	proto.RegisterType((*RequestOp)(nil), "pspb.RequestOp")
+	proto.RegisterType((*ResponseOp)(nil), "pspb.ResponseOp")
+	proto.RegisterType((*BatchRequest)(nil), "pspb.BatchRequest")
+	proto.RegisterType((*BatchResponse)(nil), "pspb.BatchResponse")
 }
 
 func init() { proto.RegisterFile("pspb.proto", fileDescriptor_3e3c719c85d382a4) }
 
 var fileDescriptor_3e3c719c85d382a4 = []byte{
-	// 558 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x74, 0x54, 0xc1, 0x6e, 0xd3, 0x4c,
-	0x10, 0x8e, 0x63, 0x27, 0x7f, 0xff, 0x71, 0x1d, 0x85, 0x45, 0x42, 0x16, 0x42, 0x96, 0x6b, 0x41,
-	0x15, 0xb5, 0x52, 0x0f, 0xe1, 0xc8, 0xad, 0x0d, 0x48, 0x11, 0x2d, 0x45, 0x9b, 0x72, 0xae, 0x36,
-	0xf5, 0x26, 0xb2, 0x1a, 0x7b, 0x8d, 0x77, 0xdb, 0x24, 0x3c, 0x05, 0x2f, 0xc1, 0x63, 0x70, 0xe7,
-	0xd8, 0x23, 0x27, 0x84, 0x92, 0x17, 0x41, 0x3b, 0xeb, 0x38, 0x4e, 0x11, 0xb7, 0xfd, 0xbe, 0xf9,
-	0x3c, 0x3b, 0xf3, 0xcd, 0xac, 0x01, 0x72, 0x99, 0x8f, 0x4f, 0xf2, 0x42, 0x28, 0x41, 0x1c, 0x7d,
-	0x8e, 0x5e, 0xc2, 0xde, 0x45, 0xb2, 0xe0, 0xf1, 0xb9, 0x98, 0x12, 0x1f, 0xfe, 0x13, 0x93, 0x89,
-	0xe4, 0x4a, 0xfa, 0x56, 0x68, 0xf7, 0x3c, 0xba, 0x81, 0xd1, 0x1b, 0x68, 0x51, 0x96, 0x4d, 0x39,
-	0x79, 0x0e, 0x7b, 0x52, 0xb1, 0x42, 0xbd, 0xe7, 0x4b, 0xdf, 0x0a, 0xad, 0xde, 0x3e, 0xad, 0x30,
-	0x79, 0x06, 0x6d, 0x9e, 0xc5, 0x3a, 0xd2, 0xc4, 0x48, 0x89, 0xa2, 0x33, 0xf0, 0xae, 0xd8, 0x78,
-	0xc6, 0xcf, 0xc5, 0x0d, 0x53, 0x89, 0xc8, 0x74, 0x12, 0xbe, 0x50, 0x3c, 0x53, 0xc3, 0x01, 0x26,
-	0x71, 0x68, 0x85, 0x75, 0x12, 0x73, 0x29, 0x26, 0xf1, 0x68, 0x89, 0xa2, 0xef, 0x16, 0x78, 0x1f,
-	0x59, 0xa1, 0x12, 0x9d, 0xe1, 0x82, 0x2b, 0x46, 0x0e, 0xa0, 0x55, 0xe8, 0x9a, 0x30, 0x85, 0xdb,
-	0x77, 0x4f, 0xb0, 0x37, 0x2c, 0x93, 0x9a, 0x08, 0x09, 0xc1, 0x1d, 0xcf, 0xc4, 0x78, 0xa4, 0x0a,
-	0xce, 0x52, 0xe9, 0x37, 0x43, 0xbb, 0xe7, 0xd0, 0x3a, 0x45, 0x5e, 0xc0, 0xff, 0x33, 0x31, 0x35,
-	0xc8, 0xb7, 0xb1, 0x96, 0x2d, 0xa1, 0xa3, 0x85, 0x98, 0x97, 0x51, 0xc7, 0x44, 0x2b, 0x82, 0x1c,
-	0x43, 0x5b, 0xe9, 0xbe, 0xa4, 0xdf, 0x0a, 0xed, 0x9e, 0xdb, 0x7f, 0x6a, 0x2a, 0xd8, 0xe9, 0x95,
-	0x96, 0x92, 0x68, 0x01, 0x1d, 0x5d, 0xb5, 0xf9, 0x74, 0xc0, 0x14, 0xd3, 0xc5, 0x55, 0x37, 0x55,
-	0x46, 0xd4, 0x29, 0xad, 0x28, 0xd8, 0xbc, 0x52, 0x34, 0x8d, 0xa2, 0x46, 0x91, 0x08, 0xf6, 0xb7,
-	0xdd, 0x0c, 0x07, 0x65, 0x07, 0x3b, 0x5c, 0xf4, 0xcb, 0x82, 0x7d, 0xca, 0xe6, 0xa7, 0x33, 0x71,
-	0x73, 0x8b, 0xc6, 0x1d, 0x82, 0xa3, 0x96, 0xb9, 0xf1, 0xad, 0xd3, 0x27, 0x1b, 0xdf, 0x8c, 0xe2,
-	0x6a, 0x99, 0x73, 0x8a, 0x71, 0x72, 0x08, 0x9d, 0x33, 0x91, 0xe6, 0x05, 0x97, 0x92, 0xc7, 0xa3,
-	0xe4, 0x0b, 0x2f, 0x47, 0xf2, 0x88, 0x25, 0x47, 0xd0, 0xfd, 0x94, 0x3d, 0x52, 0xda, 0xa8, 0xfc,
-	0x8b, 0x27, 0x01, 0xc0, 0x7d, 0xfe, 0x76, 0x33, 0x7c, 0x63, 0x69, 0x8d, 0xd1, 0xab, 0x71, 0x9f,
-	0x5f, 0x9a, 0x05, 0x68, 0x61, 0x8e, 0x0a, 0xeb, 0xd5, 0x90, 0xfc, 0xf3, 0x87, 0xbb, 0xd4, 0x6f,
-	0xe3, 0x77, 0x25, 0x8a, 0x46, 0xe0, 0x62, 0xe9, 0xa5, 0xac, 0x0b, 0xf6, 0x6d, 0xb5, 0x9d, 0xfa,
-	0xb8, 0xb3, 0x6f, 0xcd, 0x7f, 0xee, 0x9b, 0xbd, 0xb3, 0x6f, 0xdf, 0x2c, 0x00, 0x9c, 0xe4, 0x30,
-	0x8b, 0xf9, 0x82, 0x1c, 0xef, 0x3e, 0x0d, 0xb7, 0xff, 0xc4, 0xd8, 0x56, 0xbb, 0xb8, 0x7a, 0x2d,
-	0xe4, 0x00, 0xa7, 0x22, 0xd2, 0xeb, 0x49, 0x32, 0x53, 0xbc, 0x28, 0x9f, 0x83, 0x8b, 0xdc, 0x3b,
-	0xa4, 0xc8, 0x2b, 0xe8, 0x70, 0xa9, 0x92, 0x94, 0x29, 0x1e, 0x5f, 0xcb, 0x8d, 0x63, 0x0e, 0xf5,
-	0x2a, 0x16, 0xed, 0x0a, 0xc1, 0xcd, 0xee, 0xd2, 0xcb, 0x09, 0x5e, 0x23, 0xd1, 0x2f, 0x8f, 0xd6,
-	0xa9, 0xa3, 0x68, 0x3b, 0x5c, 0x3d, 0x3a, 0xb2, 0x07, 0x4e, 0xcc, 0x14, 0xeb, 0x36, 0xf4, 0x29,
-	0xe5, 0x8a, 0x75, 0xad, 0x53, 0xff, 0xc7, 0x2a, 0xb0, 0x1e, 0x56, 0x81, 0xf5, 0x7b, 0x15, 0x58,
-	0x5f, 0xd7, 0x41, 0xe3, 0x61, 0x1d, 0x34, 0x7e, 0xae, 0x83, 0xc6, 0xb8, 0x8d, 0xbf, 0x82, 0xd7,
-	0x7f, 0x02, 0x00, 0x00, 0xff, 0xff, 0x5a, 0x06, 0x05, 0x56, 0x18, 0x04, 0x00, 0x00,
+	// 1285 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xac, 0x57, 0x4d, 0x73, 0x1b, 0x45,
+	0x13, 0xd6, 0x4a, 0x2b, 0x5b, 0x6a, 0x59, 0x8a, 0x3c, 0x76, 0xc5, 0x7a, 0xf5, 0x06, 0xc5, 0x19,
+	0x52, 0xb1, 0xcb, 0x80, 0x0f, 0x32, 0xa1, 0x28, 0x3e, 0x02, 0x51, 0x1c, 0x6c, 0x57, 0x12, 0xac,
+	0x1a, 0x19, 0x28, 0x2e, 0x50, 0x2b, 0xed, 0x58, 0x6c, 0x59, 0xda, 0x5d, 0xef, 0x8e, 0x1c, 0x9b,
+	0x3b, 0x55, 0xdc, 0xe0, 0x3f, 0xf0, 0x3f, 0x38, 0xc3, 0x2d, 0x07, 0x0e, 0x9c, 0x28, 0xca, 0xfe,
+	0x23, 0xd4, 0x7c, 0xad, 0x66, 0xbd, 0x12, 0xf1, 0x81, 0xdb, 0xf4, 0xc7, 0xf4, 0xd3, 0x3d, 0xdd,
+	0x4f, 0x6b, 0x05, 0x10, 0xc6, 0x61, 0x7f, 0x3b, 0x8c, 0x02, 0x16, 0x20, 0x9b, 0x9f, 0x9b, 0x25,
+	0x2d, 0xe3, 0xfb, 0x50, 0x7a, 0xe1, 0x9d, 0x53, 0xf7, 0x79, 0x30, 0x44, 0x0d, 0x58, 0x0c, 0x8e,
+	0x8f, 0x63, 0xca, 0xe2, 0x86, 0xb5, 0x5e, 0xd8, 0xac, 0x12, 0x2d, 0xe2, 0x0f, 0xa1, 0x48, 0x1c,
+	0x7f, 0x48, 0x51, 0x13, 0x4a, 0x31, 0x73, 0x22, 0xf6, 0x8c, 0x5e, 0x34, 0xac, 0x75, 0x6b, 0x73,
+	0x89, 0x24, 0x32, 0xba, 0x0d, 0x0b, 0xd4, 0x77, 0xb9, 0x25, 0x2f, 0x2c, 0x4a, 0xc2, 0x8f, 0xa0,
+	0xf4, 0x3c, 0x18, 0x38, 0xcc, 0x0b, 0x7c, 0x7e, 0x9f, 0x9e, 0x33, 0xea, 0xb3, 0x83, 0x5d, 0x71,
+	0xdf, 0x26, 0x89, 0xcc, 0xef, 0x4b, 0x3c, 0x71, 0xbf, 0x4a, 0x94, 0x84, 0xef, 0x41, 0xa5, 0x33,
+	0x0a, 0xfa, 0x3d, 0x16, 0x51, 0x67, 0x1c, 0x23, 0x04, 0x76, 0x7f, 0x14, 0xf4, 0x45, 0x8a, 0x36,
+	0x11, 0x67, 0xfc, 0x2e, 0xd4, 0x8e, 0x9c, 0xfe, 0x88, 0x6a, 0x9c, 0x18, 0x61, 0xb0, 0x47, 0xc1,
+	0x40, 0x16, 0x52, 0x69, 0xd7, 0xb6, 0xc5, 0x13, 0x68, 0x33, 0x11, 0x36, 0xfc, 0x43, 0x1e, 0xaa,
+	0x5d, 0x27, 0x62, 0x1e, 0xd7, 0xbd, 0xa0, 0xcc, 0x41, 0x1b, 0x50, 0xe4, 0xf1, 0x62, 0x91, 0x5b,
+	0xa5, 0xbd, 0x2c, 0xaf, 0x19, 0xe8, 0x44, 0xda, 0xd1, 0x1d, 0x28, 0x8f, 0x82, 0xa1, 0x54, 0x8a,
+	0x74, 0x6d, 0x32, 0x55, 0x70, 0x6b, 0x14, 0xbc, 0x54, 0xd6, 0x82, 0xb4, 0x26, 0x0a, 0xb4, 0xa9,
+	0x52, 0xb3, 0x05, 0xc6, 0xaa, 0xc4, 0x48, 0xa7, 0x2f, 0x13, 0xe4, 0x2f, 0x12, 0x3a, 0x11, 0xf5,
+	0x59, 0xa3, 0x28, 0x82, 0x28, 0x89, 0x37, 0xca, 0xf5, 0xe2, 0x81, 0x13, 0xb9, 0x8d, 0x05, 0xf1,
+	0xd4, 0x5a, 0x44, 0xff, 0x87, 0x7c, 0x34, 0x6c, 0x2c, 0x8a, 0xc8, 0x15, 0x19, 0x59, 0x34, 0x8e,
+	0xe4, 0xa3, 0x21, 0x0f, 0xc7, 0xcb, 0x3d, 0xd8, 0x6d, 0x94, 0x64, 0x38, 0x29, 0xe1, 0xf7, 0xa1,
+	0xd4, 0xed, 0xed, 0x52, 0xe6, 0x78, 0x23, 0xfe, 0xba, 0xdd, 0x5e, 0xd2, 0x1c, 0x71, 0xe6, 0x70,
+	0x8e, 0xeb, 0x46, 0x34, 0x8e, 0x45, 0xa9, 0x65, 0xa2, 0x45, 0xec, 0x01, 0x10, 0x3a, 0xf4, 0x02,
+	0xff, 0xc0, 0x3f, 0x0e, 0x14, 0xb8, 0xf5, 0x3a, 0xf0, 0xbc, 0x09, 0x9e, 0x00, 0x16, 0x0c, 0x40,
+	0x04, 0x36, 0x47, 0x10, 0x2f, 0x54, 0x26, 0xe2, 0x8c, 0xff, 0xb2, 0x60, 0x89, 0x38, 0x2f, 0x3b,
+	0xa3, 0x60, 0x70, 0x22, 0x7a, 0xf5, 0x00, 0x6c, 0x76, 0x11, 0x52, 0x81, 0x57, 0x6b, 0x23, 0x8d,
+	0x27, 0x3d, 0x8e, 0x2e, 0x42, 0x4a, 0x84, 0x1d, 0x3d, 0x80, 0xda, 0x93, 0x60, 0x1c, 0xf2, 0x7c,
+	0xa9, 0xdb, 0xf3, 0xbe, 0xa7, 0x6a, 0xbc, 0xae, 0x69, 0xd1, 0x16, 0xd4, 0xbf, 0xf0, 0xaf, 0x79,
+	0x16, 0x84, 0x67, 0x46, 0x8f, 0x5a, 0x00, 0x67, 0xe1, 0x53, 0x3d, 0xc8, 0xb6, 0x48, 0xdd, 0xd0,
+	0xf0, 0x31, 0x3f, 0x0b, 0x0f, 0xe5, 0x30, 0x17, 0x45, 0x8c, 0x44, 0xe6, 0x0f, 0x11, 0xd3, 0xd3,
+	0xcf, 0x27, 0x63, 0xd1, 0x3b, 0x9b, 0x28, 0x09, 0xf7, 0xc4, 0x98, 0x0f, 0x4e, 0x94, 0x5b, 0x1d,
+	0x0a, 0x27, 0x09, 0xc9, 0xf8, 0x31, 0xc5, 0x9d, 0xfc, 0x5c, 0xee, 0x14, 0x52, 0xdc, 0xf9, 0xc5,
+	0x02, 0x10, 0xa3, 0x75, 0xe0, 0xbb, 0xf4, 0x1c, 0xbd, 0x95, 0x66, 0xb8, 0x39, 0xe1, 0x1a, 0x38,
+	0x21, 0x3d, 0x5a, 0x87, 0x4a, 0x7f, 0x14, 0x04, 0xe3, 0xcf, 0xbc, 0x11, 0xa3, 0x91, 0x22, 0xb5,
+	0xa9, 0x42, 0xf7, 0xa1, 0x4a, 0x63, 0xe6, 0x8d, 0x1d, 0x66, 0xbc, 0x97, 0x4d, 0xd2, 0x4a, 0x1e,
+	0xc7, 0x9f, 0x8c, 0x0f, 0x8f, 0x05, 0x88, 0x1c, 0xfb, 0x2a, 0x31, 0x55, 0xf8, 0x1d, 0x58, 0xdb,
+	0xa3, 0x2c, 0x45, 0x45, 0x42, 0x4f, 0x27, 0x34, 0x66, 0xb3, 0xe6, 0x11, 0x3b, 0xd0, 0xc8, 0xba,
+	0xc7, 0x61, 0xe0, 0xc7, 0x14, 0xdd, 0x01, 0x7b, 0x10, 0xb8, 0x7a, 0x2a, 0x4a, 0xdb, 0x61, 0x7f,
+	0xfb, 0x49, 0xe0, 0x52, 0x22, 0xb4, 0x68, 0x03, 0xec, 0x31, 0x65, 0x4e, 0x23, 0x2f, 0x8a, 0x5f,
+	0x91, 0xc5, 0xa7, 0x03, 0x09, 0x07, 0x3c, 0x84, 0xff, 0xf5, 0x28, 0x23, 0x9a, 0xb3, 0xe2, 0x09,
+	0x63, 0x9d, 0xd3, 0x3a, 0x54, 0x42, 0x7d, 0x27, 0x49, 0xcd, 0x54, 0x25, 0x14, 0xcf, 0xbf, 0x8e,
+	0xe2, 0xf8, 0x03, 0x68, 0xce, 0x02, 0xba, 0x49, 0x35, 0x78, 0x05, 0x96, 0xf7, 0x28, 0x93, 0x04,
+	0xd4, 0xc9, 0xe1, 0x6f, 0x00, 0x99, 0xca, 0x1b, 0x3d, 0xcb, 0x16, 0x2c, 0x46, 0xf2, 0x82, 0x7a,
+	0x99, 0xba, 0x62, 0x53, 0xc2, 0x6d, 0xa2, 0x1d, 0xf0, 0x06, 0x2c, 0x73, 0x75, 0xcc, 0x68, 0xd4,
+	0xed, 0x19, 0x5d, 0x12, 0x84, 0xb5, 0x0c, 0xc2, 0x76, 0x00, 0x99, 0x8e, 0x37, 0x4a, 0xa4, 0x06,
+	0x79, 0xcf, 0x55, 0xc3, 0x9d, 0xf7, 0x5c, 0x8c, 0xa0, 0xce, 0x3b, 0xdd, 0x13, 0x29, 0xa8, 0x02,
+	0x3f, 0x16, 0x55, 0x6b, 0x9d, 0x0a, 0xbb, 0x09, 0x8b, 0x31, 0x8d, 0xce, 0x68, 0x74, 0x6d, 0xe3,
+	0xeb, 0xbd, 0x46, 0xb4, 0x19, 0xff, 0x68, 0x01, 0x74, 0x27, 0x4c, 0x67, 0x9e, 0xa5, 0xd9, 0x2a,
+	0x14, 0xcf, 0x9c, 0xd1, 0x84, 0xaa, 0x81, 0x97, 0x02, 0x5f, 0xe9, 0x4f, 0xcf, 0x43, 0x2f, 0xa2,
+	0xf1, 0x63, 0xa6, 0x57, 0x7a, 0xa2, 0xe0, 0xd6, 0x30, 0xe6, 0xe1, 0xbd, 0xc0, 0x57, 0xeb, 0x60,
+	0xaa, 0x50, 0x6b, 0x9c, 0x79, 0xae, 0xb1, 0xc6, 0x99, 0xe7, 0xe2, 0xbb, 0x50, 0x11, 0x99, 0xa8,
+	0x1a, 0x32, 0xa9, 0xe0, 0xaf, 0xa0, 0xba, 0x4b, 0x47, 0x94, 0xd1, 0xf9, 0xd9, 0xa6, 0x90, 0xf3,
+	0x37, 0x45, 0xfe, 0x14, 0x6a, 0x3a, 0xf0, 0x3c, 0xf0, 0x7f, 0x8f, 0x8c, 0x8f, 0x00, 0xc4, 0x98,
+	0xfd, 0xb7, 0x79, 0x3d, 0x84, 0x8a, 0x88, 0x3a, 0x37, 0xa9, 0x99, 0xcd, 0xc1, 0xbf, 0x5a, 0x50,
+	0x56, 0xa9, 0x1c, 0x86, 0x68, 0x07, 0x2a, 0x91, 0x14, 0xbe, 0x0d, 0x27, 0x4c, 0xfd, 0x1e, 0xa9,
+	0x89, 0x9e, 0x76, 0x7e, 0x3f, 0x47, 0x40, 0xb9, 0x75, 0x27, 0x0c, 0x7d, 0x04, 0x35, 0x7d, 0xc9,
+	0x15, 0x2f, 0xa3, 0xb8, 0xab, 0x76, 0x44, 0xaa, 0x0d, 0xfb, 0x39, 0x52, 0x55, 0xce, 0x52, 0x6f,
+	0x42, 0x0e, 0xd5, 0x0e, 0x4e, 0x20, 0xa7, 0xcf, 0x64, 0x40, 0xee, 0x51, 0xd6, 0x29, 0x73, 0xd6,
+	0xc9, 0x99, 0xfe, 0xdd, 0xe2, 0x3f, 0xa4, 0xb2, 0xea, 0xc3, 0x10, 0xbd, 0x07, 0x4b, 0x91, 0x92,
+	0x8c, 0x12, 0x96, 0x8d, 0x12, 0xa4, 0x71, 0x3f, 0x47, 0x2a, 0xda, 0x91, 0x17, 0xf1, 0x09, 0xdc,
+	0x4a, 0xee, 0xa5, 0xaa, 0x58, 0x4d, 0x57, 0x91, 0xdc, 0xae, 0x69, 0x77, 0x55, 0x87, 0x09, 0x3c,
+	0x2d, 0x64, 0xd9, 0x28, 0x24, 0x0b, 0xcc, 0x4b, 0x01, 0x28, 0x69, 0x11, 0xef, 0xc0, 0x52, 0xc7,
+	0x61, 0x83, 0xef, 0xf4, 0x6c, 0xbc, 0x09, 0x76, 0x44, 0x4f, 0x35, 0x2f, 0x6f, 0xe9, 0xcd, 0xa2,
+	0xba, 0x45, 0x84, 0x11, 0xb7, 0xa1, 0xaa, 0x2e, 0xa9, 0xd6, 0xdf, 0x83, 0x42, 0x44, 0xf5, 0x3a,
+	0xca, 0x5c, 0xe2, 0xb6, 0x2d, 0x3c, 0xfd, 0x20, 0xe0, 0x3f, 0xf7, 0xa8, 0x04, 0xb6, 0xeb, 0x30,
+	0xa7, 0x9e, 0xe3, 0x27, 0xbe, 0xc5, 0xeb, 0x56, 0xfb, 0xa7, 0x02, 0xac, 0x4d, 0xf7, 0xbb, 0xe3,
+	0x3b, 0x43, 0x1a, 0xf5, 0x68, 0x74, 0xe6, 0x0d, 0x28, 0xfa, 0x1a, 0x50, 0x76, 0xf5, 0xa2, 0xbb,
+	0x12, 0x6b, 0xee, 0xf6, 0x6f, 0xae, 0xcf, 0x77, 0x50, 0x2f, 0x90, 0x43, 0x8f, 0xe5, 0x77, 0x91,
+	0xdc, 0x7d, 0x68, 0x6d, 0xba, 0x4d, 0x53, 0x6b, 0xb3, 0xd9, 0xc8, 0x1a, 0xcc, 0x10, 0xd3, 0x3d,
+	0xae, 0x43, 0x64, 0xd6, 0xbd, 0x0e, 0x91, 0x5d, 0xf9, 0x38, 0x87, 0x7a, 0x72, 0x7b, 0xa6, 0xbe,
+	0x70, 0xdf, 0x48, 0xfc, 0x67, 0xfd, 0xdc, 0x36, 0x5b, 0xf3, 0xcc, 0x49, 0xd0, 0x47, 0x50, 0x4e,
+	0xd6, 0x2f, 0xba, 0x3d, 0x75, 0x37, 0x77, 0x74, 0x73, 0x2d, 0xa3, 0xd7, 0xf7, 0xdb, 0x7f, 0x58,
+	0x50, 0x49, 0x62, 0x3f, 0xfb, 0x12, 0xb5, 0xa1, 0x28, 0x3a, 0x8f, 0xd4, 0x17, 0x9c, 0x39, 0x3b,
+	0xcd, 0x95, 0x94, 0x2e, 0xc9, 0xe1, 0x6d, 0x28, 0xf0, 0x71, 0xcf, 0x70, 0xba, 0x99, 0xa5, 0x88,
+	0xf4, 0xde, 0xa3, 0x89, 0xf7, 0x94, 0x8e, 0xcd, 0xec, 0x5c, 0xe3, 0x1c, 0x7a, 0x08, 0x0b, 0x8a,
+	0x0c, 0xb3, 0xa8, 0xdf, 0x9c, 0xc9, 0x24, 0x9c, 0xeb, 0x34, 0x7e, 0xbb, 0x6c, 0x59, 0xaf, 0x2e,
+	0x5b, 0xd6, 0xdf, 0x97, 0x2d, 0xeb, 0xe7, 0xab, 0x56, 0xee, 0xd5, 0x55, 0x2b, 0xf7, 0xe7, 0x55,
+	0x2b, 0xd7, 0x5f, 0x10, 0x7f, 0xb4, 0x76, 0xfe, 0x09, 0x00, 0x00, 0xff, 0xff, 0x95, 0x07, 0x95,
+	0x91, 0x86, 0x0d, 0x00, 0x00,
+}
+
+// Reference imports to suppress errors if they are not otherwise used.
+var _ context.Context
+var _ grpc.ClientConn
+
+// This is a compile-time assertion to ensure that this generated file
+// is compatible with the grpc package it is being compiled against.
+const _ = grpc.SupportPackageIsVersion4
+
+// PartitionManagerServiceClient is the client API for PartitionManagerService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://godoc.org/google.golang.org/grpc#ClientConn.NewStream.
+type PartitionManagerServiceClient interface {
+	SetRowStreamTables(ctx context.Context, in *SetRowStreamTablesRequest, opts ...grpc.CallOption) (*SetRowStreamTablesResponse, error)
+	RegisterPS(ctx context.Context, in *RegisterPSRequest, opts ...grpc.CallOption) (*RegisterPSResponse, error)
+	GetRegions(ctx context.Context, in *GetRegionsRequest, opts ...grpc.CallOption) (*GetRegionsResponse, error)
+	GetPartitionMeta(ctx context.Context, in *GetPartitionMetaRequest, opts ...grpc.CallOption) (*GetPartitionMetaResponse, error)
+	GetPSInfo(ctx context.Context, in *GetPSInfoRequest, opts ...grpc.CallOption) (*GetPSInfoResponse, error)
+}
+
+type partitionManagerServiceClient struct {
+	cc *grpc.ClientConn
+}
+
+func NewPartitionManagerServiceClient(cc *grpc.ClientConn) PartitionManagerServiceClient {
+	return &partitionManagerServiceClient{cc}
+}
+
+func (c *partitionManagerServiceClient) SetRowStreamTables(ctx context.Context, in *SetRowStreamTablesRequest, opts ...grpc.CallOption) (*SetRowStreamTablesResponse, error) {
+	out := new(SetRowStreamTablesResponse)
+	err := c.cc.Invoke(ctx, "/pspb.PartitionManagerService/SetRowStreamTables", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *partitionManagerServiceClient) RegisterPS(ctx context.Context, in *RegisterPSRequest, opts ...grpc.CallOption) (*RegisterPSResponse, error) {
+	out := new(RegisterPSResponse)
+	err := c.cc.Invoke(ctx, "/pspb.PartitionManagerService/RegisterPS", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *partitionManagerServiceClient) GetRegions(ctx context.Context, in *GetRegionsRequest, opts ...grpc.CallOption) (*GetRegionsResponse, error) {
+	out := new(GetRegionsResponse)
+	err := c.cc.Invoke(ctx, "/pspb.PartitionManagerService/GetRegions", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *partitionManagerServiceClient) GetPartitionMeta(ctx context.Context, in *GetPartitionMetaRequest, opts ...grpc.CallOption) (*GetPartitionMetaResponse, error) {
+	out := new(GetPartitionMetaResponse)
+	err := c.cc.Invoke(ctx, "/pspb.PartitionManagerService/GetPartitionMeta", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *partitionManagerServiceClient) GetPSInfo(ctx context.Context, in *GetPSInfoRequest, opts ...grpc.CallOption) (*GetPSInfoResponse, error) {
+	out := new(GetPSInfoResponse)
+	err := c.cc.Invoke(ctx, "/pspb.PartitionManagerService/GetPSInfo", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// PartitionManagerServiceServer is the server API for PartitionManagerService service.
+type PartitionManagerServiceServer interface {
+	SetRowStreamTables(context.Context, *SetRowStreamTablesRequest) (*SetRowStreamTablesResponse, error)
+	RegisterPS(context.Context, *RegisterPSRequest) (*RegisterPSResponse, error)
+	GetRegions(context.Context, *GetRegionsRequest) (*GetRegionsResponse, error)
+	GetPartitionMeta(context.Context, *GetPartitionMetaRequest) (*GetPartitionMetaResponse, error)
+	GetPSInfo(context.Context, *GetPSInfoRequest) (*GetPSInfoResponse, error)
+}
+
+// UnimplementedPartitionManagerServiceServer can be embedded to have forward compatible implementations.
+type UnimplementedPartitionManagerServiceServer struct {
+}
+
+func (*UnimplementedPartitionManagerServiceServer) SetRowStreamTables(ctx context.Context, req *SetRowStreamTablesRequest) (*SetRowStreamTablesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SetRowStreamTables not implemented")
+}
+func (*UnimplementedPartitionManagerServiceServer) RegisterPS(ctx context.Context, req *RegisterPSRequest) (*RegisterPSResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RegisterPS not implemented")
+}
+func (*UnimplementedPartitionManagerServiceServer) GetRegions(ctx context.Context, req *GetRegionsRequest) (*GetRegionsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetRegions not implemented")
+}
+func (*UnimplementedPartitionManagerServiceServer) GetPartitionMeta(ctx context.Context, req *GetPartitionMetaRequest) (*GetPartitionMetaResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetPartitionMeta not implemented")
+}
+func (*UnimplementedPartitionManagerServiceServer) GetPSInfo(ctx context.Context, req *GetPSInfoRequest) (*GetPSInfoResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetPSInfo not implemented")
+}
+
+func RegisterPartitionManagerServiceServer(s *grpc.Server, srv PartitionManagerServiceServer) {
+	s.RegisterService(&_PartitionManagerService_serviceDesc, srv)
+}
+
+func _PartitionManagerService_SetRowStreamTables_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetRowStreamTablesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PartitionManagerServiceServer).SetRowStreamTables(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/pspb.PartitionManagerService/SetRowStreamTables",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PartitionManagerServiceServer).SetRowStreamTables(ctx, req.(*SetRowStreamTablesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PartitionManagerService_RegisterPS_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RegisterPSRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PartitionManagerServiceServer).RegisterPS(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/pspb.PartitionManagerService/RegisterPS",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PartitionManagerServiceServer).RegisterPS(ctx, req.(*RegisterPSRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PartitionManagerService_GetRegions_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRegionsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PartitionManagerServiceServer).GetRegions(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/pspb.PartitionManagerService/GetRegions",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PartitionManagerServiceServer).GetRegions(ctx, req.(*GetRegionsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PartitionManagerService_GetPartitionMeta_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetPartitionMetaRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PartitionManagerServiceServer).GetPartitionMeta(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/pspb.PartitionManagerService/GetPartitionMeta",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PartitionManagerServiceServer).GetPartitionMeta(ctx, req.(*GetPartitionMetaRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PartitionManagerService_GetPSInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetPSInfoRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PartitionManagerServiceServer).GetPSInfo(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/pspb.PartitionManagerService/GetPSInfo",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PartitionManagerServiceServer).GetPSInfo(ctx, req.(*GetPSInfoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+var _PartitionManagerService_serviceDesc = grpc.ServiceDesc{
+	ServiceName: "pspb.PartitionManagerService",
+	HandlerType: (*PartitionManagerServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "SetRowStreamTables",
+			Handler:    _PartitionManagerService_SetRowStreamTables_Handler,
+		},
+		{
+			MethodName: "RegisterPS",
+			Handler:    _PartitionManagerService_RegisterPS_Handler,
+		},
+		{
+			MethodName: "GetRegions",
+			Handler:    _PartitionManagerService_GetRegions_Handler,
+		},
+		{
+			MethodName: "GetPartitionMeta",
+			Handler:    _PartitionManagerService_GetPartitionMeta_Handler,
+		},
+		{
+			MethodName: "GetPSInfo",
+			Handler:    _PartitionManagerService_GetPSInfo_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "pspb.proto",
+}
+
+// PartitionKVClient is the client API for PartitionKV service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://godoc.org/google.golang.org/grpc#ClientConn.NewStream.
+type PartitionKVClient interface {
+	//
+	//option (google.api.http) = {
+	//post: "/v3/kv/txn"
+	//body: "*"
+	//};
+	Batch(ctx context.Context, in *BatchRequest, opts ...grpc.CallOption) (*BatchResponse, error)
+	Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*PutResponse, error)
+	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error)
+	Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error)
+}
+
+type partitionKVClient struct {
+	cc *grpc.ClientConn
+}
+
+func NewPartitionKVClient(cc *grpc.ClientConn) PartitionKVClient {
+	return &partitionKVClient{cc}
+}
+
+func (c *partitionKVClient) Batch(ctx context.Context, in *BatchRequest, opts ...grpc.CallOption) (*BatchResponse, error) {
+	out := new(BatchResponse)
+	err := c.cc.Invoke(ctx, "/pspb.PartitionKV/Batch", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *partitionKVClient) Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*PutResponse, error) {
+	out := new(PutResponse)
+	err := c.cc.Invoke(ctx, "/pspb.PartitionKV/Put", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *partitionKVClient) Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error) {
+	out := new(GetResponse)
+	err := c.cc.Invoke(ctx, "/pspb.PartitionKV/Get", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *partitionKVClient) Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error) {
+	out := new(DeleteResponse)
+	err := c.cc.Invoke(ctx, "/pspb.PartitionKV/Delete", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// PartitionKVServer is the server API for PartitionKV service.
+type PartitionKVServer interface {
+	//
+	//option (google.api.http) = {
+	//post: "/v3/kv/txn"
+	//body: "*"
+	//};
+	Batch(context.Context, *BatchRequest) (*BatchResponse, error)
+	Put(context.Context, *PutRequest) (*PutResponse, error)
+	Get(context.Context, *GetRequest) (*GetResponse, error)
+	Delete(context.Context, *DeleteRequest) (*DeleteResponse, error)
+}
+
+// UnimplementedPartitionKVServer can be embedded to have forward compatible implementations.
+type UnimplementedPartitionKVServer struct {
+}
+
+func (*UnimplementedPartitionKVServer) Batch(ctx context.Context, req *BatchRequest) (*BatchResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Batch not implemented")
+}
+func (*UnimplementedPartitionKVServer) Put(ctx context.Context, req *PutRequest) (*PutResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Put not implemented")
+}
+func (*UnimplementedPartitionKVServer) Get(ctx context.Context, req *GetRequest) (*GetResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Get not implemented")
+}
+func (*UnimplementedPartitionKVServer) Delete(ctx context.Context, req *DeleteRequest) (*DeleteResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Delete not implemented")
+}
+
+func RegisterPartitionKVServer(s *grpc.Server, srv PartitionKVServer) {
+	s.RegisterService(&_PartitionKV_serviceDesc, srv)
+}
+
+func _PartitionKV_Batch_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BatchRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PartitionKVServer).Batch(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/pspb.PartitionKV/Batch",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PartitionKVServer).Batch(ctx, req.(*BatchRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PartitionKV_Put_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PutRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PartitionKVServer).Put(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/pspb.PartitionKV/Put",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PartitionKVServer).Put(ctx, req.(*PutRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PartitionKV_Get_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PartitionKVServer).Get(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/pspb.PartitionKV/Get",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PartitionKVServer).Get(ctx, req.(*GetRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PartitionKV_Delete_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PartitionKVServer).Delete(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/pspb.PartitionKV/Delete",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PartitionKVServer).Delete(ctx, req.(*DeleteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+var _PartitionKV_serviceDesc = grpc.ServiceDesc{
+	ServiceName: "pspb.PartitionKV",
+	HandlerType: (*PartitionKVServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Batch",
+			Handler:    _PartitionKV_Batch_Handler,
+		},
+		{
+			MethodName: "Put",
+			Handler:    _PartitionKV_Put_Handler,
+		},
+		{
+			MethodName: "Get",
+			Handler:    _PartitionKV_Get_Handler,
+		},
+		{
+			MethodName: "Delete",
+			Handler:    _PartitionKV_Delete_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "pspb.proto",
 }
 
 func (m *MixedLog) Marshal() (dAtA []byte, err error) {
@@ -681,7 +2419,7 @@ func (m *Range) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	return len(dAtA) - i, nil
 }
 
-func (m *TableLocation) Marshal() (dAtA []byte, err error) {
+func (m *Location) Marshal() (dAtA []byte, err error) {
 	size := m.Size()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
@@ -691,12 +2429,12 @@ func (m *TableLocation) Marshal() (dAtA []byte, err error) {
 	return dAtA[:n], nil
 }
 
-func (m *TableLocation) MarshalTo(dAtA []byte) (int, error) {
+func (m *Location) MarshalTo(dAtA []byte) (int, error) {
 	size := m.Size()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
-func (m *TableLocation) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+func (m *Location) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	i := len(dAtA)
 	_ = i
 	var l int
@@ -710,6 +2448,84 @@ func (m *TableLocation) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 		i = encodeVarintPspb(dAtA, i, uint64(m.ExtentID))
 		i--
 		dAtA[i] = 0x8
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *BlobStreams) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *BlobStreams) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *BlobStreams) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if len(m.Blob) > 0 {
+		dAtA4 := make([]byte, len(m.Blob)*10)
+		var j3 int
+		for _, num := range m.Blob {
+			for num >= 1<<7 {
+				dAtA4[j3] = uint8(uint64(num)&0x7f | 0x80)
+				num >>= 7
+				j3++
+			}
+			dAtA4[j3] = uint8(num)
+			j3++
+		}
+		i -= j3
+		copy(dAtA[i:], dAtA4[:j3])
+		i = encodeVarintPspb(dAtA, i, uint64(j3))
+		i--
+		dAtA[i] = 0xa
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *TableLocations) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *TableLocations) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *TableLocations) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if len(m.Locs) > 0 {
+		for iNdEx := len(m.Locs) - 1; iNdEx >= 0; iNdEx-- {
+			{
+				size, err := m.Locs[iNdEx].MarshalToSizedBuffer(dAtA[:i])
+				if err != nil {
+					return 0, err
+				}
+				i -= size
+				i = encodeVarintPspb(dAtA, i, uint64(size))
+			}
+			i--
+			dAtA[i] = 0xa
+		}
 	}
 	return len(dAtA) - i, nil
 }
@@ -734,51 +2550,60 @@ func (m *PartitionMeta) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if len(m.Tables) > 0 {
-		for iNdEx := len(m.Tables) - 1; iNdEx >= 0; iNdEx-- {
-			{
-				size, err := m.Tables[iNdEx].MarshalToSizedBuffer(dAtA[:i])
-				if err != nil {
-					return 0, err
-				}
-				i -= size
-				i = encodeVarintPspb(dAtA, i, uint64(size))
+	if m.PartID != 0 {
+		i = encodeVarintPspb(dAtA, i, uint64(m.PartID))
+		i--
+		dAtA[i] = 0x40
+	}
+	if m.Rg != nil {
+		{
+			size, err := m.Rg.MarshalToSizedBuffer(dAtA[:i])
+			if err != nil {
+				return 0, err
 			}
-			i--
-			dAtA[i] = 0x2a
+			i -= size
+			i = encodeVarintPspb(dAtA, i, uint64(size))
 		}
+		i--
+		dAtA[i] = 0x3a
+	}
+	if len(m.Discard) > 0 {
+		i -= len(m.Discard)
+		copy(dAtA[i:], m.Discard)
+		i = encodeVarintPspb(dAtA, i, uint64(len(m.Discard)))
+		i--
+		dAtA[i] = 0x32
+	}
+	if m.Parent != 0 {
+		i = encodeVarintPspb(dAtA, i, uint64(m.Parent))
+		i--
+		dAtA[i] = 0x28
+	}
+	if m.Locs != nil {
+		{
+			size, err := m.Locs.MarshalToSizedBuffer(dAtA[:i])
+			if err != nil {
+				return 0, err
+			}
+			i -= size
+			i = encodeVarintPspb(dAtA, i, uint64(size))
+		}
+		i--
+		dAtA[i] = 0x22
 	}
 	if m.RowStream != 0 {
 		i = encodeVarintPspb(dAtA, i, uint64(m.RowStream))
 		i--
-		dAtA[i] = 0x20
+		dAtA[i] = 0x18
 	}
 	if m.LogStream != 0 {
 		i = encodeVarintPspb(dAtA, i, uint64(m.LogStream))
 		i--
-		dAtA[i] = 0x18
+		dAtA[i] = 0x10
 	}
-	if len(m.BlobStreams) > 0 {
-		dAtA4 := make([]byte, len(m.BlobStreams)*10)
-		var j3 int
-		for _, num := range m.BlobStreams {
-			for num >= 1<<7 {
-				dAtA4[j3] = uint8(uint64(num)&0x7f | 0x80)
-				num >>= 7
-				j3++
-			}
-			dAtA4[j3] = uint8(num)
-			j3++
-		}
-		i -= j3
-		copy(dAtA[i:], dAtA4[:j3])
-		i = encodeVarintPspb(dAtA, i, uint64(j3))
-		i--
-		dAtA[i] = 0x12
-	}
-	if m.Range != nil {
+	if m.Blobs != nil {
 		{
-			size, err := m.Range.MarshalToSizedBuffer(dAtA[:i])
+			size, err := m.Blobs.MarshalToSizedBuffer(dAtA[:i])
 			if err != nil {
 				return 0, err
 			}
@@ -791,7 +2616,7 @@ func (m *PartitionMeta) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	return len(dAtA) - i, nil
 }
 
-func (m *MetaStreamData) Marshal() (dAtA []byte, err error) {
+func (m *PSDetail) Marshal() (dAtA []byte, err error) {
 	size := m.Size()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
@@ -801,30 +2626,79 @@ func (m *MetaStreamData) Marshal() (dAtA []byte, err error) {
 	return dAtA[:n], nil
 }
 
-func (m *MetaStreamData) MarshalTo(dAtA []byte) (int, error) {
+func (m *PSDetail) MarshalTo(dAtA []byte) (int, error) {
 	size := m.Size()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
-func (m *MetaStreamData) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+func (m *PSDetail) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	i := len(dAtA)
 	_ = i
 	var l int
 	_ = l
-	if m.BlobStreamID != 0 {
-		i = encodeVarintPspb(dAtA, i, uint64(m.BlobStreamID))
+	if len(m.Address) > 0 {
+		i -= len(m.Address)
+		copy(dAtA[i:], m.Address)
+		i = encodeVarintPspb(dAtA, i, uint64(len(m.Address)))
+		i--
+		dAtA[i] = 0x12
+	}
+	if m.PSID != 0 {
+		i = encodeVarintPspb(dAtA, i, uint64(m.PSID))
+		i--
+		dAtA[i] = 0x8
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *RegionInfo) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *RegionInfo) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *RegionInfo) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if len(m.Addr) > 0 {
+		i -= len(m.Addr)
+		copy(dAtA[i:], m.Addr)
+		i = encodeVarintPspb(dAtA, i, uint64(len(m.Addr)))
+		i--
+		dAtA[i] = 0x22
+	}
+	if m.PSID != 0 {
+		i = encodeVarintPspb(dAtA, i, uint64(m.PSID))
 		i--
 		dAtA[i] = 0x18
 	}
-	if m.RawStreamID != 0 {
-		i = encodeVarintPspb(dAtA, i, uint64(m.RawStreamID))
+	if m.PartID != 0 {
+		i = encodeVarintPspb(dAtA, i, uint64(m.PartID))
 		i--
 		dAtA[i] = 0x10
 	}
-	if m.LogStreamID != 0 {
-		i = encodeVarintPspb(dAtA, i, uint64(m.LogStreamID))
+	if m.Rg != nil {
+		{
+			size, err := m.Rg.MarshalToSizedBuffer(dAtA[:i])
+			if err != nil {
+				return 0, err
+			}
+			i -= size
+			i = encodeVarintPspb(dAtA, i, uint64(size))
+		}
 		i--
-		dAtA[i] = 0x8
+		dAtA[i] = 0xa
 	}
 	return len(dAtA) - i, nil
 }
@@ -976,6 +2850,830 @@ func (m *TableIndex) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	return len(dAtA) - i, nil
 }
 
+func (m *GetPartitionMetaRequest) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *GetPartitionMetaRequest) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *GetPartitionMetaRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if m.PSID != 0 {
+		i = encodeVarintPspb(dAtA, i, uint64(m.PSID))
+		i--
+		dAtA[i] = 0x8
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *GetPartitionMetaResponse) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *GetPartitionMetaResponse) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *GetPartitionMetaResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if len(m.Meta) > 0 {
+		for iNdEx := len(m.Meta) - 1; iNdEx >= 0; iNdEx-- {
+			{
+				size, err := m.Meta[iNdEx].MarshalToSizedBuffer(dAtA[:i])
+				if err != nil {
+					return 0, err
+				}
+				i -= size
+				i = encodeVarintPspb(dAtA, i, uint64(size))
+			}
+			i--
+			dAtA[i] = 0x12
+		}
+	}
+	if m.Code != 0 {
+		i = encodeVarintPspb(dAtA, i, uint64(m.Code))
+		i--
+		dAtA[i] = 0x8
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *SetRowStreamTablesRequest) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *SetRowStreamTablesRequest) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *SetRowStreamTablesRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if m.Locs != nil {
+		{
+			size, err := m.Locs.MarshalToSizedBuffer(dAtA[:i])
+			if err != nil {
+				return 0, err
+			}
+			i -= size
+			i = encodeVarintPspb(dAtA, i, uint64(size))
+		}
+		i--
+		dAtA[i] = 0x12
+	}
+	if m.PartitionID != 0 {
+		i = encodeVarintPspb(dAtA, i, uint64(m.PartitionID))
+		i--
+		dAtA[i] = 0x8
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *SetRowStreamTablesResponse) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *SetRowStreamTablesResponse) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *SetRowStreamTablesResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if m.Code != 0 {
+		i = encodeVarintPspb(dAtA, i, uint64(m.Code))
+		i--
+		dAtA[i] = 0x8
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *GetRegionsRequest) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *GetRegionsRequest) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *GetRegionsRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	return len(dAtA) - i, nil
+}
+
+func (m *GetRegionsResponse) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *GetRegionsResponse) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *GetRegionsResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if len(m.Regions) > 0 {
+		for iNdEx := len(m.Regions) - 1; iNdEx >= 0; iNdEx-- {
+			{
+				size, err := m.Regions[iNdEx].MarshalToSizedBuffer(dAtA[:i])
+				if err != nil {
+					return 0, err
+				}
+				i -= size
+				i = encodeVarintPspb(dAtA, i, uint64(size))
+			}
+			i--
+			dAtA[i] = 0x12
+		}
+	}
+	if m.Code != 0 {
+		i = encodeVarintPspb(dAtA, i, uint64(m.Code))
+		i--
+		dAtA[i] = 0x8
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *RegisterPSRequest) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *RegisterPSRequest) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *RegisterPSRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if len(m.Addr) > 0 {
+		i -= len(m.Addr)
+		copy(dAtA[i:], m.Addr)
+		i = encodeVarintPspb(dAtA, i, uint64(len(m.Addr)))
+		i--
+		dAtA[i] = 0xa
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *RegisterPSResponse) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *RegisterPSResponse) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *RegisterPSResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if m.Id != 0 {
+		i = encodeVarintPspb(dAtA, i, uint64(m.Id))
+		i--
+		dAtA[i] = 0x10
+	}
+	if m.Code != 0 {
+		i = encodeVarintPspb(dAtA, i, uint64(m.Code))
+		i--
+		dAtA[i] = 0x8
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *GetPSInfoRequest) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *GetPSInfoRequest) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *GetPSInfoRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	return len(dAtA) - i, nil
+}
+
+func (m *GetPSInfoResponse) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *GetPSInfoResponse) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *GetPSInfoResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if len(m.Servers) > 0 {
+		for iNdEx := len(m.Servers) - 1; iNdEx >= 0; iNdEx-- {
+			{
+				size, err := m.Servers[iNdEx].MarshalToSizedBuffer(dAtA[:i])
+				if err != nil {
+					return 0, err
+				}
+				i -= size
+				i = encodeVarintPspb(dAtA, i, uint64(size))
+			}
+			i--
+			dAtA[i] = 0xa
+		}
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *PutRequest) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *PutRequest) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *PutRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if m.Partid != 0 {
+		i = encodeVarintPspb(dAtA, i, uint64(m.Partid))
+		i--
+		dAtA[i] = 0x28
+	}
+	if m.Psversion != 0 {
+		i = encodeVarintPspb(dAtA, i, uint64(m.Psversion))
+		i--
+		dAtA[i] = 0x20
+	}
+	if m.ExpiresAt != 0 {
+		i = encodeVarintPspb(dAtA, i, uint64(m.ExpiresAt))
+		i--
+		dAtA[i] = 0x18
+	}
+	if len(m.Value) > 0 {
+		i -= len(m.Value)
+		copy(dAtA[i:], m.Value)
+		i = encodeVarintPspb(dAtA, i, uint64(len(m.Value)))
+		i--
+		dAtA[i] = 0x12
+	}
+	if len(m.Key) > 0 {
+		i -= len(m.Key)
+		copy(dAtA[i:], m.Key)
+		i = encodeVarintPspb(dAtA, i, uint64(len(m.Key)))
+		i--
+		dAtA[i] = 0xa
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *PutResponse) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *PutResponse) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *PutResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if len(m.Key) > 0 {
+		i -= len(m.Key)
+		copy(dAtA[i:], m.Key)
+		i = encodeVarintPspb(dAtA, i, uint64(len(m.Key)))
+		i--
+		dAtA[i] = 0xa
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *DeleteRequest) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *DeleteRequest) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *DeleteRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if m.Partid != 0 {
+		i = encodeVarintPspb(dAtA, i, uint64(m.Partid))
+		i--
+		dAtA[i] = 0x28
+	}
+	if m.Psversion != 0 {
+		i = encodeVarintPspb(dAtA, i, uint64(m.Psversion))
+		i--
+		dAtA[i] = 0x10
+	}
+	if len(m.Key) > 0 {
+		i -= len(m.Key)
+		copy(dAtA[i:], m.Key)
+		i = encodeVarintPspb(dAtA, i, uint64(len(m.Key)))
+		i--
+		dAtA[i] = 0xa
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *DeleteResponse) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *DeleteResponse) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *DeleteResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if m.Psversion != 0 {
+		i = encodeVarintPspb(dAtA, i, uint64(m.Psversion))
+		i--
+		dAtA[i] = 0x10
+	}
+	if len(m.Key) > 0 {
+		i -= len(m.Key)
+		copy(dAtA[i:], m.Key)
+		i = encodeVarintPspb(dAtA, i, uint64(len(m.Key)))
+		i--
+		dAtA[i] = 0xa
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *GetRequest) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *GetRequest) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *GetRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if m.Partid != 0 {
+		i = encodeVarintPspb(dAtA, i, uint64(m.Partid))
+		i--
+		dAtA[i] = 0x28
+	}
+	if m.Psversion != 0 {
+		i = encodeVarintPspb(dAtA, i, uint64(m.Psversion))
+		i--
+		dAtA[i] = 0x10
+	}
+	if len(m.Key) > 0 {
+		i -= len(m.Key)
+		copy(dAtA[i:], m.Key)
+		i = encodeVarintPspb(dAtA, i, uint64(len(m.Key)))
+		i--
+		dAtA[i] = 0xa
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *GetResponse) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *GetResponse) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *GetResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if len(m.Value) > 0 {
+		i -= len(m.Value)
+		copy(dAtA[i:], m.Value)
+		i = encodeVarintPspb(dAtA, i, uint64(len(m.Value)))
+		i--
+		dAtA[i] = 0x12
+	}
+	if len(m.Key) > 0 {
+		i -= len(m.Key)
+		copy(dAtA[i:], m.Key)
+		i = encodeVarintPspb(dAtA, i, uint64(len(m.Key)))
+		i--
+		dAtA[i] = 0xa
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *RequestOp) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *RequestOp) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *RequestOp) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if m.Request != nil {
+		{
+			size := m.Request.Size()
+			i -= size
+			if _, err := m.Request.MarshalTo(dAtA[i:]); err != nil {
+				return 0, err
+			}
+		}
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *RequestOp_RequestPut) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *RequestOp_RequestPut) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	if m.RequestPut != nil {
+		{
+			size, err := m.RequestPut.MarshalToSizedBuffer(dAtA[:i])
+			if err != nil {
+				return 0, err
+			}
+			i -= size
+			i = encodeVarintPspb(dAtA, i, uint64(size))
+		}
+		i--
+		dAtA[i] = 0xa
+	}
+	return len(dAtA) - i, nil
+}
+func (m *RequestOp_RequestDelete) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *RequestOp_RequestDelete) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	if m.RequestDelete != nil {
+		{
+			size, err := m.RequestDelete.MarshalToSizedBuffer(dAtA[:i])
+			if err != nil {
+				return 0, err
+			}
+			i -= size
+			i = encodeVarintPspb(dAtA, i, uint64(size))
+		}
+		i--
+		dAtA[i] = 0x12
+	}
+	return len(dAtA) - i, nil
+}
+func (m *RequestOp_RequestGet) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *RequestOp_RequestGet) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	if m.RequestGet != nil {
+		{
+			size, err := m.RequestGet.MarshalToSizedBuffer(dAtA[:i])
+			if err != nil {
+				return 0, err
+			}
+			i -= size
+			i = encodeVarintPspb(dAtA, i, uint64(size))
+		}
+		i--
+		dAtA[i] = 0x1a
+	}
+	return len(dAtA) - i, nil
+}
+func (m *ResponseOp) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *ResponseOp) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *ResponseOp) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if m.Response != nil {
+		{
+			size := m.Response.Size()
+			i -= size
+			if _, err := m.Response.MarshalTo(dAtA[i:]); err != nil {
+				return 0, err
+			}
+		}
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *ResponseOp_ResponsePut) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *ResponseOp_ResponsePut) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	if m.ResponsePut != nil {
+		{
+			size, err := m.ResponsePut.MarshalToSizedBuffer(dAtA[:i])
+			if err != nil {
+				return 0, err
+			}
+			i -= size
+			i = encodeVarintPspb(dAtA, i, uint64(size))
+		}
+		i--
+		dAtA[i] = 0xa
+	}
+	return len(dAtA) - i, nil
+}
+func (m *ResponseOp_ResponseDelete) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *ResponseOp_ResponseDelete) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	if m.ResponseDelete != nil {
+		{
+			size, err := m.ResponseDelete.MarshalToSizedBuffer(dAtA[:i])
+			if err != nil {
+				return 0, err
+			}
+			i -= size
+			i = encodeVarintPspb(dAtA, i, uint64(size))
+		}
+		i--
+		dAtA[i] = 0x12
+	}
+	return len(dAtA) - i, nil
+}
+func (m *ResponseOp_ResponseGet) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *ResponseOp_ResponseGet) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	if m.ResponseGet != nil {
+		{
+			size, err := m.ResponseGet.MarshalToSizedBuffer(dAtA[:i])
+			if err != nil {
+				return 0, err
+			}
+			i -= size
+			i = encodeVarintPspb(dAtA, i, uint64(size))
+		}
+		i--
+		dAtA[i] = 0x1a
+	}
+	return len(dAtA) - i, nil
+}
+func (m *BatchRequest) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *BatchRequest) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *BatchRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if len(m.Reqs) > 0 {
+		for iNdEx := len(m.Reqs) - 1; iNdEx >= 0; iNdEx-- {
+			{
+				size, err := m.Reqs[iNdEx].MarshalToSizedBuffer(dAtA[:i])
+				if err != nil {
+					return 0, err
+				}
+				i -= size
+				i = encodeVarintPspb(dAtA, i, uint64(size))
+			}
+			i--
+			dAtA[i] = 0xa
+		}
+	}
+	return len(dAtA) - i, nil
+}
+
+func (m *BatchResponse) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *BatchResponse) MarshalTo(dAtA []byte) (int, error) {
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *BatchResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if len(m.Res) > 0 {
+		for iNdEx := len(m.Res) - 1; iNdEx >= 0; iNdEx-- {
+			{
+				size, err := m.Res[iNdEx].MarshalToSizedBuffer(dAtA[:i])
+				if err != nil {
+					return 0, err
+				}
+				i -= size
+				i = encodeVarintPspb(dAtA, i, uint64(size))
+			}
+			i--
+			dAtA[i] = 0x12
+		}
+	}
+	return len(dAtA) - i, nil
+}
+
 func encodeVarintPspb(dAtA []byte, offset int, v uint64) int {
 	offset -= sovPspb(v)
 	base := offset
@@ -1020,7 +3718,7 @@ func (m *Range) Size() (n int) {
 	return n
 }
 
-func (m *TableLocation) Size() (n int) {
+func (m *Location) Size() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -1035,31 +3733,30 @@ func (m *TableLocation) Size() (n int) {
 	return n
 }
 
-func (m *PartitionMeta) Size() (n int) {
+func (m *BlobStreams) Size() (n int) {
 	if m == nil {
 		return 0
 	}
 	var l int
 	_ = l
-	if m.Range != nil {
-		l = m.Range.Size()
-		n += 1 + l + sovPspb(uint64(l))
-	}
-	if len(m.BlobStreams) > 0 {
+	if len(m.Blob) > 0 {
 		l = 0
-		for _, e := range m.BlobStreams {
+		for _, e := range m.Blob {
 			l += sovPspb(uint64(e))
 		}
 		n += 1 + sovPspb(uint64(l)) + l
 	}
-	if m.LogStream != 0 {
-		n += 1 + sovPspb(uint64(m.LogStream))
+	return n
+}
+
+func (m *TableLocations) Size() (n int) {
+	if m == nil {
+		return 0
 	}
-	if m.RowStream != 0 {
-		n += 1 + sovPspb(uint64(m.RowStream))
-	}
-	if len(m.Tables) > 0 {
-		for _, e := range m.Tables {
+	var l int
+	_ = l
+	if len(m.Locs) > 0 {
+		for _, e := range m.Locs {
 			l = e.Size()
 			n += 1 + l + sovPspb(uint64(l))
 		}
@@ -1067,20 +3764,78 @@ func (m *PartitionMeta) Size() (n int) {
 	return n
 }
 
-func (m *MetaStreamData) Size() (n int) {
+func (m *PartitionMeta) Size() (n int) {
 	if m == nil {
 		return 0
 	}
 	var l int
 	_ = l
-	if m.LogStreamID != 0 {
-		n += 1 + sovPspb(uint64(m.LogStreamID))
+	if m.Blobs != nil {
+		l = m.Blobs.Size()
+		n += 1 + l + sovPspb(uint64(l))
 	}
-	if m.RawStreamID != 0 {
-		n += 1 + sovPspb(uint64(m.RawStreamID))
+	if m.LogStream != 0 {
+		n += 1 + sovPspb(uint64(m.LogStream))
 	}
-	if m.BlobStreamID != 0 {
-		n += 1 + sovPspb(uint64(m.BlobStreamID))
+	if m.RowStream != 0 {
+		n += 1 + sovPspb(uint64(m.RowStream))
+	}
+	if m.Locs != nil {
+		l = m.Locs.Size()
+		n += 1 + l + sovPspb(uint64(l))
+	}
+	if m.Parent != 0 {
+		n += 1 + sovPspb(uint64(m.Parent))
+	}
+	l = len(m.Discard)
+	if l > 0 {
+		n += 1 + l + sovPspb(uint64(l))
+	}
+	if m.Rg != nil {
+		l = m.Rg.Size()
+		n += 1 + l + sovPspb(uint64(l))
+	}
+	if m.PartID != 0 {
+		n += 1 + sovPspb(uint64(m.PartID))
+	}
+	return n
+}
+
+func (m *PSDetail) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.PSID != 0 {
+		n += 1 + sovPspb(uint64(m.PSID))
+	}
+	l = len(m.Address)
+	if l > 0 {
+		n += 1 + l + sovPspb(uint64(l))
+	}
+	return n
+}
+
+func (m *RegionInfo) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.Rg != nil {
+		l = m.Rg.Size()
+		n += 1 + l + sovPspb(uint64(l))
+	}
+	if m.PartID != 0 {
+		n += 1 + sovPspb(uint64(m.PartID))
+	}
+	if m.PSID != 0 {
+		n += 1 + sovPspb(uint64(m.PSID))
+	}
+	l = len(m.Addr)
+	if l > 0 {
+		n += 1 + l + sovPspb(uint64(l))
 	}
 	return n
 }
@@ -1152,6 +3907,379 @@ func (m *TableIndex) Size() (n int) {
 	}
 	if m.NumOfBlocks != 0 {
 		n += 1 + sovPspb(uint64(m.NumOfBlocks))
+	}
+	return n
+}
+
+func (m *GetPartitionMetaRequest) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.PSID != 0 {
+		n += 1 + sovPspb(uint64(m.PSID))
+	}
+	return n
+}
+
+func (m *GetPartitionMetaResponse) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.Code != 0 {
+		n += 1 + sovPspb(uint64(m.Code))
+	}
+	if len(m.Meta) > 0 {
+		for _, e := range m.Meta {
+			l = e.Size()
+			n += 1 + l + sovPspb(uint64(l))
+		}
+	}
+	return n
+}
+
+func (m *SetRowStreamTablesRequest) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.PartitionID != 0 {
+		n += 1 + sovPspb(uint64(m.PartitionID))
+	}
+	if m.Locs != nil {
+		l = m.Locs.Size()
+		n += 1 + l + sovPspb(uint64(l))
+	}
+	return n
+}
+
+func (m *SetRowStreamTablesResponse) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.Code != 0 {
+		n += 1 + sovPspb(uint64(m.Code))
+	}
+	return n
+}
+
+func (m *GetRegionsRequest) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	return n
+}
+
+func (m *GetRegionsResponse) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.Code != 0 {
+		n += 1 + sovPspb(uint64(m.Code))
+	}
+	if len(m.Regions) > 0 {
+		for _, e := range m.Regions {
+			l = e.Size()
+			n += 1 + l + sovPspb(uint64(l))
+		}
+	}
+	return n
+}
+
+func (m *RegisterPSRequest) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	l = len(m.Addr)
+	if l > 0 {
+		n += 1 + l + sovPspb(uint64(l))
+	}
+	return n
+}
+
+func (m *RegisterPSResponse) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.Code != 0 {
+		n += 1 + sovPspb(uint64(m.Code))
+	}
+	if m.Id != 0 {
+		n += 1 + sovPspb(uint64(m.Id))
+	}
+	return n
+}
+
+func (m *GetPSInfoRequest) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	return n
+}
+
+func (m *GetPSInfoResponse) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if len(m.Servers) > 0 {
+		for _, e := range m.Servers {
+			l = e.Size()
+			n += 1 + l + sovPspb(uint64(l))
+		}
+	}
+	return n
+}
+
+func (m *PutRequest) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	l = len(m.Key)
+	if l > 0 {
+		n += 1 + l + sovPspb(uint64(l))
+	}
+	l = len(m.Value)
+	if l > 0 {
+		n += 1 + l + sovPspb(uint64(l))
+	}
+	if m.ExpiresAt != 0 {
+		n += 1 + sovPspb(uint64(m.ExpiresAt))
+	}
+	if m.Psversion != 0 {
+		n += 1 + sovPspb(uint64(m.Psversion))
+	}
+	if m.Partid != 0 {
+		n += 1 + sovPspb(uint64(m.Partid))
+	}
+	return n
+}
+
+func (m *PutResponse) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	l = len(m.Key)
+	if l > 0 {
+		n += 1 + l + sovPspb(uint64(l))
+	}
+	return n
+}
+
+func (m *DeleteRequest) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	l = len(m.Key)
+	if l > 0 {
+		n += 1 + l + sovPspb(uint64(l))
+	}
+	if m.Psversion != 0 {
+		n += 1 + sovPspb(uint64(m.Psversion))
+	}
+	if m.Partid != 0 {
+		n += 1 + sovPspb(uint64(m.Partid))
+	}
+	return n
+}
+
+func (m *DeleteResponse) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	l = len(m.Key)
+	if l > 0 {
+		n += 1 + l + sovPspb(uint64(l))
+	}
+	if m.Psversion != 0 {
+		n += 1 + sovPspb(uint64(m.Psversion))
+	}
+	return n
+}
+
+func (m *GetRequest) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	l = len(m.Key)
+	if l > 0 {
+		n += 1 + l + sovPspb(uint64(l))
+	}
+	if m.Psversion != 0 {
+		n += 1 + sovPspb(uint64(m.Psversion))
+	}
+	if m.Partid != 0 {
+		n += 1 + sovPspb(uint64(m.Partid))
+	}
+	return n
+}
+
+func (m *GetResponse) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	l = len(m.Key)
+	if l > 0 {
+		n += 1 + l + sovPspb(uint64(l))
+	}
+	l = len(m.Value)
+	if l > 0 {
+		n += 1 + l + sovPspb(uint64(l))
+	}
+	return n
+}
+
+func (m *RequestOp) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.Request != nil {
+		n += m.Request.Size()
+	}
+	return n
+}
+
+func (m *RequestOp_RequestPut) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.RequestPut != nil {
+		l = m.RequestPut.Size()
+		n += 1 + l + sovPspb(uint64(l))
+	}
+	return n
+}
+func (m *RequestOp_RequestDelete) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.RequestDelete != nil {
+		l = m.RequestDelete.Size()
+		n += 1 + l + sovPspb(uint64(l))
+	}
+	return n
+}
+func (m *RequestOp_RequestGet) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.RequestGet != nil {
+		l = m.RequestGet.Size()
+		n += 1 + l + sovPspb(uint64(l))
+	}
+	return n
+}
+func (m *ResponseOp) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.Response != nil {
+		n += m.Response.Size()
+	}
+	return n
+}
+
+func (m *ResponseOp_ResponsePut) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.ResponsePut != nil {
+		l = m.ResponsePut.Size()
+		n += 1 + l + sovPspb(uint64(l))
+	}
+	return n
+}
+func (m *ResponseOp_ResponseDelete) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.ResponseDelete != nil {
+		l = m.ResponseDelete.Size()
+		n += 1 + l + sovPspb(uint64(l))
+	}
+	return n
+}
+func (m *ResponseOp_ResponseGet) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.ResponseGet != nil {
+		l = m.ResponseGet.Size()
+		n += 1 + l + sovPspb(uint64(l))
+	}
+	return n
+}
+func (m *BatchRequest) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if len(m.Reqs) > 0 {
+		for _, e := range m.Reqs {
+			l = e.Size()
+			n += 1 + l + sovPspb(uint64(l))
+		}
+	}
+	return n
+}
+
+func (m *BatchResponse) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if len(m.Res) > 0 {
+		for _, e := range m.Res {
+			l = e.Size()
+			n += 1 + l + sovPspb(uint64(l))
+		}
 	}
 	return n
 }
@@ -1412,7 +4540,7 @@ func (m *Range) Unmarshal(dAtA []byte) error {
 	}
 	return nil
 }
-func (m *TableLocation) Unmarshal(dAtA []byte) error {
+func (m *Location) Unmarshal(dAtA []byte) error {
 	l := len(dAtA)
 	iNdEx := 0
 	for iNdEx < l {
@@ -1435,10 +4563,10 @@ func (m *TableLocation) Unmarshal(dAtA []byte) error {
 		fieldNum := int32(wire >> 3)
 		wireType := int(wire & 0x7)
 		if wireType == 4 {
-			return fmt.Errorf("proto: TableLocation: wiretype end group for non-group")
+			return fmt.Errorf("proto: Location: wiretype end group for non-group")
 		}
 		if fieldNum <= 0 {
-			return fmt.Errorf("proto: TableLocation: illegal tag %d (wire type %d)", fieldNum, wire)
+			return fmt.Errorf("proto: Location: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
 		case 1:
@@ -1503,7 +4631,7 @@ func (m *TableLocation) Unmarshal(dAtA []byte) error {
 	}
 	return nil
 }
-func (m *PartitionMeta) Unmarshal(dAtA []byte) error {
+func (m *BlobStreams) Unmarshal(dAtA []byte) error {
 	l := len(dAtA)
 	iNdEx := 0
 	for iNdEx < l {
@@ -1526,49 +4654,13 @@ func (m *PartitionMeta) Unmarshal(dAtA []byte) error {
 		fieldNum := int32(wire >> 3)
 		wireType := int(wire & 0x7)
 		if wireType == 4 {
-			return fmt.Errorf("proto: PartitionMeta: wiretype end group for non-group")
+			return fmt.Errorf("proto: BlobStreams: wiretype end group for non-group")
 		}
 		if fieldNum <= 0 {
-			return fmt.Errorf("proto: PartitionMeta: illegal tag %d (wire type %d)", fieldNum, wire)
+			return fmt.Errorf("proto: BlobStreams: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
 		case 1:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Range", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowPspb
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				msglen |= int(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthPspb
-			}
-			postIndex := iNdEx + msglen
-			if postIndex < 0 {
-				return ErrInvalidLengthPspb
-			}
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			if m.Range == nil {
-				m.Range = &Range{}
-			}
-			if err := m.Range.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		case 2:
 			if wireType == 0 {
 				var v uint64
 				for shift := uint(0); ; shift += 7 {
@@ -1585,7 +4677,7 @@ func (m *PartitionMeta) Unmarshal(dAtA []byte) error {
 						break
 					}
 				}
-				m.BlobStreams = append(m.BlobStreams, v)
+				m.Blob = append(m.Blob, v)
 			} else if wireType == 2 {
 				var packedLen int
 				for shift := uint(0); ; shift += 7 {
@@ -1620,8 +4712,8 @@ func (m *PartitionMeta) Unmarshal(dAtA []byte) error {
 					}
 				}
 				elementCount = count
-				if elementCount != 0 && len(m.BlobStreams) == 0 {
-					m.BlobStreams = make([]uint64, 0, elementCount)
+				if elementCount != 0 && len(m.Blob) == 0 {
+					m.Blob = make([]uint64, 0, elementCount)
 				}
 				for iNdEx < postIndex {
 					var v uint64
@@ -1639,52 +4731,67 @@ func (m *PartitionMeta) Unmarshal(dAtA []byte) error {
 							break
 						}
 					}
-					m.BlobStreams = append(m.BlobStreams, v)
+					m.Blob = append(m.Blob, v)
 				}
 			} else {
-				return fmt.Errorf("proto: wrong wireType = %d for field BlobStreams", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field Blob", wireType)
 			}
-		case 3:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field LogStream", wireType)
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPspb(dAtA[iNdEx:])
+			if err != nil {
+				return err
 			}
-			m.LogStream = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowPspb
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				m.LogStream |= uint64(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
+			if skippy < 0 {
+				return ErrInvalidLengthPspb
 			}
-		case 4:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field RowStream", wireType)
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPspb
 			}
-			m.RowStream = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowPspb
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				m.RowStream |= uint64(b&0x7F) << shift
-				if b < 0x80 {
-					break
-				}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
 			}
-		case 5:
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *TableLocations) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPspb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: TableLocations: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: TableLocations: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Tables", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field Locs", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -1711,8 +4818,8 @@ func (m *PartitionMeta) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.Tables = append(m.Tables, &TableLocation{})
-			if err := m.Tables[len(m.Tables)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+			m.Locs = append(m.Locs, &Location{})
+			if err := m.Locs[len(m.Locs)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -1740,7 +4847,7 @@ func (m *PartitionMeta) Unmarshal(dAtA []byte) error {
 	}
 	return nil
 }
-func (m *MetaStreamData) Unmarshal(dAtA []byte) error {
+func (m *PartitionMeta) Unmarshal(dAtA []byte) error {
 	l := len(dAtA)
 	iNdEx := 0
 	for iNdEx < l {
@@ -1763,17 +4870,17 @@ func (m *MetaStreamData) Unmarshal(dAtA []byte) error {
 		fieldNum := int32(wire >> 3)
 		wireType := int(wire & 0x7)
 		if wireType == 4 {
-			return fmt.Errorf("proto: MetaStreamData: wiretype end group for non-group")
+			return fmt.Errorf("proto: PartitionMeta: wiretype end group for non-group")
 		}
 		if fieldNum <= 0 {
-			return fmt.Errorf("proto: MetaStreamData: illegal tag %d (wire type %d)", fieldNum, wire)
+			return fmt.Errorf("proto: PartitionMeta: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
 		case 1:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field LogStreamID", wireType)
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Blobs", wireType)
 			}
-			m.LogStreamID = 0
+			var msglen int
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowPspb
@@ -1783,16 +4890,33 @@ func (m *MetaStreamData) Unmarshal(dAtA []byte) error {
 				}
 				b := dAtA[iNdEx]
 				iNdEx++
-				m.LogStreamID |= uint64(b&0x7F) << shift
+				msglen |= int(b&0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
+			if msglen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.Blobs == nil {
+				m.Blobs = &BlobStreams{}
+			}
+			if err := m.Blobs.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
 		case 2:
 			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field RawStreamID", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field LogStream", wireType)
 			}
-			m.RawStreamID = 0
+			m.LogStream = 0
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowPspb
@@ -1802,16 +4926,16 @@ func (m *MetaStreamData) Unmarshal(dAtA []byte) error {
 				}
 				b := dAtA[iNdEx]
 				iNdEx++
-				m.RawStreamID |= uint64(b&0x7F) << shift
+				m.LogStream |= uint64(b&0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
 		case 3:
 			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field BlobStreamID", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field RowStream", wireType)
 			}
-			m.BlobStreamID = 0
+			m.RowStream = 0
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowPspb
@@ -1821,11 +4945,418 @@ func (m *MetaStreamData) Unmarshal(dAtA []byte) error {
 				}
 				b := dAtA[iNdEx]
 				iNdEx++
-				m.BlobStreamID |= uint64(b&0x7F) << shift
+				m.RowStream |= uint64(b&0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
+		case 4:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Locs", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.Locs == nil {
+				m.Locs = &TableLocations{}
+			}
+			if err := m.Locs.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 5:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Parent", wireType)
+			}
+			m.Parent = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Parent |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 6:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Discard", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				byteLen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Discard = append(m.Discard[:0], dAtA[iNdEx:postIndex]...)
+			if m.Discard == nil {
+				m.Discard = []byte{}
+			}
+			iNdEx = postIndex
+		case 7:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Rg", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.Rg == nil {
+				m.Rg = &Range{}
+			}
+			if err := m.Rg.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 8:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field PartID", wireType)
+			}
+			m.PartID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.PartID |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPspb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *PSDetail) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPspb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: PSDetail: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: PSDetail: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field PSID", wireType)
+			}
+			m.PSID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.PSID |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Address", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Address = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPspb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *RegionInfo) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPspb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: RegionInfo: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: RegionInfo: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Rg", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.Rg == nil {
+				m.Rg = &Range{}
+			}
+			if err := m.Rg.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field PartID", wireType)
+			}
+			m.PartID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.PartID |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 3:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field PSID", wireType)
+			}
+			m.PSID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.PSID |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 4:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Addr", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Addr = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipPspb(dAtA[iNdEx:])
@@ -2277,6 +5808,2071 @@ func (m *TableIndex) Unmarshal(dAtA []byte) error {
 					break
 				}
 			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPspb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *GetPartitionMetaRequest) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPspb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: GetPartitionMetaRequest: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: GetPartitionMetaRequest: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field PSID", wireType)
+			}
+			m.PSID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.PSID |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPspb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *GetPartitionMetaResponse) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPspb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: GetPartitionMetaResponse: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: GetPartitionMetaResponse: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Code", wireType)
+			}
+			m.Code = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Code |= pb.Code(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Meta", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Meta = append(m.Meta, &PartitionMeta{})
+			if err := m.Meta[len(m.Meta)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPspb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *SetRowStreamTablesRequest) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPspb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: SetRowStreamTablesRequest: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: SetRowStreamTablesRequest: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field PartitionID", wireType)
+			}
+			m.PartitionID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.PartitionID |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Locs", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.Locs == nil {
+				m.Locs = &TableLocations{}
+			}
+			if err := m.Locs.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPspb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *SetRowStreamTablesResponse) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPspb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: SetRowStreamTablesResponse: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: SetRowStreamTablesResponse: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Code", wireType)
+			}
+			m.Code = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Code |= pb.Code(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPspb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *GetRegionsRequest) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPspb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: GetRegionsRequest: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: GetRegionsRequest: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPspb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *GetRegionsResponse) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPspb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: GetRegionsResponse: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: GetRegionsResponse: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Code", wireType)
+			}
+			m.Code = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Code |= pb.Code(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Regions", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Regions = append(m.Regions, &RegionInfo{})
+			if err := m.Regions[len(m.Regions)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPspb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *RegisterPSRequest) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPspb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: RegisterPSRequest: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: RegisterPSRequest: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Addr", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Addr = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPspb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *RegisterPSResponse) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPspb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: RegisterPSResponse: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: RegisterPSResponse: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Code", wireType)
+			}
+			m.Code = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Code |= pb.Code(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Id", wireType)
+			}
+			m.Id = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Id |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPspb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *GetPSInfoRequest) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPspb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: GetPSInfoRequest: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: GetPSInfoRequest: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPspb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *GetPSInfoResponse) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPspb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: GetPSInfoResponse: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: GetPSInfoResponse: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Servers", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Servers = append(m.Servers, &PSDetail{})
+			if err := m.Servers[len(m.Servers)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPspb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *PutRequest) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPspb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: PutRequest: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: PutRequest: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Key", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				byteLen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Key = append(m.Key[:0], dAtA[iNdEx:postIndex]...)
+			if m.Key == nil {
+				m.Key = []byte{}
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Value", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				byteLen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Value = append(m.Value[:0], dAtA[iNdEx:postIndex]...)
+			if m.Value == nil {
+				m.Value = []byte{}
+			}
+			iNdEx = postIndex
+		case 3:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ExpiresAt", wireType)
+			}
+			m.ExpiresAt = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.ExpiresAt |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 4:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Psversion", wireType)
+			}
+			m.Psversion = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Psversion |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 5:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Partid", wireType)
+			}
+			m.Partid = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Partid |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPspb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *PutResponse) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPspb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: PutResponse: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: PutResponse: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Key", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				byteLen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Key = append(m.Key[:0], dAtA[iNdEx:postIndex]...)
+			if m.Key == nil {
+				m.Key = []byte{}
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPspb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *DeleteRequest) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPspb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: DeleteRequest: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: DeleteRequest: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Key", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				byteLen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Key = append(m.Key[:0], dAtA[iNdEx:postIndex]...)
+			if m.Key == nil {
+				m.Key = []byte{}
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Psversion", wireType)
+			}
+			m.Psversion = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Psversion |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 5:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Partid", wireType)
+			}
+			m.Partid = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Partid |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPspb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *DeleteResponse) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPspb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: DeleteResponse: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: DeleteResponse: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Key", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				byteLen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Key = append(m.Key[:0], dAtA[iNdEx:postIndex]...)
+			if m.Key == nil {
+				m.Key = []byte{}
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Psversion", wireType)
+			}
+			m.Psversion = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Psversion |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPspb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *GetRequest) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPspb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: GetRequest: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: GetRequest: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Key", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				byteLen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Key = append(m.Key[:0], dAtA[iNdEx:postIndex]...)
+			if m.Key == nil {
+				m.Key = []byte{}
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Psversion", wireType)
+			}
+			m.Psversion = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Psversion |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 5:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Partid", wireType)
+			}
+			m.Partid = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Partid |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPspb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *GetResponse) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPspb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: GetResponse: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: GetResponse: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Key", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				byteLen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Key = append(m.Key[:0], dAtA[iNdEx:postIndex]...)
+			if m.Key == nil {
+				m.Key = []byte{}
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Value", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				byteLen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Value = append(m.Value[:0], dAtA[iNdEx:postIndex]...)
+			if m.Value == nil {
+				m.Value = []byte{}
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPspb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *RequestOp) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPspb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: RequestOp: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: RequestOp: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field RequestPut", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			v := &PutRequest{}
+			if err := v.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			m.Request = &RequestOp_RequestPut{v}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field RequestDelete", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			v := &DeleteRequest{}
+			if err := v.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			m.Request = &RequestOp_RequestDelete{v}
+			iNdEx = postIndex
+		case 3:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field RequestGet", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			v := &GetRequest{}
+			if err := v.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			m.Request = &RequestOp_RequestGet{v}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPspb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *ResponseOp) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPspb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: ResponseOp: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: ResponseOp: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ResponsePut", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			v := &PutResponse{}
+			if err := v.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			m.Response = &ResponseOp_ResponsePut{v}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ResponseDelete", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			v := &DeleteResponse{}
+			if err := v.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			m.Response = &ResponseOp_ResponseDelete{v}
+			iNdEx = postIndex
+		case 3:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ResponseGet", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			v := &GetResponse{}
+			if err := v.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			m.Response = &ResponseOp_ResponseGet{v}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPspb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *BatchRequest) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPspb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: BatchRequest: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: BatchRequest: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Reqs", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Reqs = append(m.Reqs, &RequestOp{})
+			if err := m.Reqs[len(m.Reqs)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipPspb(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *BatchResponse) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowPspb
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: BatchResponse: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: BatchResponse: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Res", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowPspb
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthPspb
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthPspb
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Res = append(m.Res, &RequestOp{})
+			if err := m.Res[len(m.Res)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipPspb(dAtA[iNdEx:])

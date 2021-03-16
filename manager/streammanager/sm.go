@@ -2,7 +2,6 @@ package streammanager
 
 import (
 	"context"
-	"encoding/binary"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -18,7 +17,7 @@ import (
 	"google.golang.org/grpc"
 )
 
-var (
+const (
 	idKey             = "AutumnSmIDKey"
 	electionKeyPrefix = "AutumnSmLeader"
 )
@@ -44,7 +43,7 @@ type StreamManager struct {
 	client     *clientv3.Client
 	config     *manager.Config
 	grcpServer *grpc.Server
-	ID         uint64
+	ID         uint64 //backend ETCD server's ID
 
 	allocIdLock sync.Mutex //used in AllocID
 
@@ -68,7 +67,7 @@ func NewStreamManager(etcd *embed.Etcd, client *clientv3.Client, config *manager
 	v := pb.SMMemberValue{
 		ID:      sm.ID,
 		Name:    etcd.Config().Name,
-		GrpcURL: config.GrpcUrl,
+		GrpcURL: config.GrpcUrlSM,
 	}
 
 	data, err := v.Marshal()
@@ -217,37 +216,10 @@ func (sm *StreamManager) allocUniqID(count uint64) (uint64, uint64) {
 
 func (sm *StreamManager) allocUniqID(count uint64) (uint64, uint64, error) {
 
-	var err error
 	sm.allocIdLock.Lock()
 	defer sm.allocIdLock.Unlock()
 
-	curValue, err := manager.EtcdGetKV(sm.client, idKey)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	//build txn, compare and set ID
-	var cmp clientv3.Cmp
-	var curr uint64
-
-	if curValue == nil {
-		cmp = clientv3.Compare(clientv3.CreateRevision(idKey), "=", 0)
-	} else {
-		curr = binary.BigEndian.Uint64(curValue)
-		cmp = clientv3.Compare(clientv3.Value(idKey), "=", string(curValue))
-	}
-
-	var newValue [8]byte
-	binary.BigEndian.PutUint64(newValue[:], curr+count)
-
-	txn := clientv3.NewKV(sm.client).Txn(context.Background())
-	t := txn.If(cmp)
-	_, err = t.Then(clientv3.OpPut(idKey, string(newValue[:]))).Commit()
-	if err != nil {
-		return 0, 0, err
-	}
-	return curr, curr + count, nil
-
+	return manager.EtcdAllocUniqID(sm.client, idKey, count)
 }
 
 func (sm *StreamManager) ServeGRPC() error {
@@ -259,7 +231,7 @@ func (sm *StreamManager) ServeGRPC() error {
 
 	pb.RegisterStreamManagerServiceServer(grpcServer, sm)
 
-	listener, err := net.Listen("tcp", sm.config.GrpcUrl)
+	listener, err := net.Listen("tcp", sm.config.GrpcUrlSM)
 	if err != nil {
 		return err
 	}

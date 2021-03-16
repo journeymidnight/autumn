@@ -246,7 +246,8 @@ func BenchmarkExtent(b *testing.B) {
 	if err != nil {
 		panic(err.Error())
 	}
-	block := generateBlock("test", 4096)
+	n := uint32(4096)
+	block := generateBlock("test", n)
 	commit := uint32(512)
 	extent.Lock()
 	for i := 0; i < b.N; i++ {
@@ -257,6 +258,6 @@ func BenchmarkExtent(b *testing.B) {
 		if err != nil {
 			panic(err.Error())
 		}
-		commit += 512 + 4096
+		commit += 512 + n
 	}
 }

@@ -37,7 +37,7 @@ type Table struct {
 	Cache         *ristretto.Cache
 	BfCache       *ristretto.Cache
 
-	Loc        pspb.TableLocation
+	Loc        pspb.Location
 	LastSeq    uint64
 	VpExtentID uint64
 	VpOffset   uint32
@@ -82,7 +82,7 @@ func OpenTable(stream streamclient.StreamClient,
 		blockIndex:    make([]*pspb.BlockOffset, len(tableIndex.Offsets)),
 		stream:        stream,
 		estimatedSize: tableIndex.EstimatedSize,
-		Loc: pspb.TableLocation{
+		Loc: pspb.Location{
 			ExtentID: extentID,
 			Offset:   offset,
 		},

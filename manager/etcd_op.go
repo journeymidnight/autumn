@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"encoding/binary"
 	"time"
 
 	"github.com/coreos/etcd/clientv3"
@@ -61,4 +62,35 @@ func EtcdRange(c *clientv3.Client, prefix string) ([]*mvccpb.KeyValue, error) {
 		return nil, err
 	}
 	return resp.Kvs, err
+}
+
+func EtcdAllocUniqID(c *clientv3.Client, idKey string, count uint64) (uint64, uint64, error) {
+
+	curValue, err := EtcdGetKV(c, idKey)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	//build txn, compare and set ID
+	var cmp clientv3.Cmp
+	var curr uint64
+
+	if curValue == nil {
+		cmp = clientv3.Compare(clientv3.CreateRevision(idKey), "=", 0)
+	} else {
+		curr = binary.BigEndian.Uint64(curValue)
+		cmp = clientv3.Compare(clientv3.Value(idKey), "=", string(curValue))
+	}
+
+	var newValue [8]byte
+	binary.BigEndian.PutUint64(newValue[:], curr+count)
+
+	txn := clientv3.NewKV(c).Txn(context.Background())
+	t := txn.If(cmp)
+	_, err = t.Then(clientv3.OpPut(idKey, string(newValue[:]))).Commit()
+	if err != nil {
+		return 0, 0, err
+	}
+	return curr, curr + count, nil
+
 }

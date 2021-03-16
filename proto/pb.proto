@@ -12,12 +12,11 @@
  * limitations under the License.
  */
 
-
-
 syntax = "proto3";
 package pb;
 
 import "gogoproto/gogo.proto";
+
 
 
 
@@ -221,7 +220,7 @@ message CreateStreamResponse {
 
 message TruncateRequest {
 	uint64 streamID = 1;
-	repeated uint64 extentIDs = 2;
+	uint64 extentID = 2;
 }
 
 message TruncateResponse {
@@ -254,6 +253,7 @@ message SMMemberValue {
 message ExtentInfo {
 	uint64 extentID = 1;
 	repeated uint64 replicates = 2; 
+	uint64 sealSize = 3; //TODO:
 }
 
 message StreamInfo {

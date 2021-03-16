@@ -27,7 +27,7 @@ func TestCompaction(t *testing.T) {
 		wg.Add(1)
 		k := fmt.Sprintf("%04d", i)
 		v := fmt.Sprintf("%d", i)
-		rp.writeAsync([]byte(k), []byte(v), func(e error) {
+		rp.WriteAsync([]byte(k), []byte(v), func(e error) {
 			wg.Done()
 		})
 	}

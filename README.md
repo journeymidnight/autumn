@@ -48,65 +48,7 @@ StreamAllocExtent流程:
 5. 修改sm里面的内存结构
 ```
 
-目录结构
 
-```
-.
-├── LICENSE
-├── Makefile
-├── README.md
-├── cmd
-│   ├── extent-node
-│   │   ├── Makefile
-│   │   ├── Procfile
-│   │   ├── main.go
-│   ├── stream-client
-│   │   ├── Makefile
-│   │   ├── main.go
-│   └── stream-manager
-│       ├── Makefile
-│       ├── Procfile
-│       ├── main.go
-├── conn
-│   ├── pool.go
-│   └── snappy.go
-├── extent
-│   ├── extent.go
-│   ├── extent.test
-│   └── extent_test.go
-├── manager
-│   ├── config.go
-│   ├── etcd.go
-│   ├── etcd.log
-│   ├── etcd_op.go
-│   ├── etcd_op_test.go
-│   ├── smclient
-│   │   └── sm_client.go
-│   └── streammanager
-│       ├── policy.go
-│       ├── sm.go
-│       └── sm_service.go //grpc interface
-├── node
-│   ├── node.go
-│   ├── node_service.go //grpc interface
-│   ├── node_test.go
-├── proto
-│   ├── gen.sh
-│   ├── pb.proto //stream layer
-│   └── pspb.proto //partition layer
-├── rangepartition
-│   ├── commit_log.go
-│   └── range_partion.go
-├── streamclient
-│   └── streamclient.go
-├── utils
-│   ├── lock.go
-│   ├── stopper.go
-│   ├── stopper_test.go
-│   └── utils.go
-└── xlog
-    └── xlog.go
-```
 
 ### extent结构
 
@@ -187,7 +129,6 @@ API:
 	rpc CreateStream(CreateStreamRequest) returns  (CreateStreamResponse) {}
 	rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse) {}
 ```
-
 
 
 
@@ -286,15 +227,38 @@ journal的话, 这些优化可能都不需要
 ETCD存储结构in PM(Partition Manager)
 
 ```
-PART_%d/range => [startKey, endKey]
-PART_%d/blobStreams => [id,...,id]
-PART_%d/logStream => id
-PART_%d/rowStream => id
-PART_%d/tables => [(extentID,offset),...,(extentID,offset)]
+PART/{PartID}/blobStreams => [id,...,id]
+PART/{PartID}/logStream => id
+PART/{PartID}/rowStream => id
+PART/{PartID}/tables => [(extentID,offset),...,(extentID,offset)]
+PART/{PartID}/discard => <DATA>
+PART/{PartID}/parent = PSID
+PART/{PartID}/range = <startKey, endKey>
+
+PSSERVER/{PSID} => {PSDETAIL}
+//when updating PART/*/range. update PSVERSION
+PSVERSION  => {num}
 ```
 
-1.增加Option便于测试
+//client call get regions,
+//<startKey, endKey, PartID, PSID, address>
+//read PART/{PartID}/range
+//read PART/{PartID}/parent
+//read PSSERVER/{PSID} //cached
+
+
+//ps call
+//1. read PART/{PartID}/parent
+//then. read whole data 
+
+
+
 2.grpc里面, res.Code代替err
-3.mockclient如何测试truncate
-4.sm_service增加truncate的API
 5.rp实现valuelog的truncate(*)
+
+6.pm_service/pmclient
+7.ps server//single range partion
+8.run in cluster
+9.APIs
+10.stream V2, block format:没有512字节header,512字节对齐
+11.stream extent增加refcont
