@@ -68,7 +68,7 @@ func (ps *PartitionServer) Init() {
 		if err := ps.startRangePartition(partMeta); err != nil {
 			xlog.Logger.Warnf(err.Error())
 		}
-	
+	}
 }
 
 func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta) error {
