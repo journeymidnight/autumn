@@ -228,12 +228,12 @@ ETCD存储结构in PM(Partition Manager)
 
 ```
 PART/{PartID}/blobStreams => [id,...,id]
-PART/{PartID}/logStream => id
-PART/{PartID}/rowStream => id
+PART/{PartID}/logStream => id <MUST>
+PART/{PartID}/rowStream => id <MUST>
 PART/{PartID}/tables => [(extentID,offset),...,(extentID,offset)]
 PART/{PartID}/discard => <DATA>
-PART/{PartID}/parent = PSID
-PART/{PartID}/range = <startKey, endKey>
+PART/{PartID}/parent = PSID <MUST>
+PART/{PartID}/range = <startKey, endKey> <MUST>
 
 PSSERVER/{PSID} => {PSDETAIL}
 //when updating PART/*/range. update PSVERSION

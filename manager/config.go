@@ -21,8 +21,8 @@ type Config struct {
 	InitialClusterState string // --initial-cluster-state
 	ClusterToken        string
 
-	GrpcUrlSM string // --listen-stream-manager-grpc
-	GrpcUrlPM string
+	GrpcUrl string // --listen-stream-manager-grpc
+	//GrpcUrlPM string
 }
 
 func parseUrls(s string) (ret []url.URL, err error) {
@@ -132,15 +132,17 @@ func NewConfig() *Config {
 				Required:    true,
 			},
 			&cli.StringFlag{
-				Name:        "listen-grpc-sm",
-				Destination: &config.GrpcUrlSM,
+				Name:        "listen-grpc",
+				Destination: &config.GrpcUrl,
 				Required:    true,
 			},
-			&cli.StringFlag{
-				Name:        "listen-grpc-pm",
-				Destination: &config.GrpcUrlPM,
-				Required:    true,
-			},
+			/*
+				&cli.StringFlag{
+					Name:        "listen-grpc-pm",
+					Destination: &config.GrpcUrlPM,
+					Required:    true,
+				},
+			*/
 		},
 	}
 	if err = app.Run(os.Args); err != nil {

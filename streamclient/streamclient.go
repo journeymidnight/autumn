@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gogo/protobuf/proto"
 	"github.com/journeymidnight/autumn/conn"
 	"github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/proto/pb"
@@ -108,10 +109,9 @@ func NewAutomnExtentManager(sm *smclient.SMClient) *AutumnExtentManager {
 }
 
 func (em *AutumnExtentManager) GetPeers(extentID uint64) []string {
-	em.RLock()
-	defer em.RUnlock()
-	//sc.blockReader.
-	extentInfo := em.extentInfo[extentID]
+
+	extentInfo := em.GetExtentInfo(extentID)
+
 	var ret []string
 	for _, id := range extentInfo.Replicates {
 		n := em.smClient.LookupNode(id)
@@ -123,10 +123,7 @@ func (em *AutumnExtentManager) GetPeers(extentID uint64) []string {
 
 //always get alive node: FIXME:确保pool是healthy
 func (em *AutumnExtentManager) GetExtentConn(extentID uint64) *grpc.ClientConn {
-	em.RLock()
-	defer em.RUnlock()
-	extentInfo := em.extentInfo[extentID]
-
+	extentInfo := em.GetExtentInfo(extentID)
 	nodeInfo := em.smClient.LookupNode(extentInfo.Replicates[0])
 	pool := conn.GetPools().Connect(nodeInfo.Address)
 	return pool.Get()
@@ -134,8 +131,26 @@ func (em *AutumnExtentManager) GetExtentConn(extentID uint64) *grpc.ClientConn {
 
 func (em *AutumnExtentManager) GetExtentInfo(extentID uint64) *pb.ExtentInfo {
 	em.RLock()
-	defer em.RUnlock()
-	return em.extentInfo[extentID]
+	info, ok := em.extentInfo[extentID]
+	em.RUnlock()
+	if !ok {
+		//lazy receive data extentData, must success
+		var ei *pb.ExtentInfo
+		for {
+			m, err := em.smClient.ExtentInfo(context.Background(), []uint64{extentID})
+			if err == nil {
+				ei = proto.Clone(m[extentID]).(*pb.ExtentInfo)
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		em.Lock()
+		em.extentInfo[extentID] = ei
+		em.Unlock()
+		info = ei
+
+	}
+	return info
 }
 
 func (em *AutumnExtentManager) SetExtentInfo(extentID uint64, info *pb.ExtentInfo) {

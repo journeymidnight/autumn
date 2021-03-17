@@ -151,12 +151,23 @@ message GetPSInfoResponse {
 	repeated PSDetail servers = 1;
 }
 
+message BootstrapRequest {
+	uint64 logID = 1;
+	uint64 rowID = 2;
+	uint64 parent = 3; //PSID
+}
+
+message BootstrapResponse {
+	uint64 partID = 1;
+}
+
 service PartitionManagerService {
 	rpc SetRowStreamTables(SetRowStreamTablesRequest) returns (SetRowStreamTablesResponse) {}
 	rpc RegisterPS(RegisterPSRequest) returns (RegisterPSResponse) {}
 	rpc GetRegions(GetRegionsRequest) returns (GetRegionsResponse) {}
 	rpc GetPartitionMeta(GetPartitionMetaRequest) returns (GetPartitionMetaResponse) {}
 	rpc GetPSInfo(GetPSInfoRequest) returns (GetPSInfoResponse) {}
+	rpc Bootstrap(BootstrapRequest) returns (BootstrapResponse) {}
 }
 
 

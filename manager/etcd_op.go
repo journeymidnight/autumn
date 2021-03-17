@@ -73,7 +73,7 @@ func EtcdAllocUniqID(c *clientv3.Client, idKey string, count uint64) (uint64, ui
 
 	//build txn, compare and set ID
 	var cmp clientv3.Cmp
-	var curr uint64
+	var curr uint64 = 1
 
 	if curValue == nil {
 		cmp = clientv3.Compare(clientv3.CreateRevision(idKey), "=", 0)

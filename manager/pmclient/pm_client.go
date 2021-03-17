@@ -59,7 +59,7 @@ func (client *AutumnPMClient) Connect() error {
 
 func (client *AutumnPMClient) try(f func(conn *grpc.ClientConn) bool, x time.Duration) {
 	client.RLock()
-	connLen := len(client.conns) * 2
+	connLen := len(client.conns)
 	client.RUnlock()
 
 	current := atomic.LoadInt32(&client.lastLeader)
@@ -80,7 +80,6 @@ func (client *AutumnPMClient) try(f func(conn *grpc.ClientConn) bool, x time.Dur
 			}
 		}
 	}
-	client.RUnlock()
 }
 
 func (client *AutumnPMClient) SetRowStreamTables(id uint64, tables []*pspb.Location) error {
@@ -111,11 +110,56 @@ func (client *AutumnPMClient) GetPartitionMeta(psid uint64) (ret []*pspb.Partiti
 		res, err := c.GetPartitionMeta(context.Background(), &pspb.GetPartitionMetaRequest{
 			PSID: psid,
 		})
-		if err != nil || res.Code != pb.Code_OK {
+		if err != nil {
+			xlog.Logger.Warnf("%s from %s", err.Error(), conn.Target())
+			return true
+		}
+		if res.Code != pb.Code_OK {
+			xlog.Logger.Warnf("not Code_OK, %s from %s", res.Code.String(), conn.Target())
+			return true
+		}
+
+		ret = res.Meta
+		return false
+
+	}, 10*time.Millisecond)
+	return ret
+}
+
+func (client *AutumnPMClient) Bootstrap(logID uint64, rowID uint64, psID uint64) (uint64, error) {
+	acerr := errors.New("unknow err")
+	var partID uint64
+
+	req := &pspb.BootstrapRequest{
+		LogID:  logID,
+		RowID:  rowID,
+		Parent: psID,
+	}
+	client.try(func(conn *grpc.ClientConn) bool {
+		c := pspb.NewPartitionManagerServiceClient(conn)
+		res, err := c.Bootstrap(context.Background(), req)
+		if err != nil {
 			xlog.Logger.Warnf(err.Error())
 			return true
 		}
-		ret = res.Meta
+		acerr = nil
+		partID = res.PartID
+		return false
+
+	}, 10*time.Millisecond)
+
+	return partID, acerr
+}
+
+func (client *AutumnPMClient) GetPSInfo() (ret []*pspb.PSDetail) {
+	client.try(func(conn *grpc.ClientConn) bool {
+		c := pspb.NewPartitionManagerServiceClient(conn)
+		res, err := c.GetPSInfo(context.Background(), &pspb.GetPSInfoRequest{})
+		if err != nil {
+			xlog.Logger.Warnf(err.Error())
+			return true
+		}
+		ret = res.Servers
 		return false
 
 	}, 10*time.Millisecond)
@@ -145,9 +189,12 @@ func (client *AutumnPMClient) RegisterSelf(address string) (uint64, error) {
 		c := pspb.NewPartitionManagerServiceClient(conn)
 		var res *pspb.RegisterPSResponse
 		res, err = c.RegisterPS(context.Background(), &pspb.RegisterPSRequest{})
-		if err != nil || res.Code != pb.Code_OK {
+		if err != nil {
 			xlog.Logger.Warnf(err.Error())
 			return true
+		}
+		if res.Code != pb.Code_OK {
+			xlog.Logger.Warnf(res.Code.String())
 		}
 		id = res.Id
 		err = nil

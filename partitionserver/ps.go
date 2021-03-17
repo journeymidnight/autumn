@@ -64,11 +64,16 @@ func (ps *PartitionServer) Init() {
 	ps.extentManager = streamclient.NewAutomnExtentManager(ps.smClient)
 	ps.blockReader = streamclient.NewAutumnBlockReader(ps.extentManager, ps.smClient)
 
-	for _, partMeta := range ps.pmClient.GetPartitionMeta(ps.PSID) {
+	metas := ps.pmClient.GetPartitionMeta(ps.PSID)
+	xlog.Logger.Infof("get all partitions for PS :%d: RangePartitions", metas)
+
+	for _, partMeta := range metas {
+		xlog.Logger.Infof("start %+v\n", partMeta)
 		if err := ps.startRangePartition(partMeta); err != nil {
-			xlog.Logger.Warnf(err.Error())
+			xlog.Logger.Fatal(err.Error())
 		}
-	
+	}
+
 }
 
 func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta) error {
@@ -101,8 +106,26 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta) error {
 	openStream := func(si pb.StreamInfo) streamclient.StreamClient {
 		return streamclient.NewStreamClient(ps.smClient, ps.extentManager, si.StreamID)
 	}
-	rp := rangepartition.OpenRangePartition(meta.PartID, row, log, ps.blockReader, meta.Rg.StartKey, meta.Rg.EndKey, meta.Locs.Locs,
-		meta.Blobs.Blob, ps.pmClient, openStream, nil)
+
+	var startKey []byte
+	var endKey []byte
+	if meta.Rg != nil {
+		startKey = meta.Rg.StartKey
+		endKey = meta.Rg.EndKey
+	}
+
+	var locs []*pspb.Location
+	if meta.Locs != nil {
+		locs = meta.Locs.Locs
+	}
+
+	var blobs []uint64
+	if meta.Blobs != nil {
+		blobs = meta.Blobs.Blob
+	}
+
+	rp := rangepartition.OpenRangePartition(meta.PartID, row, log, ps.blockReader, startKey, endKey, locs,
+		blobs, ps.pmClient, openStream, nil)
 
 	//FIXME: check each partID is uniq
 	ps.Lock()
@@ -120,7 +143,6 @@ func (ps *PartitionServer) Close() {
 }
 
 func (ps *PartitionServer) registerPS() {
-	xlog.Logger.Infof("Register Partition Server")
 	utils.AssertTrue(ps.address != "")
 
 	//two lines//PSID相同但是address修改的情况
@@ -137,13 +159,14 @@ func (ps *PartitionServer) registerPS() {
 		return
 	}
 
+	xlog.Logger.Infof("Register Partition Server")
 	id, err := ps.pmClient.RegisterSelf(ps.address)
 	if err != nil {
 		xlog.Logger.Fatalf(err.Error())
 	}
 
 	ps.PSID = id
-	if err = ioutil.WriteFile(storeIDPath, []byte(fmt.Sprintf("%d")), 0644); err != nil {
+	if err = ioutil.WriteFile(storeIDPath, []byte(fmt.Sprintf("%d", id)), 0644); err != nil {
 		xlog.Logger.Fatalf("try to write file %s, %d, but failed, try to save it manually", storeIDPath, id)
 	}
 	xlog.Logger.Infof("success to register to sm")
