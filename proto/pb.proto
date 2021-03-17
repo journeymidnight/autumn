@@ -244,7 +244,7 @@ service StreamManagerService {
 }
 
 //used in Etcd Campaign
-message SMMemberValue {
+message MemberValue {
         uint64 ID = 1;
         string Name = 2;
         string GrpcURL =3;

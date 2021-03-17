@@ -10,7 +10,7 @@ import (
 )
 
 //FIXME: inc and decr
-func (ps *PartitionServer) checkVersion(verison uint64, partID uint64, key []bytes) *rangepartition.RangePartition {
+func (ps *PartitionServer) checkVersion(verison uint64, partID uint64, key []byte) *rangepartition.RangePartition {
 	ps.RLock()
 	rp := ps.rangePartitions[partID]
 	ps.RUnlock()

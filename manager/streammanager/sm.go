@@ -2,7 +2,6 @@ package streammanager
 
 import (
 	"context"
-	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -64,10 +63,10 @@ func NewStreamManager(etcd *embed.Etcd, client *clientv3.Client, config *manager
 		policy: new(SimplePolicy),
 	}
 
-	v := pb.SMMemberValue{
+	v := pb.MemberValue{
 		ID:      sm.ID,
-		Name:    etcd.Config().Name,
-		GrpcURL: config.GrpcUrlSM,
+		Name:    etcd.Config().Name + "_SM",
+		GrpcURL: config.GrpcUrl,
 	}
 
 	data, err := v.Marshal()
@@ -222,24 +221,27 @@ func (sm *StreamManager) allocUniqID(count uint64) (uint64, uint64, error) {
 	return manager.EtcdAllocUniqID(sm.client, idKey, count)
 }
 
-func (sm *StreamManager) ServeGRPC() error {
-	grpcServer := grpc.NewServer(
-		grpc.MaxRecvMsgSize(8<<20),
-		grpc.MaxSendMsgSize(8<<20),
-		grpc.MaxConcurrentStreams(1000),
-	)
+func (sm *StreamManager) RegisterGRPC(grpcServer *grpc.Server) {
+	/*
+		grpcServer := grpc.NewServer(
+			grpc.MaxRecvMsgSize(8<<20),
+			grpc.MaxSendMsgSize(8<<20),
+			grpc.MaxConcurrentStreams(1000),
+		)
+	*/
 
 	pb.RegisterStreamManagerServiceServer(grpcServer, sm)
 
-	listener, err := net.Listen("tcp", sm.config.GrpcUrlSM)
-	if err != nil {
-		return err
-	}
-	go func() {
-		grpcServer.Serve(listener)
-	}()
+	/*
+		listener, err := net.Listen("tcp", sm.config.GrpcUrl)
+		if err != nil {
+			return err
+		}
+		go func() {
+			grpcServer.Serve(listener)
+		}()
+	*/
 	sm.grcpServer = grpcServer
-	return nil
 }
 
 func (sm *StreamManager) Close() {

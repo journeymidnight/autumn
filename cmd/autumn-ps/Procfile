@@ -1,0 +1,1 @@
+ps:./autumn-ps --listen 127.0.0.1:9951 --dir whoami --smAddr 127.0.0.1:3401 --pmAddr 127.0.0.1:3401
