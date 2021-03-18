@@ -170,8 +170,12 @@ func (client *AutumnPMClient) GetRegions() (ret []*pspb.RegionInfo) {
 	client.try(func(conn *grpc.ClientConn) bool {
 		c := pspb.NewPartitionManagerServiceClient(conn)
 		res, err := c.GetRegions(context.Background(), &pspb.GetRegionsRequest{})
-		if err != nil || res.Code != pb.Code_OK {
+		if err != nil {
 			xlog.Logger.Warnf(err.Error())
+			return true
+		}
+		if res.Code != pb.Code_OK {
+			xlog.Logger.Warnf("not Code_OK")
 			return true
 		}
 		ret = res.Regions
@@ -188,7 +192,7 @@ func (client *AutumnPMClient) RegisterSelf(address string) (uint64, error) {
 	client.try(func(conn *grpc.ClientConn) bool {
 		c := pspb.NewPartitionManagerServiceClient(conn)
 		var res *pspb.RegisterPSResponse
-		res, err = c.RegisterPS(context.Background(), &pspb.RegisterPSRequest{})
+		res, err = c.RegisterPS(context.Background(), &pspb.RegisterPSRequest{Addr: address})
 		if err != nil {
 			xlog.Logger.Warnf(err.Error())
 			return true

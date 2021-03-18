@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/rangepartition"
@@ -15,11 +16,13 @@ func (ps *PartitionServer) checkVersion(verison uint64, partID uint64, key []byt
 	rp := ps.rangePartitions[partID]
 	ps.RUnlock()
 	if rp == nil {
+		fmt.Println("no such rp")
 		return nil
 	}
 	if bytes.Compare(rp.StartKey, key) <= 0 && (len(rp.EndKey) == 0 || bytes.Compare(key, rp.EndKey) < 0) {
 		return rp
 	}
+	fmt.Println("compare?")
 	return nil
 }
 
@@ -28,7 +31,7 @@ func (ps *PartitionServer) Batch(ctx context.Context, req *pspb.BatchRequest) (*
 }
 
 func (ps *PartitionServer) Put(ctx context.Context, req *pspb.PutRequest) (*pspb.PutResponse, error) {
-	rp := ps.checkVersion(req.Psversion, ps.PSID, req.Key)
+	rp := ps.checkVersion(req.Psversion, req.Partid, req.Key)
 	if rp == nil {
 		return nil, errors.New("no such partid")
 	}

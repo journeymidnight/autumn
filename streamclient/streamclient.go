@@ -134,7 +134,7 @@ func (em *AutumnExtentManager) GetExtentInfo(extentID uint64) *pb.ExtentInfo {
 	info, ok := em.extentInfo[extentID]
 	em.RUnlock()
 	if !ok {
-		//lazy receive data extentData, must success
+		//lazy receive data extentData, must success:FIXME: add new function to prefetch ExtentInfo
 		var ei *pb.ExtentInfo
 		for {
 			m, err := em.smClient.ExtentInfo(context.Background(), []uint64{extentID})

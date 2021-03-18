@@ -3,7 +3,6 @@ package partitionmanager
 import (
 	"context"
 	"encoding/binary"
-	"fmt"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -104,7 +103,6 @@ func parseParts(kvs []*mvccpb.KeyValue) map[uint64]*pspb.PartitionMeta {
 
 	//依赖必须PARTID永远不为0, 需要在allocUniqID的时候,从1开始
 	for _, kv := range kvs {
-		fmt.Printf("reading %s\n", kv.Key)
 		partID, suffix, err := parse(string(kv.Key))
 		if err != nil {
 			xlog.Logger.Warnf(err.Error())
@@ -114,6 +112,7 @@ func parseParts(kvs []*mvccpb.KeyValue) map[uint64]*pspb.PartitionMeta {
 			ret[partID] = &pspb.PartitionMeta{
 				PartID: partID,
 			}
+
 		}
 		lastPartID = partID
 
@@ -152,9 +151,6 @@ func parseParts(kvs []*mvccpb.KeyValue) map[uint64]*pspb.PartitionMeta {
 			continue
 		}
 	}
-
-	fmt.Printf("ret is %+v\n\n", ret)
-
 	return ret
 }
 
@@ -192,8 +188,6 @@ func (pm *PartitionManager) runAsLeader() {
 		return
 	}
 	pm.partMeta = parseParts(kvs)
-
-	fmt.Printf("????? %+v", pm.partMeta[3].Rg)
 
 	atomic.StoreInt32(&pm.isLeader, 1)
 }
