@@ -106,14 +106,6 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta) error {
 	openStream := func(si pb.StreamInfo) streamclient.StreamClient {
 		return streamclient.NewStreamClient(ps.smClient, ps.extentManager, si.StreamID)
 	}
-
-	var startKey []byte
-	var endKey []byte
-	if meta.Rg != nil {
-		startKey = meta.Rg.StartKey
-		endKey = meta.Rg.EndKey
-	}
-
 	var locs []*pspb.Location
 	if meta.Locs != nil {
 		locs = meta.Locs.Locs
@@ -124,13 +116,14 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta) error {
 		blobs = meta.Blobs.Blob
 	}
 
-	rp := rangepartition.OpenRangePartition(meta.PartID, row, log, ps.blockReader, startKey, endKey, locs,
+	rp := rangepartition.OpenRangePartition(meta.PartID, row, log, ps.blockReader, meta.Rg.StartKey, meta.Rg.EndKey, locs,
 		blobs, ps.pmClient, openStream, nil)
 
 	//FIXME: check each partID is uniq
 	ps.Lock()
 	ps.rangePartitions[meta.PartID] = rp
 	ps.Unlock()
+	xlog.Logger.Infof("open range partition %d, StartKey:[%s], EndKey:[%s]", meta.PartID, meta.Rg.StartKey, meta.Rg.EndKey)
 	return nil
 }
 

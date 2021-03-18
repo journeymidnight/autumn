@@ -90,6 +90,9 @@ func (pm *PartitionManager) RegisterPS(ctx context.Context, req *pspb.RegisterPS
 		return nil, errors.Errorf("not a leader")
 	}
 
+	if len(req.Addr) == 0 {
+		return nil, errors.Errorf("no address")
+	}
 	var hasDup bool
 	pm.pslock.RLock()
 	for _, n := range pm.psNodes {
@@ -228,6 +231,7 @@ func (pm *PartitionManager) GetRegions(ctx context.Context, req *pspb.GetRegions
 	*/
 	var regions []*pspb.RegionInfo
 	for partID, meta := range pm.partMeta {
+		utils.AssertTrue(meta.Rg != nil)
 		region := &pspb.RegionInfo{
 			Rg:     meta.Rg,
 			PartID: partID,
@@ -237,11 +241,13 @@ func (pm *PartitionManager) GetRegions(ctx context.Context, req *pspb.GetRegions
 		detail, ok := pm.psNodes[meta.Parent]
 		if !ok {
 			xlog.Logger.Warnf("can not find region's address")
+
 			pm.pslock.RUnlock()
 			continue
 		}
 		pm.pslock.RUnlock()
 		region.Addr = detail.Address
+		fmt.Printf("return region is %+v\n", region)
 		regions = append(regions, region)
 	}
 

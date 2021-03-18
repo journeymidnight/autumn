@@ -227,13 +227,14 @@ journal的话, 这些优化可能都不需要
 ETCD存储结构in PM(Partition Manager)
 
 ```
-PART/{PartID}/blobStreams => [id,...,id]
+
 PART/{PartID}/logStream => id <MUST>
 PART/{PartID}/rowStream => id <MUST>
-PART/{PartID}/tables => [(extentID,offset),...,(extentID,offset)]
-PART/{PartID}/discard => <DATA>
 PART/{PartID}/parent = PSID <MUST>
 PART/{PartID}/range = <startKey, endKey> <MUST>
+PART/{PartID}/tables => [(extentID,offset),...,(extentID,offset)]
+PART/{PartID}/blobStreams => [id,...,id]
+PART/{PartID}/discard => <DATA>
 
 PSSERVER/{PSID} => {PSDETAIL}
 //when updating PART/*/range. update PSVERSION
