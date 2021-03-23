@@ -182,3 +182,21 @@ func (rt *RandomTicker) nextInterval() time.Duration {
 	interval := rand.Int63n(rt.max-rt.min) + rt.min
 	return time.Duration(interval) * time.Nanosecond
 }
+
+//thread-safe rand
+type LockedSource struct {
+	lk  sync.Mutex
+	src rand.Source
+}
+
+func (r *LockedSource) Int63() int64 {
+	r.lk.Lock()
+	defer r.lk.Unlock()
+	return r.src.Int63()
+}
+
+func (r *LockedSource) Seed(seed int64) {
+	r.lk.Lock()
+	defer r.lk.Unlock()
+	r.src.Seed(seed)
+}

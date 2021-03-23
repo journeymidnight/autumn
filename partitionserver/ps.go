@@ -65,7 +65,7 @@ func (ps *PartitionServer) Init() {
 	ps.blockReader = streamclient.NewAutumnBlockReader(ps.extentManager, ps.smClient)
 
 	metas := ps.pmClient.GetPartitionMeta(ps.PSID)
-	xlog.Logger.Infof("get all partitions for PS :%d: RangePartitions", metas)
+	xlog.Logger.Infof("get all partitions for PS :%+v: RangePartitions", metas)
 
 	for _, partMeta := range metas {
 		xlog.Logger.Infof("start %+v\n", partMeta)
@@ -115,6 +115,9 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta) error {
 	if meta.Blobs != nil {
 		blobs = meta.Blobs.Blob
 	}
+
+	utils.AssertTrue(meta.Rg != nil)
+	utils.AssertTrue(meta.PartID != 0)
 
 	rp := rangepartition.OpenRangePartition(meta.PartID, row, log, ps.blockReader, meta.Rg.StartKey, meta.Rg.EndKey, locs,
 		blobs, ps.pmClient, openStream, nil)

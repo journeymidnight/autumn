@@ -17,8 +17,8 @@ import (
 )
 
 const (
-	idKey             = "AutumnSmIDKey"
-	electionKeyPrefix = "AutumnSmLeader"
+	idKey             = "AutumnSMIDKey"
+	electionKeyPrefix = "AutumnSMLeader"
 )
 
 type NodeStatus struct {

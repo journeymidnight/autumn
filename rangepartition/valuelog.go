@@ -13,8 +13,6 @@ import (
 
 //replay valuelog
 //compact valuelog
-//FIXME, 读/写下降到streamlayer
-//如果request有多个Entry, 还需要修改/FIXME
 func (rp *RangePartition) writeValueLog(reqs []*request) ([]*pb.EntryInfo, valuePointer, error) {
 
 	var entries []*pb.EntryInfo

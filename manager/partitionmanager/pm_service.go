@@ -28,7 +28,7 @@ func (pm *PartitionManager) GetPartitionMeta(ctx context.Context, req *pspb.GetP
 	var ret []*pspb.PartitionMeta
 	for _, meta := range pm.partMeta {
 		if meta.Parent == req.PSID {
-			ret = append(ret, meta)
+			ret = append(ret, proto.Clone(meta).(*pspb.PartitionMeta))
 		}
 	}
 	return &pspb.GetPartitionMetaResponse{
@@ -176,7 +176,7 @@ func (pm *PartitionManager) Bootstrap(ctx context.Context, req *pspb.BootstrapRe
 	}
 
 	//alloc new partID
-	partID, _, err := pm.allocUniqID(1)
+	partID, _, err := pm.allocUniqID(2)
 	if err != nil {
 		return nil, err
 	}
@@ -207,6 +207,8 @@ func (pm *PartitionManager) Bootstrap(ctx context.Context, req *pspb.BootstrapRe
 		LogStream: req.LogID,
 		RowStream: req.RowID,
 		Parent:    req.Parent,
+		Rg:        rg,
+		PartID:    partID,
 	}
 	return &pspb.BootstrapResponse{PartID: partID}, nil
 }

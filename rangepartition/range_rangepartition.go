@@ -29,7 +29,8 @@ const (
 	maxEntriesInBlock = 100
 
 	//4 * KB for test
-	maxSkipList = 4 * KB
+	maxSkipList     = 64 * MB
+	writeChCapacity = 64
 )
 
 var (
@@ -121,7 +122,7 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	seq := uint64(0)
 	var lastTable *table.Table
 	for _, table := range rp.tables {
-		fmt.Printf("read table  from [%s] to [%s]: seq[%d], vp[%d]\n", y.ParseKey(table.Smallest()), y.ParseKey(table.Biggest()), table.LastSeq, table.VpOffset)
+		fmt.Printf("read table from [%s] to [%s]: seq[%d], vp[%d]\n", y.ParseKey(table.Smallest()), y.ParseKey(table.Biggest()), table.LastSeq, table.VpOffset)
 		if table.LastSeq > seq {
 			seq = table.LastSeq
 			lastTable = table
@@ -160,6 +161,12 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 			// you will get a deadlock.
 			time.Sleep(10 * time.Millisecond)
 		}
+		/*
+			if len(ei.Log.Key) == 0 {
+				return true, nil
+			}
+		*/
+		//fmt.Printf("replay %s, %d\n", ei.Log.Key, len(ei.Log.Value))
 		rp.writeToLSM([]*pb.EntryInfo{ei})
 		return true, nil
 	}
@@ -192,7 +199,7 @@ type flushTask struct {
 
 func (rp *RangePartition) startWriteLoop() {
 	rp.writeStopper = utils.NewStopper()
-	rp.writeCh = make(chan *request, 16)
+	rp.writeCh = make(chan *request, writeChCapacity)
 
 	rp.writeStopper.RunWorker(rp.doWrites)
 }
@@ -530,18 +537,19 @@ func isReqsTooBig(reqs []*request) bool {
 	n := 0
 	for _, req := range reqs {
 		size += req.Size()
-		if size > 20*MB {
+		if size > 30*MB {
 			return true
 		}
 
 		n += len(req.entries)
-		if n > 10 {
+		if n > 3*writeChCapacity {
 			return true
 		}
 	}
 
 	return false
 }
+
 func (rp *RangePartition) doWrites() {
 	//defer lc.Done()
 
@@ -588,6 +596,7 @@ func (rp *RangePartition) doWrites() {
 			case <-rp.writeStopper.ShouldStop():
 				goto closedCase
 			}
+
 		}
 
 	closedCase:
@@ -835,6 +844,28 @@ func (rp *RangePartition) WriteAsync(key, value []byte, f func(error)) {
 		f(err)
 	}()
 
+}
+
+func (rp *RangePartition) Delete(key []byte) error {
+	//search
+	vs := rp.getValueStruct(key, 0)
+	if vs.Version == 0 || vs.Meta&y.BitDelete > 0 {
+		return errNotFound
+	}
+
+	newSeqNumber := atomic.AddUint64(&rp.seqNumber, 1)
+	e := &pb.EntryInfo{
+		Log: &pb.Entry{
+			Key:  y.KeyWithTs(key, newSeqNumber),
+			Meta: uint32(y.BitDelete),
+		},
+	}
+
+	req, err := rp.sendToWriteCh([]*pb.EntryInfo{e})
+	if err != nil {
+		return err
+	}
+	return req.Wait()
 }
 
 //req.Wait will free the request

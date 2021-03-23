@@ -91,7 +91,7 @@ func (lib *AutumnLib) update() {
 
 }
 
-func (lib *AutumnLib) Put(key, value []byte) error {
+func (lib *AutumnLib) Put(ctx context.Context, key, value []byte) error {
 	sortedRegions := lib.getRegions()
 	if len(sortedRegions) == 0 {
 		return errors.New("no regions to write")
@@ -105,7 +105,7 @@ func (lib *AutumnLib) Put(key, value []byte) error {
 
 	conn := lib.getConn(sortedRegions[idx].Addr)
 	client := pspb.NewPartitionKVClient(conn)
-	_, err := client.Put(context.Background(), &pspb.PutRequest{
+	_, err := client.Put(ctx, &pspb.PutRequest{
 		Key:    key,
 		Value:  value,
 		Partid: sortedRegions[idx].PartID,
@@ -113,7 +113,7 @@ func (lib *AutumnLib) Put(key, value []byte) error {
 	return err
 }
 
-func (lib *AutumnLib) Get(key []byte) ([]byte, error) {
+func (lib *AutumnLib) Get(ctx context.Context, key []byte) ([]byte, error) {
 	sortedRegions := lib.getRegions()
 	if len(sortedRegions) == 0 {
 		return nil, errors.New("no regions to write")
@@ -128,7 +128,7 @@ func (lib *AutumnLib) Get(key []byte) ([]byte, error) {
 
 	conn := lib.getConn(sortedRegions[idx].Addr)
 	client := pspb.NewPartitionKVClient(conn)
-	res, err := client.Get(context.Background(), &pspb.GetRequest{
+	res, err := client.Get(ctx, &pspb.GetRequest{
 		Key:    key,
 		Partid: sortedRegions[idx].PartID,
 	})
@@ -137,5 +137,32 @@ func (lib *AutumnLib) Get(key []byte) ([]byte, error) {
 		return nil, err
 	}
 	return res.Value, err
+
+}
+
+func (lib *AutumnLib) Delete(ctx context.Context, key []byte) error {
+	sortedRegions := lib.getRegions()
+	if len(sortedRegions) == 0 {
+		return errors.New("no regions to write")
+	}
+	//idx
+	idx := sort.Search(len(sortedRegions), func(i int) bool {
+		if len(sortedRegions[i].Rg.EndKey) == 0 {
+			return true
+		}
+		return bytes.Compare(sortedRegions[i].Rg.EndKey, key) > 0
+	})
+
+	conn := lib.getConn(sortedRegions[idx].Addr)
+	client := pspb.NewPartitionKVClient(conn)
+	_, err := client.Delete(ctx, &pspb.DeleteRequest{
+		Key:    key,
+		Partid: sortedRegions[idx].PartID,
+	})
+
+	if err != nil {
+		return err
+	}
+	return err
 
 }

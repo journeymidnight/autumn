@@ -223,6 +223,17 @@ func TestReplayExtent(t *testing.T) {
 
 }
 
+func TestExtentReadEntries(t *testing.T) {
+	ex, err := OpenExtent("extent_13.ext")
+	require.Nil(t, err)
+	//from start
+	eis, _, err := ex.ReadEntries(512, 32<<20, true)
+	for _, ei := range eis {
+		fmt.Printf("%d, %s, len %d\n", ei.Log.Meta, ei.Log.Key, len(ei.Log.Value))
+	}
+	ex.Close()
+}
+
 func TestExtentHeader(t *testing.T) {
 	header := newExtentHeader(3)
 	assert.Equal(t, extentMagicNumber, string(header.magicNumber))
