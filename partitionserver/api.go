@@ -60,5 +60,17 @@ func (ps *PartitionServer) Get(ctx context.Context, req *pspb.GetRequest) (*pspb
 }
 
 func (ps *PartitionServer) Delete(ctx context.Context, req *pspb.DeleteRequest) (*pspb.DeleteResponse, error) {
-	return nil, errors.New("not implemented")
+	rp := ps.checkVersion(req.Psversion, req.Partid, req.Key)
+	if rp == nil {
+		return nil, errors.New("no such partid")
+	}
+
+	err := rp.Delete(req.Key)
+	if err != nil {
+		return nil, err
+	}
+
+	return &pspb.DeleteResponse{
+		Key: req.Key,
+	}, nil
 }

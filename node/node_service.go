@@ -254,7 +254,7 @@ func (en *ExtentNode) ReadEntries(ctx context.Context, req *pb.ReadEntriesReques
 	if req.Replay > 0 {
 		replay = true
 	}
-	ei, endOffset, err := ex.ReadEntries(req.Offset, (16 << 20), replay)
+	ei, endOffset, err := ex.ReadEntries(req.Offset, (25 << 20), replay)
 	if err != nil && err != extent.EndOfStream && err != extent.EndOfExtent {
 		xlog.Logger.Infof("request ReadEntires extentID: %d, offset: %d, : %v", req.ExtentID, req.Offset, err)
 		return nil, err

@@ -22,6 +22,7 @@ import (
 	"os"
 	"sync/atomic"
 
+	_ "bufio"
 	"io"
 
 	"github.com/pkg/errors"
@@ -474,6 +475,7 @@ func writeBlock(w io.Writer, block *pb.Block) (err error) {
 }
 
 func readBlockEntries(reader io.Reader, extentID uint64, offset uint32, replay bool) ([]*pb.EntryInfo, uint64, error) {
+
 	var buf [512]byte
 
 	_, err := io.ReadFull(reader, buf[:])
@@ -527,6 +529,7 @@ func readBlockEntries(reader io.Reader, extentID uint64, offset uint32, replay b
 		utils.Check(err)
 
 		if y.ShouldWriteValueToLSM(entry) {
+
 			if replay { //replay read
 				ret = append(ret, &pb.EntryInfo{
 					Log:           entry,
@@ -547,6 +550,7 @@ func readBlockEntries(reader io.Reader, extentID uint64, offset uint32, replay b
 			//big value
 			//keep entry.Value and make sure BitValuePointer
 			entry.Meta |= uint32(y.BitValuePointer)
+			entry.Value = nil
 			ret = append(ret, &pb.EntryInfo{
 				Log:           entry,
 				EstimatedSize: blockLength + 512,
@@ -557,6 +561,7 @@ func readBlockEntries(reader io.Reader, extentID uint64, offset uint32, replay b
 			return ret, blockLength, nil
 		}
 	}
+
 	return ret, blockLength, nil
 }
 

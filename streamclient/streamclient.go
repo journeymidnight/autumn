@@ -2,6 +2,7 @@ package streamclient
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"sync"
 	"time"
@@ -208,7 +209,7 @@ type AutumnLogEntryIter struct {
 	currentExtentIndex int
 	noMore             bool
 	cache              []*pb.EntryInfo
-	replay             bool
+	replay             uint32
 }
 
 func (iter *AutumnLogEntryIter) HasNext() (bool, error) {
@@ -248,9 +249,11 @@ retry:
 	res, err := c.ReadEntries(ctx, &pb.ReadEntriesRequest{
 		ExtentID: extentID,
 		Offset:   iter.currentOffset,
+		Replay:   uint32(iter.replay),
 	})
 	cancel()
-	if err == context.DeadlineExceeded {
+	//if err == context.DeadlineExceeded {
+	if err != nil {
 		if loop > 5 {
 			return errors.New("finally timeout")
 		}
@@ -259,7 +262,8 @@ retry:
 		goto retry
 	}
 
-	xlog.Logger.Debugf("res code is %v, len of entries %d\n", res.Code, len(res.Entries))
+	fmt.Printf("ans: %v, %v\n", err, err == context.DeadlineExceeded)
+	//xlog.Logger.Debugf("res code is %v, len of entries %d\n", res.Code, len(res.Entries))
 	if len(res.Entries) > 0 {
 		iter.cache = nil
 		iter.cache = append(iter.cache, res.Entries...)
@@ -290,9 +294,11 @@ retry:
 
 func (sc *AutumnStreamClient) NewLogEntryIter(opt ReadOption) LogEntryIter {
 	leIter := &AutumnLogEntryIter{
-		sc:     sc,
-		opt:    opt,
-		replay: opt.Replay,
+		sc:  sc,
+		opt: opt,
+	}
+	if opt.Replay {
+		leIter.replay = 1
 	}
 	if opt.ReadFromStart {
 		leIter.currentExtentIndex = 0
