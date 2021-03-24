@@ -214,7 +214,6 @@ message GetRequest {
 	bytes key = 1;
 	uint64 psversion = 2;
 	uint64 partid = 5;
-
 }
 
 message GetResponse {
@@ -239,13 +238,26 @@ message ResponseOp {
 }
 
 message BatchRequest {
-	repeated RequestOp reqs = 1;
+	repeated RequestOp req = 1;
 }
 
 message BatchResponse {
-	repeated RequestOp res  = 2;
+	repeated RequestOp res  = 1;
 }
 
+//return message KeyValue?
+message RangeRequest{
+	bytes prefix = 1;
+	bytes start = 2;
+	uint32 limit = 3;
+	uint64 partid = 4;
+	uint64 psversion = 5;
+}
+
+message RangeResponse {
+	uint32 truncated = 1;
+	repeated bytes keys = 2;
+}
 
 service PartitionKV {
 	/*
@@ -258,4 +270,5 @@ service PartitionKV {
 	rpc Put(PutRequest) returns (PutResponse) {}
 	rpc Get (GetRequest) returns (GetResponse) {}
 	rpc Delete(DeleteRequest) returns (DeleteResponse) {}
+	rpc Range(RangeRequest) returns (RangeResponse) {}
 }

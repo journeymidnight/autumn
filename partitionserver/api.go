@@ -74,3 +74,15 @@ func (ps *PartitionServer) Delete(ctx context.Context, req *pspb.DeleteRequest) 
 		Key: req.Key,
 	}, nil
 }
+
+func (ps *PartitionServer) Range(ctx context.Context, req *pspb.RangeRequest) (*pspb.RangeResponse, error) {
+	rp := ps.checkVersion(req.Psversion, req.Partid, req.Start)
+	if rp == nil {
+		return nil, errors.New("no such partid")
+	}
+	out := rp.Range(req.Prefix, req.Start, req.Limit)
+	return &pspb.RangeResponse{
+		Truncated: 0,
+		Keys:      out,
+	}, nil
+}
