@@ -223,6 +223,7 @@ func TestReplayExtent(t *testing.T) {
 
 }
 
+/*
 func TestExtentReadEntries(t *testing.T) {
 	ex, err := OpenExtent("extent_13.ext")
 	require.Nil(t, err)
@@ -233,6 +234,7 @@ func TestExtentReadEntries(t *testing.T) {
 	}
 	ex.Close()
 }
+*/
 
 func TestExtentHeader(t *testing.T) {
 	header := newExtentHeader(3)

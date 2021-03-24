@@ -29,8 +29,8 @@ const (
 	maxEntriesInBlock = 100
 
 	//4 * KB for test
-	maxSkipList     = 64 * MB
-	writeChCapacity = 64
+	maxSkipList     = 1024 * KB //60MB
+	writeChCapacity = 4         //64
 )
 
 var (
@@ -667,6 +667,27 @@ func (rp *RangePartition) ensureRoomForWrite(entries []*pb.EntryInfo, head value
 	}
 }
 
+func (rp *RangePartition) newIterator() y.Iterator {
+	//prefix不包括seqnum
+	//FIXME: 是否实现prefetch?
+
+	var iters []y.Iterator
+	mts, decr := rp.getMemTables()
+	defer decr()
+
+	//memtable iters
+	for i := 0; i < len(mts); i++ {
+		iters = append(iters, mts[i].NewUniIterator(false))
+	}
+
+	rp.tableLock.RLock()
+	for i := len(rp.tables) - 1; i >= 0; i-- {
+		iters = append(iters, rp.tables[i].NewIterator(false))
+	}
+	rp.tableLock.RUnlock()
+	return table.NewMergeIterator(iters, false)
+}
+
 func (rp *RangePartition) getTablesForKey(userKey []byte) ([]*table.Table, func()) {
 	var out []*table.Table
 
@@ -677,6 +698,7 @@ func (rp *RangePartition) getTablesForKey(userKey []byte) ([]*table.Table, func(
 		end := y.ParseKey(t.Biggest())
 		if bytes.Compare(userKey, start) >= 0 && bytes.Compare(userKey, end) <= 0 {
 			out = append(out, t)
+			t.IncrRef()
 		}
 	}
 	//返回的tables安装.SeqNUm排序, SeqNum大的在前(新的table在前), 保证如果出现vesion相同
@@ -690,6 +712,36 @@ func (rp *RangePartition) getTablesForKey(userKey []byte) ([]*table.Table, func(
 			t.DecrRef()
 		}
 	}
+}
+
+func (rp *RangePartition) Range(prefix []byte, start []byte, limit uint32) [][]byte {
+	iter := rp.newIterator()
+	defer iter.Close()
+	var out [][]byte
+	var skipKey []byte //note:包括seqnum
+	startTs := y.KeyWithTs(start, atomic.LoadUint64(&rp.seqNumber))
+	for iter.Seek(startTs); iter.Valid() && uint32(len(out)) < limit; iter.Next() {
+		if !bytes.HasPrefix(iter.Key(), prefix) {
+			break
+		}
+		if len(skipKey) > 0 {
+			if y.SameKey(iter.Key(), skipKey) {
+				continue
+			} else {
+				skipKey = skipKey[:0] //reset
+			}
+		}
+		vs := iter.Value()
+
+		skipKey = y.SafeCopy(skipKey, iter.Key())
+
+		if isDeletedOrExpired(vs.Meta, vs.ExpiresAt) {
+			continue
+		}
+
+		out = append(out, y.ParseKey(iter.Key()))
+	}
+	return out
 }
 
 func (rp *RangePartition) Get(userKey []byte, version uint64) ([]byte, error) {

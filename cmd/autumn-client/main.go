@@ -270,6 +270,33 @@ func get(c *cli.Context) error {
 	return nil
 }
 
+func autumnRange(c *cli.Context) error {
+	pmAddr := utils.SplitAndTrim(c.String("pmAddr"), ",")
+	if len(pmAddr) == 0 {
+		return errors.Errorf("pmAddr is nil")
+	}
+	client := NewAutumnLib(pmAddr)
+	//defer client.Close()
+
+	if err := client.Connect(); err != nil {
+		return err
+	}
+	prefix := c.Args().First()
+	/*
+		if len(prefix) == 0 {
+			return errors.New("no key")
+		}
+	*/
+	out, err := client.Range(context.Background(), []byte(prefix), []byte(prefix))
+	if err != nil {
+		return err
+	}
+	for i := range out {
+		fmt.Printf("%s\n", out[i])
+	}
+	return nil
+}
+
 //FIXME: grpc stream is better to send big values
 func put(c *cli.Context) error {
 	pmAddr := utils.SplitAndTrim(c.String("pmAddr"), ",")
@@ -399,18 +426,18 @@ func main() {
 			},
 			Action: wbench,
 		},
-
-		/*
-			{
-				Name: "replay",
-				Usage: "get --smAddr <addrs> <streamID> <offset>"
-			}
-		*/
-
 		{
 			Name:   "plot",
 			Usage:  "plot <file.json>",
 			Action: plot,
+		},
+		{
+			Name:  "ls",
+			Usage: "ls --pmAddr <addrs> <prefix>",
+			Flags: []cli.Flag{
+				&cli.StringFlag{Name: "pmAddr", Value: "127.0.0.1:3401"},
+			},
+			Action: autumnRange,
 		},
 	}
 	err := app.Run(os.Args)

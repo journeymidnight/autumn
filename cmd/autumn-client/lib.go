@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"math"
 	"sort"
 	"time"
 
@@ -138,6 +139,33 @@ func (lib *AutumnLib) Get(ctx context.Context, key []byte) ([]byte, error) {
 	}
 	return res.Value, err
 
+}
+
+func (lib *AutumnLib) Range(ctx context.Context, prefix []byte, start []byte) ([][]byte, error) {
+	sortedRegions := lib.getRegions()
+	if len(sortedRegions) == 0 {
+		return nil, errors.New("no regions to write")
+	}
+	//FIXME: 多range partition的情况
+	//idx
+	idx := sort.Search(len(sortedRegions), func(i int) bool {
+		if len(sortedRegions[i].Rg.EndKey) == 0 {
+			return true
+		}
+		return bytes.Compare(sortedRegions[i].Rg.EndKey, prefix) > 0
+	})
+	conn := lib.getConn(sortedRegions[idx].Addr)
+	client := pspb.NewPartitionKVClient(conn)
+	res, err := client.Range(ctx, &pspb.RangeRequest{
+		Prefix: prefix,
+		Start:  start,
+		Limit:  math.MaxUint32,
+		Partid: sortedRegions[idx].PartID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return res.Keys, nil
 }
 
 func (lib *AutumnLib) Delete(ctx context.Context, key []byte) error {

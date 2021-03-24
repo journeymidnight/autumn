@@ -234,3 +234,49 @@ func TestReopenRangePartitionWithBig(t *testing.T) {
 	}
 	rp.Close()
 }
+
+func TestRange(t *testing.T) {
+	runRPTest(t, func(t *testing.T, rp *RangePartition) {
+		var wg sync.WaitGroup
+		for i := 0; i < 100; i++ {
+			wg.Add(1)
+			rp.WriteAsync([]byte(fmt.Sprintf("key%d", i)), []byte(fmt.Sprintf("val%d", i)), func(e error) {
+				wg.Done()
+			})
+			//rp.write([]byte(fmt.Sprintf("key%d", i)), []byte(fmt.Sprintf("val%d", i)))
+		}
+		wg.Wait()
+
+		//write twice
+
+		for i := 0; i < 100; i++ {
+			wg.Add(1)
+			rp.WriteAsync([]byte(fmt.Sprintf("key%d", i)), []byte(fmt.Sprintf("val%d", i)), func(e error) {
+				wg.Done()
+			})
+			//rp.write([]byte(fmt.Sprintf("key%d", i)), []byte(fmt.Sprintf("val%d", i)))
+		}
+		wg.Wait()
+
+		err := rp.Delete([]byte("key99"))
+		require.Nil(t, err)
+
+		//key0, key1 key10,  ... ,k90, key91 ... key98
+		var array [][]byte
+		array = append(array, []byte("key9"))
+		for i := 90; i <= 98; i++ {
+			array = append(array, []byte(fmt.Sprintf("key%d", i)))
+
+		}
+		out := rp.Range([]byte("key9"), []byte("key9"), 100)
+
+		/* display out
+		for _, x := range out {
+			binary.Write(os.Stdout, binary.LittleEndian, x)
+			fmt.Println()
+		}
+		*/
+		require.Equal(t, array, out)
+
+	})
+}
