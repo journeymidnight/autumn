@@ -2,7 +2,6 @@ package rangepartition
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/journeymidnight/autumn/rangepartition/skiplist"
@@ -55,7 +54,6 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 	}
 
 	it := table.NewMergeIterator(iters, false)
-	fmt.Println(it)
 	defer it.Close()
 
 	it.Rewind()

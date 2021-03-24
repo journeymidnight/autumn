@@ -28,9 +28,12 @@ const (
 	MB                = KB * 1024
 	maxEntriesInBlock = 100
 
-	//4 * KB for test
-	maxSkipList     = 1024 * KB //60MB
-	writeChCapacity = 4         //64
+	//1 * MB for test
+	//60 * MB for production
+	maxSkipList = 1 * MB
+	//64 for production
+	//16 for test
+	writeChCapacity = 64
 )
 
 var (
@@ -184,8 +187,58 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		replayLog(rp.logStream, lastTable.VpExtentID, lastTable.VpOffset, true, replay)
 	}
 	fmt.Printf("replayed log number: %d\n", replayedLog)
+
 	//start real write
 	rp.startWriteLoop()
+
+	//do compactions:FIXME, doCompactions放到另一个goroutine里面执行
+	var tbls []*table.Table
+	rp.tableLock.RLock()
+	for _, t := range rp.tables {
+		t.IncrRef()
+		tbls = append(tbls, t)
+	}
+	rp.tableLock.RUnlock()
+
+	if len(tbls) <= 1 {
+		return rp
+	}
+
+	rp.doCompact(tbls, true)
+
+	//remove tbls from rp.tables, and update etcd,
+	rp.tableLock.Lock()
+	var i, j int
+	var newTables []*table.Table
+	for i < len(tbls) && j < len(rp.tables) {
+		if tbls[i].LastSeq == rp.tables[j].LastSeq {
+			i++
+			j++ //同时存在
+		} else if tbls[i].LastSeq < rp.tables[j].LastSeq {
+			i++ //只在tbls存在
+		} else {
+			newTables = append(newTables, rp.tables[j])
+			rp.tables[j].IncrRef()
+			j++ //只在rp.tables存在
+		}
+	}
+	for ; j < len(rp.tables); j++ {
+		newTables = append(newTables, rp.tables[j])
+		rp.tables[j].IncrRef()
+	}
+
+	tableLocs = nil
+	for _, t := range newTables {
+		tableLocs = append(tableLocs, &t.Loc)
+	}
+	rp.updateTableLocs(tableLocs)
+
+	for _, t := range rp.tables {
+		t.DecrRef()
+	}
+	rp.tables = newTables
+	rp.tableLock.Unlock()
+
 	return rp
 }
 
@@ -328,21 +381,28 @@ func (rp *RangePartition) flushMemtable() {
 		for _, t := range rp.tables {
 			tableLocs = append(tableLocs, &t.Loc)
 		}
+		rp.updateTableLocs(tableLocs)
 		rp.tableLock.RUnlock()
 
-		for {
-			err := rp.pmClient.SetRowStreamTables(rp.PartID, tableLocs)
-			if err != nil {
-				xlog.Logger.Errorf("failed to set tableLocs for %d, retry...", rp.PartID)
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
-			break
-		}
 		if ft.isCompact {
 			ft.resultCh <- struct{}{}
 		}
 
+	}
+}
+
+func (rp *RangePartition) updateTableLocs(tableLocs []*pspb.Location) {
+	if len(tableLocs) == 0 {
+		return
+	}
+	for {
+		err := rp.pmClient.SetRowStreamTables(rp.PartID, tableLocs)
+		if err != nil {
+			xlog.Logger.Errorf("failed to set tableLocs for %d, retry...", rp.PartID)
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		break
 	}
 }
 
