@@ -820,8 +820,8 @@
     },
     {
       "type": "text",
-      "version": 494,
-      "versionNonce": 443345428,
+      "version": 497,
+      "versionNonce": 453709543,
       "isDeleted": false,
       "id": "YlLHgTSWRgLrjYU4QBAqt",
       "fillStyle": "hachure",
@@ -842,7 +842,7 @@
       "boundElementIds": [],
       "fontSize": 16,
       "fontFamily": 3,
-      "text": "1. write logStram\n2. insert logs into memtable",
+      "text": "1. write logStream\n2. insert logs into memtable",
       "baseline": 34,
       "textAlign": "left",
       "verticalAlign": "top"

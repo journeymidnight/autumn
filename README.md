@@ -219,8 +219,7 @@ nodes    map[uint64]*NodeStatus
 13. 增加extent模块benchmark的内容(mac SSD上面, sync 4k需要30ms?!!), 现在benchmark的结果只有4k
 14. extent也有很大的优化空间, AppendBlock发到每块硬盘的队列上, 然后取队列, 写数据, 再sync,可以减少单块硬盘上的sync次数. 但是: 如果有SSD
 journal的话, 这些优化可能都不需要
-15. streamclient增加自动Seal的功能
-16. extent层用mmap,提升读性能
+15. extent层用mmap,提升读性能
 
 ## partion layer
 
@@ -241,25 +240,12 @@ PSSERVER/{PSID} => {PSDETAIL}
 PSVERSION  => {num}
 ```
 
-//client call get regions,
-//<startKey, endKey, PartID, PSID, address>
-//read PART/{PartID}/range
-//read PART/{PartID}/parent
-//read PSSERVER/{PSID} //cached
-
-
-//ps call
-//1. read PART/{PartID}/parent
-//then. read whole data 
 
 
 
-2.grpc里面, res.Code代替err
-5.rp实现valuelog的truncate(*)
-
-6.pm_service/pmclient
-7.ps server//single range partion
-8.run in cluster
-9.APIs
-10.stream V2, block format:没有512字节header,512字节对齐
-11.stream extent增加refcont
+## TODO
+1. grpc里面, res.Code代替err
+2. rp实现valuelog的truncate(*)
+3. 实现logstream分为2个不同的stream,一个可以在生成memtable后直接删除, 另一个长久保存(定期recycle或者EC化)
+4. ps merge / split
+4. stream extent增加refcont

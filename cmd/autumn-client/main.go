@@ -115,7 +115,7 @@ func benchmark(pmAddrs []string, op BenchType, threadNum int, duration int, size
 								fmt.Printf("%v\n", err)
 								return
 							}
-							if loop%5 == 0 {
+							if loop%3 == 0 {
 								lock.Lock()
 								results = append(results, Result{
 									Key:       key,
