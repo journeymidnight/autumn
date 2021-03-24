@@ -672,6 +672,7 @@ func (rp *RangePartition) newIterator() y.Iterator {
 	//FIXME: 是否实现prefetch?
 
 	var iters []y.Iterator
+
 	mts, decr := rp.getMemTables()
 	defer decr()
 
@@ -720,6 +721,7 @@ func (rp *RangePartition) Range(prefix []byte, start []byte, limit uint32) [][]b
 	var out [][]byte
 	var skipKey []byte //note:包括seqnum
 	startTs := y.KeyWithTs(start, atomic.LoadUint64(&rp.seqNumber))
+	//readTs: 是否以后支持readTs:如果version比readTS大, 则忽略这个版本
 	for iter.Seek(startTs); iter.Valid() && uint32(len(out)) < limit; iter.Next() {
 		if !bytes.HasPrefix(iter.Key(), prefix) {
 			break
@@ -731,15 +733,15 @@ func (rp *RangePartition) Range(prefix []byte, start []byte, limit uint32) [][]b
 				skipKey = skipKey[:0] //reset
 			}
 		}
-		vs := iter.Value()
-
 		skipKey = y.SafeCopy(skipKey, iter.Key())
+
+		vs := iter.Value()
 
 		if isDeletedOrExpired(vs.Meta, vs.ExpiresAt) {
 			continue
 		}
-
-		out = append(out, y.ParseKey(iter.Key()))
+		//FIXME:slab allocation key
+		out = append(out, y.Copy(y.ParseKey(iter.Key())))
 	}
 	return out
 }
