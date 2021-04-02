@@ -70,50 +70,11 @@ func (f *memory) Write(p []byte) (n int, err error) {
 	return n, nil
 }
 
-func TestReadWriteBlockUserData(t *testing.T) {
-	data := make([]byte, 1024)
-	block := pb.Block{
-		CheckSum:    utils.AdlerCheckSum(data),
-		BlockLength: 1024,
-		Data:        data,
-		UserData:    []byte("hello"),
-	}
-
-	f := newMemory(3000)
-	err := writeBlock(f, &block)
-	assert.Nil(t, err)
-
-	f.resetPos()
-	block1, err := readBlock(f)
-
-	assert.Equal(t, block, block1)
-}
-
-func TestReadWriteBlock(t *testing.T) {
-	data := make([]byte, 1024)
-	block := pb.Block{
-		CheckSum:    utils.AdlerCheckSum(data),
-		BlockLength: 1024,
-		Data:        data,
-	}
-
-	f := newMemory(3000)
-	err := writeBlock(f, &block)
-	assert.Nil(t, err)
-
-	f.resetPos()
-	block1, err := readBlock(f)
-
-	assert.Equal(t, block, block1)
-}
-
 func generateBlock(name string, size uint32) *pb.Block {
 	data := make([]byte, size)
 	utils.SetRandStringBytes(data)
 	return &pb.Block{
-		CheckSum:    utils.AdlerCheckSum(data),
-		BlockLength: size,
-		Data:        data,
+		Data: data,
 	}
 }
 
@@ -129,16 +90,18 @@ func TestAppendReadFile(t *testing.T) {
 	defer os.Remove("localtest.ext")
 	assert.Nil(t, err)
 	extent.Lock()
-	ret, err := extent.AppendBlocks(cases, nil)
+	ret, _, err := extent.AppendBlocks(cases, nil, true)
 	extent.Unlock()
 	assert.Nil(t, err)
 
 	//single thread read
-	retBlocks, err := extent.ReadBlocks(ret[0], 4, (20 << 20))
+	retBlocks, _, _, err := extent.ReadBlocks(ret[0], 4, (20 << 20))
 
+	assert.Nil(t, err)
 	assert.Equal(t, cases, retBlocks)
 
 	//multithread read, push offset index into chan
+
 	type tuple struct {
 		caseIndex uint32
 		offset    uint32
@@ -150,11 +113,10 @@ func TestAppendReadFile(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		go func() {
 			for ele := range ch {
-				blocks, err := extent.ReadBlocks(ele.offset, 1, (20 << 20))
+				blocks, _, _, err := extent.ReadBlocks(ele.offset, 1, (20 << 20))
 				require.Nil(t, err)
 
 				require.Equal(t, cases[ele.caseIndex], blocks[0])
-
 				atomic.AddInt32(&complets, 1)
 				if atomic.LoadInt32(&complets) == int32(len(cases)) {
 					close(ch)
@@ -169,6 +131,7 @@ func TestAppendReadFile(t *testing.T) {
 			offset:    offset,
 		}
 	}
+
 }
 
 func TestReplayExtent(t *testing.T) {
@@ -185,7 +148,7 @@ func TestReplayExtent(t *testing.T) {
 	defer os.Remove(extentName)
 	assert.Nil(t, err)
 	extent.Lock()
-	_, err = extent.AppendBlocks(cases, nil)
+	_, _, err = extent.AppendBlocks(cases, nil, true)
 	extent.Unlock()
 	assert.Nil(t, err)
 
@@ -195,11 +158,10 @@ func TestReplayExtent(t *testing.T) {
 	ex, err := OpenExtent(extentName)
 	assert.Nil(t, err)
 	assert.False(t, ex.IsSeal())
-	assert.Equal(t, uint32(512*5+4096*3+8192), ex.CommitLength())
 
 	//write new cases
 	ex.Lock()
-	_, err = ex.AppendBlocks(cases, nil)
+	_, _, err = ex.AppendBlocks(cases, nil, true)
 	ex.Unlock()
 	assert.Nil(t, err)
 	commit := ex.CommitLength()
@@ -216,7 +178,7 @@ func TestReplayExtent(t *testing.T) {
 	assert.Equal(t, commit, ex.CommitLength())
 
 	//read test
-	blocks, err := ex.ReadBlocks(512, 1, (20 << 20)) //read object1
+	blocks, _, _, err := ex.ReadBlocks(0, 1, (20 << 20)) //read object1
 
 	assert.Nil(t, err)
 	assert.Equal(t, cases[0], blocks[0])
@@ -236,23 +198,6 @@ func TestExtentReadEntries(t *testing.T) {
 }
 */
 
-func TestExtentHeader(t *testing.T) {
-	header := newExtentHeader(3)
-	assert.Equal(t, extentMagicNumber, string(header.magicNumber))
-
-	f := newMemory(512)
-	err := header.Marshal(f)
-	assert.Nil(t, err)
-
-	f.resetPos()
-
-	newHeader := newExtentHeader(0)
-	newHeader.Unmarshal(f)
-
-	assert.Equal(t, header, newHeader)
-
-}
-
 func BenchmarkExtent(b *testing.B) {
 	extent, err := CreateExtent("localtest.ext", 100)
 	defer os.Remove("localtest.ext")
@@ -261,16 +206,15 @@ func BenchmarkExtent(b *testing.B) {
 	}
 	n := uint32(4096)
 	block := generateBlock("test", n)
-	commit := uint32(512)
+	commit := uint32(0)
 	extent.Lock()
 	for i := 0; i < b.N; i++ {
-		_, err = extent.AppendBlocks([]*pb.Block{
+		_, commit, err = extent.AppendBlocks([]*pb.Block{
 			block,
-		}, &commit)
+		}, &commit, true)
 
 		if err != nil {
 			panic(err.Error())
 		}
-		commit += 512 + n
 	}
 }

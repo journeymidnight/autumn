@@ -826,8 +826,8 @@ func (rp *RangePartition) Get(userKey []byte, version uint64) ([]byte, error) {
 			return nil, err
 		}
 
-		entries := y.ExtractLogEntry(blocks[0])
-		return entries[0].Value, nil
+		entry := y.ExtractLogEntry(blocks[0])
+		return entry.Value, nil
 	}
 	return vs.Value, nil
 

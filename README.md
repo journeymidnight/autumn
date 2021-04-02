@@ -249,3 +249,16 @@ PSVERSION  => {num}
 3. 实现logstream分为2个不同的stream,一个可以在生成memtable后直接删除, 另一个长久保存(定期recycle或者EC化)
 4. ps merge / split
 4. stream extent增加refcont
+
+### LOG
+
+```
++---------+-----------+-----------+--- ... ---+
+|CRC (4B) | Size (2B) | Type (1B) | Payload   |
++---------+-----------+-----------+--- ... ---+
+```
+
+Pros:
+1. detect corruption and space saving
+2. EC friendly
+3. no extra bufffer, 32K buf
