@@ -2,8 +2,8 @@ package utils
 
 import (
 	"fmt"
-	"hash"
 	"hash/adler32"
+	"hash/crc32"
 	"math"
 	"math/rand"
 	"strings"
@@ -15,6 +15,7 @@ import (
 	"github.com/pkg/errors"
 )
 
+/*
 var (
 	hashPool = sync.Pool{
 		New: func() interface{} {
@@ -22,6 +23,7 @@ var (
 		},
 	}
 )
+*/
 
 func Max(a, b int) int {
 	if a < b {
@@ -62,9 +64,7 @@ func SetRandStringBytes(data []byte) {
 }
 
 func AdlerCheckSum(data []byte) uint32 {
-	hash := hashPool.Get().(hash.Hash32)
-	defer hashPool.Put(hash)
-	hash.Reset()
+	hash := adler32.New()
 	hash.Write(data)
 	return hash.Sum32()
 }
@@ -199,4 +199,20 @@ func (r *LockedSource) Seed(seed int64) {
 	r.lk.Lock()
 	defer r.lk.Unlock()
 	r.src.Seed(seed)
+}
+
+var table = crc32.MakeTable(crc32.Castagnoli)
+
+type CRC uint32
+
+func NewCRC(b []byte) CRC {
+	return CRC(0).Update(b)
+}
+
+func (c CRC) Update(b []byte) CRC {
+	return CRC(crc32.Update(uint32(c), table, b))
+}
+
+func (c CRC) Value() uint32 {
+	return uint32(c>>15|c<<17) + 0xa282ead8
 }

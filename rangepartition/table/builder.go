@@ -127,6 +127,7 @@ func NewTableBuilder(stream streamclient.StreamClient) *Builder {
 				utils.Check(err)
 
 				for i, offset := range offsets {
+					//在写入block之后, 把block的sz, baseKey, offset写入metablock
 					b.addBlockToIndex(baseKeys[i], extentID, offset)
 				}
 				blocks = nil
@@ -270,6 +271,7 @@ func (b *Builder) addBlockToIndex(baseKey []byte, extentID uint64, offset uint32
 		Key:      baseKey,
 		ExtentID: extentID,
 		Offset:   offset,
+		//FIXME, 如果是固定blockSize, 在这里加上sz
 	}
 	b.tableIndex.Offsets = append(b.tableIndex.Offsets, bo)
 }

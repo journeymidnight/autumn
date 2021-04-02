@@ -46,17 +46,21 @@ enum Code {
 	TruncateNotMatch = 6;
 }
 
+/*
 enum BlockType {
 	MIXED = 0;
 	PURE = 1;
 }
+*/
 
 message Block {
+	/*
 	uint32 checkSum = 1;   //4
 	uint32 blockLength = 2;//4
 	bytes userData = 3;//所以userData不能超过500字节
+	*/
 	//-- 512 --
-	bytes data = 4;
+	bytes data = 1;
 }
 
 message AppendRequest {

@@ -25,7 +25,6 @@ import (
 	"unsafe"
 
 	"github.com/journeymidnight/autumn/proto/pb"
-	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/utils"
 )
 
@@ -135,17 +134,9 @@ func ShouldWriteValueToLSM(e *pb.Entry) bool {
 	return e.Meta&uint32(BitValuePointer) == 0 && len(e.Value) <= ValueThrottle
 }
 
-func ExtractLogEntry(block *pb.Block) []*pb.Entry {
-	var mix pspb.MixedLog
-	utils.Check(mix.Unmarshal(block.UserData))
-	ret := make([]*pb.Entry, len(mix.Offsets)-1, len(mix.Offsets)-1)
-	//FIXME: offsets换成len, 表示end offset
-	for i := 0; i < len(mix.Offsets)-1; i++ {
-		length := mix.Offsets[i+1] - mix.Offsets[i]
-		entry := new(pb.Entry)
-		err := entry.Unmarshal(block.Data[mix.Offsets[i] : mix.Offsets[i]+length])
-		utils.Check(err)
-		ret[i] = entry
-	}
-	return ret
+func ExtractLogEntry(block *pb.Block) *pb.Entry {
+	entry := new(pb.Entry)
+	err := entry.Unmarshal(block.Data)
+	utils.Check(err)
+	return entry
 }
