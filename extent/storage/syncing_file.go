@@ -14,7 +14,7 @@ type SyncingFileOptions struct {
 	PreallocateSize int
 }
 
-type SyncingFile struct {
+type syncingFile struct {
 	File
 	fd              uintptr
 	useSyncRange    bool
@@ -35,7 +35,7 @@ type SyncingFile struct {
 // bytesPerSync is zero, the original file is returned as no syncing is
 // requested.
 func NewSyncingFile(f File, opts SyncingFileOptions) File {
-	s := &SyncingFile{
+	s := &syncingFile{
 		File:            f,
 		bytesPerSync:    int64(opts.BytesPerSync),
 		preallocateSize: int64(opts.PreallocateSize),
@@ -53,7 +53,7 @@ func NewSyncingFile(f File, opts SyncingFileOptions) File {
 }
 
 // NB: syncingFile.Write is unsafe for concurrent use!
-func (f *SyncingFile) Write(p []byte) (n int, err error) {
+func (f *syncingFile) Write(p []byte) (n int, err error) {
 	_ = f.preallocate(atomic.LoadInt64(&f.atomic.offset) + int64(n))
 
 	n, err = f.File.Write(p)
@@ -69,7 +69,7 @@ func (f *SyncingFile) Write(p []byte) (n int, err error) {
 	return n, nil
 }
 
-func (f *SyncingFile) preallocate(offset int64) error {
+func (f *syncingFile) preallocate(offset int64) error {
 	if f.fd == 0 || f.preallocateSize == 0 {
 		return nil
 	}
@@ -85,7 +85,7 @@ func (f *SyncingFile) preallocate(offset int64) error {
 	return preallocExtend(f.fd, offset, length)
 }
 
-func (f *SyncingFile) ratchetSyncOffset(offset int64) {
+func (f *syncingFile) ratchetSyncOffset(offset int64) {
 	for {
 		syncOffset := atomic.LoadInt64(&f.atomic.syncOffset)
 		if syncOffset >= offset {
@@ -97,7 +97,7 @@ func (f *SyncingFile) ratchetSyncOffset(offset int64) {
 	}
 }
 
-func (f *SyncingFile) Sync() error {
+func (f *syncingFile) Sync() error {
 	// We update syncOffset (atomically) in order to avoid spurious syncs in
 	// maybeSync. Note that even if syncOffset is larger than the current file
 	// offset, we still need to call the underlying file's sync for persistence
@@ -106,7 +106,7 @@ func (f *SyncingFile) Sync() error {
 	return f.syncData()
 }
 
-func (f *SyncingFile) maybeSync() error {
+func (f *syncingFile) maybeSync() error {
 	if f.bytesPerSync <= 0 {
 		return nil
 	}
@@ -137,14 +137,4 @@ func (f *SyncingFile) maybeSync() error {
 		return f.Sync()
 	}
 	return f.syncTo(syncToOffset)
-}
-
-func (f *SyncingFile) Truncate(size int64) error {
-	if err := f.File.Truncate(size); err != nil {
-		return err
-	}
-	atomic.StoreInt64(&f.atomic.syncOffset, size)
-	atomic.StoreInt64(&f.atomic.offset, size)
-	f.File.Sync()
-	return nil
 }
