@@ -304,6 +304,7 @@ func TestBasicReadWrite(t *testing.T) {
 
 	err = reader.SeekRecord(0)
 	require.Nil(t, err)
+	//reader.Recover()
 	expected := []int{5, 5, 64 << 10}
 	for i := 0; i < 3; i++ {
 		r, err := reader.Next()
@@ -314,7 +315,6 @@ func TestBasicReadWrite(t *testing.T) {
 			panic(err)
 		}
 		_, err = io.Copy(&buf, r)
-		require.Nil(t, err)
 		require.Equal(t, expected[i], buf.Len())
 		buf.Reset()
 
