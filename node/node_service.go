@@ -60,7 +60,7 @@ func (en *ExtentNode) ReplicateBlocks(ctx context.Context, req *pb.ReplicateBloc
 	}
 	ex.Lock()
 	defer ex.Unlock()
-	ret, err := ex.AppendBlocks(req.Blocks, &req.Commit)
+	ret, err := ex.AppendBlocks(req.Blocks, &req.Commit, true)
 	if err != nil {
 		return nil, err
 	}

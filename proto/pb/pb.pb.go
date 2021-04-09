@@ -213,7 +213,6 @@ func (m *EntryInfo) GetEstimatedSize() uint64 {
 }
 
 type Block struct {
-	//-- 512 --
 	Data []byte `protobuf:"bytes,1,opt,name=data,proto3" json:"data,omitempty"`
 }
 

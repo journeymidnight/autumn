@@ -643,6 +643,7 @@ func (rp *RangePartition) doWrites() {
 
 		for {
 			reqs = append(reqs, r)
+
 			if isReqsTooBig(reqs) {
 				pendingCh <- struct{}{} // blocking.
 				goto writeCase
@@ -666,12 +667,12 @@ func (rp *RangePartition) doWrites() {
 			select {
 			case r = <-rp.writeCh:
 				reqs = append(reqs, r)
-
-				if isReqsTooBig(reqs) {
-					pendingCh <- struct{}{} // blocking.
-					goto writeCase
-				}
-
+				/*
+					if isReqsTooBig(reqs) {
+						pendingCh <- struct{}{} // blocking.
+						goto writeCase
+					}
+				*/
 			default:
 				pendingCh <- struct{}{} // Push to pending before doing a write.
 				writeRequests(reqs)
