@@ -20,7 +20,6 @@ type File interface {
 	io.Writer
 	Stat() (os.FileInfo, error)
 	Sync() error
-	Truncate(size int64) error
 }
 
 // Storage is a namespace for files.
@@ -93,7 +92,7 @@ func (defaultFS) Link(oldname, newname string) error {
 }
 
 func (defaultFS) Open(name string) (File, error) {
-	return os.OpenFile(name, os.O_RDWR, 0644)
+	return os.Open(name)
 }
 
 func (defaultFS) Remove(name string) error {
