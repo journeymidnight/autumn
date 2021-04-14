@@ -20,12 +20,12 @@ import (
 	"net"
 	"path"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/journeymidnight/autumn/conn"
 	"github.com/journeymidnight/autumn/extent"
+	"github.com/journeymidnight/autumn/extent/wal"
 	smclient "github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
@@ -47,7 +47,9 @@ type ExtentNode struct {
 	nodeID      uint64
 	grcpServer  *grpc.Server
 	listenUrl   string
-	baseFileDir string
+	baseFileDir string //FIXME
+	diskFSs     []*diskFS
+	wal         *wal.WAL
 	extentMap   *sync.Map
 	//extentMap map[uint64]*extent.Extent //extent it owns: extentID => file
 	//TODO: cached SM date in EN
@@ -57,16 +59,41 @@ type ExtentNode struct {
 	smClient *smclient.SMClient
 }
 
-func NewExtentNode(baseFileDir string, listenUrl string, smAddr []string) *ExtentNode {
+func NewExtentNode(baseFileDir string, diskDirs []string, walDir string, listenUrl string, smAddr []string) (*ExtentNode, error) {
 	utils.AssertTrue(xlog.Logger != nil)
 
-	return &ExtentNode{
+	en := &ExtentNode{
 		extentMap: new(sync.Map),
 		//replicates:  new(sync.Map),
 		baseFileDir: baseFileDir,
 		listenUrl:   listenUrl,
 		smClient:    smclient.NewSMClient(smAddr),
 	}
+
+	//load disk
+	for _, diskDir := range diskDirs {
+		disk, err := OpenDiskFS(diskDir)
+		if err != nil {
+			xlog.Logger.Warnf("can not open disk %s", diskDir)
+		}
+		//FIXME: validate dirs
+		en.diskFSs = append(en.diskFSs, disk)
+	}
+
+	//load wal
+	if len(walDir) > 0 {
+		wal, err := wal.OpenWal(walDir, en.SyncFs)
+		if err != nil {
+			xlog.Logger.Warnf("can not open waldir :%s", walDir)
+		} else {
+			en.wal = wal
+		}
+	}
+	return en, nil
+}
+
+func (en *ExtentNode) SyncFs() {
+
 }
 
 func (en *ExtentNode) getExtent(ID uint64) *extent.Extent {
@@ -140,21 +167,37 @@ func (en *ExtentNode) RegisterNode() {
 }
 
 func (en *ExtentNode) LoadExtents() error {
-	fileInfos, err := ioutil.ReadDir(en.baseFileDir)
-	if err != nil {
-		return err
+	//register each extent to node
+	register := func(ex *extent.Extent) {
+		en.setExtent(ex.ID, ex)
+		xlog.Logger.Debugf("found file %s", ex.ID)
 	}
-	for _, info := range fileInfos {
-		name := info.Name()
-		if strings.HasSuffix(name, ".ext") {
-			ext, err := extent.OpenExtent(path.Join(en.baseFileDir, name))
-			if err != nil {
-				xlog.Logger.Warnf("can not open %s %v", name, err)
-				continue
-			}
-			en.setExtent(ext.ID, ext)
+
+	var wg sync.WaitGroup
+	for _, disk := range en.diskFSs {
+		wg.Add(1)
+		go func() {
+			disk.LoadExtents(register)
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+
+	replay := func(ID uint64, start uint32, data []*pb.Block) {
+		ex := en.getExtent(ID)
+		if ex == nil {
+			xlog.Logger.Warnf("extentID %d not exist", ID)
+			return
 		}
+		ex.RecoveryData(start, data)
+		//ex.CommitLength()
 	}
+
+	//replay en.wal to recovery
+	if en.wal != nil {
+		en.wal.Replay(replay)
+	}
+
 	return nil
 }
 
@@ -162,11 +205,13 @@ func (en *ExtentNode) Shutdown() {
 	en.grcpServer.Stop()
 	//loop over all extent to close
 	//Range(f func(key, value interface{}) bool)
-	en.extentMap.Range(func(k, v interface{}) bool {
-		ex := v.(*extent.Extent)
-		ex.Close()
-		return true
-	})
+	/*
+		en.extentMap.Range(func(k, v interface{}) bool {
+			ex := v.(*extent.Extent)
+			ex.Close()
+			return true
+		})
+	*/
 }
 
 func (en *ExtentNode) ServeGRPC() error {
@@ -187,4 +232,13 @@ func (en *ExtentNode) ServeGRPC() error {
 	}()
 	en.grcpServer = grpcServer
 	return nil
+}
+
+func formatNode() {
+	/*
+		1. register and get new ID
+		2. format directories
+		3.
+	*/
+
 }

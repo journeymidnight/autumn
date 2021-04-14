@@ -84,6 +84,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"os"
 
 	"github.com/journeymidnight/autumn/utils"
 )
@@ -140,6 +141,8 @@ type Reader struct {
 	err error
 	// buf is the buffer.
 	buf [BlockSize]byte
+
+	offset int64 //absolute offset from start
 }
 
 // NewReader returns a new reader.
@@ -147,6 +150,19 @@ func NewReader(r io.Reader) *Reader {
 	return &Reader{
 		r: r,
 	}
+}
+
+//called AFTER Next()
+func (r *Reader) Offset() int64 {
+	if int64(r.i) < HeaderSize {
+		panic("r.i can not be less than HeaderSize")
+	}
+	return r.offset + int64(r.i) - HeaderSize
+}
+
+//called AFTER singleReader.Read()
+func (r *Reader) End() int64 {
+	return r.offset + int64(r.j)
 }
 
 // nextChunk sets r.buf[r.i:r.j] to hold the next chunk's payload, reading the
@@ -207,10 +223,15 @@ func (r *Reader) nextChunk(wantFirst bool) error {
 			}
 			return io.EOF
 		}
+
+		s, _ := r.r.(io.Seeker)
+		r.offset, _ = s.Seek(0, os.SEEK_CUR)
+
 		n, err := io.ReadFull(r.r, r.buf[:])
 		if err != nil && err != io.ErrUnexpectedEOF {
 			return err
 		}
+
 		r.i, r.j, r.n = 0, 0, n
 	}
 }
@@ -291,6 +312,8 @@ func (r *Reader) SeekRecord(offset int64) error {
 		return r.err
 	}
 
+	r.offset = offset &^ BlockSizeMask
+
 	// Now skip to the offset requested within the block. A subsequent
 	// call to Next will return the block at the requested offset.
 	r.i, r.j = c, c
@@ -323,5 +346,3 @@ func (x singleReader) Read(p []byte) (int, error) {
 	r.i += n
 	return n, nil
 }
-
-//remove NewWriter

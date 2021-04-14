@@ -15,6 +15,7 @@
 package extent
 
 import (
+	"fmt"
 	"io"
 	"io/ioutil"
 
@@ -103,7 +104,8 @@ func readExtentHeader(file *os.File) (*extentHeader, error) {
 }
 
 func CreateExtent(fileName string, ID uint64) (*Extent, error) {
-	f, err := os.OpenFile(fileName, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
+	//FIXME: lock file
+	f, err := os.OpenFile(fileName, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return nil, err
 	}
@@ -123,7 +125,6 @@ func CreateExtent(fileName string, ID uint64) (*Extent, error) {
 		commitLength: 0,
 		fileName:     fileName,
 		file:         f,
-		writer:       record.NewLogWriter(f, 0, 0),
 	}, nil
 
 }
@@ -166,9 +167,7 @@ func OpenExtent(fileName string) (*Extent, error) {
 		log的格式是n * record.BlockSize + tail, 一般不一致是在tail部分, 和leveldb类似, 在replayWAL
 		时, 如果发现错误, 则create新的extent或者总是create新extent(rocksdb或者leveldb逻辑)
 	*/
-
-	//前面可以只读block的meta, 直到最后一个block再读文件数据, 检查checksum
-	f, err := os.OpenFile(fileName, os.O_APPEND|os.O_RDWR, 0644)
+	f, err := os.OpenFile(fileName, os.O_RDWR, 0644)
 	if err != nil {
 		return nil, err
 	}
@@ -179,17 +178,12 @@ func OpenExtent(fileName string) (*Extent, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	bn := (info.Size() / record.BlockSize)
-	offset := int32(info.Size()) % record.BlockSize
-
 	return &Extent{
 		isSeal:       0,
 		commitLength: currentSize,
 		fileName:     fileName,
 		file:         f,
 		ID:           eh.ID,
-		writer:       record.NewLogWriter(f, bn, offset),
 	}, nil
 }
 
@@ -228,8 +222,10 @@ func (r *extentReader) Read(p []byte) (n int, err error) {
 func (ex *Extent) Seal(commit uint32) error {
 	ex.Lock()
 	defer ex.Unlock()
-	atomic.StoreInt32(&ex.isSeal, 1)
 
+	atomic.StoreInt32(&ex.isSeal, 1)
+	ex.writer.Close()
+	ex.writer = nil
 	currentLength := ex.commitLength
 	if currentLength < commit {
 		return errors.Errorf("commit is less than current commit length")
@@ -249,10 +245,10 @@ func (ex *Extent) IsSeal() bool {
 	return atomic.LoadInt32(&ex.isSeal) == 1
 }
 
-func (ex *Extent) getReader(offset uint32) *extentReader {
+func (ex *Extent) getReader() *extentReader {
 	return &extentReader{
 		extent: ex,
-		pos:    int64(offset),
+		pos:    int64(0),
 	}
 
 }
@@ -260,11 +256,78 @@ func (ex *Extent) getReader(offset uint32) *extentReader {
 func (ex *Extent) Close() {
 	ex.Lock()
 	defer ex.Unlock()
+	if ex.writer != nil {
+		ex.writer.Close()
+	}
 	ex.file.Close()
 }
 
+func (ex *Extent) ResetWriter() error {
+
+	ex.Lock()
+	defer ex.Unlock()
+	if ex.writer != nil {
+		ex.writer.Close()
+	}
+	utils.AssertTrue(ex.IsSeal() == false)
+	info, err := ex.file.Stat()
+	if err != nil {
+		return err
+	}
+	utils.AssertTrue(ex.CommitLength() == uint32(info.Size()))
+
+	ex.file.Seek(int64(ex.commitLength), os.SEEK_SET)
+	bn := (ex.CommitLength() / record.BlockSize)
+	offset := int32(ex.CommitLength()) % record.BlockSize
+	newWriter := record.NewLogWriter(ex.file, int64(bn), offset)
+	ex.writer = newWriter
+	return nil
+}
+
+func (ex *Extent) RecoveryData(start uint32, blocks []*pb.Block) error {
+
+	ex.Lock()
+	defer ex.Unlock()
+
+	expectedEnd := start
+	for _, block := range blocks {
+		expectedEnd = record.ComputeEnd(expectedEnd, uint32(len(block.Data)))
+	}
+	if expectedEnd <= ex.CommitLength() {
+		return nil
+	}
+	ex.file.Seek(int64(start), os.SEEK_SET)
+
+	fmt.Printf("fixing %d blocks from %d\n", len(blocks), start)
+	//fix current extent
+	bn := (start / record.BlockSize)
+	offset := int32(start) % record.BlockSize
+	newWriter := record.NewLogWriter(ex.file, int64(bn), offset)
+	for _, block := range blocks {
+		if _, _, err := newWriter.WriteRecord(block.Data); err != nil {
+			return err
+		}
+	}
+
+	newWriter.Close() //close will force flush data to underlying file. but doesn't close file
+
+	info, err := ex.file.Stat()
+	utils.Check(err)
+	utils.AssertTrue(expectedEnd == uint32(info.Size()))
+	atomic.StoreUint32(&ex.commitLength, expectedEnd)
+	return nil
+}
+
+func (ex *Extent) Sync() {
+	ex.Lock()
+	defer ex.Unlock()
+	ex.writer.Sync()
+}
+
 func (ex *Extent) AppendBlocks(blocks []*pb.Block, lastCommit *uint32, doSync bool) ([]uint32, uint32, error) {
-	ex.AssertLock()
+
+	ex.Lock()
+	defer ex.Unlock()
 
 	if atomic.LoadInt32(&ex.isSeal) == 1 {
 		return nil, 0, errors.Errorf("immuatble")
@@ -280,29 +343,33 @@ func (ex *Extent) AppendBlocks(blocks []*pb.Block, lastCommit *uint32, doSync bo
 	truncate := func() {
 		ex.file.Truncate(int64(currentLength))
 		ex.commitLength = currentLength
+		//reset writer
+		ex.ResetWriter()
 	}
 
 	var offsets []uint32
+	var start int64
+	var end int64
+	var err error
 	for _, block := range blocks {
-		start, end, err := ex.writer.WriteRecord(block.Data)
+		start, end, err = ex.writer.WriteRecord(block.Data)
 		if err != nil {
-			defer truncate()
+			truncate()
 			return nil, 0, err
 		}
-		//if we have ssd journal, do not have to sync every time.
-		//TODO: wait ssd channel,  这里分情况, 如果有SSD journal, 就不需要调用sync
-		//如果没有SSD journal,就需要调用sync
 		offsets = append(offsets, uint32(start))
-		currentLength = uint32(end)
 	}
 	ex.writer.Flush()
 	if doSync {
-		//FIXME
-		ex.file.Sync()
+		ex.writer.Sync()
 	}
+	utils.AssertTrue(end <= math.MaxUint32)
 
-	atomic.StoreUint32(&ex.commitLength, currentLength)
-	return offsets, currentLength, nil
+	atomic.StoreUint32(&ex.commitLength, uint32(end))
+	if lastCommit != nil {
+		*lastCommit = uint32(end)
+	}
+	return offsets, uint32(end), nil
 }
 
 func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize uint32) ([]*pb.Block, []uint32, uint32, error) {
@@ -318,7 +385,7 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 		}
 	}
 
-	wrapReader := ex.getReader(0) //thread-safe
+	wrapReader := ex.getReader() //thread-safe
 	rr := record.NewReader(wrapReader)
 	err := rr.SeekRecord(int64(offset))
 	if err != nil {
@@ -327,10 +394,11 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 	size := uint32(0)
 
 	var offsets []uint32
+	var end uint32
 	for i := uint32(0); i < maxNumOfBlocks; i++ {
-
-		start := wrapReader.pos
 		reader, err := rr.Next()
+		start := rr.Offset()
+
 		if err == io.EOF {
 			if ex.IsSeal() {
 				return ret, offsets, uint32(wrapReader.pos), EndOfExtent
@@ -341,7 +409,8 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 
 		if err != nil {
 			//TODO: we can call rr.Recover() to continue
-			return nil, nil, 0, err
+			rr.Recover()
+			continue
 		}
 
 		data, err := ioutil.ReadAll(reader)
@@ -352,8 +421,9 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 		}
 		ret = append(ret, &pb.Block{data})
 		offsets = append(offsets, uint32(start))
+		end = uint32(rr.End())
 	}
-	return ret, offsets, uint32(wrapReader.pos), nil
+	return ret, offsets, end, nil
 }
 
 func (ex *Extent) CommitLength() uint32 {
@@ -362,6 +432,7 @@ func (ex *Extent) CommitLength() uint32 {
 
 //helper function, block could be pb.Entries, support ReadEntries
 func (ex *Extent) ReadEntries(offset uint32, maxTotalSize uint32, replay bool) ([]*pb.EntryInfo, uint32, error) {
+
 	blocks, offsets, end, err := ex.ReadBlocks(offset, 10, maxTotalSize)
 	if err != nil && err != EndOfStream && err != EndOfExtent {
 		return nil, 0, err
@@ -378,6 +449,7 @@ func (ex *Extent) ReadEntries(offset uint32, maxTotalSize uint32, replay bool) (
 	}
 
 	return ret, end, err
+
 }
 
 func ExtractEntryInfo(b *pb.Block, extentID uint64, offset uint32, replay bool) (*pb.EntryInfo, error) {
@@ -395,7 +467,7 @@ func ExtractEntryInfo(b *pb.Block, extentID uint64, offset uint32, replay bool) 
 				Offset:        offset,
 			}, nil
 		} else { //gc read
-			entry.Value = nil //或者可以直接返回空
+			entry.Value = nil //或者可以直接返回空entry
 			return &pb.EntryInfo{
 				Log:           entry,
 				EstimatedSize: uint64(entry.Size()),

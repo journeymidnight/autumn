@@ -272,7 +272,9 @@ func TestReopenLogWriter(t *testing.T) {
 	utils.SetRandStringBytes(data)
 	start, end, _ := w.WriteRecord(data)
 	require.Equal(t, int64(24), start)
-	require.Equal(t, int64(32782+24), end) //7*2 + (32<<10)
+	xend := ComputeEnd(uint32(start), uint32(len(data)))
+
+	require.Equal(t, end, int64(xend))
 
 }
 func TestBasicReadWrite(t *testing.T) {
@@ -292,9 +294,7 @@ func TestBasicReadWrite(t *testing.T) {
 
 	data := make([]byte, (64 << 10))
 	utils.SetRandStringBytes(data)
-	start, end, _ = w.WriteRecord(data) //64K文件会占据3个block, 7*3 + (64<<10)
-	//7*3 + (64<<10) = 65557
-	require.Equal(t, int64(24+65557), end)
+	start, end, _ = w.WriteRecord(data)
 
 	w.Sync()
 
@@ -630,7 +630,7 @@ func TestRecoverLastCompleteBlock(t *testing.T) {
 }
 
 func BenchmarkRecordWrite(b *testing.B) {
-	for _, size := range []int{8, 16, 32, 64, 128} {
+	for _, size := range []int{8, 16, 32, 64, 128, 1 << 20} {
 		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
 			w := NewLogWriter(ioutil.Discard, 0, 0)
 			defer w.Close()

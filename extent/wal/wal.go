@@ -243,7 +243,7 @@ func (wal *Wal) doWrites() {
 }
 
 //write will block until write is done
-func (wal *Wal) Write(extentID uint64, start uint32, blocks []pb.Block) error {
+func (wal *Wal) Write(extentID uint64, start uint32, blocks []*pb.Block) error {
 	req := requestPool.Get().(*request)
 	req.reset()
 	req.data = blocks
@@ -277,7 +277,7 @@ func (wal *Wal) Close() {
 	}
 }
 
-func (wal *Wal) Replay(callback func(uint64, uint32, []pb.Block)) error {
+func (wal *Wal) Replay(callback func(uint64, uint32, []*pb.Block)) error {
 	//delete pendingWals after replay
 	for _, fname := range wal.oldWALs {
 		f, err := storage.Default.Open(fname)
@@ -292,7 +292,6 @@ func (wal *Wal) Replay(callback func(uint64, uint32, []pb.Block)) error {
 				break
 			}
 			if err != nil {
-				//records.Recover()
 				xlog.Logger.Warnf("recovering: %v", err)
 				break
 			}
@@ -306,9 +305,9 @@ func (wal *Wal) Replay(callback func(uint64, uint32, []pb.Block)) error {
 }
 
 type request struct {
-	extentID uint64     //encoding
-	start    uint32     //encoding
-	data     []pb.Block //encoding
+	extentID uint64      //encoding
+	start    uint32      //encoding
+	data     []*pb.Block //encoding
 
 	//return value
 	err error
@@ -348,7 +347,7 @@ func (r *request) decode(buf []byte) {
 	buf = buf[off:]
 	for len(buf) > 0 {
 		size, sz := binary.Uvarint(buf)
-		r.data = append(r.data, pb.Block{
+		r.data = append(r.data, &pb.Block{
 			Data: buf[sz : sz+int(size)],
 		})
 
