@@ -2,7 +2,6 @@ package utils
 
 import (
 	"fmt"
-	"hash/adler32"
 	"hash/crc32"
 	"math"
 	"math/rand"
@@ -63,11 +62,13 @@ func SetRandStringBytes(data []byte) {
 	}
 }
 
+/*
 func AdlerCheckSum(data []byte) uint32 {
 	hash := adler32.New()
 	hash.Write(data)
 	return hash.Sum32()
 }
+*/
 
 func Check(err error) {
 	if err != nil {

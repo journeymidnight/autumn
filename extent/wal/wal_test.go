@@ -31,10 +31,10 @@ func TestWalEncode(t *testing.T) {
 	x := request{
 		extentID: 10,
 		start:    3,
-		data:     make([]pb.Block, 2),
+		data:     make([]*pb.Block, 2),
 	}
-	x.data[0] = pb.Block{make([]byte, 99)}
-	x.data[1] = pb.Block{make([]byte, 567)}
+	x.data[0] = &pb.Block{make([]byte, 99)}
+	x.data[1] = &pb.Block{make([]byte, 567)}
 
 	buf := new(bytes.Buffer)
 	x.encodeTo(buf)
@@ -64,14 +64,14 @@ func TestWalWrite(t *testing.T) {
 	require.Nil(t, err)
 
 	for i := 0; i < 10; i++ {
-		wal.Write(10, 10, []pb.Block{{Data: make([]byte, 100)}, {Data: make([]byte, 9)}})
+		wal.Write(10, 10, []*pb.Block{&pb.Block{Data: make([]byte, 100)}, &pb.Block{Data: make([]byte, 9)}})
 	}
 	wal.Close()
 
 	wal, err = OpenWal(p, func() {})
 	require.Nil(t, err)
 
-	wal.Replay(func(id uint64, start uint32, data []pb.Block) {
+	wal.Replay(func(id uint64, start uint32, data []*pb.Block) {
 		require.Equal(t, uint32(10), start)
 		require.Equal(t, 2, len(data))
 	})
@@ -87,7 +87,7 @@ func TestMultiWal(t *testing.T) {
 	maxWalSize = (1 << 20) //for debug
 	require.Nil(t, err)
 	for i := 0; i < 100; i++ {
-		wal.Write(10, 10, []pb.Block{{Data: make([]byte, 50240)}, {Data: make([]byte, 9)}})
+		wal.Write(10, 10, []*pb.Block{&pb.Block{Data: make([]byte, 50240)}, &pb.Block{Data: make([]byte, 9)}})
 	}
 
 	wal.Close()
@@ -118,7 +118,7 @@ func BenchmarkRecordWrite(b *testing.B) {
 			b.SetBytes(int64(len(buf)))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				err := wal.Write(10, 10, []pb.Block{{Data: buf}})
+				err := wal.Write(10, 10, []*pb.Block{{Data: buf}})
 				if err != nil {
 					b.Fatal(err)
 				}

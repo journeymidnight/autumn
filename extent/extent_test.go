@@ -3,13 +3,19 @@ package extent
 import (
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 
+	"github.com/journeymidnight/autumn/extent/wal"
+
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
+	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
+	"go.uber.org/zap/zapcore"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -70,7 +76,11 @@ func (f *memory) Write(p []byte) (n int, err error) {
 	return n, nil
 }
 
-func generateBlock(name string, size uint32) *pb.Block {
+func init() {
+	xlog.InitLog([]string{"extent_test.log"}, zapcore.DebugLevel)
+}
+
+func generateBlock(size uint32) *pb.Block {
 	data := make([]byte, size)
 	utils.SetRandStringBytes(data)
 	return &pb.Block{
@@ -80,18 +90,17 @@ func generateBlock(name string, size uint32) *pb.Block {
 
 func TestAppendReadFile(t *testing.T) {
 	cases := []*pb.Block{
-		generateBlock("object1", 4096),
-		generateBlock("object2", 4096),
-		generateBlock("object3", 8192),
-		generateBlock("object4", 4096),
+		generateBlock(4096),
+		generateBlock(4096),
+		generateBlock(8192),
+		generateBlock(4096),
 	}
 
 	extent, err := CreateExtent("localtest.ext", 100)
 	defer os.Remove("localtest.ext")
+	extent.ResetWriter()
 	assert.Nil(t, err)
-	extent.Lock()
 	ret, _, err := extent.AppendBlocks(cases, nil, true)
-	extent.Unlock()
 	assert.Nil(t, err)
 
 	//single thread read
@@ -138,34 +147,29 @@ func TestReplayExtent(t *testing.T) {
 
 	extentName := "localtest.ext"
 	cases := []*pb.Block{
-		generateBlock("object1", 4096),
-		generateBlock("object2", 4096),
-		generateBlock("object3", 8192),
-		generateBlock("object4", 4096),
+		generateBlock(4096),
+		generateBlock(4096),
+		generateBlock(8192),
+		generateBlock(4096),
 	}
 
 	extent, err := CreateExtent(extentName, 100)
+	extent.ResetWriter()
 	defer os.Remove(extentName)
 	assert.Nil(t, err)
-	extent.Lock()
 	_, _, err = extent.AppendBlocks(cases, nil, true)
-	extent.Unlock()
 	assert.Nil(t, err)
-
 	extent.Close()
 
-	//open append extent, replay all the data
 	ex, err := OpenExtent(extentName)
 	assert.Nil(t, err)
 	assert.False(t, ex.IsSeal())
+	ex.ResetWriter()
 
 	//write new cases
-	ex.Lock()
 	_, _, err = ex.AppendBlocks(cases, nil, true)
-	ex.Unlock()
 	assert.Nil(t, err)
 	commit := ex.CommitLength()
-
 	err = ex.Seal(ex.commitLength)
 	assert.Nil(t, err)
 	defer os.Remove("localtest.idx")
@@ -185,29 +189,100 @@ func TestReplayExtent(t *testing.T) {
 
 }
 
-/*
-func TestExtentReadEntries(t *testing.T) {
-	ex, err := OpenExtent("extent_13.ext")
-	require.Nil(t, err)
-	//from start
-	eis, _, err := ex.ReadEntries(512, 32<<20, true)
-	for _, ei := range eis {
-		fmt.Printf("%d, %s, len %d\n", ei.Log.Meta, ei.Log.Key, len(ei.Log.Value))
+func TestWalExtent(t *testing.T) {
+	extent, err := CreateExtent("localtest.ext", 100)
+	extent.ResetWriter()
+	defer os.Remove("localtest.ext")
+	if err != nil {
+		panic(err.Error())
 	}
-	ex.Close()
+	p, err := ioutil.TempDir(os.TempDir(), "waltest")
+	defer os.RemoveAll(p)
+
+	walLog, err := wal.OpenWal(p, func() {
+		extent.Sync()
+	})
+	require.Nil(t, err)
+
+	cases := []*pb.Block{
+		generateBlock(10),
+		generateBlock(20),
+		generateBlock(4 << 10),
+		generateBlock(40 << 20),
+		generateBlock(10),
+	}
+
+	last := uint32(0)
+	i := 0
+	for _, block := range cases {
+		var wg sync.WaitGroup
+		wg.Add(2) //2 tasks
+		errC := make(chan error)
+		go func() { //wal
+			defer wg.Done()
+			fmt.Printf("wal have %d\n", last)
+			err := walLog.Write(100, last, []*pb.Block{block})
+			errC <- err
+		}()
+
+		go func() { //extent
+			defer wg.Done()
+
+			if i == len(cases)-1 { //skip last write
+				errC <- nil
+				return
+			}
+
+			_, _, err := extent.AppendBlocks([]*pb.Block{block}, &last, false)
+			errC <- err
+		}()
+
+		go func() {
+			wg.Wait()
+			close(errC)
+		}()
+
+		for err := range errC {
+			require.Nil(t, err)
+		}
+		i++
+	}
+	walLog.Close()
+	extent.Close()
+
+	extent, err = OpenExtent("localtest.ext")
+	require.Nil(t, err)
+	walLog, err = wal.OpenWal(p, func() {})
+	require.Nil(t, err)
+
+	err = walLog.Replay(func(_ uint64, start uint32, blocks []*pb.Block) {
+		if err := extent.RecoveryData(start, blocks); err != nil {
+			t.Fatal(err.Error())
+		}
+	})
+
+	require.Nil(t, err)
+
+	//FIXME
+	blocks, offsets, end, err := extent.ReadBlocks(0, uint32(len(cases)), 60<<20)
+	//require.Nil(t, err)
+	for i := range blocks {
+		fmt.Printf("offset %d, len:%d\n", offsets[i], len(blocks[i].Data))
+		require.Equal(t, cases[i].Data, blocks[i].Data)
+	}
+	fmt.Printf("End:%d\n", end)
 }
-*/
 
 func BenchmarkExtent(b *testing.B) {
 	extent, err := CreateExtent("localtest.ext", 100)
+	extent.ResetWriter()
 	defer os.Remove("localtest.ext")
 	if err != nil {
 		panic(err.Error())
 	}
 	n := uint32(4096)
-	block := generateBlock("test", n)
+	block := generateBlock(n)
 	commit := uint32(0)
-	extent.Lock()
 	for i := 0; i < b.N; i++ {
 		_, commit, err = extent.AppendBlocks([]*pb.Block{
 			block,

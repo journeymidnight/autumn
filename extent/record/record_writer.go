@@ -7,6 +7,7 @@ package record
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	_ "fmt"
 	"io"
 	"sync"
@@ -170,11 +171,14 @@ func (w *LogWriter) Close() error {
 	if err := w.Sync(); err != nil {
 		return err
 	}
-	if w.c != nil {
-		if err := w.c.Close(); err != nil {
-			return err
+	//Closing LogWriter do not close the file.
+	/*
+		if w.c != nil {
+			if err := w.c.Close(); err != nil {
+				return err
+			}
 		}
-	}
+	*/
 	w.err = errors.New("pebble/record: closed LogWriter")
 	return nil
 }
@@ -272,19 +276,50 @@ func (w *LogWriter) Sync() error {
 	return nil
 }
 
+func ComputeEnd(start uint32, length uint32) uint32 {
+	fix := func(end uint32) uint32 {
+		written := end & BlockSizeMask
+		if BlockSize-written < HeaderSize {
+			return utils.Ceil(end, BlockSize)
+		}
+		return end
+	}
+
+	var middle, last uint32
+	written := start & BlockSizeMask
+	if length+HeaderSize <= BlockSize-written {
+		return fix(start + HeaderSize + length) //full
+	}
+
+	n := length - (BlockSize - written - HeaderSize) //remaining data to write
+	first := start + BlockSize - written
+	middle = (n / (BlockSize - HeaderSize)) * BlockSize
+	if (n % (BlockSize - HeaderSize)) > 0 {
+		last = ((n % (BlockSize - HeaderSize)) + HeaderSize)
+	}
+	return fix(first + middle + last)
+
+}
+
 // WriteRecord writes a complete record. Returns the offset just past the end
 // of the record.
 func (w *LogWriter) WriteRecord(p []byte) (int64, int64, error) {
 	if w.err != nil {
 		return -1, -1, w.err
 	}
-
+	lp := len(p)
 	start := w.blockNumber*BlockSize + int64(w.block.written)
 	for i := 0; i == 0 || len(p) > 0; i++ {
 		p = w.emitFragment(i, p)
 	}
 
 	end := w.blockNumber*BlockSize + int64(w.block.written)
+	xend := ComputeEnd(uint32(start), uint32(lp))
+
+	if uint32(end) != xend {
+		panic(fmt.Sprintf("start %d, len %d, end %d, your end is %d\n", start, lp, end, xend))
+	}
+
 	return start, end, w.err
 }
 
