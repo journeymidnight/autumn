@@ -120,30 +120,54 @@ func (client *SMClient) Alive() bool {
 	return len(client.conns) > 0
 }
 
-func (client *SMClient) RegisterNode(ctx context.Context, addr string) (uint64, error) {
+
+
+func (client *SMClient) try(f func(conn *grpc.ClientConn) bool, x time.Duration) {
 	client.RLock()
-	defer client.RUnlock()
+	connLen := len(client.conns)
+	client.RUnlock()
+
 	current := atomic.LoadInt32(&client.lastLeader)
-	for loop := 0; loop < len(client.conns)*2; loop++ {
+	for loop := 0; loop < connLen*2; loop++ {
+		client.RLock()
 		if client.conns != nil && client.conns[current] != nil {
-			c := pb.NewStreamManagerServiceClient(client.conns[current])
-			res, err := c.RegisterNode(ctx, &pb.RegisterNodeRequest{
-				Addr: addr,
-			})
-			if err == context.Canceled || err == context.DeadlineExceeded {
-				return 0, err
-			}
-			if err != nil {
-				xlog.Logger.Warnf(err.Error())
-				current = (current + 1) % int32(len(client.conns))
-				time.Sleep(500 * time.Millisecond)
+			//if f() return true, sleep and continue
+			//if f() return false, return
+			if f(client.conns[current]) == true {
+				current = (current + 1) % int32(connLen)
+				client.RUnlock()
+				time.Sleep(x)
 				continue
+			} else {
+				atomic.StoreInt32(&client.lastLeader, current)
+				client.RUnlock()
+				return
 			}
-			atomic.StoreInt32(&client.lastLeader, current)
-			return res.NodeId, nil
 		}
 	}
-	return 0, errors.Errorf("timeout : cannot register Node")
+}
+
+func (client *SMClient) RegisterNode(ctx context.Context, addr string) (uint64, error) {
+	var err error
+	var res *pb.RegisterNodeResponse
+	nodeID := uint64(0)
+	client.try(func(conn *grpc.ClientConn) bool {
+		c := pb.NewStreamManagerServiceClient(conn)
+		res, err = c.RegisterNode(ctx, &pb.RegisterNodeRequest{
+			Addr: addr,
+		})
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			return false
+		}
+		if err != nil {
+			xlog.Logger.Warnf(err.Error())
+			return true
+		}
+		nodeID = res.NodeId
+		return false
+	}, 10*time.Millisecond)
+
+	return nodeID, err
 }
 
 func (client *SMClient) CreateStream(ctx context.Context) (*pb.StreamInfo, *pb.ExtentInfo, error) {

@@ -116,7 +116,7 @@ func CreateExtent(fileName string, ID uint64) (*Extent, error) {
 		return nil, err
 	}
 
-	f.Sync()
+	//f.Sync()
 
 	//write header of Extent
 	return &Extent{
@@ -269,6 +269,10 @@ func (ex *Extent) ResetWriter() error {
 	if ex.writer != nil {
 		ex.writer.Close()
 	}
+	if atomic.LoadInt32(&ex.isSeal) == 1 {
+		return nil
+	}
+
 	utils.AssertTrue(ex.IsSeal() == false)
 	info, err := ex.file.Stat()
 	if err != nil {
@@ -324,7 +328,7 @@ func (ex *Extent) Sync() {
 	ex.writer.Sync()
 }
 
-func (ex *Extent) AppendBlocks(blocks []*pb.Block, lastCommit *uint32, doSync bool) ([]uint32, uint32, error) {
+func (ex *Extent) AppendBlocks(blocks []*pb.Block,  doSync bool) ([]uint32, uint32, error) {
 
 	ex.Lock()
 	defer ex.Unlock()
@@ -334,9 +338,11 @@ func (ex *Extent) AppendBlocks(blocks []*pb.Block, lastCommit *uint32, doSync bo
 	}
 
 	//for secondary extents, it must check lastCommit.
+	/*
 	if lastCommit != nil && *lastCommit != ex.CommitLength() {
 		return nil, 0, errors.Errorf("offset not match...")
 	}
+	*/
 
 	currentLength := atomic.LoadUint32(&ex.commitLength)
 
@@ -366,9 +372,6 @@ func (ex *Extent) AppendBlocks(blocks []*pb.Block, lastCommit *uint32, doSync bo
 	utils.AssertTrue(end <= math.MaxUint32)
 
 	atomic.StoreUint32(&ex.commitLength, uint32(end))
-	if lastCommit != nil {
-		*lastCommit = uint32(end)
-	}
 	return offsets, uint32(end), nil
 }
 
@@ -391,19 +394,18 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 	if err != nil {
 		return nil, nil, 0, err
 	}
-	size := uint32(0)
+	size := int64(0)
 
 	var offsets []uint32
 	var end uint32
 	for i := uint32(0); i < maxNumOfBlocks; i++ {
 		reader, err := rr.Next()
 		start := rr.Offset()
-
 		if err == io.EOF {
 			if ex.IsSeal() {
-				return ret, offsets, uint32(wrapReader.pos), EndOfExtent
+				return ret, offsets, end, EndOfExtent
 			} else {
-				return ret, offsets, uint32(wrapReader.pos), EndOfStream
+				return ret, offsets, end, EndOfStream
 			}
 		}
 
@@ -413,13 +415,14 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 			continue
 		}
 
-		data, err := ioutil.ReadAll(reader)
-
-		size += uint32(len(data))
-		if size > maxTotalSize {
+		if rr.End() - start + size > int64(maxTotalSize) {
+			end = uint32(start)
 			break
 		}
-		ret = append(ret, &pb.Block{data})
+
+		data, err := ioutil.ReadAll(reader)
+
+		ret = append(ret, &pb.Block{Data:data})
 		offsets = append(offsets, uint32(start))
 		end = uint32(rr.End())
 	}

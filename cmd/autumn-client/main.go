@@ -8,14 +8,18 @@ import (
 	"io/ioutil"
 	"os"
 	"os/signal"
+	"path"
+	"path/filepath"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/journeymidnight/autumn/manager/pmclient"
 	"github.com/journeymidnight/autumn/manager/smclient"
+	"github.com/journeymidnight/autumn/node"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
 	_ "github.com/journeymidnight/autumn/xlog"
@@ -374,7 +378,7 @@ func main() {
 	app.Commands = []*cli.Command{
 		{
 			Name:  "info",
-			Usage: "info --smAddrs <path>",
+			Usage: "info --smAddr <path>",
 			Flags: []cli.Flag{
 				&cli.StringFlag{Name: "smAddr", Value: "127.0.0.1:3401"},
 			},
@@ -439,12 +443,113 @@ func main() {
 			},
 			Action: autumnRange,
 		},
+		{
+			Name: "format",
+			Usage: "format --walDir <dir> --listenUrl <addr> --smAddr <addrs> <dir list> ",
+			Flags: []cli.Flag{
+				&cli.StringFlag{Name: "smAddr", Value: "127.0.0.1:3401"},
+				&cli.StringFlag{Name: "listenUrl"},
+				&cli.StringFlag{Name: "walDir"},
+
+			},
+			Action :format,
+		},
 	}
 	err := app.Run(os.Args)
 	if err != nil {
 		fmt.Println(err)
 	}
 
+}
+
+func format(c *cli.Context) error {
+	//if any error happend, revert.
+	revert := func(dirList []string) {
+		for _, dir := range dirList {
+			d, _ := os.Open(dir)
+			defer d.Close()
+			names, _ := d.Readdirnames(-1)
+			for _, name := range names {
+				if err := os.RemoveAll(filepath.Join(dir, name)); err != nil {
+					fmt.Printf(err.Error())
+				}
+			}
+		}
+		return 
+	}
+	smAddr := utils.SplitAndTrim(c.String("smAddr"), ",")
+	listenUrl := c.String("listenUrl")
+	
+
+	walDir := c.String("walDir")
+	if len(walDir) > 0 {
+		_, err := os.Stat(walDir)
+		if err != nil {
+			return err
+		}
+	}
+
+	dirList := c.Args().Slice()
+
+	if len(listenUrl) == 0 {
+		return errors.New("listenUrl can not be empty")
+	}
+	if len(dirList) == 0 {
+		return errors.New("dir List can not be empty")
+	}
+
+	sm := smclient.NewSMClient(smAddr)
+
+	if err := sm.Connect(); err != nil {
+		return err
+	}
+
+	for _, dir := range dirList {
+		if err := node.FormatDisk(dir); err != nil {
+			revert(dirList)
+			return err
+		}
+	}
+
+
+	//register a new NodeID
+
+	fmt.Printf("format on disks : %+v", dirList)
+
+	fmt.Printf("register node on stream manager ..\n")
+	nodeID, err := sm.RegisterNode(context.Background(), listenUrl)
+	if err != nil {
+		revert(dirList)
+		return err
+	}
+
+	fmt.Printf("node %d is registered\n", nodeID)
+	for _, dir := range dirList {
+		storeIDPath := path.Join(dir, "node_id")
+		if err := ioutil.WriteFile(storeIDPath, []byte(fmt.Sprintf("%d", nodeID)), 0644); err != nil {
+			revert(dirList)
+			return err
+		}
+	}
+
+
+	//generate config file for node
+	var config node.Config
+	config.Dirs  = dirList
+	config.ID = nodeID
+	config.ListenUrl = listenUrl
+	config.WalDir = walDir
+	
+	f , err := os.Create(fmt.Sprintf("en_%d.toml", nodeID))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err = toml.NewEncoder(f).Encode(config); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func wbench(c *cli.Context) error {

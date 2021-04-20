@@ -271,7 +271,7 @@ retry:
 
 	switch res.Code {
 	case pb.Code_OK:
-		iter.currentOffset = res.EndOffset
+		iter.currentOffset = res.End
 		return nil
 	case pb.Code_EndOfExtent:
 		iter.currentOffset = 512 //skip extent header
@@ -464,11 +464,4 @@ retry:
 	}
 	return extentID, res.Offsets, nil
 
-}
-
-func SizeOfBlocks(blocks []*pb.Block) (ret uint32) {
-	for i := range blocks {
-		ret += blocks[i].BlockLength + 512
-	}
-	return
 }

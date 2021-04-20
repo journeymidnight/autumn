@@ -88,6 +88,27 @@ func generateBlock(size uint32) *pb.Block {
 	}
 }
 
+
+func TestReadEntries(t *testing.T) {
+	entry := new(pb.Entry)
+	entry.Key = []byte("key")
+	entry.Value = []byte("value")
+	data , err := entry.Marshal()
+	require.Nil(t, err)
+	extent, err := CreateExtent("localtest.ext", 100)
+	defer os.Remove("localtest.ext")
+	extent.ResetWriter()
+	extent.AppendBlocks([]*pb.Block{{Data: data}}, true)
+
+	entries, end, err := extent.ReadEntries(0, 10 << 20, true)
+	for i := range entries {
+		require.Equal(t, uint64(100),entries[i].ExtentID)
+		require.Equal(t, []byte("key"), entries[i].Log.Key)
+		require.Equal(t, []byte("value"), entries[i].Log.Value)
+	}
+	fmt.Println(end)
+}
+
 func TestAppendReadFile(t *testing.T) {
 	cases := []*pb.Block{
 		generateBlock(4096),
@@ -100,7 +121,7 @@ func TestAppendReadFile(t *testing.T) {
 	defer os.Remove("localtest.ext")
 	extent.ResetWriter()
 	assert.Nil(t, err)
-	ret, _, err := extent.AppendBlocks(cases, nil, true)
+	ret, _, err := extent.AppendBlocks(cases, true)
 	assert.Nil(t, err)
 
 	//single thread read
@@ -157,7 +178,7 @@ func TestReplayExtent(t *testing.T) {
 	extent.ResetWriter()
 	defer os.Remove(extentName)
 	assert.Nil(t, err)
-	_, _, err = extent.AppendBlocks(cases, nil, true)
+	_, _, err = extent.AppendBlocks(cases, true)
 	assert.Nil(t, err)
 	extent.Close()
 
@@ -167,7 +188,7 @@ func TestReplayExtent(t *testing.T) {
 	ex.ResetWriter()
 
 	//write new cases
-	_, _, err = ex.AppendBlocks(cases, nil, true)
+	_, _, err = ex.AppendBlocks(cases, true)
 	assert.Nil(t, err)
 	commit := ex.CommitLength()
 	err = ex.Seal(ex.commitLength)
@@ -188,6 +209,7 @@ func TestReplayExtent(t *testing.T) {
 	assert.Equal(t, cases[0], blocks[0])
 
 }
+
 
 func TestWalExtent(t *testing.T) {
 	extent, err := CreateExtent("localtest.ext", 100)
@@ -212,7 +234,7 @@ func TestWalExtent(t *testing.T) {
 		generateBlock(10),
 	}
 
-	last := uint32(0)
+	end := uint32(0)
 	i := 0
 	for _, block := range cases {
 		var wg sync.WaitGroup
@@ -220,8 +242,7 @@ func TestWalExtent(t *testing.T) {
 		errC := make(chan error)
 		go func() { //wal
 			defer wg.Done()
-			fmt.Printf("wal have %d\n", last)
-			err := walLog.Write(100, last, []*pb.Block{block})
+			err := walLog.Write(100, end, []*pb.Block{block})
 			errC <- err
 		}()
 
@@ -233,7 +254,7 @@ func TestWalExtent(t *testing.T) {
 				return
 			}
 
-			_, _, err := extent.AppendBlocks([]*pb.Block{block}, &last, false)
+			_, end, err = extent.AppendBlocks([]*pb.Block{block}, false)
 			errC <- err
 		}()
 
@@ -282,11 +303,10 @@ func BenchmarkExtent(b *testing.B) {
 	}
 	n := uint32(4096)
 	block := generateBlock(n)
-	commit := uint32(0)
 	for i := 0; i < b.N; i++ {
-		_, commit, err = extent.AppendBlocks([]*pb.Block{
+		_, _, err = extent.AppendBlocks([]*pb.Block{
 			block,
-		}, &commit, true)
+		}, true)
 
 		if err != nil {
 			panic(err.Error())

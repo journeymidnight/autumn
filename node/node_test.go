@@ -1,16 +1,9 @@
 package node
 
 import (
-	"context"
 	"fmt"
-	"os"
-	"testing"
-	"time"
 
-	"github.com/journeymidnight/autumn/proto/pb"
-	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
-	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap/zapcore"
 )
 
@@ -22,6 +15,7 @@ func init() {
 	xlog.InitLog([]string{"test.log"}, zapcore.DebugLevel)
 }
 
+/*
 func TestBasicNode(t *testing.T) {
 	nodes := make([]*ExtentNode, 3)
 	os.Mkdir("xnodestore1", 0744)
@@ -69,3 +63,4 @@ func TestBasicNode(t *testing.T) {
 	//_, err = node1.ReadBlocks(context.Background(), &pb.ReadBlocksRequest{ExtentID: 100, Offsets: []uint32{512}})
 
 }
+*/
