@@ -18,8 +18,6 @@ func newTestBlock(size uint32) *pb.Block {
 	utils.SetRandStringBytes(data)
 	rand.Seed(time.Now().UnixNano())
 	return &pb.Block{
-		CheckSum:    utils.AdlerCheckSum(data),
-		BlockLength: size,
 		Data:        data,
 	}
 }
@@ -29,10 +27,10 @@ func TestAppendReadBlocks(t *testing.T) {
 	client := NewMockStreamClient("log")
 	bReader := client.(BlockReader)
 	defer client.Close()
-	exID, offsets, err := client.Append(context.Background(), []*pb.Block{b})
+	exID, offsets,_, err := client.Append(context.Background(), []*pb.Block{b})
 	assert.Nil(t, err)
 
-	bs, err := bReader.Read(context.Background(), exID, offsets[0], 1)
+	bs,_, err := bReader.Read(context.Background(), exID, offsets[0], 1)
 	assert.Nil(t, err)
 	assert.Equal(t, b.Data, bs[0].Data)
 }
@@ -58,12 +56,13 @@ func TestAppendReadEntries(t *testing.T) {
 	eID, tail, err := client.AppendEntries(context.Background(), cases)
 
 	require.NoError(t, err)
-	require.Equal(t, uint32(512+512+4096), tail)
+	
 
 	//GC read
 	iter := client.NewLogEntryIter(ReadOption{}.WithReadFromStart())
 
 	//小value在GC时,一个block只返回自己的大小, 上面的entry全部可以GC
+	n := 0
 	for {
 		ok, err := iter.HasNext()
 		require.NoError(t, err)
@@ -72,7 +71,10 @@ func TestAppendReadEntries(t *testing.T) {
 		}
 		ei := iter.Next()
 		require.Equal(t, []byte(nil), ei.Log.Key)
+		require.Equal(t, []byte(nil), ei.Log.Value)
+		n ++
 	}
+	require.Equal(t,2, n)
 
 	iter = client.NewLogEntryIter(ReadOption{}.WithReadFromStart().WithReplay())
 
@@ -132,18 +134,23 @@ func TestAppendReadBigBlocks(t *testing.T) {
 	require.NoError(t, err)
 
 	iter := client.NewLogEntryIter(ReadOption{}.WithReadFromStart().WithReplay())
-	var ans [][]byte
-	for {
+	var ans []int //value大小
+	for i :=0 ; i < len(cases) ; i ++ {
 		ok, err := iter.HasNext()
 		require.NoError(t, err)
 		if !ok {
 			break
 		}
 		ei := iter.Next()
-		ans = append(ans, ei.Log.Key)
-	}
-	require.Equal(t, [][]byte{[]byte("a"), []byte("b")}, ans)
+		//key都存在
+		require.Equal(t, cases[i].Log.Key, ei.Log.Key)
 
+		ans = append(ans, len(ei.Log.Value))
+	}
+
+	//小key的value长度== 2
+	//big value return nil value
+	require.Equal(t, []int{2,0}, ans) 
 }
 
 func TestSplitExtent(t *testing.T) {

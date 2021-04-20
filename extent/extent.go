@@ -415,7 +415,7 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 			continue
 		}
 
-		if rr.End() - start + size > int64(maxTotalSize) {
+		if rr.End() - start + size > int64(maxTotalSize) && len(ret) > 0{
 			end = uint32(start)
 			break
 		}
@@ -470,12 +470,12 @@ func ExtractEntryInfo(b *pb.Block, extentID uint64, offset uint32, replay bool) 
 				Offset:        offset,
 			}, nil
 		} else { //gc read
-			entry.Value = nil //或者可以直接返回空entry
+			entry.Key = nil //直接返回空entry
+			entry.Value = nil 
 			return &pb.EntryInfo{
 				Log:           entry,
 				EstimatedSize: uint64(entry.Size()),
 				ExtentID:      extentID,
-
 				Offset: offset,
 			}, nil
 		}
