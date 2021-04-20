@@ -276,6 +276,7 @@ func (w *LogWriter) Sync() error {
 	return nil
 }
 
+//ComputeEnd caculate the absolute end of appeding some "length" bytes
 func ComputeEnd(start uint32, length uint32) uint32 {
 	fix := func(end uint32) uint32 {
 		written := end & BlockSizeMask
