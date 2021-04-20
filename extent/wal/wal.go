@@ -149,6 +149,7 @@ func (wal *Wal) doRequest(reqs []*request) error {
 		}
 	}
 
+	//rotate wal
 	if wal.walOffset > maxWalSize && atomic.LoadInt32(&wal.syncing) == 0 {
 		//non-block
 		wal.oldWALs = append(wal.oldWALs, pathName(wal.dir, wal.currentWAL))

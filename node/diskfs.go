@@ -11,7 +11,6 @@ import (
 
 	"github.com/dgryski/go-farm"
 	"github.com/journeymidnight/autumn/extent"
-	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
 )
@@ -30,7 +29,6 @@ func OpenDiskFS(dir string, nodeID uint64) (*diskFS, error) {
 	s := &diskFS{
 		baseDir: dir,
 	}
-	fmt.Printf("%s\n", dir)
 	s.baseFd, err = os.Open(dir) //diretory is readonly
 	if err != nil {
 		return nil, err
@@ -46,30 +44,30 @@ func OpenDiskFS(dir string, nodeID uint64) (*diskFS, error) {
 		return nil, errors.Errorf("can not parse file: node_id %v", err)
 	}
 	if id != nodeID {
-		return nil, errors.Errorf("the node_id on disk is different,%d != %d", id,nodeID)
+		return nil, errors.Errorf("the node_id on disk is different,%d != %d", id, nodeID)
 	}
 
 	return s, nil
 }
 
-func (s *diskFS) pathName(extentID uint64, level int) string {
+func (s *diskFS) pathName(extentID uint64) string {
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], extentID)
 	h := farm.Hash32(buf[:])
-	utils.AssertTrue(level <= 4)
-	fpath := make([]string, level+2)
+	pathLen := diskLevel + 2
+	fpath := make([]string, pathLen)
 	fpath[0] = s.baseDir
-	for i := 1; i <= level; i++ {
+	for i := 1; i < pathLen-1; i++ {
 		n := (h >> (4 - i) * 8) & 0xFF
 		fpath[i] = fmt.Sprintf("%02x", n)
 	}
-	fpath[level-1] = fmt.Sprintf("%d.ext", extentID)
+	fpath[pathLen-1] = fmt.Sprintf("%d.ext", extentID)
 
 	return filepath.Join(fpath...)
 }
 
 func (s *diskFS) AllocExtent(ID uint64) (*extent.Extent, error) {
-	fpath := s.pathName(ID, diskLevel)
+	fpath := s.pathName(ID)
 	ex, err := extent.CreateExtent(fpath, ID)
 	if err != nil {
 		return nil, err
@@ -108,13 +106,12 @@ func (s diskFS) Close() {
 	s.baseFd.Close()
 }
 
-
-func mkHashDir(dir string, level int) error{
+func mkHashDir(dir string, level int) error {
 	if level == 0 {
 		return nil
 	}
 	dirs := make([]string, 256)
-	for i := 0 ;i < 256 ;i ++ {
+	for i := 0; i < 256; i++ {
 		dirName := filepath.Join(dir, fmt.Sprintf("%02x", i))
 		if err := os.Mkdir(dirName, 0755); err != nil {
 			return err
@@ -122,7 +119,7 @@ func mkHashDir(dir string, level int) error{
 		dirs[i] = dirName
 	}
 
-	for _, d :=range dirs {
+	for _, d := range dirs {
 		if err := mkHashDir(d, level-1); err != nil {
 			return err
 		}
@@ -130,7 +127,7 @@ func mkHashDir(dir string, level int) error{
 	return nil
 }
 
-func FormatDisk(dir string) error{
+func FormatDisk(dir string) error {
 	if err := mkHashDir(dir, diskLevel); err != nil {
 		return err
 	}

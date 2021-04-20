@@ -14,6 +14,8 @@ import (
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 //read from start
@@ -440,6 +442,7 @@ func (sc *AutumnStreamClient) Read(ctx context.Context, extentID uint64, offset 
 }
 
 func (sc *AutumnStreamClient) Append(ctx context.Context, blocks []*pb.Block) (uint64, []uint32, uint32,  error) {
+	loop := 0
 retry:
 	extentID, conn := sc.getLastExtentConn()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -451,10 +454,18 @@ retry:
 	})
 	cancel()
 
-	//FIXME
-	if err == context.DeadlineExceeded { //timeout
+	
+	if status.Code(err) == codes.DeadlineExceeded{//timeout
+		if loop < 3 {
+			loop ++
+			goto retry
+		}
 		sc.mustAllocNewExtent(extentID)
+		loop = 0
 		goto retry
+	}
+	if err != nil {//other errors
+		return 0,nil,0, err
 	}
 	//检查offset结果, 如果已经超过2GB, 调用StreamAllocExtent
 	if res.End > MaxExtentSize {

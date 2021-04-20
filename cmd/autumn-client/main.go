@@ -96,7 +96,7 @@ func benchmark(pmAddrs []string, op BenchType, threadNum int, duration int, size
 			t := i
 			stopper.RunWorker(func() {
 				j := 0
-				var ctx context.Context
+				var ctx context.Context	
 				var cancel context.CancelFunc
 				for {
 

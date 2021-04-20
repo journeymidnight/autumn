@@ -40,12 +40,12 @@ view about the extents it owns and where the peer replicas are for a given exten
 extentID:[nodeID, nodeID, nodeID]
 */
 type ExtentNode struct {
-	nodeID      uint64
-	grcpServer  *grpc.Server
-	listenUrl   string
-	diskFSs     []*diskFS
-	wal         *wal.Wal
-	extentMap   *sync.Map
+	nodeID     uint64
+	grcpServer *grpc.Server
+	listenUrl  string
+	diskFSs    []*diskFS
+	wal        *wal.Wal
+	extentMap  *sync.Map
 	//extentMap map[uint64]*extent.Extent //extent it owns: extentID => file
 	//TODO: cached SM date in EN
 	//replicates *sync.Map
@@ -59,9 +59,9 @@ func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl st
 
 	en := &ExtentNode{
 		extentMap: new(sync.Map),
-		listenUrl:   listenUrl,
-		smClient:    smclient.NewSMClient(smAddr),
-		nodeID: nodeID,
+		listenUrl: listenUrl,
+		smClient:  smclient.NewSMClient(smAddr),
+		nodeID:    nodeID,
 	}
 
 	//load disk
@@ -120,12 +120,11 @@ func (en *ExtentNode) setReplicates(extentID uint64, addrs []string) {
 }
 */
 
-
 func (en *ExtentNode) LoadExtents() error {
 	//register each extent to node
 	register := func(ex *extent.Extent) {
 		en.setExtent(ex.ID, ex)
-		xlog.Logger.Debugf("found file %s", ex.ID)
+		xlog.Logger.Debugf("found extent %d", ex.ID)
 	}
 
 	var wg sync.WaitGroup
@@ -170,9 +169,9 @@ func (en *ExtentNode) Shutdown() {
 	//loop over all extent to close
 
 	en.extentMap.Range(func(k, v interface{}) bool {
-			ex := v.(*extent.Extent)
-			ex.Close()
-			return true
+		ex := v.(*extent.Extent)
+		ex.Close()
+		return true
 	})
 }
 
@@ -202,12 +201,10 @@ func (en *ExtentNode) AppendWithWal(extentID uint64, blocks []*pb.Block) ([]uint
 	if ex == nil {
 		return nil, 0, errors.Errorf("no suck extent")
 	}
-	ex.Lock()
-	defer ex.Unlock()
 
-	if en.wal == nil || sizeOfBlocks(blocks) > (64 << 10){
+	if en.wal == nil || sizeOfBlocks(blocks) > (64<<10) {
 		//force sync write
-		return ex.AppendBlocks(blocks, true) 
+		return ex.AppendBlocks(blocks, true)
 	}
 
 	var wg sync.WaitGroup
@@ -231,7 +228,7 @@ func (en *ExtentNode) AppendWithWal(extentID uint64, blocks []*pb.Block) ([]uint
 		errC <- err
 	}()
 
-	go func(){
+	go func() {
 		wg.Wait()
 		close(errC)
 	}()
