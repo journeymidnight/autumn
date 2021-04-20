@@ -2,7 +2,6 @@ package streamclient
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"sync"
 	"time"
@@ -52,17 +51,17 @@ const (
 type StreamClient interface {
 	Connect() error
 	Close()
-	AppendEntries(ctx context.Context, entries []*pb.EntryInfo) (uint64, uint32, error) //reorder
-	Append(ctx context.Context, blocks []*pb.Block) (extentID uint64, offsets []uint32, err error)
+	AppendEntries(ctx context.Context, entries []*pb.EntryInfo) (uint64, uint32, error)
+    Append(ctx context.Context, blocks []*pb.Block) (extentID uint64, offsets []uint32, end uint32, err error)
 	NewLogEntryIter(opt ReadOption) LogEntryIter
-	Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, error)
+	Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, uint32, error)
 	Truncate(ctx context.Context, extentID uint64) (pb.StreamInfo, pb.StreamInfo, error)
 	//FIXME: stat => ([]extentID , offset)
 }
 
 //random read block
 type BlockReader interface {
-	Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, error)
+	Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, uint32, error)
 }
 
 type LogEntryIter interface {
@@ -262,7 +261,7 @@ retry:
 		goto retry
 	}
 
-	fmt.Printf("ans: %v, %v\n", err, err == context.DeadlineExceeded)
+	//fmt.Printf("ans: %v, %v\n", err, err == context.DeadlineExceeded)
 	//xlog.Logger.Debugf("res code is %v, len of entries %d\n", res.Code, len(res.Entries))
 	if len(res.Entries) > 0 {
 		iter.cache = nil
@@ -274,7 +273,7 @@ retry:
 		iter.currentOffset = res.End
 		return nil
 	case pb.Code_EndOfExtent:
-		iter.currentOffset = 512 //skip extent header
+		iter.currentOffset = 0
 		iter.currentExtentIndex++
 		//如果stream是BlobStream, 最后一个extent也返回EndOfExtent
 		if iter.currentExtentIndex == len(iter.sc.streamInfo.ExtentIDs) {
@@ -302,7 +301,7 @@ func (sc *AutumnStreamClient) NewLogEntryIter(opt ReadOption) LogEntryIter {
 	}
 	if opt.ReadFromStart {
 		leIter.currentExtentIndex = 0
-		leIter.currentOffset = 512
+		leIter.currentOffset = 0
 	} else {
 		leIter.currentOffset = opt.Offset
 		leIter.currentExtentIndex = sc.getExtentIndexFromID(opt.ExtentID)
@@ -413,18 +412,17 @@ func (sc *AutumnStreamClient) AppendEntries(ctx context.Context, entries []*pb.E
 	if len(entries) == 0 {
 		return 0, 0, errors.Errorf("blocks can not be nil")
 	}
-	blocks, j, k := entriesToBlocks(entries)
-	exID, offsets, err := sc.Append(ctx, blocks)
-	if err != nil {
-		return 0, 0, err
-	}
-	for i := 0; i < len(entries)-j; i++ {
-		entries[j+i].ExtentID = uint64(exID)
-		entries[j+i].Offset = offsets[k+i]
-	}
-	tail := offsets[len(offsets)-1] + blocks[len(blocks)-1].BlockLength + 512
 
-	return uint64(exID), tail, nil
+	blocks := make([]*pb.Block,0, len(entries))
+
+    for _, entry := range entries {
+               data := utils.MustMarshal(entry.Log)
+               blocks = append(blocks,  &pb.Block{
+                       data,
+               })
+    }
+	extentID, _, tail, err := sc.Append(ctx, blocks)
+    return extentID, tail, err
 }
 
 func (sc *AutumnStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, error) {
@@ -441,7 +439,7 @@ func (sc *AutumnStreamClient) Read(ctx context.Context, extentID uint64, offset 
 	return res.Blocks, err
 }
 
-func (sc *AutumnStreamClient) Append(ctx context.Context, blocks []*pb.Block) (extentID uint64, offsets []uint32, err error) {
+func (sc *AutumnStreamClient) Append(ctx context.Context, blocks []*pb.Block) (uint64, []uint32, uint32,  error) {
 retry:
 	extentID, conn := sc.getLastExtentConn()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -459,9 +457,9 @@ retry:
 		goto retry
 	}
 	//检查offset结果, 如果已经超过2GB, 调用StreamAllocExtent
-	if res.Offsets[len(res.Offsets)-1] > MaxExtentSize {
+	if res.End > MaxExtentSize {
 		sc.mustAllocNewExtent(extentID)
 	}
-	return extentID, res.Offsets, nil
+	return extentID, res.Offsets,res.End, nil
 
 }

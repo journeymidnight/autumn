@@ -353,23 +353,6 @@ func info(c *cli.Context) error {
 	return nil
 }
 
-/*
-func alloc(c *cli.Context) error {
-	cluster := c.String("cluster")
-	client := smclient.NewSMClient([]string{cluster})
-	if err := client.Connect(); err != nil {
-		return err
-	}
-	s, e, err := client.CreateStream(context.Background())
-	if err != nil {
-		return err
-	}
-	fmt.Printf("%v\n", s)
-	fmt.Printf("%v\n", e)
-	return nil
-}
-*/
-
 func main() {
 	xlog.InitLog([]string{"client.log"}, zapcore.DebugLevel)
 	app := cli.NewApp()

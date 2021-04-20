@@ -50,6 +50,7 @@ func NewMockStreamClient(suffix string) StreamClient {
 
 	ex, err := extent.CreateExtent(name, sID)
 	utils.Check(err)
+	ex.ResetWriter()
 	return &MockStreamClient{
 		exs:    []*extent.Extent{ex},
 		ID:     sID,
@@ -65,6 +66,7 @@ func OpenMockStreamClient(si pb.StreamInfo) StreamClient {
 		name := fileName(eID, "log")
 		ex, err := extent.OpenExtent(name)
 		utils.Check(err)
+		ex.ResetWriter()
 		exs = append(exs, ex)
 
 	}
@@ -114,36 +116,25 @@ func (client *MockStreamClient) Truncate(ctx context.Context, extentID uint64) (
 
 //block API, entries has been batched
 func (client *MockStreamClient) AppendEntries(ctx context.Context, entries []*pb.EntryInfo) (uint64, uint32, error) {
-	//exID := len(client.exs) - 1
-	//ex := client.exs[exID]
-	//ex.Lock()
-	//commitLength := ex.CommitLength()
-	blocks, j, k := entriesToBlocks(entries)
-	//defer ex.Unlock()
-	exID, offsets, err := client.Append(ctx, blocks)
-	//offsets, err := ex.AppendBlocks(blocks, nil)
-	if err != nil {
-		return 0, 0, err
-	}
-	for i := 0; i < len(entries)-j; i++ {
-		entries[j+i].ExtentID = uint64(exID)
-		entries[j+i].Offset = offsets[k+i]
-	}
+	blocks := make([]*pb.Block,0, len(entries))
 
-	tail := offsets[len(offsets)-1] + blocks[len(blocks)-1].BlockLength + 512
-	//change entries
-	return uint64(exID), tail, nil
+    for _, entry := range entries {
+        data := utils.MustMarshal(entry.Log)
+        blocks = append(blocks,  &pb.Block{
+                       data,
+        })}
+    extentID, _, tail, err := client.Append(ctx, blocks)
+    return extentID, tail, err
 }
 
 //block API
-func (client *MockStreamClient) Append(ctx context.Context, blocks []*pb.Block) (uint64, []uint32, error) {
+func (client *MockStreamClient) Append(ctx context.Context, blocks []*pb.Block) (uint64, []uint32, uint32, error) {
 	exIndex := len(client.exs) - 1
 	exID := client.exs[exIndex].ID
 	ex := client.exs[exIndex]
-	commitLength := ex.CommitLength()
-	ex.Lock()
-	offsets, err := ex.AppendBlocks(blocks, &commitLength)
-	ex.Unlock()
+
+	offsets,end, err := ex.AppendBlocks(blocks, true)
+
 	if ex.CommitLength() > uint32(testThreshold) {
 		//seal
 		ex.Seal(ex.CommitLength())
@@ -152,11 +143,12 @@ func (client *MockStreamClient) Append(ctx context.Context, blocks []*pb.Block) 
 		name := fileName(eID, client.suffix)
 		newEx, err := extent.CreateExtent(name, eID)
 		utils.Check(err)
+		newEx.ResetWriter()
 		client.Lock()
 		client.exs = append(client.exs, newEx)
 		client.Unlock()
 	}
-	return uint64(exID), offsets, err
+	return uint64(exID), offsets, end, err
 }
 
 func (client *MockStreamClient) Close() {
@@ -171,8 +163,7 @@ func (client *MockStreamClient) Connect() error {
 	return nil
 }
 
-func (client *MockStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, error) {
-
+	func (client *MockStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, uint32, error) {
 	var ex *extent.Extent
 	client.RLock()
 	for i := range client.exs {
@@ -183,17 +174,17 @@ func (client *MockStreamClient) Read(ctx context.Context, extentID uint64, offse
 	}
 	client.RUnlock()
 	if ex == nil {
-		return nil, errors.New("extentID not good")
+		return nil,0, errors.New("extentID not good")
 	}
 
-	blocks, err := ex.ReadBlocks(offset, numOfBlocks, (32 << 20))
+	blocks,_,end, err := ex.ReadBlocks(offset, numOfBlocks, (32 << 20))
 	if err == extent.EndOfExtent || err == extent.EndOfStream {
-		return blocks, io.EOF
+		return blocks,end, io.EOF
 	}
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return blocks, err
+	return blocks, end, err
 }
 
 func (client *MockStreamClient) NewLogEntryIter(opt ReadOption) LogEntryIter {
@@ -203,7 +194,7 @@ func (client *MockStreamClient) NewLogEntryIter(opt ReadOption) LogEntryIter {
 		opt: opt,
 	}
 	if opt.ReadFromStart {
-		x.currentOffset = 512 //skip extent header
+		x.currentOffset = 0
 		x.currentIndex = 0
 	} else {
 		x.currentOffset = opt.Offset
@@ -259,7 +250,7 @@ func (iter *MockLockEntryIter) receiveEntries() error {
 		iter.currentOffset = tail
 		return nil
 	case extent.EndOfExtent:
-		iter.currentOffset = 512 //skip extent header
+		iter.currentOffset = 0
 		iter.currentIndex++
 		if iter.currentIndex == len(iter.sc.exs) {
 			iter.noMore = true
