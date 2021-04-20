@@ -72,6 +72,7 @@ message AppendRequest {
 message AppendResponse {
 	Code code = 1;
 	repeated uint32 offsets = 2;
+	uint32 end = 3;
 }
 
 message CreateExtentRequest {
@@ -92,6 +93,7 @@ message ReadBlocksRequest {
 message ReadBlocksResponse {
 	Code code = 1;
 	repeated Block blocks = 2;
+	uint32 end = 3;
 }
 
 
@@ -129,7 +131,7 @@ message ReadEntriesRequest {
 message ReadEntriesResponse{
 	Code code = 1;
 	repeated EntryInfo entries = 2;
-	uint32 endOffset = 3;
+	uint32 end = 3;
 }
 
 service ExtentService {

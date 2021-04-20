@@ -16,12 +16,8 @@ package node
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net"
-	"path"
-	"strconv"
 	"sync"
-	"time"
 
 	"github.com/journeymidnight/autumn/conn"
 	"github.com/journeymidnight/autumn/extent"
@@ -30,7 +26,7 @@ import (
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
-	"golang.org/x/net/context"
+	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 )
 
@@ -47,9 +43,8 @@ type ExtentNode struct {
 	nodeID      uint64
 	grcpServer  *grpc.Server
 	listenUrl   string
-	baseFileDir string //FIXME
 	diskFSs     []*diskFS
-	wal         *wal.WAL
+	wal         *wal.Wal
 	extentMap   *sync.Map
 	//extentMap map[uint64]*extent.Extent //extent it owns: extentID => file
 	//TODO: cached SM date in EN
@@ -59,22 +54,22 @@ type ExtentNode struct {
 	smClient *smclient.SMClient
 }
 
-func NewExtentNode(baseFileDir string, diskDirs []string, walDir string, listenUrl string, smAddr []string) (*ExtentNode, error) {
+func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl string, smAddr []string) *ExtentNode {
 	utils.AssertTrue(xlog.Logger != nil)
 
 	en := &ExtentNode{
 		extentMap: new(sync.Map),
-		//replicates:  new(sync.Map),
-		baseFileDir: baseFileDir,
 		listenUrl:   listenUrl,
 		smClient:    smclient.NewSMClient(smAddr),
+		nodeID: nodeID,
 	}
 
 	//load disk
 	for _, diskDir := range diskDirs {
-		disk, err := OpenDiskFS(diskDir)
+		disk, err := OpenDiskFS(diskDir, en.nodeID)
 		if err != nil {
-			xlog.Logger.Warnf("can not open disk %s", diskDir)
+			xlog.Logger.Fatalf("can not load disk %s, [%v]", diskDir, err)
+			//FIXME: if one disk failed, can we continue?
 		}
 		//FIXME: validate dirs
 		en.diskFSs = append(en.diskFSs, disk)
@@ -89,11 +84,13 @@ func NewExtentNode(baseFileDir string, diskDirs []string, walDir string, listenU
 			en.wal = wal
 		}
 	}
-	return en, nil
+	return en
 }
 
 func (en *ExtentNode) SyncFs() {
-
+	for _, fs := range en.diskFSs {
+		fs.Syncfs()
+	}
 }
 
 func (en *ExtentNode) getExtent(ID uint64) *extent.Extent {
@@ -123,48 +120,6 @@ func (en *ExtentNode) setReplicates(extentID uint64, addrs []string) {
 }
 */
 
-func (en *ExtentNode) RegisterNode() {
-	xlog.Logger.Infof("RegisterNode")
-
-	err := en.smClient.Connect()
-	if err != nil {
-		xlog.Logger.Fatalf(err.Error())
-	}
-
-	storeIDPath := path.Join(en.baseFileDir, "node_id")
-	idString, err := ioutil.ReadFile(storeIDPath)
-	if err == nil {
-		id, err := strconv.ParseUint(string(idString), 10, 64)
-		if err != nil {
-			xlog.Logger.Fatalf("can not read ioString")
-		}
-		en.nodeID = id
-		return
-	}
-
-	//if no such file: node_id, registerNode
-	sleep := 10 * time.Millisecond
-	for loop := 0; ; loop++ {
-		id, err := en.smClient.RegisterNode(context.Background(), en.listenUrl)
-		if err != nil {
-			xlog.Logger.Warnf("can not register myself: %v", err)
-			time.Sleep(sleep)
-			sleep = 2 * sleep
-			if loop > 10 {
-				xlog.Logger.Fatal("can not register myself")
-			}
-			continue
-		}
-		en.nodeID = id
-		break
-	}
-
-	if err = ioutil.WriteFile(storeIDPath, []byte(fmt.Sprintf("%d", en.nodeID)), 0644); err != nil {
-		xlog.Logger.Fatalf("try to write file %s, %d, but failed, try to save it manually", storeIDPath, en.nodeID)
-	}
-	xlog.Logger.Infof("success to register to sm")
-
-}
 
 func (en *ExtentNode) LoadExtents() error {
 	//register each extent to node
@@ -183,6 +138,7 @@ func (en *ExtentNode) LoadExtents() error {
 	}
 	wg.Wait()
 
+	//read the wal, and replay writes to extents
 	replay := func(ID uint64, start uint32, data []*pb.Block) {
 		ex := en.getExtent(ID)
 		if ex == nil {
@@ -198,20 +154,26 @@ func (en *ExtentNode) LoadExtents() error {
 		en.wal.Replay(replay)
 	}
 
+	en.extentMap.Range(func(k, v interface{}) bool {
+		ex := v.(*extent.Extent)
+		if err := ex.ResetWriter(); err != nil {
+			xlog.Logger.Warnf("reset writer %s", err.Error())
+		}
+		return true
+	})
+
 	return nil
 }
 
 func (en *ExtentNode) Shutdown() {
 	en.grcpServer.Stop()
 	//loop over all extent to close
-	//Range(f func(key, value interface{}) bool)
-	/*
-		en.extentMap.Range(func(k, v interface{}) bool {
+
+	en.extentMap.Range(func(k, v interface{}) bool {
 			ex := v.(*extent.Extent)
 			ex.Close()
 			return true
-		})
-	*/
+	})
 }
 
 func (en *ExtentNode) ServeGRPC() error {
@@ -234,11 +196,58 @@ func (en *ExtentNode) ServeGRPC() error {
 	return nil
 }
 
-func formatNode() {
-	/*
-		1. register and get new ID
-		2. format directories
-		3.
-	*/
+//AppendWithWal will write wal and extent in the same time.
+func (en *ExtentNode) AppendWithWal(extentID uint64, blocks []*pb.Block) ([]uint32, uint32, error) {
+	ex := en.getExtent(extentID)
+	if ex == nil {
+		return nil, 0, errors.Errorf("no suck extent")
+	}
+	ex.Lock()
+	defer ex.Unlock()
 
+	if en.wal == nil || sizeOfBlocks(blocks) > (64 << 10){
+		//force sync write
+		return ex.AppendBlocks(blocks, true) 
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2) //2 tasks
+
+	errC := make(chan error)
+	start := ex.CommitLength()
+	var offsets []uint32
+	var end uint32
+	var err error
+	go func() { //write wal
+		defer wg.Done()
+		err := en.wal.Write(extentID, start, blocks)
+		errC <- err
+	}()
+
+	go func() { //writ extent
+		defer wg.Done()
+		//wal is sync write, do no have to sync
+		offsets, end, err = ex.AppendBlocks(blocks, false)
+		errC <- err
+	}()
+
+	go func(){
+		wg.Wait()
+		close(errC)
+	}()
+
+	for err := range errC {
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+	return offsets, end, nil
+}
+
+func sizeOfBlocks(blocks []*pb.Block) uint32 {
+	ret := uint32(0)
+	for i := range blocks {
+		ret += uint32(len(blocks[i].Data))
+	}
+	return ret
 }

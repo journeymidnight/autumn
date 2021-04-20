@@ -5,6 +5,7 @@ go 1.14
 require (
 	fyne.io/fyne v1.4.3
 	fyne.io/fyne/v2 v2.0.1
+	github.com/BurntSushi/toml v0.3.1 // indirect
 	github.com/cespare/xxhash v1.1.0
 	github.com/coreos/bbolt v0.0.0-00010101000000-000000000000 // indirect
 	github.com/coreos/etcd v3.3.22+incompatible
@@ -37,8 +38,8 @@ require (
 	github.com/soheilhy/cmux v0.1.4 // indirect
 	github.com/stretchr/testify v1.6.1
 	github.com/tmc/grpc-websocket-proxy v0.0.0-20200427203606-3cfed13b9966 // indirect
-	github.com/urfave/cli v1.22.4
-	github.com/urfave/cli/v2 v2.2.0
+	github.com/urfave/cli v1.22.5 // indirect
+	github.com/urfave/cli/v2 v2.3.0
 	github.com/xiang90/probing v0.0.0-20190116061207-43a291ad63a2 // indirect
 	go.etcd.io/etcd v3.3.25+incompatible
 	go.uber.org/zap v1.16.0

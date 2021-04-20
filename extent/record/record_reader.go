@@ -162,7 +162,8 @@ func (r *Reader) Offset() int64 {
 
 //called AFTER singleReader.Read()
 func (r *Reader) End() int64 {
-	return r.offset + int64(r.j)
+	x := r.offset + int64(r.j)
+	return x
 }
 
 // nextChunk sets r.buf[r.i:r.j] to hold the next chunk's payload, reading the

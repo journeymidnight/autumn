@@ -83,7 +83,7 @@ func (client *AutumnPMClient) try(f func(conn *grpc.ClientConn) bool, x time.Dur
 }
 
 func (client *AutumnPMClient) SetRowStreamTables(id uint64, tables []*pspb.Location) error {
-	var err error
+	aerr := errors.New("fail")
 	client.try(func(conn *grpc.ClientConn) bool {
 		c := pspb.NewPartitionManagerServiceClient(conn)
 		res, err := c.SetRowStreamTables(context.Background(), &pspb.SetRowStreamTablesRequest{
@@ -96,15 +96,15 @@ func (client *AutumnPMClient) SetRowStreamTables(id uint64, tables []*pspb.Locat
 			xlog.Logger.Warnf(err.Error())
 			return true
 		}
+		aerr = err
 		return false
 
 	}, 10*time.Millisecond)
 
-	return err
+	return aerr
 }
 
 func (client *AutumnPMClient) GetPartitionMeta(psid uint64) (ret []*pspb.PartitionMeta) {
-
 	client.try(func(conn *grpc.ClientConn) bool {
 		c := pspb.NewPartitionManagerServiceClient(conn)
 		res, err := c.GetPartitionMeta(context.Background(), &pspb.GetPartitionMetaRequest{
@@ -167,6 +167,7 @@ func (client *AutumnPMClient) GetPSInfo() (ret []*pspb.PSDetail) {
 }
 
 func (client *AutumnPMClient) GetRegions() (ret []*pspb.RegionInfo) {
+	
 	client.try(func(conn *grpc.ClientConn) bool {
 		c := pspb.NewPartitionManagerServiceClient(conn)
 		res, err := c.GetRegions(context.Background(), &pspb.GetRegionsRequest{})
@@ -187,12 +188,12 @@ func (client *AutumnPMClient) GetRegions() (ret []*pspb.RegionInfo) {
 }
 
 func (client *AutumnPMClient) RegisterSelf(address string) (uint64, error) {
-	err := errors.New("error")
+	aerr := errors.New("loop timeout")
 	var id uint64
 	client.try(func(conn *grpc.ClientConn) bool {
 		c := pspb.NewPartitionManagerServiceClient(conn)
 		var res *pspb.RegisterPSResponse
-		res, err = c.RegisterPS(context.Background(), &pspb.RegisterPSRequest{Addr: address})
+		res, err := c.RegisterPS(context.Background(), &pspb.RegisterPSRequest{Addr: address})
 		if err != nil {
 			xlog.Logger.Warnf(err.Error())
 			return true
@@ -201,11 +202,11 @@ func (client *AutumnPMClient) RegisterSelf(address string) (uint64, error) {
 			xlog.Logger.Warnf(res.Code.String())
 		}
 		id = res.Id
-		err = nil
+		aerr = nil
 		return false
 
 	}, 10*time.Millisecond)
 
-	return id, err
+	return id, aerr
 
 }

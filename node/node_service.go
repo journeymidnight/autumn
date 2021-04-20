@@ -17,7 +17,7 @@ package node
 import (
 	"context"
 	"fmt"
-	"path"
+	"math/rand"
 	"time"
 
 	"github.com/journeymidnight/autumn/conn"
@@ -60,7 +60,10 @@ func (en *ExtentNode) ReplicateBlocks(ctx context.Context, req *pb.ReplicateBloc
 	}
 	ex.Lock()
 	defer ex.Unlock()
-	ret, err := ex.AppendBlocks(req.Blocks, &req.Commit, true)
+	if ex.CommitLength() != req.Commit {
+		return nil, errors.Errorf("primary commitlength is different with replicates %d vs %d", req.Commit, ex.CommitLength())
+	}
+	ret, _, err := en.AppendWithWal(req.ExtentID, req.Blocks)
 	if err != nil {
 		return nil, err
 	}
@@ -113,7 +116,8 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 	//primary
 	stopper.RunWorker(func() {
 		//start := time.Now()
-		ret, err := ex.AppendBlocks(req.Blocks, &offset)
+		//ret, err := ex.AppendBlocks(req.Blocks, &offset)
+		ret, _, err := en.AppendWithWal(req.ExtentID, req.Blocks)
 		//fmt.Printf("len %d, %v\n", len(req.Blocks), time.Now().Sub(start))
 
 		if ret != nil {
@@ -183,7 +187,7 @@ func (en *ExtentNode) ReadBlocks(ctx context.Context, req *pb.ReadBlocksRequest)
 	if ex == nil {
 		return nil, errors.Errorf("no such extent")
 	}
-	blocks, err := ex.ReadBlocks(req.Offset, req.NumOfBlocks, (32 << 20))
+	blocks, _, end, err := ex.ReadBlocks(req.Offset, req.NumOfBlocks, (32 << 20))
 	if err != nil && err != extent.EndOfStream && err != extent.EndOfExtent {
 		xlog.Logger.Infof("request extentID: %d, offset: %d, numOfBlocks: %d: %v", req.ExtentID, req.Offset, req.NumOfBlocks, err)
 		return nil, err
@@ -195,24 +199,19 @@ func (en *ExtentNode) ReadBlocks(ctx context.Context, req *pb.ReadBlocksRequest)
 	return &pb.ReadBlocksResponse{
 		Code:   errorToCode(err),
 		Blocks: blocks,
+		End: end,
 	}, nil
 }
 
-func formatExtentName(dir string, ID uint64) string {
-	return path.Join(dir, fmt.Sprintf("extent_%d.ext", ID))
-}
-
 func (en *ExtentNode) AllocExtent(ctx context.Context, req *pb.AllocExtentRequest) (*pb.AllocExtentResponse, error) {
-	ex := en.getExtent(req.ExtentID)
-	if ex != nil {
-		return nil, errors.Errorf("have extent, can not alloc new")
-	}
-
-	newEx, err := extent.CreateExtent(formatExtentName(en.baseFileDir, req.ExtentID), req.ExtentID)
+	i := rand.Intn(len(en.diskFSs))
+	ex, err := en.diskFSs[i].AllocExtent(req.ExtentID)
 	if err != nil {
+		xlog.Logger.Warnf("can not alloc extent %d", req.ExtentID)
 		return nil, err
 	}
-	en.setExtent(newEx.ID, newEx)
+	en.extentMap.Store(req.ExtentID, ex)
+
 	return &pb.AllocExtentResponse{
 		Code: pb.Code_OK,
 	}, nil
@@ -254,7 +253,7 @@ func (en *ExtentNode) ReadEntries(ctx context.Context, req *pb.ReadEntriesReques
 	if req.Replay > 0 {
 		replay = true
 	}
-	ei, endOffset, err := ex.ReadEntries(req.Offset, (25 << 20), replay)
+	ei, end, err := ex.ReadEntries(req.Offset, (25 << 20), replay)
 	if err != nil && err != extent.EndOfStream && err != extent.EndOfExtent {
 		xlog.Logger.Infof("request ReadEntires extentID: %d, offset: %d, : %v", req.ExtentID, req.Offset, err)
 		return nil, err
@@ -263,6 +262,6 @@ func (en *ExtentNode) ReadEntries(ctx context.Context, req *pb.ReadEntriesReques
 	return &pb.ReadEntriesResponse{
 		Code:      errorToCode(err),
 		Entries:   ei,
-		EndOffset: endOffset,
+		End: end,
 	}, nil
 }

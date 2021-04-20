@@ -9,53 +9,24 @@ import (
 	"github.com/journeymidnight/autumn/node"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
-	"github.com/urfave/cli/v2"
+
 	"go.uber.org/zap"
 )
 
+
+var DefaultConfigPath = "extent_node.yaml"
 func main() {
 
-	var listen string
-	var dir string
-	var ID uint64
-	app := &cli.App{
-		HelpName: "",
-		Flags: []cli.Flag{
-			&cli.StringFlag{
-				Name:        "listen",
-				Usage:       "grpc listen url",
-				Destination: &listen,
-				Required:    true,
-			},
-			&cli.StringFlag{
-				Name:        "dir",
-				Usage:       "dir",
-				Destination: &dir,
-				Required:    true,
-			},
-			&cli.Uint64Flag{
-				Name:        "ID",
-				Destination: &ID,
-				Required:    true,
-			},
-		},
-	}
-
-	if err := app.Run(os.Args); err != nil {
-		panic(err.Error())
-	}
-
-	xlog.InitLog([]string{fmt.Sprintf("node_%d.log", ID)}, zap.DebugLevel)
+	config := node.NewConfig()
+	
+	xlog.InitLog([]string{fmt.Sprintf("node_%d.log", config.ID)}, zap.DebugLevel)
 
 	//FIXME: sm address
-	node := node.NewExtentNode(dir, listen, []string{"127.0.0.1:3401"})
+	node := node.NewExtentNode(config.ID, config.Dirs, config.WalDir, config.ListenUrl, []string{"127.0.0.1:3401"})
 
 	//open all extent files
 	err := node.LoadExtents()
 	utils.Check(err)
-
-	//open 'node_id' file, if 'node_id' doesn't exist. register to sm
-	node.RegisterNode()
 
 	//start grpc service
 	err = node.ServeGRPC()
