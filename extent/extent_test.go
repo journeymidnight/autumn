@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/journeymidnight/autumn/extent/record"
 	"github.com/journeymidnight/autumn/extent/wal"
 
 	"github.com/journeymidnight/autumn/proto/pb"
@@ -294,6 +295,36 @@ func TestWalExtent(t *testing.T) {
 	fmt.Printf("End:%d\n", end)
 }
 
+
+
+
+func TestSingleBlockMaxSizeWithEC(t *testing.T) {
+	require.Equal(t, record.ComputeEnd(0, MaxBlockSize), ECChunkSize)
+}
+
+
+func TestWriteECFriendlyBlock(t *testing.T) {
+	ECChunkSize = (1 << 20)
+	extent, err := CreateExtent("localtest.ext", 100)
+	require.Nil(t, err)
+	extent.ResetWriter()
+	defer os.Remove("localtest.ext")
+	b1 := generateBlock(512<<10)
+	extent.AppendBlocks([]*pb.Block{b1}, true)
+
+	extent.AppendBlocks([]*pb.Block{b1}, true)
+
+	
+	
+	blocks, _, _, err := extent.ReadBlocks(0, 2, 5<<20)
+	require.Nil(t, err)
+	require.Equal(t, b1, blocks[0])
+	require.Equal(t, b1, blocks[1])
+	
+
+}
+
+
 func BenchmarkExtent(b *testing.B) {
 	extent, err := CreateExtent("localtest.ext", 100)
 	extent.ResetWriter()
@@ -312,4 +343,6 @@ func BenchmarkExtent(b *testing.B) {
 			panic(err.Error())
 		}
 	}
+
+
 }

@@ -98,11 +98,17 @@ func SplitAndTrim(s string, sep string) []string {
 }
 
 func Ceil(size uint32, align uint32) uint32 {
-	return (size + align - 1) / align * align
+	AssertTrue(align&(align-1)==0)
+	//fallback to? return (size + align - 1) / align * align
+	mask := align - 1
+	return (size + mask) & ^mask
 }
 
 func Floor(size uint32, align uint32) uint32 {
-	return size / align * align
+	AssertTrue(align&(align-1)==0)
+	mask := align - 1
+	//fallback to? return size / align * align?
+	return size & (^mask)
 }
 
 func MustMarshal(msg proto.Message) []byte {

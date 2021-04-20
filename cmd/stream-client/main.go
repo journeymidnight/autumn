@@ -124,7 +124,7 @@ func benchmark(smAddr []string, op BenchType, duration int, size int) error {
 			slurpLoop:
 				for {
 					reqs = append(reqs, r)
-					if len(reqs) > 10 {
+					if len(reqs) > 200 {
 						break slurpLoop
 					}
 					select {
