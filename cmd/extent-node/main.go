@@ -19,7 +19,7 @@ func main() {
 
 	config := node.NewConfig()
 	
-	xlog.InitLog([]string{fmt.Sprintf("node_%d.log", config.ID)}, zap.DebugLevel)
+	xlog.InitLog([]string{fmt.Sprintf("node_%d.log", config.ID)}, zap.InfoLevel)
 
 	//FIXME: sm address
 	node := node.NewExtentNode(config.ID, config.Dirs, config.WalDir, config.ListenUrl, []string{"127.0.0.1:3401"})

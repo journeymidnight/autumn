@@ -58,8 +58,6 @@ func (en *ExtentNode) ReplicateBlocks(ctx context.Context, req *pb.ReplicateBloc
 	if ex == nil {
 		return nil, errors.Errorf("no suck extent")
 	}
-	ex.Lock()
-	defer ex.Unlock()
 	if ex.CommitLength() != req.Commit {
 		return nil, errors.Errorf("primary commitlength is different with replicates %d vs %d", req.Commit, ex.CommitLength())
 	}
@@ -86,15 +84,14 @@ func (en *ExtentNode) connPoolOfReplicates(peers []string) ([]*conn.Pool, error)
 	return ret, nil
 }
 
-//一般来说,需要用slurp的方式合并IO, 但是考虑到stream上层是由一单线程, io queue在partiion layer实现
 func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.AppendResponse, error) {
+	
 	ex := en.getExtent(req.ExtentID)
 	if ex == nil {
 		xlog.Logger.Debugf("no extent %d", req.ExtentID)
 		return nil, errors.Errorf("not such extent")
 	}
-	ex.Lock()
-	defer ex.Unlock()
+
 
 	pools, err := en.connPoolOfReplicates(req.Peers)
 	if err != nil {
@@ -115,10 +112,8 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 	retChan := make(chan Result, 3)
 	//primary
 	stopper.RunWorker(func() {
-		//start := time.Now()
 		//ret, err := ex.AppendBlocks(req.Blocks, &offset)
 		ret, _, err := en.AppendWithWal(req.ExtentID, req.Blocks)
-		//fmt.Printf("len %d, %v\n", len(req.Blocks), time.Now().Sub(start))
 
 		if ret != nil {
 			retChan <- Result{Error: err, Offsets: ret}
@@ -207,9 +202,10 @@ func (en *ExtentNode) AllocExtent(ctx context.Context, req *pb.AllocExtentReques
 	i := rand.Intn(len(en.diskFSs))
 	ex, err := en.diskFSs[i].AllocExtent(req.ExtentID)
 	if err != nil {
-		xlog.Logger.Warnf("can not alloc extent %d", req.ExtentID)
+		xlog.Logger.Warnf("can not alloc extent %d, [%s]", req.ExtentID, err.Error())
 		return nil, err
 	}
+	ex.ResetWriter()
 	en.extentMap.Store(req.ExtentID, ex)
 
 	return &pb.AllocExtentResponse{

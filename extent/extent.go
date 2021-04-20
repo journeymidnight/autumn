@@ -330,8 +330,10 @@ func (ex *Extent) Sync() {
 
 func (ex *Extent) AppendBlocks(blocks []*pb.Block,  doSync bool) ([]uint32, uint32, error) {
 
+	
 	ex.Lock()
 	defer ex.Unlock()
+	
 
 	if atomic.LoadInt32(&ex.isSeal) == 1 {
 		return nil, 0, errors.Errorf("immuatble")
