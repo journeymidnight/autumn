@@ -468,6 +468,8 @@ retry:
 		return 0,nil,0, err
 	}
 	//检查offset结果, 如果已经超过2GB, 调用StreamAllocExtent
+	
+	utils.AssertTrue(res.End > 0)
 	if res.End > MaxExtentSize {
 		sc.mustAllocNewExtent(extentID)
 	}
