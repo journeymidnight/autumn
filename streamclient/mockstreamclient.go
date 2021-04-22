@@ -50,7 +50,6 @@ func NewMockStreamClient(suffix string) StreamClient {
 
 	ex, err := extent.CreateExtent(name, sID)
 	utils.Check(err)
-	ex.ResetWriter()
 	return &MockStreamClient{
 		exs:    []*extent.Extent{ex},
 		ID:     sID,
@@ -66,7 +65,6 @@ func OpenMockStreamClient(si pb.StreamInfo) StreamClient {
 		name := fileName(eID, "log")
 		ex, err := extent.OpenExtent(name)
 		utils.Check(err)
-		ex.ResetWriter()
 		exs = append(exs, ex)
 
 	}
@@ -143,7 +141,6 @@ func (client *MockStreamClient) Append(ctx context.Context, blocks []*pb.Block) 
 		name := fileName(eID, client.suffix)
 		newEx, err := extent.CreateExtent(name, eID)
 		utils.Check(err)
-		newEx.ResetWriter()
 		client.Lock()
 		client.exs = append(client.exs, newEx)
 		client.Unlock()

@@ -58,10 +58,12 @@ func (en *ExtentNode) ReplicateBlocks(ctx context.Context, req *pb.ReplicateBloc
 	if ex == nil {
 		return nil, errors.Errorf("no suck extent")
 	}
+	ex.Lock()
+	defer ex.Unlock()
 	if ex.CommitLength() != req.Commit {
 		return nil, errors.Errorf("primary commitlength is different with replicates %d vs %d", req.Commit, ex.CommitLength())
 	}
-	ret, _, err := en.AppendWithWal(req.ExtentID, req.Blocks)
+	ret, _, err := en.AppendWithWal(ex, req.Blocks)
 	if err != nil {
 		return nil, err
 	}
@@ -92,6 +94,8 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 		return nil, errors.Errorf("not such extent")
 	}
 
+	ex.Lock()
+	defer ex.Unlock()
 
 	pools, err := en.connPoolOfReplicates(req.Peers)
 	if err != nil {
@@ -113,7 +117,7 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 	//primary
 	stopper.RunWorker(func() {
 		//ret, err := ex.AppendBlocks(req.Blocks, &offset)
-		ret, _, err := en.AppendWithWal(req.ExtentID, req.Blocks)
+		ret, _, err := en.AppendWithWal(ex, req.Blocks)
 
 		if ret != nil {
 			retChan <- Result{Error: err, Offsets: ret}
@@ -122,8 +126,9 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 		}
 		xlog.Logger.Debugf("write primary done: %v, %v", ret, err)
 	})
-	//secondary
 
+
+	//secondary
 	for i := 1; i < 3; i++ {
 		j := i
 		stopper.RunWorker(func() {
@@ -146,6 +151,7 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 
 	stopper.Wait()
 	close(retChan)
+
 	var preOffsets []uint32
 	for result := range retChan {
 		if preOffsets == nil {
@@ -158,6 +164,7 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 			return nil, errors.Errorf("block is not appended at the same offset [%v] vs [%v]", result.Offsets, preOffsets)
 		}
 	}
+
 	return &pb.AppendResponse{
 		Code:    pb.Code_OK,
 		Offsets: preOffsets,
@@ -205,7 +212,6 @@ func (en *ExtentNode) AllocExtent(ctx context.Context, req *pb.AllocExtentReques
 		xlog.Logger.Warnf("can not alloc extent %d, [%s]", req.ExtentID, err.Error())
 		return nil, err
 	}
-	ex.ResetWriter()
 	en.extentMap.Store(req.ExtentID, ex)
 
 	return &pb.AllocExtentResponse{

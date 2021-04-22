@@ -26,7 +26,6 @@ import (
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
-	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 )
 
@@ -196,13 +195,11 @@ func (en *ExtentNode) ServeGRPC() error {
 }
 
 //AppendWithWal will write wal and extent in the same time.
-func (en *ExtentNode) AppendWithWal(extentID uint64, blocks []*pb.Block) ([]uint32, uint32, error) {
-	ex := en.getExtent(extentID)
-	if ex == nil {
-		return nil, 0, errors.Errorf("no suck extent")
-	}
+func (en *ExtentNode) AppendWithWal(ex *extent.Extent, blocks []*pb.Block) ([]uint32, uint32, error) {
 
-	if en.wal == nil || sizeOfBlocks(blocks) > (64<<10) {
+
+	fmt.Printf("%d\n",utils.SizeOfBlocks(blocks))
+	if en.wal == nil || utils.SizeOfBlocks(blocks) > (2<<20) {
 		//force sync write
 		return ex.AppendBlocks(blocks, true)
 	}
@@ -217,7 +214,7 @@ func (en *ExtentNode) AppendWithWal(extentID uint64, blocks []*pb.Block) ([]uint
 	var err error
 	go func() { //write wal
 		defer wg.Done()
-		err := en.wal.Write(extentID, start, blocks)
+		err := en.wal.Write(ex.ID, start, blocks)
 		errC <- err
 	}()
 
@@ -241,10 +238,4 @@ func (en *ExtentNode) AppendWithWal(extentID uint64, blocks []*pb.Block) ([]uint
 	return offsets, end, nil
 }
 
-func sizeOfBlocks(blocks []*pb.Block) uint32 {
-	ret := uint32(0)
-	for i := range blocks {
-		ret += uint32(len(blocks[i].Data))
-	}
-	return ret
-}
+

@@ -137,13 +137,15 @@ func CreateExtent(fileName string, ID uint64) (*Extent, error) {
 
 	//f.Sync()
 	//write header of Extent
-	return &Extent{
+	 ex := &Extent{
 		ID:           ID,
 		isSeal:       0,
 		commitLength: 0,
 		fileName:     fileName,
 		file:         f,
-	}, nil
+	}
+	ex.resetWriter()
+	return ex, nil
 
 }
 
@@ -168,13 +170,15 @@ func OpenExtent(fileName string) (*Extent, error) {
 			return nil, err
 		}
 
-		return &Extent{
+		ex := &Extent{
 			isSeal:       1,
 			commitLength: uint32(info.Size()),
 			fileName:     fileName,
 			file:         file,
 			ID:           eh.ID,
-		}, nil
+		}
+		ex.resetWriter()
+		return ex, nil
 	}
 
 	/*
@@ -196,13 +200,15 @@ func OpenExtent(fileName string) (*Extent, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Extent{
+	ex := &Extent{
 		isSeal:       0,
 		commitLength: currentSize,
 		fileName:     fileName,
 		file:         f,
 		ID:           eh.ID,
-	}, nil
+	}
+	ex.resetWriter()
+	return ex, nil
 }
 
 //support multple threads
@@ -237,14 +243,13 @@ func (r *extentReader) Read(p []byte) (n int, err error) {
 	return n, nil
 }
 
-func (ex *Extent) Seal(commit uint32) error {
-	ex.Lock()
-	defer ex.Unlock()
 
+//Seal requires LOCK
+func (ex *Extent) Seal(commit uint32) error {
 	atomic.StoreInt32(&ex.isSeal, 1)
 	ex.writer.Close()
 	ex.writer = nil
-	currentLength := ex.commitLength
+	currentLength := atomic.LoadUint32(&ex.commitLength)
 	if currentLength < commit {
 		return errors.Errorf("commit is less than current commit length")
 	} else if currentLength > commit {
@@ -271,9 +276,8 @@ func (ex *Extent) getReader() *extentReader {
 
 }
 
+//Close requeres LOCK
 func (ex *Extent) Close() {
-	ex.Lock()
-	defer ex.Unlock()
 	if ex.writer != nil {
 		ex.writer.Close()
 	}
@@ -294,32 +298,29 @@ func (ex *Extent) resetWriter() error {
 	if err != nil {
 		return err
 	}
-	utils.AssertTrue(ex.CommitLength() == uint32(info.Size()))
+	currentLength := atomic.LoadUint32(&ex.commitLength)
+	utils.AssertTrue(currentLength == uint32(info.Size()))
 
-	ex.file.Seek(int64(ex.commitLength), os.SEEK_SET)
-	bn := (ex.CommitLength() / record.BlockSize)
-	offset := int32(ex.CommitLength()) % record.BlockSize
+	ex.file.Seek(int64(currentLength), os.SEEK_SET)
+	bn := (currentLength / record.BlockSize)
+	offset := int32(currentLength) % record.BlockSize
 	newWriter := record.NewLogWriter(ex.file, int64(bn), offset)
 	ex.writer = newWriter
 	return nil
 }
 
 func (ex *Extent) ResetWriter() error {
-	ex.Lock()
-	defer ex.Unlock()
 	return ex.resetWriter()
 }
 
 func (ex *Extent) RecoveryData(start uint32, blocks []*pb.Block) error {
-
-	ex.Lock()
-	defer ex.Unlock()
-
 	expectedEnd := start
 	for _, block := range blocks {
 		expectedEnd = record.ComputeEnd(expectedEnd, uint32(len(block.Data)))
 	}
-	if expectedEnd <= ex.CommitLength() {
+	currentLength := atomic.LoadUint32(&ex.commitLength)
+
+	if expectedEnd <= currentLength {
 		return nil
 	}
 	ex.file.Seek(int64(start), os.SEEK_SET)
@@ -345,36 +346,26 @@ func (ex *Extent) RecoveryData(start uint32, blocks []*pb.Block) error {
 }
 
 func (ex *Extent) Sync() {
-	ex.Lock()
-	defer ex.Unlock()
 	ex.writer.Sync()
 }
 
+
+
 func (ex *Extent) AppendBlocks(blocks []*pb.Block,  doSync bool) ([]uint32, uint32, error) {
 
-	
-	ex.Lock()
-	defer ex.Unlock()
-	
+	ex.AssertLock()
 
 	if atomic.LoadInt32(&ex.isSeal) == 1 {
 		return nil, 0, errors.Errorf("immuatble")
 	}
 
-	//for secondary extents, it must check lastCommit.
-	/*
-	if lastCommit != nil && *lastCommit != ex.CommitLength() {
-		return nil, 0, errors.Errorf("offset not match...")
-	}
-	*/
-
-	currentLength := atomic.LoadUint32(&ex.commitLength)
+	currentLength := ex.commitLength
 
 	truncate := func() {
 		ex.file.Truncate(int64(currentLength))
-		ex.commitLength = currentLength
+		atomic.StoreUint32(&ex.commitLength, currentLength)
 		//reset writer
-		ex.ResetWriter()
+		ex.resetWriter()
 	}
 
 	var offsets []uint32
@@ -388,6 +379,7 @@ func (ex *Extent) AppendBlocks(blocks []*pb.Block,  doSync bool) ([]uint32, uint
 			return nil, 0 ,err
 		}
 		start, end, err = ex.writer.WriteRecord(block.Data)
+		utils.AssertTrue(end <= math.MaxUint32)
 		if err != nil {
 			truncate()
 			return nil, 0, err
@@ -421,7 +413,7 @@ func (ex *Extent) makeErasureCodeSkip(start uint32, block *pb.Block) error{
 	ex.writer = nil
 
 	ex.file.Truncate(int64(ecBorder))
-	ex.commitLength = ecBorder
+	atomic.StoreUint32(&ex.commitLength, ecBorder)
 	ex.resetWriter()
 	return nil
 }
@@ -430,8 +422,10 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 
 	var ret []*pb.Block
 	//TODO: fix block number
-	current := atomic.LoadUint32(&ex.commitLength)
-	if current <= offset {
+
+	currentLength := atomic.LoadUint32(&ex.commitLength)
+
+	if currentLength <= offset {
 		if ex.IsSeal() {
 			return nil, nil, 0, EndOfExtent
 		} else {
