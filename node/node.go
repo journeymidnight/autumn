@@ -197,8 +197,6 @@ func (en *ExtentNode) ServeGRPC() error {
 //AppendWithWal will write wal and extent in the same time.
 func (en *ExtentNode) AppendWithWal(ex *extent.Extent, blocks []*pb.Block) ([]uint32, uint32, error) {
 
-
-	fmt.Printf("%d\n",utils.SizeOfBlocks(blocks))
 	if en.wal == nil || utils.SizeOfBlocks(blocks) > (2<<20) {
 		//force sync write
 		return ex.AppendBlocks(blocks, true)

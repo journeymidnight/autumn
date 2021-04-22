@@ -259,6 +259,6 @@ PSVERSION  => {num}
 ```
 
 Pros:
-1. detect corruption and space saving
-2. EC friendly
-3. no extra bufffer, 32K buf
+3. EC skip read
+4. isReqTooBig
+5. extent lock files

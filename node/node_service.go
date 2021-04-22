@@ -63,13 +63,14 @@ func (en *ExtentNode) ReplicateBlocks(ctx context.Context, req *pb.ReplicateBloc
 	if ex.CommitLength() != req.Commit {
 		return nil, errors.Errorf("primary commitlength is different with replicates %d vs %d", req.Commit, ex.CommitLength())
 	}
-	ret, _, err := en.AppendWithWal(ex, req.Blocks)
+	ret, end, err := en.AppendWithWal(ex, req.Blocks)
 	if err != nil {
 		return nil, err
 	}
 	return &pb.ReplicateBlocksResponse{
 		Code:    pb.Code_OK,
 		Offsets: ret,
+		End : end,
 	}, nil
 
 }
@@ -112,15 +113,17 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 	type Result struct {
 		Error   error
 		Offsets []uint32
+		End uint32
 	}
 	retChan := make(chan Result, 3)
+
 	//primary
 	stopper.RunWorker(func() {
 		//ret, err := ex.AppendBlocks(req.Blocks, &offset)
-		ret, _, err := en.AppendWithWal(ex, req.Blocks)
+		ret, end, err := en.AppendWithWal(ex, req.Blocks)
 
 		if ret != nil {
-			retChan <- Result{Error: err, Offsets: ret}
+			retChan <- Result{Error: err, Offsets: ret, End:end}
 		} else {
 			retChan <- Result{Error: err}
 		}
@@ -140,7 +143,7 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 				Blocks:   req.Blocks,
 			})
 			if res != nil {
-				retChan <- Result{Error: err, Offsets: res.Offsets}
+				retChan <- Result{Error: err, Offsets: res.Offsets, End: res.End}
 			} else {
 				retChan <- Result{Error: err}
 			}
@@ -153,21 +156,27 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 	close(retChan)
 
 	var preOffsets []uint32
+	preEnd  := int64(-1)
 	for result := range retChan {
 		if preOffsets == nil {
 			preOffsets = result.Offsets
 		}
+		if preEnd == -1 {
+			preEnd = int64(result.End)
+		}
 		if result.Error != nil || !utils.EqualUint32(result.Offsets, preOffsets) {
 			return nil, result.Error
 		}
-		if !utils.EqualUint32(result.Offsets, preOffsets) {
-			return nil, errors.Errorf("block is not appended at the same offset [%v] vs [%v]", result.Offsets, preOffsets)
+		if !utils.EqualUint32(result.Offsets, preOffsets) || preEnd != int64(result.End){
+			return nil, errors.Errorf("block is not appended at the same offset [%v] vs [%v], end [%v] vs [%v]", 
+			result.Offsets, preOffsets, preEnd, result.End)
 		}
 	}
 
 	return &pb.AppendResponse{
 		Code:    pb.Code_OK,
 		Offsets: preOffsets,
+		End: uint32(preEnd),
 	}, nil
 }
 

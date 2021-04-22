@@ -85,7 +85,7 @@ func threadedOp(threadNum int, stopper *utils.Stopper, done chan struct{}, op Be
 	stopper.Wait()
 }
 
-var kCapacity = 100
+var kCapacity = 64
 
 //batch op
 func batchOp(stopper *utils.Stopper, done chan struct{}, op BenchType,
@@ -146,7 +146,7 @@ func doWrites(writeCh chan *writeRequest, done chan struct{}, sc *streamclient.A
 		<-pendingCh
 	}
 
-	reqs := make([]*writeRequest, 0, 50)
+	reqs := make([]*writeRequest, 0, kCapacity)
 	for {
 		var r *writeRequest
 
@@ -159,7 +159,7 @@ func doWrites(writeCh chan *writeRequest, done chan struct{}, sc *streamclient.A
 		for {
 			reqs = append(reqs, r)
 
-			if len(reqs) > 2*kCapacity {
+			if len(reqs) > kCapacity {
 				pendingCh <- struct{}{}
 				goto writeCase
 			}

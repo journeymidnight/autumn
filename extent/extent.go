@@ -295,16 +295,15 @@ func (ex *Extent) resetWriter() error {
 
 	utils.AssertTrue(ex.IsSeal() == false)
 	info, err := ex.file.Stat()
-	if err != nil {
-		return err
-	}
+	utils.Check(err)
+
 	currentLength := atomic.LoadUint32(&ex.commitLength)
 	utils.AssertTrue(currentLength == uint32(info.Size()))
 
 	ex.file.Seek(int64(currentLength), os.SEEK_SET)
 	bn := (currentLength / record.BlockSize)
-	offset := int32(currentLength) % record.BlockSize
-	newWriter := record.NewLogWriter(ex.file, int64(bn), offset)
+	offset := currentLength % record.BlockSize
+	newWriter := record.NewLogWriter(ex.file, int64(bn), int32(offset))
 	ex.writer = newWriter
 	return nil
 }
@@ -328,8 +327,8 @@ func (ex *Extent) RecoveryData(start uint32, blocks []*pb.Block) error {
 	fmt.Printf("fixing %d blocks from %d\n", len(blocks), start)
 	//fix current extent
 	bn := (start / record.BlockSize)
-	offset := int32(start) % record.BlockSize
-	newWriter := record.NewLogWriter(ex.file, int64(bn), offset)
+	offset := start % record.BlockSize
+	newWriter := record.NewLogWriter(ex.file, int64(bn), int32(offset))
 	for _, block := range blocks {
 		if _, _, err := newWriter.WriteRecord(block.Data); err != nil {
 			return err
@@ -362,7 +361,10 @@ func (ex *Extent) AppendBlocks(blocks []*pb.Block,  doSync bool) ([]uint32, uint
 	currentLength := ex.commitLength
 
 	truncate := func() {
-		ex.file.Truncate(int64(currentLength))
+		ex.writer.Flush()
+		
+		utils.Check(ex.file.Truncate(int64(currentLength)))
+		ex.file.Sync()
 		atomic.StoreUint32(&ex.commitLength, currentLength)
 		//reset writer
 		ex.resetWriter()
@@ -375,9 +377,12 @@ func (ex *Extent) AppendBlocks(blocks []*pb.Block,  doSync bool) ([]uint32, uint
 	for _, block := range blocks {
 		//EC friendly
 		//if expected end > 128M, skip to 128M
+		
+		
 		if err := ex.makeErasureCodeSkip(uint32(end), block); err != nil {
 			return nil, 0 ,err
 		}
+		
 		start, end, err = ex.writer.WriteRecord(block.Data)
 		utils.AssertTrue(end <= math.MaxUint32)
 		if err != nil {
@@ -400,6 +405,7 @@ func (ex *Extent) makeErasureCodeSkip(start uint32, block *pb.Block) error{
 	if len(block.Data) > int(MaxBlockSize) {
 		return errors.Errorf("block size exceeds the max block Size %d > %d", len(block.Data), MaxBlockSize)
 	}
+
 	ecBorder := utils.Ceil(start, ECChunkSize)
 	if start == ecBorder {
 		ecBorder += ECChunkSize
@@ -410,9 +416,10 @@ func (ex *Extent) makeErasureCodeSkip(start uint32, block *pb.Block) error{
 		return nil
 	}
 	//skip to ecBoarder
-	ex.writer = nil
+	ex.writer.Flush()
+	
 
-	ex.file.Truncate(int64(ecBorder))
+	utils.Check(ex.file.Truncate(int64(ecBorder)))
 	atomic.StoreUint32(&ex.commitLength, ecBorder)
 	ex.resetWriter()
 	return nil

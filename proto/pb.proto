@@ -156,6 +156,7 @@ message ReplicateBlocksRequest {
 message ReplicateBlocksResponse {
 	Code code = 1;
 	repeated uint32 offsets = 2;
+	uint32 end = 3;
 }
 
 message AllocExtentRequest {
