@@ -644,6 +644,7 @@ func (rp *RangePartition) doWrites() {
 		for {
 			reqs = append(reqs, r)
 
+			//FIXME: if (reqs + r) too big, send reqs, and create new reqs including r 
 			if isReqsTooBig(reqs) {
 				pendingCh <- struct{}{} // blocking.
 				goto writeCase

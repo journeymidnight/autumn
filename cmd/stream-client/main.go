@@ -42,21 +42,145 @@ type writeRequest struct {
 	err    error
 }
 
-func writeStream(writeCh chan *writeRequest, sc *streamclient.AutumnStreamClient, blocks []*pb.Block, callback func(error)) {
-	r := &writeRequest{
-		blocks: blocks,
+func threadedOp(threadNum int, stopper *utils.Stopper, done chan struct{}, op BenchType, sc *streamclient.AutumnStreamClient, blocks []*pb.Block,
+	callback func(s time.Time, loop int, err error)) {
+
+	for i := 0; i < threadNum; i++ {
+		stopper.RunWorker(func() {
+			for {
+				loop := 0 //sample to record lantency
+				select {
+				case <-stopper.ShouldStop():
+					return
+				default:
+					write := func() {
+						start := time.Now()
+						//fmt.Printf("good %s")
+						_, _, _, err := sc.Append(context.Background(), blocks)
+
+						//fmt.Println("not bad")
+
+						callback(start, loop, err)
+						loop++
+					}
+
+					read := func() {}
+					switch op {
+					case "read":
+						read()
+					case "write":
+						write()
+					default:
+						fmt.Println("bench type is wrong")
+						return
+					}
+
+				}
+
+			}
+		})
+
 	}
 
-	r.wg.Add(1)
-
-	writeCh <- r
-	go func() {
-		r.wg.Wait()
-		callback(r.err)
-	}()
+	stopper.Wait()
 }
 
-func benchmark(smAddr []string, op BenchType, duration int, size int) error {
+var kCapacity = 100
+
+//batch op
+func batchOp(stopper *utils.Stopper, done chan struct{}, op BenchType,
+	sc *streamclient.AutumnStreamClient, blocks []*pb.Block, callback func(s time.Time, loop int, err error)) {
+	//single thread, no batch
+
+	writeCh := make(chan *writeRequest, kCapacity)
+
+	go doWrites(writeCh, done, sc)
+
+	stopper.RunWorker(func() {
+		loop := 0 //sample to record lantency
+		for {
+			select {
+			case <-stopper.ShouldStop():
+				return
+			default:
+				switch op {
+				case "read":
+					break
+				case "write":
+					start := time.Now()
+					r := &writeRequest{
+						blocks: blocks,
+					}
+
+					r.wg.Add(1)
+					writeCh <- r
+
+					go func() {
+						r.wg.Wait()
+						callback(start, loop, r.err)
+					}()
+					loop++
+				default:
+					fmt.Println("bench type is wrong")
+					return
+				}
+			}
+
+		}
+
+	})
+}
+
+func doWrites(writeCh chan *writeRequest, done chan struct{}, sc *streamclient.AutumnStreamClient) {
+	pendingCh := make(chan struct{}, 1)
+	writeRequests := func(reqs []*writeRequest) {
+		var blocks []*pb.Block
+		for _, req := range reqs {
+			blocks = append(blocks, req.blocks...)
+		}
+		_, _, _, err := sc.Append(context.Background(), blocks)
+		for _, req := range reqs {
+			req.err = err
+			req.wg.Done()
+		}
+		<-pendingCh
+	}
+
+	reqs := make([]*writeRequest, 0, 50)
+	for {
+		var r *writeRequest
+
+		select {
+		case r = <-writeCh:
+		case <-done:
+			return
+		}
+
+		for {
+			reqs = append(reqs, r)
+
+			if len(reqs) > 2*kCapacity {
+				pendingCh <- struct{}{}
+				goto writeCase
+			}
+
+			select {
+			// Either push to pending, or continue to pick from writeCh.
+			case r = <-writeCh:
+			case pendingCh <- struct{}{}:
+				goto writeCase
+			case <-done:
+				return
+			}
+
+		}
+	writeCase:
+		go writeRequests(reqs)
+		reqs = make([]*writeRequest, 0, kCapacity)
+	}
+}
+
+func benchmark(smAddr []string, op BenchType, duration int, size int, threadNum int) error {
 
 	sm := smclient.NewSMClient(smAddr)
 	if err := sm.Connect(); err != nil {
@@ -113,82 +237,27 @@ func benchmark(smAddr []string, op BenchType, duration int, size int) error {
 		}
 	}
 
-	writeCh := make(chan *writeRequest, 100)
-	go func() {
-		var reqs []*writeRequest
-		for {
-			select {
-			case <-done:
-				return
-			case r := <-writeCh:
-			slurpLoop:
-				for {
-					reqs = append(reqs, r)
-					if len(reqs) > 200 {
-						break slurpLoop
-					}
-					select {
-					case r = <-writeCh:
-					case <-done:
-						return
-					default:
-						break slurpLoop
-					}
-				}
-				var blocks []*pb.Block
-				for _, req := range reqs {
-					blocks = append(blocks, req.blocks...)
-				}
-				_, _, _, err := sc.Append(context.Background(), blocks)
-				for _, req := range reqs {
-					req.err = err
-					req.wg.Done()
-				}
-				reqs = nil
-
-			}
+	writeDone := func(start time.Time, loop int, err error) {
+		if err != nil {
+			panic(fmt.Sprintf(err.Error()))
 		}
-	}()
-
-	//single thread, no batch
-	stopper.RunWorker(func() {
-		loop := 0 //sample to record lantency
-		for {
-			select {
-			case <-stopper.ShouldStop():
-				return
-			default:
-				switch op {
-				case "read":
-					break
-				case "write":
-
-					start := time.Now()
-					writeStream(writeCh, sc, blocks, func(err error) {
-						atomic.AddUint64(&totalSize, uint64(size))
-						atomic.AddUint64(&count, 1)
-						if loop%10 == 0 {
-							lock.Lock()
-							results = append(results, Result{
-								StartTime: start.Sub(benchStartTime).Seconds(),
-								Elapsed:   time.Now().Sub(start).Seconds(),
-							})
-							lock.Unlock()
-						}
-					})
-
-					if err != nil {
-						panic(err.Error())
-					}
-				default:
-					fmt.Println("bench type is wrong")
-					return
-				}
-			}
-
+		atomic.AddUint64(&totalSize, uint64(size))
+		atomic.AddUint64(&count, 1)
+		if loop%3 == 0 {
+			lock.Lock()
+			results = append(results, Result{
+				StartTime: start.Sub(benchStartTime).Seconds(),
+				Elapsed:   time.Now().Sub(start).Seconds(),
+			})
+			lock.Unlock()
 		}
+	}
 
-	})
+	if threadNum == 1 {
+		go batchOp(stopper, done, op, sc, blocks, writeDone)
+	} else {
+		go threadedOp(threadNum, stopper, done, op, sc, blocks, writeDone)
+	}
 
 	go livePrint()
 
@@ -233,7 +302,7 @@ func benchmark(smAddr []string, op BenchType, duration int, size int) error {
 			fmt.Println("failed to write result.json")
 		}
 	}
-	printSummary(time.Now().Sub(start), atomic.LoadUint64(&count), atomic.LoadUint64(&totalSize), 1, size)
+	printSummary(time.Now().Sub(start), atomic.LoadUint64(&count), atomic.LoadUint64(&totalSize), threadNum, size)
 
 	return nil
 }
@@ -301,7 +370,7 @@ func main() {
 			Usage: "wbench --cluster <path> --thread <num> --duration <duration>",
 			Flags: []cli.Flag{
 				&cli.StringFlag{Name: "cluster", Value: "127.0.0.1:3401, 127.0.0.1:3402, 127.0.0.1:3403", Aliases: []string{"c"}},
-				&cli.IntFlag{Name: "thread", Value: 4, Aliases: []string{"t"}},
+				&cli.IntFlag{Name: "thread", Value: 1, Aliases: []string{"t"}},
 				&cli.IntFlag{Name: "duration", Value: 10, Aliases: []string{"d"}},
 				&cli.IntFlag{Name: "size", Value: 8192, Aliases: []string{"s"}},
 			},
@@ -325,7 +394,8 @@ func wbench(c *cli.Context) error {
 	duration := c.Int("duration")
 	size := c.Int("size")
 	addrs := utils.SplitAndTrim(cluster, ",")
-	return benchmark(addrs, benchWrite, duration, size)
+	threadNum := c.Int("thread")
+	return benchmark(addrs, benchWrite, duration, size, threadNum)
 }
 
 func printSummary(elapsed time.Duration, totalCount uint64, totalSize uint64, threadNum int, size int) {

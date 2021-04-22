@@ -98,9 +98,9 @@ func TestReadEntries(t *testing.T) {
 	require.Nil(t, err)
 	extent, err := CreateExtent("localtest.ext", 100)
 	defer os.Remove("localtest.ext")
-	extent.ResetWriter()
+	extent.Lock()
 	extent.AppendBlocks([]*pb.Block{{Data: data}}, true)
-
+	extent.Unlock()
 	entries, end, err := extent.ReadEntries(0, 10 << 20, true)
 	for i := range entries {
 		require.Equal(t, uint64(100),entries[i].ExtentID)
@@ -120,9 +120,11 @@ func TestAppendReadFile(t *testing.T) {
 
 	extent, err := CreateExtent("localtest.ext", 100)
 	defer os.Remove("localtest.ext")
-	extent.ResetWriter()
+	//extent.ResetWriter()
 	assert.Nil(t, err)
+	extent.Lock()
 	ret, _, err := extent.AppendBlocks(cases, true)
+	extent.Unlock()
 	assert.Nil(t, err)
 
 	//single thread read
@@ -176,20 +178,25 @@ func TestReplayExtent(t *testing.T) {
 	}
 
 	extent, err := CreateExtent(extentName, 100)
-	extent.ResetWriter()
+	//extent.ResetWriter()
 	defer os.Remove(extentName)
 	assert.Nil(t, err)
+	extent.Lock()
 	_, _, err = extent.AppendBlocks(cases, true)
+	extent.Unlock()
 	assert.Nil(t, err)
 	extent.Close()
 
 	ex, err := OpenExtent(extentName)
 	assert.Nil(t, err)
 	assert.False(t, ex.IsSeal())
-	ex.ResetWriter()
+	//ex.ResetWriter()
 
 	//write new cases
+	ex.Lock()
 	_, _, err = ex.AppendBlocks(cases, true)
+	ex.Unlock()
+
 	assert.Nil(t, err)
 	commit := ex.CommitLength()
 	err = ex.Seal(ex.commitLength)
@@ -214,7 +221,7 @@ func TestReplayExtent(t *testing.T) {
 
 func TestWalExtent(t *testing.T) {
 	extent, err := CreateExtent("localtest.ext", 100)
-	extent.ResetWriter()
+	//extent.ResetWriter()
 	defer os.Remove("localtest.ext")
 	if err != nil {
 		panic(err.Error())
@@ -234,6 +241,8 @@ func TestWalExtent(t *testing.T) {
 		generateBlock(40 << 20),
 		generateBlock(10),
 	}
+
+	extent.Lock()
 
 	end := uint32(0)
 	i := 0
@@ -270,6 +279,7 @@ func TestWalExtent(t *testing.T) {
 		i++
 	}
 	walLog.Close()
+	extent.Unlock()
 	extent.Close()
 
 	extent, err = OpenExtent("localtest.ext")
@@ -307,13 +317,14 @@ func TestWriteECFriendlyBlock(t *testing.T) {
 	ECChunkSize = (1 << 20)
 	extent, err := CreateExtent("localtest.ext", 100)
 	require.Nil(t, err)
-	extent.ResetWriter()
+	//extent.ResetWriter()
 	defer os.Remove("localtest.ext")
 	b1 := generateBlock(512<<10)
+	extent.Lock()
 	extent.AppendBlocks([]*pb.Block{b1}, true)
 
 	extent.AppendBlocks([]*pb.Block{b1}, true)
-
+	extent.Unlock()
 	
 	
 	blocks, _, _, err := extent.ReadBlocks(0, 2, 5<<20)
@@ -327,7 +338,7 @@ func TestWriteECFriendlyBlock(t *testing.T) {
 
 func BenchmarkExtent(b *testing.B) {
 	extent, err := CreateExtent("localtest.ext", 100)
-	extent.ResetWriter()
+	//extent.ResetWriter()
 	defer os.Remove("localtest.ext")
 	if err != nil {
 		panic(err.Error())
