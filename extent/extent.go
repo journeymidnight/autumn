@@ -314,9 +314,18 @@ func (ex *Extent) ResetWriter() error {
 
 func (ex *Extent) RecoveryData(start uint32, blocks []*pb.Block) error {
 	expectedEnd := start
+
 	for _, block := range blocks {
 		expectedEnd = record.ComputeEnd(expectedEnd, uint32(len(block.Data)))
+		ecBorder := utils.Ceil(start, ECChunkSize)
+		if start == ecBorder {
+			ecBorder += ECChunkSize
+		}
+		if expectedEnd > ecBorder {
+			expectedEnd = ecBorder + record.ComputeEnd(expectedEnd, uint32(len(block.Data)))
+		}
 	}
+	
 	currentLength := atomic.LoadUint32(&ex.commitLength)
 
 	if expectedEnd <= currentLength {
