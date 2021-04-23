@@ -164,7 +164,7 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 		if preEnd == -1 {
 			preEnd = int64(result.End)
 		}
-		if result.Error != nil || !utils.EqualUint32(result.Offsets, preOffsets) {
+		if result.Error != nil {
 			return nil, result.Error
 		}
 		if !utils.EqualUint32(result.Offsets, preOffsets) || preEnd != int64(result.End){
