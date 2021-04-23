@@ -1,9 +1,10 @@
 package node
 
 import (
-	"fmt"
 	"os"
 
+	"github.com/BurntSushi/toml"
+	"github.com/pkg/errors"
 	"github.com/urfave/cli/v2"
 	"github.com/urfave/cli/v2/altsrc"
 )
@@ -15,13 +16,22 @@ type Config struct {
 	WalDir string
 }
 
-func NewConfig() *Config {
+func NewConfig() (*Config, error) {
+
+
+	//https://github.com/urfave/cli/issues/599
+	//cli does not support [Parsing int64, uint64, uint, time.Duration]
+	//so we use the action function to receive all data
+
 	var config Config
-	var slices cli.StringSlice
+	var configFile string
+	var dirSlice cli.StringSlice
 	flags := []cli.Flag{
 		&cli.StringFlag{
 			Name:    "config",
 			Usage:   "Path to the config file",
+			Aliases: []string{"c"},
+			Destination: &configFile,
 		},
 		altsrc.NewStringFlag(&cli.StringFlag{
 			Name:        "listenUrl",
@@ -31,7 +41,7 @@ func NewConfig() *Config {
 		altsrc.NewStringSliceFlag(&cli.StringSliceFlag{
 			Name:        "dirs",
 			Usage:       "dirs",
-			Destination: &slices,
+			Destination: &dirSlice,
 		}),
 		altsrc.NewUint64Flag(&cli.Uint64Flag{
 			Name:        "ID",
@@ -41,35 +51,41 @@ func NewConfig() *Config {
 			Name:        "walDir",
 			Destination: &config.WalDir,
 		}),
+		
 	}
-	
-	
-	 initFileSourceConf := func(flags []cli.Flag) func(*cli.Context) error {
-		return func(c *cli.Context) error {
-			path := c.String("config")
-			if path == "" {
-				return nil
-			}
-			_, err := os.Stat(path)
-			if os.IsNotExist(err) {
-				panic(fmt.Sprintf("can not open config file %s", path))
-			} else if err != nil {
-				return err
-			}
-			return altsrc.InitInputSourceWithContext(flags, altsrc.NewTomlSourceFromFlagFunc("config"))(c)
-		}
-	}
-	
 	app := &cli.App{
-		Before: initFileSourceConf(flags),
+		Name: "extent-node",
 		Flags: flags,
 	}
-
 
 	if err := app.Run(os.Args); err != nil {
 		panic(err.Error())
 	}
 
-	config.Dirs = slices.Value()
-	return &config
+
+	_, err := os.Stat(configFile)
+	if err == nil {
+		_, err := toml.DecodeFile(configFile, &config)
+		if err != nil {
+			return nil, err
+		}
+	}
+	//validate config
+
+	if err := validateConf(&config) ; err != nil {
+		return nil, err
+	}
+
+	return &config, nil
+}
+
+func validateConf(conf *Config) error{
+	if len(conf.ListenUrl) ==  0 {
+		return errors.Errorf("ListenUrl can not be empty")
+	}
+
+	if conf.ID == 0 {
+		return errors.Errorf("ID can not be 0")
+	}
+	return nil
 }

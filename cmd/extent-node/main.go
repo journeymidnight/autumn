@@ -14,18 +14,21 @@ import (
 )
 
 
-var DefaultConfigPath = "extent_node.yaml"
 func main() {
 
-	config := node.NewConfig()
-	
+	config, err := node.NewConfig()
+	if err != nil {
+		fmt.Println(err.Error())
+		return
+	}
+	fmt.Printf("config: %+v\n", config)
 	xlog.InitLog([]string{fmt.Sprintf("node_%d.log", config.ID)}, zap.InfoLevel)
 
 	//FIXME: sm address
 	node := node.NewExtentNode(config.ID, config.Dirs, config.WalDir, config.ListenUrl, []string{"127.0.0.1:3401"})
 
 	//open all extent files
-	err := node.LoadExtents()
+	err = node.LoadExtents()
 	utils.Check(err)
 
 	//start grpc service

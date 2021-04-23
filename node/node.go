@@ -188,9 +188,10 @@ func (en *ExtentNode) ServeGRPC() error {
 		return err
 	}
 	go func() {
-		grpcServer.Serve(listener)
+		utils.Check(grpcServer.Serve(listener))
 	}()
 	en.grcpServer = grpcServer
+
 	return nil
 }
 
