@@ -503,7 +503,7 @@ func (ex *Extent) ReadEntries(offset uint32, maxTotalSize uint32, replay bool) (
 	}
 	var ret []*pb.EntryInfo
 	for i := range blocks {
-		e, err := ExtractEntryInfo(blocks[i], ex.ID, offsets[i], replay)
+		e, err := extractEntryInfo(blocks[i], ex.ID, offsets[i], replay)
 		if err != nil {
 			xlog.Logger.Error(err)
 			continue
@@ -516,7 +516,7 @@ func (ex *Extent) ReadEntries(offset uint32, maxTotalSize uint32, replay bool) (
 
 }
 
-func ExtractEntryInfo(b *pb.Block, extentID uint64, offset uint32, replay bool) (*pb.EntryInfo, error) {
+func extractEntryInfo(b *pb.Block, extentID uint64, offset uint32, replay bool) (*pb.EntryInfo, error) {
 	entry := new(pb.Entry)
 	if err := entry.Unmarshal(b.Data); err != nil {
 		return nil, err

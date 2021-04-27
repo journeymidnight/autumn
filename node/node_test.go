@@ -1,9 +1,18 @@
 package node
 
 import (
+	"context"
 	"fmt"
+	"io/ioutil"
+	"os"
+	"testing"
+	"time"
 
+	"github.com/journeymidnight/autumn/proto/pb"
+	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
+
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zapcore"
 )
 
@@ -15,52 +24,52 @@ func init() {
 	xlog.InitLog([]string{"test.log"}, zapcore.DebugLevel)
 }
 
-/*
+
 func TestBasicNode(t *testing.T) {
 	nodes := make([]*ExtentNode, 3)
-	os.Mkdir("xnodestore1", 0744)
-	os.Mkdir("xnodestore2", 0744)
-	os.Mkdir("xnodestore3", 0744)
+	dirs := []string{"store1","store2", "store3"}
+	for i, dir := range dirs {
+		os.Mkdir(dir, 0744)
+		FormatDisk(dir)
+		ioutil.WriteFile(dir + "/node_id", []byte(fmt.Sprintf("%d", i+1)), 0644)
+	}
+	for _, dir := range dirs {
+		defer os.RemoveAll(dir)
+	}
 
-	nodes[0] = NewExtentNode("xnodestore1", "127.0.0.1:3301", []string{"127.0.0.1:3401"})
-	nodes[1] = NewExtentNode("xnodestore2", "127.0.0.1:3302", []string{"127.0.0.1:3401"})
-	nodes[2] = NewExtentNode("xnodestore3", "127.0.0.1:3303", []string{"127.0.0.1:3401"})
+	for i, dir := range dirs {
+		nodes[i] = NewExtentNode(uint64(i+1), []string{dir}, "", fmt.Sprintf("127.0.0.1:330%d",i+1), []string{"127.0.0.1:3401"})
+	}
 
-	defer os.RemoveAll("xnodestore1")
-	defer os.RemoveAll("xnodestore2")
-	defer os.RemoveAll("xnodestore3")
 
 	for _, n := range nodes {
-		n.LoadExtents()
-		n.ServeGRPC()
+		utils.Check(n.LoadExtents())
+		utils.Check(n.ServeGRPC())
 	}
+
 
 	time.Sleep(time.Second)
 	for _, n := range nodes {
 		res, err := n.AllocExtent(context.Background(), &pb.AllocExtentRequest{
 			ExtentID: 100,
 		})
-		assert.Nil(t, err)
-		assert.Equal(t, pb.Code_OK, res.Code)
+		require.Nil(t, err)
+		require.Equal(t, pb.Code_OK, res.Code)
 	}
 	data := make([]byte, 4096)
 	utils.SetRandStringBytes(data)
 
 	block := &pb.Block{
-		CheckSum:    utils.AdlerCheckSum(data),
-		BlockLength: 4096,
 		Data:        data,
 	}
 
-	//nodes[0].setReplicates(100, []string{"127.0.0.1:3302", "127.0.0.1:3303"})
-	res, err := nodes[0].Append(context.Background(), &pb.AppendRequest{
+	_, err := nodes[0].Append(context.Background(), &pb.AppendRequest{
 		ExtentID: 100,
 		Blocks:   []*pb.Block{block},
+		Peers: []string{"127.0.0.1:3301", "127.0.0.1:3302", "127.0.0.1:3303"},
 	})
-	assert.Nil(t, err)
-	assert.Equal(t, uint32(512), res.Offsets[0])
 
-	//_, err = node1.ReadBlocks(context.Background(), &pb.ReadBlocksRequest{ExtentID: 100, Offsets: []uint32{512}})
+	require.Nil(t, err)
 
 }
-*/
+

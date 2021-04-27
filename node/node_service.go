@@ -89,6 +89,10 @@ func (en *ExtentNode) connPoolOfReplicates(peers []string) ([]*conn.Pool, error)
 
 func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.AppendResponse, error) {
 	
+	if len(req.Peers) != 3 || req.Peers[0] != en.listenUrl {
+		return nil, errors.Errorf("req Peers is not right %v", req.Peers)
+	}
+	
 	ex := en.getExtent(req.ExtentID)
 	if ex == nil {
 		xlog.Logger.Debugf("no extent %d", req.ExtentID)
@@ -129,7 +133,6 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 		}
 		xlog.Logger.Debugf("write primary done: %v, %v", ret, err)
 	})
-
 
 	//secondary
 	for i := 1; i < 3; i++ {
@@ -230,8 +233,8 @@ func (en *ExtentNode) AllocExtent(ctx context.Context, req *pb.AllocExtentReques
 
 func (en *ExtentNode) Seal(ctx context.Context, req *pb.SealRequest) (*pb.SealResponse, error) {
 	ex := en.getExtent(req.ExtentID)
-	if ex != nil {
-		return nil, errors.Errorf("have extent, can not alloc new")
+	if ex == nil {
+		return nil, errors.Errorf("do not have extent %d, can not alloc new", req.ExtentID)
 	}
 	err := ex.Seal(req.CommitLength)
 	if err != nil {
@@ -243,8 +246,8 @@ func (en *ExtentNode) Seal(ctx context.Context, req *pb.SealRequest) (*pb.SealRe
 }
 func (en *ExtentNode) CommitLength(ctx context.Context, req *pb.CommitLengthRequest) (*pb.CommitLengthResponse, error) {
 	ex := en.getExtent(req.ExtentID)
-	if ex != nil {
-		return nil, errors.Errorf("have extent, can not alloc new")
+	if ex == nil {
+		return nil, errors.Errorf("do not have extent %d, can not alloc new", req.ExtentID)
 	}
 
 	l := ex.CommitLength()

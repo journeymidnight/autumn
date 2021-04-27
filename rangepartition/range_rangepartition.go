@@ -26,7 +26,6 @@ import (
 const (
 	KB                = 1024
 	MB                = KB * 1024
-	maxEntriesInBlock = 100
 
 	//1 * MB for test
 	//60 * MB for production

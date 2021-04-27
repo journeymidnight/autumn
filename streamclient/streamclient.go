@@ -45,9 +45,7 @@ const (
 	GB             = 1024 * MB
 	ValueThreshold = 4 * KB
 
-	MaxMixedBlockSize = 4 * KB
 	MaxExtentSize     = 2 * GB
-	MaxEntriesInBlock = 100
 )
 
 type StreamClient interface {
@@ -374,23 +372,27 @@ func (sc *AutumnStreamClient) getLastExtentConn() (uint64, *grpc.ClientConn) {
 	return extentID, sc.em.GetExtentConn(extentID)
 }
 
-func (sc *AutumnStreamClient) mustAllocNewExtent(oldExtentID uint64) {
+func (sc *AutumnStreamClient) mustAllocNewExtent(oldExtentID uint64) error{
 	var newExInfo *pb.ExtentInfo
 	var err error
-	for {
-		//loop forever to seal and alloc new extent
+	for i := 0 ; i < 10 ; i ++{
 		newExInfo, err = sc.smClient.StreamAllocExtent(context.Background(), sc.streamID, oldExtentID)
 		if err == nil {
 			break
 		}
 		xlog.Logger.Warn(err.Error())
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
+	}
+	if err != nil {
+		return err
 	}
 	sc.Lock()
 	sc.streamInfo.ExtentIDs = append(sc.streamInfo.ExtentIDs, newExInfo.ExtentID)
 	sc.Unlock()
 
 	sc.em.SetExtentInfo(newExInfo.ExtentID, newExInfo)
+	xlog.Logger.Debugf("created new extent %d on stream %d", newExInfo.ExtentID, sc.streamID)
+	return nil
 }
 
 func (sc *AutumnStreamClient) Connect() error {
@@ -471,7 +473,10 @@ retry:
 	
 	utils.AssertTrue(res.End > 0)
 	if res.End > MaxExtentSize {
-		sc.mustAllocNewExtent(extentID)
+		
+		if err := sc.mustAllocNewExtent(extentID); err != nil {
+			return 0,nil,0, err
+		}
 	}
 	return extentID, res.Offsets,res.End, nil
 
