@@ -24,7 +24,6 @@ func (sm *StreamManager) CreateStream(ctx context.Context, req *pb.CreateStreamR
 		return nil, errors.Errorf("not a leader")
 	}
 	xlog.Logger.Info("alloc new stream")
-
 	//block forever
 	start, _, err := sm.allocUniqID(2)
 	if err != nil {
@@ -143,6 +142,7 @@ func (sm *StreamManager) getStreamInfo(streamID uint64) (*pb.StreamInfo, bool) {
 }
 
 func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAllocExtentRequest) (*pb.StreamAllocExtentResponse, error) {
+
 	if !sm.AmLeader() {
 		return nil, errors.Errorf("not a leader")
 	}
@@ -157,6 +157,10 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 
 	//recevied commit length
 	size := sm.receiveCommitlength(ctx, nodes, req.ExtentToSeal)
+
+	if size == 0 || size == math.MaxUint32 {
+		xlog.Logger.Warnf("size is %d")
+	}
 
 	sm.sealExtents(ctx, nodes, req.ExtentToSeal, size)
 
@@ -178,7 +182,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	}
 
 	//update etcd
-	stream := sm.cloneStream(req.StreamID)
+	stream := sm.cloneStreamInfo(req.StreamID)
 	stream.ExtentIDs = append(stream.ExtentIDs, extentID)
 	//add extentID to stream
 	streamKey := formatStreamKey(req.StreamID)
@@ -266,14 +270,14 @@ func (sm *StreamManager) receiveCommitlength(ctx context.Context, nodes []NodeSt
 			reCh <- res.Length
 		})
 	}
-	stopper.Wait()
-	close(reCh)
-	//choose min of all size
-	ret := uint32(512)
+	go func(){
+		stopper.Wait()
+		close(reCh)
+	}()
+
+	//choose minimal of all size
+	ret := uint32(math.MaxUint32)
 	for size := range reCh {
-		if size == math.MaxUint32 {
-			continue
-		}
 		if size < ret {
 			ret = size
 		}
@@ -494,9 +498,9 @@ func (sm *StreamManager) getAppendExtentsAddr(streamID uint64) ([]NodeStatus, ui
 	return ret, lastExtentID, nil
 }
 
-func (sm *StreamManager) cloneStream(streamID uint64) *pb.StreamInfo {
+func (sm *StreamManager) cloneStreamInfo(streamID uint64) *pb.StreamInfo {
 	sm.streamLock.RLock()
-	defer sm.streamLock.Unlock()
+	defer sm.streamLock.RUnlock()
 	stream, ok := sm.streams[streamID]
 	if !ok {
 		return nil

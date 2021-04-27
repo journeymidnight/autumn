@@ -29,6 +29,7 @@ require (
 	github.com/hashicorp/go-immutable-radix v1.3.0
 	github.com/jonboulle/clockwork v0.2.2 // indirect
 	github.com/json-iterator/go v1.1.10 // indirect
+	github.com/klauspost/reedsolomon v1.9.12 // indirect
 	github.com/phf/go-queue v0.0.0-20170504031614-9abe38d0371d
 	github.com/pkg/errors v0.9.1
 	github.com/pkg/xattr v0.4.1

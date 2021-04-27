@@ -170,60 +170,58 @@ func (client *SMClient) RegisterNode(ctx context.Context, addr string) (uint64, 
 	return nodeID, err
 }
 
-func (client *SMClient) CreateStream(ctx context.Context) (*pb.StreamInfo, *pb.ExtentInfo, error) {
-	client.RLock()
-	defer client.RUnlock()
-	current := atomic.LoadInt32(&client.lastLeader)
-	for loop := 0; loop < len(client.conns)*2; loop++ {
-		if client.conns != nil && client.conns[current] != nil {
-			c := pb.NewStreamManagerServiceClient(client.conns[current])
-			res, err := c.CreateStream(ctx, &pb.CreateStreamRequest{})
-			if err == context.Canceled || err == context.DeadlineExceeded {
-				return nil, nil, err
-			}
-			if err != nil {
-				xlog.Logger.Warnf(err.Error())
-				current = (current + 1) % int32(len(client.conns))
-				time.Sleep(500 * time.Millisecond)
-				continue
-			}
-			atomic.StoreInt32(&client.lastLeader, current)
-			return res.Stream, res.Extent, nil
 
+//FIXME: stream layer need Code to tell logic error or network error
+func (client *SMClient) CreateStream(ctx context.Context) (*pb.StreamInfo, *pb.ExtentInfo, error) {	
+	var err error
+	var res *pb.CreateStreamResponse
+	var ei *pb.ExtentInfo
+	var si *pb.StreamInfo
+	client.try(func(conn *grpc.ClientConn) bool {
+		c := pb.NewStreamManagerServiceClient(conn)
+		res, err = c.CreateStream(ctx, &pb.CreateStreamRequest{})
+
+		//user cancel or timeout
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			return false
 		}
-	}
-	return nil, nil, errors.Errorf("timeout: CreateStream failed")
+		//grpc error
+		if err != nil {
+			xlog.Logger.Warnf(err.Error())
+			return true
+		}
+		//logical error
+		ei = res.Extent
+		si = res.Stream
+		err = nil
+		return false
+	}, 500*time.Millisecond)
+
+	return si, ei, err
 }
 
 func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64, extentToSeal uint64) (*pb.ExtentInfo, error) {
-	client.RLock()
-	defer client.RUnlock()
-	last := atomic.LoadInt32(&client.lastLeader)
-	current := last
-	for loop := 0; loop < len(client.conns)*2; loop++ {
-		if client.conns != nil && client.conns[current] != nil {
-			c := pb.NewStreamManagerServiceClient(client.conns[current])
-			//
-			res, err := c.StreamAllocExtent(ctx, &pb.StreamAllocExtentRequest{
-				StreamID:     streamID,
-				ExtentToSeal: extentToSeal,
-			})
-			if err == context.Canceled || err == context.DeadlineExceeded {
-				return nil, err
-			}
-			if err != nil {
-				xlog.Logger.Warnf(err.Error())
-				current = (current + 1) % int32(len(client.conns))
-				time.Sleep(500 * time.Millisecond)
-				continue
-			}
-			if current != last {
-				atomic.StoreInt32(&client.lastLeader, current)
-			}
-			return res.Extent, nil
+	var err error
+	var res *pb.StreamAllocExtentResponse
+	var ei *pb.ExtentInfo
+	client.try(func(conn *grpc.ClientConn) bool {
+		c := pb.NewStreamManagerServiceClient(conn)
+		res, err = c.StreamAllocExtent(ctx, &pb.StreamAllocExtentRequest{
+			StreamID: streamID,
+			ExtentToSeal: extentToSeal,
+		})
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			return false
 		}
-	}
-	return nil, errors.Errorf("timeout: CreateStream failed")
+		if err != nil {
+			xlog.Logger.Warnf(err.Error())
+			return true
+		}
+		ei = res.Extent
+		return false
+	}, 100*time.Millisecond)
+
+	return ei, err	
 }
 
 func (client *SMClient) NodesInfo(ctx context.Context) (map[uint64]*pb.NodeInfo, error) {
