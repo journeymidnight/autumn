@@ -9,7 +9,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/journeymidnight/autumn/extent/record"
 	"github.com/journeymidnight/autumn/extent/wal"
 
 	"github.com/journeymidnight/autumn/proto/pb"
@@ -305,12 +304,6 @@ func TestWalExtent(t *testing.T) {
 	fmt.Printf("End:%d\n", end)
 }
 
-
-
-
-func TestSingleBlockMaxSizeWithEC(t *testing.T) {
-	require.Equal(t, record.ComputeEnd(0, MaxBlockSize), ECChunkSize)
-}
 
 
 func TestWriteECFriendlyBlock(t *testing.T) {

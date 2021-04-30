@@ -18,6 +18,7 @@ func TestRsCodecs(t *testing.T) {
 	data := make([]byte, 4 << 10)
 	utils.SetRandStringBytes(data)
 	//test 6+3
+
 	output, err := RSEncoder{}.Encode(data, 6, 3, 4<<10)
 	require.Nil(t, err)
 	require.Equal(t, 9,len(output))
