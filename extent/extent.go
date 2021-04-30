@@ -44,26 +44,9 @@ const (
 var (
 	EndOfExtent = errors.New("EndOfExtent")
 	EndOfStream = errors.New("EndOfStream")
-	MaxBlockSize uint32
-	ECChunkSize       = uint32(128 << 20) 
+	ECChunkSize       = uint32(4 << 10)  
 )
 
-
-func init() {
-	target := ECChunkSize
-	i := uint32(0)
-	j := ECChunkSize
-	for i < j {
-		mid := (i + j)/2
-		x := record.ComputeEnd(0, uint32(mid))
-		if x <= target {
-			i = mid + 1 //higher bound
-		} else {
-			j = mid 
-		}
-	}
-	MaxBlockSize = i - 1
-}
 
 type Extent struct {
 	//sync.Mutex //only one AppendBlocks could be called at a time
@@ -317,13 +300,6 @@ func (ex *Extent) RecoveryData(start uint32, blocks []*pb.Block) error {
 
 	for _, block := range blocks {
 		expectedEnd = record.ComputeEnd(expectedEnd, uint32(len(block.Data)))
-		ecBorder := utils.Ceil(start, ECChunkSize)
-		if start == ecBorder {
-			ecBorder += ECChunkSize
-		}
-		if expectedEnd > ecBorder {
-			expectedEnd = ecBorder + record.ComputeEnd(expectedEnd, uint32(len(block.Data)))
-		}
 	}
 	
 	currentLength := atomic.LoadUint32(&ex.commitLength)
@@ -386,11 +362,7 @@ func (ex *Extent) AppendBlocks(blocks []*pb.Block,  doSync bool) ([]uint32, uint
 	for _, block := range blocks {
 		//EC friendly
 		//if expected end > 128M, skip to 128M
-		
-		
-		if err := ex.makeErasureCodeSkip(uint32(end), block); err != nil {
-			return nil, 0 ,err
-		}
+	
 		
 		start, end, err = ex.writer.WriteRecord(block.Data)
 		utils.AssertTrue(end <= math.MaxUint32)
@@ -410,29 +382,6 @@ func (ex *Extent) AppendBlocks(blocks []*pb.Block,  doSync bool) ([]uint32, uint
 	return offsets, uint32(end), nil
 }
 
-func (ex *Extent) makeErasureCodeSkip(start uint32, block *pb.Block) error{
-	if len(block.Data) > int(MaxBlockSize) {
-		return errors.Errorf("block size exceeds the max block Size %d > %d", len(block.Data), MaxBlockSize)
-	}
-
-	ecBorder := utils.Ceil(start, ECChunkSize)
-	if start == ecBorder {
-		ecBorder += ECChunkSize
-	}
-
-	expectedEnd := record.ComputeEnd(start, uint32(len(block.Data)))
-	if expectedEnd <= ecBorder {
-		return nil
-	}
-	//skip to ecBoarder
-	ex.writer.Flush()
-	
-
-	utils.Check(ex.file.Truncate(int64(ecBorder)))
-	atomic.StoreUint32(&ex.commitLength, ecBorder)
-	ex.resetWriter()
-	return nil
-}
 
 func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize uint32) ([]*pb.Block, []uint32, uint32, error) {
 
