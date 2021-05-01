@@ -20,8 +20,17 @@ import (
 )
 
 func (sm *StreamManager) CreateStream(ctx context.Context, req *pb.CreateStreamRequest) (*pb.CreateStreamResponse, error) {
+
+
+	errDone := func(codeDes string) (*pb.CreateStreamResponse, error){
+		return &pb.CreateStreamResponse{
+			Code: pb.Code_ERROR,
+			CodeDes: codeDes,
+		}, nil
+	}
+
 	if !sm.AmLeader() {
-		return nil, errors.Errorf("not a leader")
+		return errDone("not a leader")
 	}
 	xlog.Logger.Info("alloc new stream")
 	//block forever
@@ -33,16 +42,22 @@ func (sm *StreamManager) CreateStream(ctx context.Context, req *pb.CreateStreamR
 	streamID := start
 	extentID := start + 1
 
+	if  req.DataShard == 0 {
+		return errDone("req.DataShard can not be 0")
+	}
+
+
+
 	nodes := sm.cloneNodeStatus()
 
-	nodes, err = sm.policy.AllocExtent(nodes, 3, nil)
+	nodes, err = sm.policy.AllocExtent(nodes, int(req.DataShard+ req.ParityShard), nil)
 	if err != nil {
-		return nil, err
+		return errDone(err.Error())
 	}
 
 	err = sm.sendAllocToNodes(ctx, nodes, extentID)
 	if err != nil {
-		return nil, err
+		return errDone(err.Error())
 	}
 
 	//update ETCD
@@ -56,11 +71,16 @@ func (sm *StreamManager) CreateStream(ctx context.Context, req *pb.CreateStreamR
 	sdata, err := streamInfo.Marshal()
 	utils.Check(err)
 
+	
+	nodesID := extractNodeId(nodes)
+
+	utils.AssertTrue(len(nodesID)==int(req.DataShard) + int(req.ParityShard))
 	//new extents
-	extentKey := formatExtentReplicate(extentID)
+	extentKey := formatExtentKey(extentID)
 	extentInfo := pb.ExtentInfo{
 		ExtentID:   extentID,
-		Replicates: extractNodeId(nodes),
+		Replicates: nodesID[:req.DataShard],
+		Parity: nodesID[req.DataShard:],
 	}
 
 	edata, err := extentInfo.Marshal()
@@ -76,7 +96,7 @@ func (sm *StreamManager) CreateStream(ctx context.Context, req *pb.CreateStreamR
 	}, ops)
 
 	if err != nil {
-		return nil, err
+		return errDone(err.Error())
 	}
 
 	//update memory, create stream and extent.
@@ -147,7 +167,8 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		return nil, errors.Errorf("not a leader")
 	}
 
-	nodes, id, err := sm.getAppendExtentsAddr(req.StreamID)
+	//get current Stream's last extent, and find current extents' nodes
+	nodes, id, lastExtentInfo, err := sm.getAppendExtentsAddr(req.StreamID)
 	if err != nil {
 		return nil, err
 	}
@@ -155,23 +176,53 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		return nil, errors.Errorf("extentID no match %d vs %d", id, req.ExtentToSeal)
 	}
 
-	//recevied commit length
-	size := sm.receiveCommitlength(ctx, nodes, req.ExtentToSeal)
 
-	if size == 0 || size == math.MaxUint32 {
-		xlog.Logger.Warnf("size is %d")
+	if lastExtentInfo.IsSealed == 0 {
+		//recevied commit length
+		size := sm.receiveCommitlength(ctx, nodes, req.ExtentToSeal)
+
+		if size == 0 || size == math.MaxUint32 {
+			return &pb.StreamAllocExtentResponse{
+				Code: pb.Code_SealFailGetLength,
+			}, nil
+		}
+
+		sm.sealExtents(ctx, nodes, req.ExtentToSeal, size)
+		//save sealed info and update version number to etcd and update local-cache
+		
+		sealedExtentInfo := proto.Clone(lastExtentInfo).(*pb.ExtentInfo)
+
+		sealedExtentInfo.IsSealed = 1
+		sealedExtentInfo.Version ++
+
+		data := utils.MustMarshal(sealedExtentInfo)
+	
+		ops := []clientv3.Op{
+			clientv3.OpPut(formatExtentKey(id), string(data)),
+		}
+		err = manager.EtctSetKVS(sm.client, []clientv3.Cmp{
+			clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
+		}, ops)
+	
+		if err != nil {
+			return &pb.StreamAllocExtentResponse{
+				Code: pb.Code_UpdateETCDFailed,
+			}, nil
+		}
+
+		lastExtentInfo.IsSealed = 1
+		lastExtentInfo.Version ++
 	}
 
-	sm.sealExtents(ctx, nodes, req.ExtentToSeal, size)
 
 	//alloc new extend
 	extentID, _, err := sm.allocUniqID(1)
 	if err != nil {
 		return nil, errors.Errorf("can not alloc id")
 	}
-
 	nodes = sm.cloneNodeStatus()
 
+	//? todo
 	nodes, err = sm.policy.AllocExtent(nodes, 3, nil)
 	if err != nil {
 		return nil, err
@@ -190,7 +241,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	utils.Check(err)
 
 	//new extents
-	extentKey := formatExtentReplicate(extentID)
+	extentKey := formatExtentKey(extentID)
 	extentInfo := pb.ExtentInfo{
 		ExtentID:   extentID,
 		Replicates: extractNodeId(nodes),
@@ -211,7 +262,9 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	}, ops)
 
 	if err != nil {
-		return nil, err
+		return &pb.StreamAllocExtentResponse{
+			Code: pb.Code_UpdateETCDFailed,
+		}, nil
 	}
 
 	//update memory
@@ -475,19 +528,19 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 		Code: pb.Code_OK}, nil
 }
 
-func (sm *StreamManager) getAppendExtentsAddr(streamID uint64) ([]NodeStatus, uint64, error) {
+func (sm *StreamManager) getAppendExtentsAddr(streamID uint64) ([]NodeStatus,uint64, *pb.ExtentInfo, error) {
 	sm.streamLock.RLock()
 	s, ok := sm.streams[streamID]
 	lastExtentID := s.ExtentIDs[len(s.ExtentIDs)-1]
 	sm.streamLock.RUnlock()
 	if !ok {
-		return nil, 0, errors.Errorf("no such stream %d", streamID)
+		return nil, 0, nil, errors.Errorf("no such stream %d", streamID)
 	}
 	sm.extentsLock.RLock()
 	extInfo, ok := sm.extents[lastExtentID]
 	sm.extentsLock.RUnlock()
 	if !ok {
-		return nil, 0, errors.Errorf("no such extentd %d", lastExtentID)
+		return nil, 0, nil, errors.Errorf("no such extentd %d", lastExtentID)
 	}
 	sm.nodeLock.RLock()
 	var ret []NodeStatus
@@ -495,7 +548,7 @@ func (sm *StreamManager) getAppendExtentsAddr(streamID uint64) ([]NodeStatus, ui
 		ret = append(ret, *sm.nodes[nodeID])
 	}
 	sm.nodeLock.RUnlock()
-	return ret, lastExtentID, nil
+	return ret, lastExtentID, extInfo, nil
 }
 
 func (sm *StreamManager) cloneStreamInfo(streamID uint64) *pb.StreamInfo {
@@ -543,7 +596,7 @@ func formatNodeKey(ID uint64) string {
 	return fmt.Sprintf("nodes/%d", ID)
 }
 
-func formatExtentReplicate(ID uint64) string {
+func formatExtentKey(ID uint64) string {
 	return fmt.Sprintf("extents/%d", ID)
 }
 

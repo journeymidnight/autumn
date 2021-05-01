@@ -38,12 +38,10 @@ message EntryInfo {
 
 enum Code {
 	OK = 0;
-	NOT_LEADER = 1;
-	NOT_PRIMARY = 2;
-	ERROR = 3;
-	EndOfExtent = 4;
-	EndOfStream = 5;
-	TruncateNotMatch = 6;
+	ERROR = 1;
+	EndOfExtent = 2;
+	EndOfStream = 3;
+	VersionLow = 4;
 }
 
 /*
@@ -66,13 +64,15 @@ message Block {
 message AppendRequest {
 	uint64 extentID = 1;
 	repeated Block blocks = 2;
-	repeated string peers = 3;
+	uint64 version = 3;
+	//repeated string peers = 3;
 }
 
 message AppendResponse {
 	Code code = 1;
-	repeated uint32 offsets = 2;
-	uint32 end = 3;
+	string codeDes = 2;
+	repeated uint32 offsets = 3;
+	uint32 end = 4;
 }
 
 message CreateExtentRequest {
@@ -81,7 +81,8 @@ message CreateExtentRequest {
 
 message CreateExtentResponse{
 	Code code = 1;
-	uint64 extentID = 2;
+	string codeDes = 2;
+	uint64 extentID = 3;
 }
 
 message ReadBlocksRequest {
@@ -92,8 +93,9 @@ message ReadBlocksRequest {
 
 message ReadBlocksResponse {
 	Code code = 1;
-	repeated Block blocks = 2;
-	uint32 end = 3;
+	string codeDes = 2;
+	repeated Block blocks = 3;
+	uint32 end = 4;
 }
 
 
@@ -108,7 +110,8 @@ message CommitLengthRequest {
 
 message CommitLengthResponse {
 	Code code = 1;
-	uint32 length = 2;
+	string codeDes = 2;
+	uint32 length = 3;
 }
 
 message SealRequest {
@@ -118,6 +121,7 @@ message SealRequest {
 
 message SealResponse {
 	Code code = 1;
+	string codeDes = 2;
 }
 
 
@@ -130,8 +134,9 @@ message ReadEntriesRequest {
 
 message ReadEntriesResponse{
 	Code code = 1;
-	repeated EntryInfo entries = 2;
-	uint32 end = 3;
+	string codeDes = 2;
+	repeated EntryInfo entries = 3;
+	uint32 end = 4;
 }
 
 service ExtentService {
@@ -155,8 +160,9 @@ message ReplicateBlocksRequest {
 
 message ReplicateBlocksResponse {
 	Code code = 1;
-	repeated uint32 offsets = 2;
-	uint32 end = 3;
+	string codeDes = 2;
+	repeated uint32 offsets = 3;
+	uint32 end = 4;
 }
 
 message AllocExtentRequest {
@@ -165,18 +171,24 @@ message AllocExtentRequest {
 
 message AllocExtentResponse {
 	Code code = 1;
+	string codeDes = 2;
 }
 
 
 message StreamAllocExtentRequest{
 	uint64 streamID = 1;
 	uint64 extentToSeal = 2;
+	uint32 dataShard = 3;
+	uint32 parityShard =4;
+
 }
 
 
 message StreamAllocExtentResponse{
-	uint64 streamID = 1;
-	ExtentInfo extent = 2;
+	Code code = 1;
+	string codeDes = 2;
+	uint64 streamID = 3;
+	ExtentInfo extent = 4;
 }
 
 
@@ -187,8 +199,9 @@ message StreamInfoRequest {
 
 message StreamInfoResponse {
 	Code code = 1;
-	map<uint64, StreamInfo> streams = 2;
-	map<uint64, ExtentInfo> extents = 3;
+	string codeDes = 2;
+	map<uint64, StreamInfo> streams = 3;
+	map<uint64, ExtentInfo> extents = 4;
 }
 
 message ExtentInfoRequest {
@@ -203,7 +216,8 @@ message ExtentInfoResponse {
 message NodesInfoRequest{}
 message NodesInfoResponse{
 	Code code = 1;
-	map<uint64, NodeInfo> nodes = 2;
+	string codeDes = 2;
+	map<uint64, NodeInfo> nodes = 3;
 }
 
 message RegisterNodeRequest{
@@ -212,17 +226,21 @@ message RegisterNodeRequest{
 
 message RegisterNodeResponse {
 	Code code = 1;
-	uint64 nodeId = 2;
+	string codeDes = 2;
+	uint64 nodeId = 3;
 }
 
 
 message CreateStreamRequest {
+	uint32 dataShard = 1;
+	uint32 parityShard = 2;
 }
 
 message CreateStreamResponse {
 	Code code = 1;
-	StreamInfo stream = 2;
-	ExtentInfo extent = 3; 
+	string codeDes = 2;
+	StreamInfo stream = 3;
+	ExtentInfo extent = 4; 
 }
 
 message TruncateRequest {
@@ -232,6 +250,7 @@ message TruncateRequest {
 
 message TruncateResponse {
 	Code code = 1;
+	string codeDes = 2;
 }
 
 service StreamManagerService {
@@ -257,11 +276,26 @@ message MemberValue {
         string GrpcURL =3;
 }
 
+
 message ExtentInfo {
-	uint64 extentID = 1;
-	repeated uint64 replicates = 2; 
-	uint64 sealSize = 3; //TODO:
+    uint64 extentID = 1;
+    repeated uint64 replicates = 2; //dataShard nodes
+ 	repeated uint64 parity = 3;//partiyShard nodes
+	uint64 version = 4; //change version when 1, updating replicates, 2. parityNodes, 3. seal
+	uint64 refs = 5; 
+	uint64 isSealed = 6;
 }
+/*
+Extent和Stream是多对多的关系, 一个stream对应多个extent.
+如果出现splitstream的情况(删除B, 生成C,D), 一个extent可能对应2个不同的stream
+如果出现mergestream的情况(删除C,D, 生成B), 仍然一个extent对应一个stream
+删除stream的情况, extent有可能可以删除, 也有可能要保留
+
+streamAllocExtent和MultiModify, deleteStream必须修改stream每一个对应extentInfo
+sm_service什么时候删除extentInfo[ref==0]? 任何时候都可以
+
+
+*/
 
 message StreamInfo {
 	uint64 streamID = 1;

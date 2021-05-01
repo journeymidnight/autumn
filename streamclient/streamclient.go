@@ -6,8 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
-	"github.com/journeymidnight/autumn/conn"
 	"github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
@@ -18,25 +16,14 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-//read from start
-//or
-//read from offset
-
-//read critical blocks
-//read all blockss
-
-//有2个要决定, 1, 从stream哪里开始, 2, 是否只读关键blocks,是否读关键blocks
-//如果当前是关键Block
-//就读出block_meta + block_data(全量)
-//如果不是关键block
-//就只读出block_meta
-
 /*
 At the start of a partition load, the partition server
 sends a “check for commit length” to the primary EN of the last extent of these two streams.
 This checks whether all the replicas are available and that they all have the same length.
 If not, the extent is sealed and reads are only performed, during partition load,
 against a replica sealed by the SM
+
+相当于hdfs的lease recovery
 */
 
 const (
@@ -70,11 +57,11 @@ type LogEntryIter interface {
 }
 
 type AutumnBlockReader struct {
-	em *AutumnExtentManager
+	em *smclient.ExtentManager
 	sm *smclient.SMClient
 }
 
-func NewAutumnBlockReader(em *AutumnExtentManager, sm *smclient.SMClient) *AutumnBlockReader {
+func NewAutumnBlockReader(em *smclient.ExtentManager, sm *smclient.SMClient) *AutumnBlockReader {
 	return &AutumnBlockReader{
 		em: em,
 		sm: sm,
@@ -95,69 +82,7 @@ func (br *AutumnBlockReader) Read(ctx context.Context, extentID uint64, offset u
 	return res.Blocks, err
 }
 
-type AutumnExtentManager struct {
-	sync.RWMutex
-	smClient   *smclient.SMClient
-	extentInfo map[uint64]*pb.ExtentInfo
-}
 
-func NewAutomnExtentManager(sm *smclient.SMClient) *AutumnExtentManager {
-	return &AutumnExtentManager{
-		smClient:   sm,
-		extentInfo: make(map[uint64]*pb.ExtentInfo),
-	}
-}
-
-func (em *AutumnExtentManager) GetPeers(extentID uint64) []string {
-
-	extentInfo := em.GetExtentInfo(extentID)
-
-	var ret []string
-	for _, id := range extentInfo.Replicates {
-		n := em.smClient.LookupNode(id)
-		utils.AssertTrue(n != nil)
-		ret = append(ret, n.Address)
-	}
-	return ret
-}
-
-//always get alive node: FIXME:确保pool是healthy
-func (em *AutumnExtentManager) GetExtentConn(extentID uint64) *grpc.ClientConn {
-	extentInfo := em.GetExtentInfo(extentID)
-	nodeInfo := em.smClient.LookupNode(extentInfo.Replicates[0])
-	pool := conn.GetPools().Connect(nodeInfo.Address)
-	return pool.Get()
-}
-
-func (em *AutumnExtentManager) GetExtentInfo(extentID uint64) *pb.ExtentInfo {
-	em.RLock()
-	info, ok := em.extentInfo[extentID]
-	em.RUnlock()
-	if !ok {
-		//lazy receive data extentData, must success:FIXME: add new function to prefetch ExtentInfo
-		var ei *pb.ExtentInfo
-		for {
-			m, err := em.smClient.ExtentInfo(context.Background(), []uint64{extentID})
-			if err == nil {
-				ei = proto.Clone(m[extentID]).(*pb.ExtentInfo)
-				break
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
-		em.Lock()
-		em.extentInfo[extentID] = ei
-		em.Unlock()
-		info = ei
-
-	}
-	return info
-}
-
-func (em *AutumnExtentManager) SetExtentInfo(extentID uint64, info *pb.ExtentInfo) {
-	em.Lock()
-	defer em.Unlock()
-	em.extentInfo[extentID] = info
-}
 
 type ReadOption struct {
 	ReadFromStart bool
@@ -188,11 +113,11 @@ type AutumnStreamClient struct {
 	streamInfo   *pb.StreamInfo
 	//FIXME: move extentInfo output StreamClient
 	//extentInfo  map[uint64]*pb.ExtentInfo
-	em       *AutumnExtentManager
+	em       *smclient.ExtentManager
 	streamID uint64
 }
 
-func NewStreamClient(sm *smclient.SMClient, em *AutumnExtentManager, streamID uint64) *AutumnStreamClient {
+func NewStreamClient(sm *smclient.SMClient, em *smclient.ExtentManager, streamID uint64) *AutumnStreamClient {
 	utils.AssertTrue(xlog.Logger != nil)
 	return &AutumnStreamClient{
 		smClient: sm,

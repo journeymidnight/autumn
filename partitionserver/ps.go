@@ -61,7 +61,7 @@ func (ps *PartitionServer) Init() {
 
 	//get lease:FIXME
 
-	ps.extentManager = streamclient.NewAutomnExtentManager(ps.smClient)
+	ps.extentManager = smclient.NewExtentManager(ps.smClient)
 	ps.blockReader = streamclient.NewAutumnBlockReader(ps.extentManager, ps.smClient)
 
 	metas := ps.pmClient.GetPartitionMeta(ps.PSID)

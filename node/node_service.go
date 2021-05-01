@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/journeymidnight/autumn/conn"
+	"github.com/journeymidnight/autumn/erasure_code"
 	"github.com/journeymidnight/autumn/extent"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
@@ -75,7 +76,7 @@ func (en *ExtentNode) ReplicateBlocks(ctx context.Context, req *pb.ReplicateBloc
 
 }
 
-func (en *ExtentNode) connPoolOfReplicates(peers []string) ([]*conn.Pool, error) {
+func (en *ExtentNode) connPool(peers []string) ([]*conn.Pool, error) {
 	var ret []*conn.Pool
 	for _, peer := range peers {
 		pool := conn.GetPools().Connect(peer)
@@ -87,44 +88,111 @@ func (en *ExtentNode) connPoolOfReplicates(peers []string) ([]*conn.Pool, error)
 	return ret, nil
 }
 
+const (
+	cellSize = 4<< 10 //4KB
+)
+
 func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.AppendResponse, error) {
-	
-	if len(req.Peers) != 3 || req.Peers[0] != en.listenUrl {
-		return nil, errors.Errorf("req Peers is not right %v", req.Peers)
+		
+	errDone := func(codeDes string) (*pb.AppendResponse, error){
+		return &pb.AppendResponse{
+			Code: pb.Code_ERROR,
+			CodeDes: codeDes,
+		}, nil
 	}
-	
+
+	//compare extent'version with client's version
+	extentInfo := en.em.GetExtentInfo(req.ExtentID)
+	if extentInfo == nil {
+		return errDone(fmt.Sprintf("no such extent %d on etcd", req.ExtentID))
+	}
+
+	for i := 0 ; i < 3 && extentInfo.Version != req.Version ; i ++ {
+		if extentInfo.Version > req.Version {
+			return &pb.AppendResponse{
+				Code:pb.Code_VersionLow,
+			}, nil
+		} else if extentInfo.Version < req.Version {
+			extentInfo = en.em.Update(req.ExtentID)
+		}
+	}
+
+	if extentInfo.Version != req.Version {
+		return errDone("i tried 3 times to match version to you, buf failed. network partition?")
+	}
+
+	if extentInfo.IsSealed > 0 {
+		return errDone(fmt.Sprintf("extent %d is sealed", req.ExtentID))
+	}
+
+	//Append	
 	ex := en.getExtent(req.ExtentID)
 	if ex == nil {
 		xlog.Logger.Debugf("no extent %d", req.ExtentID)
-		return nil, errors.Errorf("not such extent")
+		return errDone(fmt.Sprintf("no such extent %d on node %d", req.ExtentID, en.nodeID))
 	}
+
 
 	ex.Lock()
 	defer ex.Unlock()
+	
+	//extentInfo.Replicates : list of extent node'ID
+	//extentInfo.Parity:
 
-	pools, err := en.connPoolOfReplicates(req.Peers)
+	
+	pools, err := en.connPool(en.em.GetPeers(req.ExtentID))
 	if err != nil {
-		return nil, err
+		return errDone(err.Error())
 	}
+
+	//prepare data
 	offset := ex.CommitLength()
 
 	pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
+
+	n := len(pools)
+
+
+
+	dataBlocks := make([][]*pb.Block, n)
+	//erasure code
+	if len(extentInfo.Parity) > 0 {
+		//EC, prepare data
+		dataShard := len(extentInfo.Replicates)
+		parityShard := len(extentInfo.Parity)
+
+		for i := range req.Blocks {
+			striped, err := erasure_code.RSEncoder{}.Encode(req.Blocks[i].Data, uint32(dataShard),  uint32(parityShard),  cellSize)
+			if err != nil {
+				return errDone(err.Error())
+			}
+			for j := 0 ; j < len(striped) ; j ++ {
+				dataBlocks[j] = append(dataBlocks[j], &pb.Block{Data:striped[j]})
+			}
+
+		}	
+	//replicate code	
+	} else {
+		for i := 0; i < len(dataBlocks) ; i ++ {
+			dataBlocks[i] = req.Blocks
+		}
+	}
+
 	//FIXME: put stopper into sync.Pool
 	stopper := utils.NewStopper()
-
 	type Result struct {
 		Error   error
 		Offsets []uint32
 		End uint32
 	}
-	retChan := make(chan Result, 3)
+	retChan := make(chan Result, n)
 
 	//primary
 	stopper.RunWorker(func() {
 		//ret, err := ex.AppendBlocks(req.Blocks, &offset)
-		ret, end, err := en.AppendWithWal(ex, req.Blocks)
+		ret, end, err := en.AppendWithWal(ex, dataBlocks[0])
 
 		if ret != nil {
 			retChan <- Result{Error: err, Offsets: ret, End:end}
@@ -135,7 +203,7 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 	})
 
 	//secondary
-	for i := 1; i < 3; i++ {
+	for i := 1; i < n; i++ {
 		j := i
 		stopper.RunWorker(func() {
 			conn := pools[j].Get()
@@ -143,7 +211,7 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 			res, err := client.ReplicateBlocks(pctx, &pb.ReplicateBlocksRequest{
 				ExtentID: req.ExtentID,
 				Commit:   offset,
-				Blocks:   req.Blocks,
+				Blocks:   dataBlocks[j],
 			})
 			if res != nil {
 				retChan <- Result{Error: err, Offsets: res.Offsets, End: res.End}
