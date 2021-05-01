@@ -51,6 +51,7 @@ type ExtentNode struct {
 	//replicates map[uint64][]string //extentID => [addr1, addr2]
 
 	smClient *smclient.SMClient
+	em  *smclient.ExtentManager
 }
 
 func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl string, smAddr []string) *ExtentNode {
@@ -62,6 +63,13 @@ func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl st
 		smClient:  smclient.NewSMClient(smAddr),
 		nodeID:    nodeID,
 	}
+
+	if  err := en.smClient.Connect(); err != nil {
+		xlog.Logger.Fatal(err)
+		return nil
+	}
+
+	en.em = smclient.NewExtentManager(en.smClient)
 
 	//load disk
 	for _, diskDir := range diskDirs {

@@ -54,15 +54,6 @@ StreamAllocExtent流程:
 
 
 ```
-extent头(512字节)
-	magic number (8字节)
-	extent ID    (8字节)
-block头 (512字节)
-	checksum    (4字节)
-	blocklength (4字节) //4k ~32M, 4k对齐
-	userData     (小于等于512-8)
-block数据
-	数据  (4k对齐)
 
 extent是否seal, 存储在文件系统的attr里面
 "seal"=>"true"

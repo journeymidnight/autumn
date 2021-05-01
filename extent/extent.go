@@ -15,7 +15,6 @@
 package extent
 
 import (
-	"fmt"
 	"io"
 	"io/ioutil"
 
@@ -44,7 +43,6 @@ const (
 var (
 	EndOfExtent = errors.New("EndOfExtent")
 	EndOfStream = errors.New("EndOfStream")
-	ECChunkSize       = uint32(4 << 10)  
 )
 
 
@@ -60,11 +58,12 @@ type Extent struct {
 	writer *record.LogWriter
 }
 
+
 //format to JSON
 type extentHeader struct {
 	MagicNumber []byte
 	ID          uint64
-	kBlockSize  int
+	ErasureCode string //"4+3"	
 }
 
 func (eh *extentHeader) Marshal() []byte {
@@ -309,7 +308,7 @@ func (ex *Extent) RecoveryData(start uint32, blocks []*pb.Block) error {
 	}
 	ex.file.Seek(int64(start), os.SEEK_SET)
 
-	fmt.Printf("fixing %d blocks from %d\n", len(blocks), start)
+	xlog.Logger.Debugf("fixing %d blocks from %d\n", len(blocks), start)
 	//fix current extent
 	bn := (start / record.BlockSize)
 	offset := start % record.BlockSize

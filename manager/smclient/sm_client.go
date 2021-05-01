@@ -336,10 +336,8 @@ func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, ext
 			switch res.Code {
 			case pb.Code_OK:
 				break
-			case pb.Code_TruncateNotMatch:
-				return errTruncateNoMatch
 			default:
-				return errors.New(res.Code.String())
+				return errors.New(res.CodeDes)
 			}
 
 			if current != last {

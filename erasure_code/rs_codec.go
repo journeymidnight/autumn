@@ -36,6 +36,7 @@ func (RSEncoder ) Reconstruct(input []io.Reader, dataShards int, parityShards in
 const (
 	metaSize = 4
 )
+
 func (RSEncoder) Decode(input [][]byte, dataShards uint32, parityShards uint32, cellSize uint32) ([]byte, error) {
 
 	enc, err := reedsolomon.New(int(dataShards), int(parityShards))
