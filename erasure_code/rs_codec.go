@@ -8,9 +8,9 @@ import (
 	"github.com/klauspost/reedsolomon"
 )
 
-type RSEncoder struct{} 
+type ReedSolomon struct{} 
 
-func (RSEncoder ) Reconstruct(input []io.Reader, dataShards int, parityShards int,  output []io.Writer, chunkSize int, fSize int64) error{
+func (ReedSolomon ) Reconstruct(input []io.Reader, dataShards int, parityShards int,  output []io.Writer, chunkSize int, fSize int64) error{
 	enc, err := reedsolomon.NewStream(dataShards, parityShards)
 	if err != nil {
 		return err
@@ -37,7 +37,7 @@ const (
 	metaSize = 4
 )
 
-func (RSEncoder) Decode(input [][]byte, dataShards uint32, parityShards uint32, cellSize uint32) ([]byte, error) {
+func (ReedSolomon) Decode(input [][]byte, dataShards uint32, parityShards uint32, cellSize uint32) ([]byte, error) {
 
 	enc, err := reedsolomon.New(int(dataShards), int(parityShards))
 	if err != nil {
@@ -67,7 +67,7 @@ func (RSEncoder) Decode(input [][]byte, dataShards uint32, parityShards uint32, 
 	return fullData[metaSize:], nil
 }
 
-func (RSEncoder) Encode(input []byte, dataShards uint32, parityShards uint32, cellSize uint32) ([][]byte, error) {
+func (ReedSolomon) Encode(input []byte, dataShards uint32, parityShards uint32, cellSize uint32) ([][]byte, error) {
 
 	enc, err := reedsolomon.New(int(dataShards), int(parityShards))
 	if err != nil {

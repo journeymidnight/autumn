@@ -377,7 +377,7 @@ retry:
 	res, err := c.Append(ctx, &pb.AppendRequest{
 		ExtentID: extentID,
 		Blocks:   blocks,
-		Peers:    sc.em.GetPeers(extentID), //sc.getPeers(extentID),
+		Version: XXX,
 	})
 	cancel()
 
