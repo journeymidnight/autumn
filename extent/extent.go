@@ -30,6 +30,7 @@ import (
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/rangepartition/y"
 	"github.com/journeymidnight/autumn/utils"
+	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/xattr"
 )
@@ -40,10 +41,6 @@ const (
 	XATTRSEAL         = "user.XATTRSEAL"
 )
 
-var (
-	EndOfExtent = errors.New("EndOfExtent")
-	EndOfStream = errors.New("EndOfStream")
-)
 
 
 type Extent struct {
@@ -391,9 +388,9 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 
 	if currentLength <= offset {
 		if ex.IsSeal() {
-			return nil, nil, 0, EndOfExtent
+			return nil, nil, 0, wire_errors.EndOfExtent
 		} else {
-			return nil, nil, 0, EndOfStream
+			return nil, nil, 0, wire_errors.EndOfStream
 		}
 	}
 
@@ -412,9 +409,9 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 		start := rr.Offset()
 		if err == io.EOF {
 			if ex.IsSeal() {
-				return ret, offsets, end, EndOfExtent
+				return ret, offsets, end, wire_errors.EndOfExtent
 			} else {
-				return ret, offsets, end, EndOfStream
+				return ret, offsets, end, wire_errors.EndOfStream
 			}
 		}
 
@@ -446,7 +443,7 @@ func (ex *Extent) CommitLength() uint32 {
 func (ex *Extent) ReadEntries(offset uint32, maxTotalSize uint32, replay bool) ([]*pb.EntryInfo, uint32, error) {
 
 	blocks, offsets, end, err := ex.ReadBlocks(offset, 10, maxTotalSize)
-	if err != nil && err != EndOfStream && err != EndOfExtent {
+	if err != nil && err != wire_errors.EndOfStream && err != wire_errors.EndOfExtent {
 		return nil, 0, err
 	}
 	var ret []*pb.EntryInfo
