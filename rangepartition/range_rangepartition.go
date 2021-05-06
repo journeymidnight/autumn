@@ -667,7 +667,7 @@ func (rp *RangePartition) doWrites() {
 			select {
 			case r = <-rp.writeCh:
 				reqs = append(reqs, r)
-				/*
+				/*	
 					if isReqsTooBig(reqs) {
 						pendingCh <- struct{}{} // blocking.
 						goto writeCase

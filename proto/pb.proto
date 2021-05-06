@@ -42,6 +42,7 @@ enum Code {
 	EndOfExtent = 2;
 	EndOfStream = 3;
 	EVersionLow = 4;
+	NotLEADER = 5;
 }
 
 

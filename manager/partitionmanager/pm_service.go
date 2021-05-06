@@ -11,6 +11,7 @@ import (
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/utils"
+	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
 )
@@ -19,7 +20,7 @@ func (pm *PartitionManager) GetPartitionMeta(ctx context.Context, req *pspb.GetP
 
 	if !pm.AmLeader() {
 		return &pspb.GetPartitionMetaResponse{
-			Code: pb.Code_NOT_LEADER,
+			Code: pb.Code_NotLEADER,
 		}, nil
 	}
 
@@ -37,11 +38,13 @@ func (pm *PartitionManager) GetPartitionMeta(ctx context.Context, req *pspb.GetP
 	}, nil
 }
 
-//FIXME:ERROR
 func (pm *PartitionManager) SetRowStreamTables(ctx context.Context, req *pspb.SetRowStreamTablesRequest) (*pspb.SetRowStreamTablesResponse, error) {
-	done := func(err error) (*pspb.SetRowStreamTablesResponse, error) {
+	
+	//FIXME:fix done, add codedes
+	done := func(err error) (*pspb.SetRowStreamTablesResponse, error){
+		code, _ := wire_errors.ConvertToPBCode(err)
 		return &pspb.SetRowStreamTablesResponse{
-			Code: pb.Code_ERROR,
+			Code: code,
 		}, nil
 	}
 
@@ -59,7 +62,7 @@ func (pm *PartitionManager) SetRowStreamTables(ctx context.Context, req *pspb.Se
 		clientv3.OpPut(fmt.Sprintf("PART/%d/tables", req.PartitionID), string(data)),
 	}
 
-	err = manager.EtctSetKVS(pm.client, []clientv3.Cmp{
+	err = manager.EtcdSetKVS(pm.client, []clientv3.Cmp{
 		clientv3.Compare(clientv3.Value(pm.leaderKey), "=", pm.memberValue),
 	}, ops)
 
@@ -126,7 +129,7 @@ func (pm *PartitionManager) RegisterPS(ctx context.Context, req *pspb.RegisterPS
 		clientv3.OpPut(PSKEY, string(data)),
 	}
 
-	err = manager.EtctSetKVS(pm.client, []clientv3.Cmp{
+	err = manager.EtcdSetKVS(pm.client, []clientv3.Cmp{
 		clientv3.Compare(clientv3.Value(pm.leaderKey), "=", pm.memberValue),
 	}, ops)
 	if err != nil {
@@ -199,7 +202,7 @@ func (pm *PartitionManager) Bootstrap(ctx context.Context, req *pspb.BootstrapRe
 	}
 
 	//FIXME: update PSVERSION
-	err = manager.EtctSetKVS(pm.client, []clientv3.Cmp{
+	err = manager.EtcdSetKVS(pm.client, []clientv3.Cmp{
 		clientv3.Compare(clientv3.Value(pm.leaderKey), "=", pm.memberValue),
 	}, ops)
 

@@ -31,7 +31,7 @@ func (suite *EtcdUtilTestSuite) SetupSuite() {
 		InitialCluster:      "etcd=http://127.0.0.1:2380",
 		InitialClusterState: "new",
 		ClusterToken:        "cluster",
-		GrpcUrlSM:             "127.0.0.1:3000",
+		GrpcUrl:             "127.0.0.1:3000",
 	}
 	etcd, client, err := ServeETCD(config)
 	suite.Nil(err)

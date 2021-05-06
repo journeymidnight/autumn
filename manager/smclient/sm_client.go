@@ -8,6 +8,7 @@ import (
 
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
+	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
@@ -125,10 +126,11 @@ func (client *SMClient) Alive() bool {
 func (client *SMClient) try(f func(conn *grpc.ClientConn) bool, x time.Duration) {
 	client.RLock()
 	connLen := len(client.conns)
+	utils.AssertTrue(connLen > 0)
 	client.RUnlock()
 
 	current := atomic.LoadInt32(&client.lastLeader)
-	for loop := 0; loop < connLen*2; loop++ {
+	for loop := 0; loop < connLen * 4; loop++ {
 		client.RLock()
 		if client.conns != nil && client.conns[current] != nil {
 			//if f() return true, sleep and continue
@@ -144,11 +146,12 @@ func (client *SMClient) try(f func(conn *grpc.ClientConn) bool, x time.Duration)
 				return
 			}
 		}
+		
 	}
 }
 
 func (client *SMClient) RegisterNode(ctx context.Context, addr string) (uint64, error) {
-	var err error
+	err := errors.New("can not find connection to stream manager")
 	var res *pb.RegisterNodeResponse
 	nodeID := uint64(0)
 	client.try(func(conn *grpc.ClientConn) bool {
@@ -163,23 +166,35 @@ func (client *SMClient) RegisterNode(ctx context.Context, addr string) (uint64, 
 			xlog.Logger.Warnf(err.Error())
 			return true
 		}
+		if res.Code != pb.Code_OK {
+			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
+			//if remote is not a leader, retry
+			if err == wire_errors.NotLeader {
+				return true
+			}
+			return false
+		}
+
 		nodeID = res.NodeId
 		return false
-	}, 10*time.Millisecond)
+	}, 500*time.Millisecond)
 
 	return nodeID, err
 }
 
 
 //FIXME: stream layer need Code to tell logic error or network error
-func (client *SMClient) CreateStream(ctx context.Context) (*pb.StreamInfo, *pb.ExtentInfo, error) {	
-	var err error
+func (client *SMClient) CreateStream(ctx context.Context, dataShard uint32, parityShard uint32) (*pb.StreamInfo, *pb.ExtentInfo, error) {	
+	err := errors.New("can not find connection to stream manager")
 	var res *pb.CreateStreamResponse
 	var ei *pb.ExtentInfo
 	var si *pb.StreamInfo
 	client.try(func(conn *grpc.ClientConn) bool {
 		c := pb.NewStreamManagerServiceClient(conn)
-		res, err = c.CreateStream(ctx, &pb.CreateStreamRequest{})
+		res, err = c.CreateStream(ctx, &pb.CreateStreamRequest{
+			DataShard: dataShard,
+			ParityShard: parityShard,
+		})
 
 		//user cancel or timeout
 		if err == context.Canceled || err == context.DeadlineExceeded {
@@ -188,9 +203,13 @@ func (client *SMClient) CreateStream(ctx context.Context) (*pb.StreamInfo, *pb.E
 		//grpc error
 		if err != nil {
 			xlog.Logger.Warnf(err.Error())
-			return true
+			return true //retry
 		}
 		//logical error
+		if res.Code != pb.Code_OK {
+			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
+			return false
+		}
 		ei = res.Extent
 		si = res.Stream
 		err = nil

@@ -69,16 +69,22 @@ func NewAutumnBlockReader(em *smclient.ExtentManager, sm *smclient.SMClient) *Au
 }
 
 func (br *AutumnBlockReader) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, error) {
+	exInfo := br.em.GetExtentInfo(extentID)
+	if exInfo == nil {
+		return nil,  errors.Errorf("no such extent")
+	}
 	conn := br.em.GetExtentConn(extentID)
 	if conn == nil {
 		return nil, errors.Errorf("no such extent")
 	}
 	c := pb.NewExtentServiceClient(conn)
-	res, err := c.ReadBlocks(ctx, &pb.ReadBlocksRequest{
+	res, err := c.SmartReadBlocks(ctx, &pb.ReadBlocksRequest{
 		ExtentID:    extentID,
 		Offset:      offset,
 		NumOfBlocks: numOfBlocks,
+		Eversion: exInfo.Eversion ,
 	})
+	
 	return res.Blocks, err
 }
 
@@ -289,12 +295,15 @@ func (sc *AutumnStreamClient) getExtentConnFromIndex(extendIdIndex int) (*grpc.C
 	return conn, id, nil
 }
 
-func (sc *AutumnStreamClient) getLastExtentConn() (uint64, *grpc.ClientConn) {
+func (sc *AutumnStreamClient) getLastExtentConn() (uint64, *grpc.ClientConn, error) {
 	sc.RLock()
 	defer sc.RUnlock()
+	if sc.streamInfo == nil || len(sc.streamInfo.ExtentIDs) == 0 {
+		return 0, nil, errors.New("no streamInfo or streamInfo is not correct")
+	}
 	extentID := sc.streamInfo.ExtentIDs[len(sc.streamInfo.ExtentIDs)-1] //last extentd
 
-	return extentID, sc.em.GetExtentConn(extentID)
+	return extentID, sc.em.GetExtentConn(extentID),nil
 }
 
 func (sc *AutumnStreamClient) mustAllocNewExtent(oldExtentID uint64) error{
@@ -371,18 +380,26 @@ func (sc *AutumnStreamClient) Read(ctx context.Context, extentID uint64, offset 
 func (sc *AutumnStreamClient) Append(ctx context.Context, blocks []*pb.Block) (uint64, []uint32, uint32,  error) {
 	loop := 0
 retry:
-	extentID, conn := sc.getLastExtentConn()
+	extentID, conn, err := sc.getLastExtentConn()
+	if err != nil {
+		return 0, nil, 0, err
+	}
+	exInfo := sc.em.GetExtentInfo(extentID)
+	if exInfo == nil {
+		return extentID, nil, 0, errors.New("not such extent")
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	c := pb.NewExtentServiceClient(conn)
 	res, err := c.Append(ctx, &pb.AppendRequest{
 		ExtentID: extentID,
 		Blocks:   blocks,
-		Version: XXX,
+		Eversion: exInfo.Eversion,
 	})
 	cancel()
 
 	
-	if status.Code(err) == codes.DeadlineExceeded{//timeout
+	if status.Code(err) == codes.DeadlineExceeded{ //timeout
 		if loop < 3 {
 			loop ++
 			goto retry

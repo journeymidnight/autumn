@@ -87,21 +87,18 @@ func (ReedSolomon) Encode(input []byte, dataShards uint32, parityShards uint32, 
 
 	//fill the first cell
 	binary.BigEndian.PutUint32(data[0], uint32(rawSize))
-	copy(data[0][metaSize:], input[0:cellSize-metaSize])
+
+	//len of input could be smaller than cellSize - metaSize
+	size := utils.Min(len(input), int(cellSize) - metaSize)
+	copy(data[0][metaSize:], input[0:size])
 
 	//fill the other cell
 	cellNums := utils.Ceil(uint32(actualSize), uint32(cellSize)) / uint32(cellSize)
 	for k := uint32(1) ; k <  cellNums ; k ++ {
 		i := k / dataShards
 		j := k % dataShards
-
-		var availData uint32
-		if cellSize < actualSize - k*cellSize {
-			availData = cellSize
-		} else {
-			availData = actualSize - k*cellSize
-		}
-		copy(data[j][i*cellSize:], input[k*cellSize-metaSize:k*cellSize-metaSize+availData])
+		availData := utils.Min(int(cellSize), int(actualSize- k *cellSize))
+		copy(data[j][i*cellSize:], input[k*cellSize-metaSize:k*cellSize-metaSize+uint32(availData)])
 	}
 
 	err = enc.Encode(data)
