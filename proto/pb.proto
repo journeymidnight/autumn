@@ -202,7 +202,8 @@ message ExtentInfoRequest {
 
 message ExtentInfoResponse {
 	Code code = 1;
-	map<uint64, ExtentInfo> extents = 2;
+	string codeDes = 2;
+	map<uint64, ExtentInfo> extents = 3;
 }
 
 message NodesInfoRequest{}

@@ -446,8 +446,17 @@ func (sm *StreamManager) NodesInfo(ctx context.Context, req *pb.NodesInfoRequest
 }
 
 func (sm *StreamManager) ExtentInfo(ctx context.Context, req *pb.ExtentInfoRequest) (*pb.ExtentInfoResponse, error) {
+	
+	errDone := func(err error) (*pb.ExtentInfoResponse, error){
+		code, desCode := wire_errors.ConvertToPBCode(err)
+		return &pb.ExtentInfoResponse{
+			Code: code,
+			CodeDes: desCode,
+		}, nil
+	}
+
 	if !sm.AmLeader() {
-		return nil, errors.Errorf("not a leader")
+		return errDone(wire_errors.NotLeader)
 	}
 	sm.extentsLock.RLock()
 	defer sm.extentsLock.RUnlock()
@@ -467,9 +476,19 @@ func (sm *StreamManager) ExtentInfo(ctx context.Context, req *pb.ExtentInfoReque
 }
 
 func (sm *StreamManager) StreamInfo(ctx context.Context, req *pb.StreamInfoRequest) (*pb.StreamInfoResponse, error) {
-	if !sm.AmLeader() {
-		return nil, errors.Errorf("not a leader")
+	
+	errDone := func(err error) (*pb.StreamInfoResponse, error){
+		code, desCode := wire_errors.ConvertToPBCode(err)
+		return &pb.StreamInfoResponse{
+			Code: code,
+			CodeDes: desCode,
+		}, nil
 	}
+
+	if !sm.AmLeader() {
+		return errDone(wire_errors.NotLeader)
+	}
+
 	sm.streamLock.RLock()
 	defer sm.streamLock.RUnlock()
 	sm.extentsLock.RLock()
@@ -500,17 +519,24 @@ func (sm *StreamManager) StreamInfo(ctx context.Context, req *pb.StreamInfoReque
 }
 
 func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) (*pb.TruncateResponse, error) {
-	if !sm.AmLeader() {
-		return nil, errors.Errorf("not a leader")
+	
+	errDone := func(err error) (*pb.TruncateResponse, error){
+		code, desCode := wire_errors.ConvertToPBCode(err)
+		return &pb.TruncateResponse{
+			Code: code,
+			CodeDes: desCode,
+		}, nil
 	}
+
+	if !sm.AmLeader() {
+		return errDone(wire_errors.NotLeader)
+	}
+
 	sm.streamLock.Lock()
 	defer sm.streamLock.Unlock()
 	streamInfo, ok := sm.streams[req.StreamID]
 	if !ok {
-		return &pb.TruncateResponse{
-			Code: pb.Code_ERROR,
-			CodeDes: "stream do not have streaminfo",
-		}, nil
+		return errDone(errors.Errorf("stream do not have streaminfo"))
 	}
 	var i int
 	for i = range streamInfo.ExtentIDs {
@@ -543,7 +569,7 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 	}, ops)
 
 	if err != nil {
-		return nil, err
+		return errDone(err)
 	}
 
 	sm.streams[req.StreamID] = &newStreamInfo
