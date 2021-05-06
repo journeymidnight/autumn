@@ -122,7 +122,6 @@ func (client *SMClient) Alive() bool {
 }
 
 
-
 func (client *SMClient) try(f func(conn *grpc.ClientConn) bool, x time.Duration) {
 	client.RLock()
 	connLen := len(client.conns)
@@ -220,7 +219,7 @@ func (client *SMClient) CreateStream(ctx context.Context, dataShard uint32, pari
 }
 
 func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64, extentToSeal uint64) (*pb.ExtentInfo, error) {
-	var err error
+	err := errors.New("can not find connection to stream manager")
 	var res *pb.StreamAllocExtentResponse
 	var ei *pb.ExtentInfo
 	client.try(func(conn *grpc.ClientConn) bool {
@@ -236,6 +235,15 @@ func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64, 
 			xlog.Logger.Warnf(err.Error())
 			return true
 		}
+		if res.Code != pb.Code_OK {
+			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
+			//if remote is not a leader, retry
+			if err == wire_errors.NotLeader {
+				return true
+			}
+			return false
+		}
+
 		ei = res.Extent
 		return false
 	}, 100*time.Millisecond)
@@ -244,127 +252,124 @@ func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64, 
 }
 
 func (client *SMClient) NodesInfo(ctx context.Context) (map[uint64]*pb.NodeInfo, error) {
-	client.RLock()
-	defer client.RUnlock()
-	last := atomic.LoadInt32(&client.lastLeader)
-	current := last
-	for loop := 0; loop < len(client.conns)*2; loop++ {
-		if client.conns != nil && client.conns[current] != nil {
-			c := pb.NewStreamManagerServiceClient(client.conns[current])
-			//
-			res, err := c.NodesInfo(ctx, &pb.NodesInfoRequest{})
-			if err == context.Canceled || err == context.DeadlineExceeded {
-				return nil, err
-			}
-			if err != nil {
-				xlog.Logger.Warnf(err.Error())
-				current = (current + 1) % int32(len(client.conns))
-				time.Sleep(500 * time.Millisecond)
-				continue
-			}
-			if current != last {
-				atomic.StoreInt32(&client.lastLeader, current)
-			}
-			return res.Nodes, nil
+	
+	err := errors.New("can not find connection to stream manager")
+	var res *pb.NodesInfoResponse
+	var nodeInfos map[uint64]*pb.NodeInfo
+	client.try(func(conn *grpc.ClientConn) bool {
+		c := pb.NewStreamManagerServiceClient(conn)
+		res, err = c.NodesInfo(ctx, &pb.NodesInfoRequest{})
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			return false
 		}
-	}
-	return nil, errors.Errorf("timeout: NodesInfo failed")
+		if err != nil {
+			xlog.Logger.Warnf(err.Error())
+			return true
+		}
+		if res.Code != pb.Code_OK {
+			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
+			//if remote is not a leader, retry
+			if err == wire_errors.NotLeader {
+				return true
+			}
+			return false
+		}
+		nodeInfos = res.Nodes
+		return false
+	}, 500*time.Millisecond)
+
+	return nodeInfos, err
 }
 
 func (client *SMClient) ExtentInfo(ctx context.Context, extentIDs []uint64) (map[uint64]*pb.ExtentInfo, error) {
-	client.RLock()
-	defer client.RUnlock()
-	last := atomic.LoadInt32(&client.lastLeader)
-	current := last
-	for loop := 0; loop < len(client.conns)*2; loop++ {
-		if client.conns != nil && client.conns[current] != nil {
-			c := pb.NewStreamManagerServiceClient(client.conns[current])
-			//
-			res, err := c.ExtentInfo(ctx, &pb.ExtentInfoRequest{
-				Extents: extentIDs,
-			})
-			if err == context.Canceled || err == context.DeadlineExceeded {
-				return nil, err
-			}
-			if err != nil {
-				xlog.Logger.Warnf(err.Error())
-				current = (current + 1) % int32(len(client.conns))
-				time.Sleep(500 * time.Millisecond)
-				continue
-			}
-			if current != last {
-				atomic.StoreInt32(&client.lastLeader, current)
-			}
-			return res.Extents, nil
+	
+	err := errors.New("can not find connection to stream manager")
+	var res *pb.ExtentInfoResponse
+	var extentInfos map[uint64]*pb.ExtentInfo
+	client.try(func(conn *grpc.ClientConn) bool {
+		c := pb.NewStreamManagerServiceClient(conn)
+		res, err = c.ExtentInfo(ctx, &pb.ExtentInfoRequest{Extents: extentIDs})
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			return false
 		}
-	}
-	return nil, errors.Errorf("timeout: ExtentInfo failed")
+		if err != nil {
+			xlog.Logger.Warnf(err.Error())
+			return true
+		}
+		if res.Code != pb.Code_OK {
+			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
+			//if remote is not a leader, retry
+			if err == wire_errors.NotLeader {
+				return true
+			}
+			return false
+		}
+		extentInfos = res.Extents
+		return false
+	}, 500*time.Millisecond)
+
+	return extentInfos, err
 }
 
 func (client *SMClient) StreamInfo(ctx context.Context, streamIDs []uint64) (map[uint64]*pb.StreamInfo, map[uint64]*pb.ExtentInfo, error) {
-	client.RLock()
-	defer client.RUnlock()
-	last := atomic.LoadInt32(&client.lastLeader)
-	current := last
-	for loop := 0; loop < len(client.conns)*2; loop++ {
-		if client.conns != nil && client.conns[current] != nil {
-			c := pb.NewStreamManagerServiceClient(client.conns[current])
-			//
-			res, err := c.StreamInfo(ctx, &pb.StreamInfoRequest{
-				StreamIDs: streamIDs,
-			})
-			if err == context.Canceled || err == context.DeadlineExceeded {
-				return nil, nil, err
-			}
-			if err != nil {
-				xlog.Logger.Warnf(err.Error())
-				current = (current + 1) % int32(len(client.conns))
-				time.Sleep(500 * time.Millisecond)
-				continue
-			}
-			if current != last {
-				atomic.StoreInt32(&client.lastLeader, current)
-			}
-			return res.Streams, res.Extents, nil
+	
+	err := errors.New("can not find connection to stream manager")
+	var res *pb.StreamInfoResponse
+	var extentInfos map[uint64]*pb.ExtentInfo
+	var streamInfos map[uint64]*pb.StreamInfo
+
+	client.try(func(conn *grpc.ClientConn) bool {
+		c := pb.NewStreamManagerServiceClient(conn)
+		res, err = c.StreamInfo(ctx, &pb.StreamInfoRequest{StreamIDs: streamIDs})
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			return false
 		}
-	}
-	return nil, nil, errors.Errorf("timeout: StreamInfo failed")
+		if err != nil {
+			xlog.Logger.Warnf(err.Error())
+			return true
+		}
+		if res.Code != pb.Code_OK {
+			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
+			//if remote is not a leader, retry
+			if err == wire_errors.NotLeader {
+				return true
+			}
+			return false
+		}
+		extentInfos = res.Extents
+		streamInfos = res.Streams
+		return false
+	}, 500*time.Millisecond)
+
+	return streamInfos, extentInfos, err	
 }
 
 func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, extentID uint64) error {
-	client.RLock()
-	defer client.RUnlock()
-	last := atomic.LoadInt32(&client.lastLeader)
-	current := last
-	for loop := 0; loop < len(client.conns)*2; loop++ {
-		if client.conns != nil && client.conns[current] != nil {
-			c := pb.NewStreamManagerServiceClient(client.conns[current])
-			res, err := c.Truncate(ctx, &pb.TruncateRequest{
-				StreamID: streamID,
-				ExtentID: extentID,
-			})
-			if err == context.Canceled || err == context.DeadlineExceeded {
-				return err
-			}
-			if err != nil {
-				xlog.Logger.Warnf(err.Error())
-				current = (current + 1) % int32(len(client.conns))
-				time.Sleep(500 * time.Millisecond)
-				continue
-			}
-			switch res.Code {
-			case pb.Code_OK:
-				break
-			default:
-				return errors.New(res.CodeDes)
-			}
-
-			if current != last {
-				atomic.StoreInt32(&client.lastLeader, current)
-			}
-			return nil
+	err := errors.New("can not find connection to stream manager")
+	var res *pb.TruncateResponse
+	client.try(func(conn *grpc.ClientConn) bool {
+		c := pb.NewStreamManagerServiceClient(conn)
+		res, err = c.Truncate(ctx, &pb.TruncateRequest{
+			StreamID: streamID,
+			ExtentID: extentID,
+		})
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			return false
 		}
-	}
-	return errors.Errorf("timeout: StreamInfo failed")
+		if err != nil {
+			xlog.Logger.Warnf(err.Error())
+			return true
+		}
+		if res.Code != pb.Code_OK {
+			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
+			//if remote is not a leader, retry
+			if err == wire_errors.NotLeader {
+				return true
+			}
+			return false
+		}
+		return false
+	}, 500*time.Millisecond)
 
+	return  err	
 }
