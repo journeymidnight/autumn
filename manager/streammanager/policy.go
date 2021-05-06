@@ -3,6 +3,7 @@ package streammanager
 import (
 	"sort"
 
+	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
 )
 
@@ -13,6 +14,8 @@ type AllocExtentPolicy interface {
 type SimplePolicy struct{}
 
 func (sp *SimplePolicy) AllocExtent(ns []NodeStatus, count int, keepNodes []uint64) ([]NodeStatus, error) {
+
+	xlog.Logger.Debugf("alloc extents %d from %d", count, len(ns))
 	sort.Slice(ns, func(a, b int) bool {
 		if ns[a].lastEcho.After(ns[b].lastEcho) {
 			return true
@@ -26,7 +29,9 @@ func (sp *SimplePolicy) AllocExtent(ns []NodeStatus, count int, keepNodes []uint
 	for _, id := range keepNodes {
 		set[id] = true
 	}
-
+	if len(ns) < count {
+		return nil, errors.New("not enough nodes")
+	}
 	var ret []NodeStatus
 	for i := 0; i < count; i++ {
 		if _, ok := set[ns[i].NodeID]; !ok {

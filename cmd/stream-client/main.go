@@ -187,12 +187,12 @@ func benchmark(smAddr []string, op BenchType, duration int, size int, threadNum 
 		return err
 	}
 	stopper := utils.NewStopper()
-	s, _, err := sm.CreateStream(context.Background())
+	s, _, err := sm.CreateStream(context.Background(), 2, 1)
 	if err != nil {
 		return err
 	}
 
-	em := streamclient.NewAutomnExtentManager(sm)
+	em := smclient.NewExtentManager(sm)
 
 	sc := streamclient.NewStreamClient(sm, em, s.StreamID)
 	if err = sc.Connect(); err != nil {
@@ -334,7 +334,7 @@ func alloc(c *cli.Context) error {
 	if err := client.Connect(); err != nil {
 		return err
 	}
-	s, e, err := client.CreateStream(context.Background())
+	s, e, err := client.CreateStream(context.Background(), 2, 1)
 	if err != nil {
 		return err
 	}
@@ -369,7 +369,7 @@ func main() {
 			Name:  "wbench",
 			Usage: "wbench --cluster <path> --thread <num> --duration <duration>",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "cluster", Value: "127.0.0.1:3401, 127.0.0.1:3402, 127.0.0.1:3403", Aliases: []string{"c"}},
+				&cli.StringFlag{Name: "cluster", Value: "127.0.0.1:3401", Aliases: []string{"c"}},
 				&cli.IntFlag{Name: "thread", Value: 1, Aliases: []string{"t"}},
 				&cli.IntFlag{Name: "duration", Value: 10, Aliases: []string{"d"}},
 				&cli.IntFlag{Name: "size", Value: 8192, Aliases: []string{"s"}},

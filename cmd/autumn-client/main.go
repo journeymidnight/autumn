@@ -218,11 +218,11 @@ func bootstrap(c *cli.Context) error {
 	}
 	//choose the first one
 
-	log, _, err := smc.CreateStream(context.Background())
+	log, _, err := smc.CreateStream(context.Background(),3,0)
 	if err != nil {
 		return err
 	}
-	row, _, err := smc.CreateStream(context.Background())
+	row, _, err := smc.CreateStream(context.Background(),3,0)
 	if err != nil {
 		return err
 	}

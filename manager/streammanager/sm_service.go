@@ -15,6 +15,7 @@ import (
 	"github.com/journeymidnight/autumn/manager"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
+	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
 )
@@ -22,42 +23,46 @@ import (
 func (sm *StreamManager) CreateStream(ctx context.Context, req *pb.CreateStreamRequest) (*pb.CreateStreamResponse, error) {
 
 
-	errDone := func(codeDes string) (*pb.CreateStreamResponse, error){
+	errDone := func(err error) (*pb.CreateStreamResponse, error){
+		code, desCode := wire_errors.ConvertToPBCode(err)
 		return &pb.CreateStreamResponse{
-			Code: pb.Code_ERROR,
-			CodeDes: codeDes,
+			Code: code,
+			CodeDes: desCode,
 		}, nil
 	}
 
 	if !sm.AmLeader() {
-		return errDone("not a leader")
+		return errDone(wire_errors.NotLeader)
 	}
+
 	xlog.Logger.Info("alloc new stream")
 	//block forever
 	start, _, err := sm.allocUniqID(2)
 	if err != nil {
-		return nil, err
+		return errDone(err)
 	}
 	//streamID and extentID.
 	streamID := start
 	extentID := start + 1
 
-	if  req.DataShard == 0 {
-		return errDone("req.DataShard can not be 0")
+	if req.DataShard == 0 {
+		return errDone(errors.New("req.DataShard can not be 0"))
 	}
-
+	if req.ParityShard == 0 && req.DataShard != 3 {
+		return errDone(errors.New("replica only support 3 replics"))
+	}
 
 
 	nodes := sm.cloneNodeStatus()
 
-	nodes, err = sm.policy.AllocExtent(nodes, int(req.DataShard+ req.ParityShard), nil)
+	nodes, err = sm.policy.AllocExtent(nodes, int(req.DataShard + req.ParityShard), nil)
 	if err != nil {
-		return errDone(err.Error())
+		return errDone(err)
 	}
 
 	err = sm.sendAllocToNodes(ctx, nodes, extentID)
 	if err != nil {
-		return errDone(err.Error())
+		return errDone(err)
 	}
 
 	//update ETCD
@@ -91,12 +96,12 @@ func (sm *StreamManager) CreateStream(ctx context.Context, req *pb.CreateStreamR
 		clientv3.OpPut(extentKey, string(edata)),
 	}
 
-	err = manager.EtctSetKVS(sm.client, []clientv3.Cmp{
+	err = manager.EtcdSetKVS(sm.client, []clientv3.Cmp{
 		clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
 	}, ops)
 
 	if err != nil {
-		return errDone(err.Error())
+		return errDone(err)
 	}
 
 	//update memory, create stream and extent.
@@ -163,17 +168,32 @@ func (sm *StreamManager) getStreamInfo(streamID uint64) (*pb.StreamInfo, bool) {
 
 func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAllocExtentRequest) (*pb.StreamAllocExtentResponse, error) {
 
-	if !sm.AmLeader() {
-		return nil, errors.Errorf("not a leader")
+	errDone := func(err error) (*pb.StreamAllocExtentResponse, error){
+		code, desCode := wire_errors.ConvertToPBCode(err)
+		return &pb.StreamAllocExtentResponse{
+			Code: code,
+			CodeDes: desCode,
+		}, nil
 	}
 
+	if !sm.AmLeader() {
+		return errDone(wire_errors.NotLeader)
+	}
+
+	if req.DataShard == 0 {
+		return errDone(errors.New("req.DataShard can not be 0"))
+	}
+	if req.ParityShard == 0 && req.DataShard != 3 {
+		return errDone(errors.New("replica only support 3 replics"))
+	}
+	
 	//get current Stream's last extent, and find current extents' nodes
 	nodes, id, lastExtentInfo, err := sm.getAppendExtentsAddr(req.StreamID)
 	if err != nil {
-		return nil, err
+		return errDone(err)
 	}
 	if id != req.ExtentToSeal {
-		return nil, errors.Errorf("extentID no match %d vs %d", id, req.ExtentToSeal)
+		return errDone(errors.Errorf("extentID no match %d vs %d", id, req.ExtentToSeal))
 	}
 
 
@@ -182,9 +202,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		size := sm.receiveCommitlength(ctx, nodes, req.ExtentToSeal)
 
 		if size == 0 || size == math.MaxUint32 {
-			return &pb.StreamAllocExtentResponse{
-				Code: pb.Code_SealFailGetLength,
-			}, nil
+			return errDone(errors.New("seal can not get Commitlength"))
 		}
 
 		sm.sealExtents(ctx, nodes, req.ExtentToSeal, size)
@@ -193,43 +211,41 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		sealedExtentInfo := proto.Clone(lastExtentInfo).(*pb.ExtentInfo)
 
 		sealedExtentInfo.IsSealed = 1
-		sealedExtentInfo.Version ++
+		sealedExtentInfo.Eversion ++
 
 		data := utils.MustMarshal(sealedExtentInfo)
 	
 		ops := []clientv3.Op{
 			clientv3.OpPut(formatExtentKey(id), string(data)),
 		}
-		err = manager.EtctSetKVS(sm.client, []clientv3.Cmp{
+		err = manager.EtcdSetKVS(sm.client, []clientv3.Cmp{
 			clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
 		}, ops)
 	
 		if err != nil {
-			return &pb.StreamAllocExtentResponse{
-				Code: pb.Code_UpdateETCDFailed,
-			}, nil
+			return errDone(errors.Errorf("can not set ETCD"))
 		}
 
 		lastExtentInfo.IsSealed = 1
-		lastExtentInfo.Version ++
+		lastExtentInfo.Eversion ++
 	}
 
 
 	//alloc new extend
 	extentID, _, err := sm.allocUniqID(1)
 	if err != nil {
-		return nil, errors.Errorf("can not alloc id")
+		return errDone(errors.Errorf("can not alloc a new id"))
 	}
 	nodes = sm.cloneNodeStatus()
 
 	//? todo
-	nodes, err = sm.policy.AllocExtent(nodes, 3, nil)
+	nodes, err = sm.policy.AllocExtent(nodes, int(req.DataShard+ req.ParityShard), nil)
 	if err != nil {
-		return nil, err
+		return errDone(err)
 	}
 
 	if err = sm.sendAllocToNodes(ctx, nodes, extentID); err != nil {
-		return nil, err
+		return errDone(err)
 	}
 
 	//update etcd
@@ -257,20 +273,19 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		clientv3.OpPut(extentKey, string(edata)),
 	}
 
-	err = manager.EtctSetKVS(sm.client, []clientv3.Cmp{
+	err = manager.EtcdSetKVS(sm.client, []clientv3.Cmp{
 		clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
 	}, ops)
 
 	if err != nil {
-		return &pb.StreamAllocExtentResponse{
-			Code: pb.Code_UpdateETCDFailed,
-		}, nil
+		return errDone(errors.New("update etcd failed"))
 	}
 
 	//update memory
 	sm.addExtent(req.StreamID, &extentInfo)
 
 	return &pb.StreamAllocExtentResponse{
+		Code: pb.Code_OK,
 		StreamID: req.StreamID,
 		Extent:   &extentInfo,
 	}, nil
@@ -371,19 +386,27 @@ func (sm *StreamManager) sendAllocToNodes(ctx context.Context, nodes []NodeStatu
 }
 
 func (sm *StreamManager) RegisterNode(ctx context.Context, req *pb.RegisterNodeRequest) (*pb.RegisterNodeResponse, error) {
+	
+	errDone := func(err error) (*pb.RegisterNodeResponse, error){
+		code, desCode := wire_errors.ConvertToPBCode(err)
+		return &pb.RegisterNodeResponse{
+			Code: code,
+			CodeDes: desCode,
+		}, nil
+	}
+
 	if !sm.AmLeader() {
-		return nil, errors.Errorf("not a leader")
+		return errDone(wire_errors.NotLeader)
 	}
 
 	if sm.hasDuplicateAddr(req.Addr) {
-		return nil, errors.Errorf("duplicated addr")
+		return errDone(errors.New("duplicated addr"))
 	}
 
 	id, _, err := sm.allocUniqID(1)
 	if err != nil {
-		return nil, errors.Errorf("failed to alloc uniq id")
+		return errDone(errors.New("failed to alloc uniq id"))
 	}
-
 	//modify etcd
 	nodeInfo := &pb.NodeInfo{
 		NodeID:  id,
@@ -397,16 +420,15 @@ func (sm *StreamManager) RegisterNode(ctx context.Context, req *pb.RegisterNodeR
 		clientv3.OpPut(nodeKey, string(nodeValue)),
 	}
 
-	err = manager.EtctSetKVS(sm.client, []clientv3.Cmp{
+	err = manager.EtcdSetKVS(sm.client, []clientv3.Cmp{
 		clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
 	}, ops)
 	if err != nil {
-		return nil, err
+		return errDone(err)
 	}
 
 	//modify memory
 	sm.addNode(id, req.Addr)
-
 	return &pb.RegisterNodeResponse{
 		Code:   pb.Code_OK,
 		NodeId: id,
@@ -486,7 +508,8 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 	streamInfo, ok := sm.streams[req.StreamID]
 	if !ok {
 		return &pb.TruncateResponse{
-			Code: pb.Code_TruncateNotMatch,
+			Code: pb.Code_ERROR,
+			CodeDes: "stream do not have streaminfo",
 		}, nil
 	}
 	var i int
@@ -515,7 +538,7 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 	ops := []clientv3.Op{
 		clientv3.OpPut(streamKey, string(sdata)),
 	}
-	err = manager.EtctSetKVS(sm.client, []clientv3.Cmp{
+	err = manager.EtcdSetKVS(sm.client, []clientv3.Cmp{
 		clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
 	}, ops)
 

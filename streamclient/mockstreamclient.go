@@ -10,6 +10,7 @@ import (
 	"github.com/journeymidnight/autumn/extent"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
+	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/pkg/errors"
 )
 
@@ -175,7 +176,7 @@ func (client *MockStreamClient) Connect() error {
 	}
 
 	blocks,_,end, err := ex.ReadBlocks(offset, numOfBlocks, (32 << 20))
-	if err == extent.EndOfExtent || err == extent.EndOfStream {
+	if err == wire_errors.EndOfExtent || err ==  wire_errors.EndOfStream {
 		return blocks,end, io.EOF
 	}
 	if err != nil {
@@ -246,14 +247,14 @@ func (iter *MockLockEntryIter) receiveEntries() error {
 	case nil:
 		iter.currentOffset = tail
 		return nil
-	case extent.EndOfExtent:
+	case wire_errors.EndOfExtent:
 		iter.currentOffset = 0
 		iter.currentIndex++
 		if iter.currentIndex == len(iter.sc.exs) {
 			iter.noMore = true
 		}
 		return nil
-	case extent.EndOfStream:
+	case wire_errors.EndOfStream:
 		iter.noMore = true
 		return nil
 	default:

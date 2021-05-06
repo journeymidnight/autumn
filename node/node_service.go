@@ -137,7 +137,7 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 	}
 
 
-	ex, extentInfo, err := en.validReq(req.ExtentID, req.Version)
+	ex, extentInfo, err := en.validReq(req.ExtentID, req.Eversion)
 
 	if err != nil {
 		return errDone(err)
@@ -344,7 +344,6 @@ func (en *ExtentNode) SmartReadBlocks(ctx context.Context, req *pb.ReadBlocksReq
 			Error : err,
 			End: res.End,
 			Len: len(res.Blocks),
-			//Blocks: res.Blocks,
 		}
 	}
 
@@ -427,7 +426,10 @@ func (en *ExtentNode) SmartReadBlocks(ctx context.Context, req *pb.ReadBlocksReq
 	for i := 0 ;i < lenOfBlocks ; i ++ {
 		data := make([][]byte, n)
 		for j := range dataBlocks {
-			data[j] = dataBlocks[j][i].Data
+			//in EC read, dataBlocks[j] could be nil, because we have got enough data to decode
+			if dataBlocks[j]!= nil {
+				data[j] = dataBlocks[j][i].Data
+			}
 		}
 		output, err := erasure_code.ReedSolomon{}.Decode(data, uint32(dataShards), uint32(parityShards), cellSize)
 		if err != nil {

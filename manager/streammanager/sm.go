@@ -170,7 +170,7 @@ func (sm *StreamManager) runAsLeader() {
 func (sm *StreamManager) LeaderLoop() {
 	for {
 		if sm.ID != sm.etcdLeader() {
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 		s, err := concurrency.NewSession(sm.client, concurrency.WithTTL(15))
@@ -186,6 +186,7 @@ func (sm *StreamManager) LeaderLoop() {
 			xlog.Logger.Warnf(err.Error())
 			continue
 		}
+
 		sm.leaderKey = e.Key()
 		xlog.Logger.Infof("elected %d as leader", sm.ID)
 		sm.runAsLeader()
