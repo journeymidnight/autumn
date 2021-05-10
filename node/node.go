@@ -51,7 +51,7 @@ type ExtentNode struct {
 	//replicates map[uint64][]string //extentID => [addr1, addr2]
 
 	smClient *smclient.SMClient
-	em  *smclient.ExtentManager
+	em       *smclient.ExtentManager
 }
 
 func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl string, smAddr []string) *ExtentNode {
@@ -64,7 +64,7 @@ func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl st
 		nodeID:    nodeID,
 	}
 
-	if  err := en.smClient.Connect(); err != nil {
+	if err := en.smClient.Connect(); err != nil {
 		xlog.Logger.Fatal(err)
 		return nil
 	}
@@ -225,7 +225,7 @@ func (en *ExtentNode) AppendWithWal(ex *extent.Extent, blocks []*pb.Block) ([]ui
 		errC <- err
 	}()
 
-	go func() { //writ extent
+	go func() { //write extent
 		defer wg.Done()
 		//wal is sync write, do no have to sync
 		offsets, end, err = ex.AppendBlocks(blocks, false)
@@ -244,5 +244,3 @@ func (en *ExtentNode) AppendWithWal(ex *extent.Extent, blocks []*pb.Block) ([]ui
 	}
 	return offsets, end, nil
 }
-
-

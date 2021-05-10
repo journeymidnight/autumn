@@ -354,13 +354,12 @@ func (sm *StreamManager) receiveCommitlength(ctx context.Context, nodes []NodeSt
 	return ret
 }
 
-//FIXME: sendCmdToNodes()
 func (sm *StreamManager) sendAllocToNodes(ctx context.Context, nodes []NodeStatus, extentID uint64) error {
 	pctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
 
 	stopper := utils.NewStopper()
-
+	n := int32(len(nodes))
 	var complets int32
 	for _, node := range nodes {
 		addr := node.Address
@@ -379,7 +378,7 @@ func (sm *StreamManager) sendAllocToNodes(ctx context.Context, nodes []NodeStatu
 		})
 	}
 	stopper.Wait()
-	if complets != 3 || !sm.AmLeader() {
+	if complets != n || !sm.AmLeader() {
 		return errors.Errorf("not to create stream")
 	}
 	return nil

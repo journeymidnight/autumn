@@ -204,13 +204,9 @@ nodes    map[uint64]*NodeStatus
 7. unit test全部缺少
 8. 测试多ETCD的情况, 现在只测试了一个ETCD的情况
 9. ETCD的key应该改成/clusterKey/node/0, /clusterKey/stream/1的情况, 防止多集群冲突
-10. sm的内部数据结构能否改成https://github.com/hashicorp/go-memdb. 在不损失性能的情况下, 提高代码可读性
 11. *node支持多硬盘*
-12. 在sm里增加version, 每次nodes变化, version加1, 并且在rpc的返回里面增加version, 这样client根据version可以自动更新
-13. 增加extent模块benchmark的内容(mac SSD上面, sync 4k需要30ms?!!), 现在benchmark的结果只有4k
-14. extent也有很大的优化空间, AppendBlock发到每块硬盘的队列上, 然后取队列, 写数据, 再sync,可以减少单块硬盘上的sync次数. 但是: 如果有SSD
-journal的话, 这些优化可能都不需要
-15. extent层用mmap,提升读性能
+12. *在sm里增加version, 每次nodes变化, version加1, 并且在rpc的返回里面增加version, 这样client根据version可以自动更新*, ref count
+13. extent层用mmap,提升读性能
 
 ## partion layer
 
@@ -235,11 +231,9 @@ PSVERSION  => {num}
 
 
 ## TODO
-1. grpc里面, res.Code代替err
 2. rp实现valuelog的truncate(*)
 3. 实现logstream分为2个不同的stream,一个可以在生成memtable后直接删除, 另一个长久保存(定期recycle或者EC化)
 4. ps merge / split
-4. stream extent增加refcont
 
 ### LOG
 
@@ -249,7 +243,18 @@ PSVERSION  => {num}
 +---------+-----------+-----------+--- ... ---+
 ```
 
-Pros:
-3. EC skip read
-4. isReqTooBig
-5. extent lock files
+
+
+### sm service
+(a) maintaining the stream namespace and state of all active streams and extents DONE
+(b) monitoring the health of the ENs                                             DONE 
++ node api: usage
++ sm : (go func)update usage and set dead flag if node is not responding in n minute
+(c) creating and assigning extents to ENs                                        DONE
+(d) performing the lazy re-replication of extent replicas that are lost due to hardware failures or unavailability 
++ (go func)loop over extentInfo, if it has dead note, replicas the data
+(e) garbage collecting extents that are no longer pointed to by any stream ==> (ref count) 
++ node: (go func)loop over extents, ask extentInfo, if (ref count) == 0 , delete file
+
++ sm API, 主要变更时修改ref count
+The SM periodically polls (syncs) the state of the ENs and what extents they store. If the SM discovers that an extent is replicated on fewer than the expected number of ENs, a re-replication of the extent will lazily be created by the SM to regain the desired level of replication. For extent replica placement, the SM randomly chooses ENs across different fault domains, so that they are stored on nodes that will not have correlated failures due to power, network, or being on the same rack.
