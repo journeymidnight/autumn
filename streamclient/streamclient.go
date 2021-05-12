@@ -306,11 +306,11 @@ func (sc *AutumnStreamClient) getLastExtentConn() (uint64, *grpc.ClientConn, err
 	return extentID, sc.em.GetExtentConn(extentID),nil
 }
 
-func (sc *AutumnStreamClient) mustAllocNewExtent(oldExtentID uint64) error{
+func (sc *AutumnStreamClient) mustAllocNewExtent(oldExtentID uint64, dataShard, parityShard uint32) error{
 	var newExInfo *pb.ExtentInfo
 	var err error
 	for i := 0 ; i < 10 ; i ++{
-		newExInfo, err = sc.smClient.StreamAllocExtent(context.Background(), sc.streamID, oldExtentID)
+		newExInfo, err = sc.smClient.StreamAllocExtent(context.Background(), sc.streamID, oldExtentID, dataShard, parityShard)
 		if err == nil {
 			break
 		}
@@ -404,7 +404,7 @@ retry:
 			loop ++
 			goto retry
 		}
-		sc.mustAllocNewExtent(extentID)
+		sc.mustAllocNewExtent(extentID, uint32(len(exInfo.Replicates)), uint32(len(exInfo.Parity)))
 		loop = 0
 		goto retry
 	}
@@ -416,7 +416,7 @@ retry:
 	utils.AssertTrue(res.End > 0)
 	if res.End > MaxExtentSize {
 		
-		if err := sc.mustAllocNewExtent(extentID); err != nil {
+		if err := sc.mustAllocNewExtent(extentID, uint32(len(exInfo.Replicates)), uint32(len(exInfo.Parity))); err != nil {
 			return 0,nil,0, err
 		}
 	}
