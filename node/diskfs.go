@@ -50,6 +50,10 @@ func OpenDiskFS(dir string, nodeID uint64) (*diskFS, error) {
 	return s, nil
 }
 
+func (s *diskFS) Df() (uint64, uint64 , error){
+	return getDiskInfo(s.baseDir)
+}
+
 func (s *diskFS) pathName(extentID uint64) string {
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], extentID)

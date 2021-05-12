@@ -160,6 +160,11 @@ func (p *Pool) shutdown() {
 	}
 }
 
+
+func (p *Pool) LastEcho() time.Time {
+	return p.lastEcho
+}
+
 // SetUnhealthy marks a pool as unhealthy.
 func (p *Pool) SetUnhealthy() {
 	p.Lock()

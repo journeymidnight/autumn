@@ -12,7 +12,7 @@ import (
 	"github.com/coreos/etcd/embed"
 	"github.com/journeymidnight/autumn/manager"
 	smclient "github.com/journeymidnight/autumn/manager/smclient"
-	"github.com/journeymidnight/autumn/manager/streammanager"
+	"github.com/journeymidnight/autumn/manager/stream_manager"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/streamclient"
 	"github.com/journeymidnight/autumn/xlog"
@@ -36,7 +36,7 @@ type ExtentNodeTestSuite struct {
 	suite.Suite
 	ens [3]*ExtentNode
 	tmpdir string
-	sm    *streammanager.StreamManager
+	sm    *stream_manager.StreamManager
 	smServer   *grpc.Server
 	etcd  *embed.Etcd
 }
@@ -60,7 +60,7 @@ func setupStreamManager(ent *ExtentNodeTestSuite, dir string) {
 	if err != nil {
 		panic(err.Error())
 	}
-	sm := streammanager.NewStreamManager(etcd, client, config)
+	sm := stream_manager.NewStreamManager(etcd, client, config)
 	go sm.LeaderLoop()
 
 	grpcServer := grpc.NewServer(

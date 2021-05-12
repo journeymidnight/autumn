@@ -1,4 +1,4 @@
-package streammanager
+package stream_manager
 
 import (
 	"context"
@@ -8,6 +8,7 @@ import (
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/embed"
+	"github.com/journeymidnight/autumn/conn"
 	"github.com/journeymidnight/autumn/manager"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
@@ -23,12 +24,35 @@ const (
 
 type NodeStatus struct {
 	pb.NodeInfo
-	usage    float64
-	lastEcho time.Time
+	Total    uint64
+	Free     uint64
 }
 
+func (ns *NodeStatus) GetConn() *grpc.ClientConn {
+	pool := conn.GetPools().Connect(ns.Address)
+	if pool == nil {
+		return nil
+	}
+	return pool.Get()
+}
+func (ns *NodeStatus) LastEcho() time.Time {
+	pool := conn.GetPools().Connect(ns.Address)
+	if pool == nil {
+		return time.Time{}
+	}
+	return pool.LastEcho()
+}
+
+func (ns *NodeStatus) IsHealthy() bool {
+	pool := conn.GetPools().Connect(ns.Address)
+	if pool == nil {
+		return false
+	}
+	return pool.IsHealthy()
+}
+
+
 type StreamManager struct {
-	//FIXME: version support
 	streamLock utils.SafeMutex
 	streams    map[uint64]*pb.StreamInfo
 
@@ -52,6 +76,7 @@ type StreamManager struct {
 	leaderKey string
 
 	policy AllocExtentPolicy
+	stopper *utils.Stopper //leader tasks
 }
 
 func NewStreamManager(etcd *embed.Etcd, client *clientv3.Client, config *manager.Config) *StreamManager {
@@ -61,7 +86,9 @@ func NewStreamManager(etcd *embed.Etcd, client *clientv3.Client, config *manager
 		config: config,
 		ID:     uint64(etcd.Server.ID()),
 		policy: new(SimplePolicy),
+		stopper: utils.NewStopper(),
 	}
+	
 
 	v := pb.MemberValue{
 		ID:      sm.ID,
@@ -164,8 +191,16 @@ func (sm *StreamManager) runAsLeader() {
 		}
 	}
 
+	//start leader tasks
+	sm.stopper.RunWorker(sm.routineUpdateDF)
+	sm.stopper.RunWorker(sm.routineFixReplics)
+	sm.stopper.RunWorker(sm.routineDispatchTask)
+
 	atomic.StoreInt32(&sm.isLeader, 1)
 }
+
+
+
 
 func (sm *StreamManager) LeaderLoop() {
 	for {
@@ -195,24 +230,11 @@ func (sm *StreamManager) LeaderLoop() {
 		case <-s.Done():
 			s.Close()
 			atomic.StoreInt32(&sm.isLeader, 0)
+			sm.stopper.Stop()
 			xlog.Logger.Info("%d's leadershipt expire", sm.ID)
 		}
 	}
 }
-
-/*
-func (sm *StreamManager) allocUniqID(count uint64) (uint64, uint64) {
-	n := 10
-	for {
-		start, end, err := sm._allocUniqID(count)
-		if err == nil {
-			return start, end
-		}
-		time.Sleep(time.Duration(n) * time.Millisecond)
-		n *= 2
-	}
-}
-*/
 
 func (sm *StreamManager) allocUniqID(count uint64) (uint64, uint64, error) {
 
@@ -223,28 +245,10 @@ func (sm *StreamManager) allocUniqID(count uint64) (uint64, uint64, error) {
 }
 
 func (sm *StreamManager) RegisterGRPC(grpcServer *grpc.Server) {
-	/*
-		grpcServer := grpc.NewServer(
-			grpc.MaxRecvMsgSize(8<<20),
-			grpc.MaxSendMsgSize(8<<20),
-			grpc.MaxConcurrentStreams(1000),
-		)
-	*/
-
 	pb.RegisterStreamManagerServiceServer(grpcServer, sm)
-
-	/*
-		listener, err := net.Listen("tcp", sm.config.GrpcUrl)
-		if err != nil {
-			return err
-		}
-		go func() {
-			grpcServer.Serve(listener)
-		}()
-	*/
 	sm.grcpServer = grpcServer
 }
 
 func (sm *StreamManager) Close() {
-
+	sm.stopper.Stop()
 }

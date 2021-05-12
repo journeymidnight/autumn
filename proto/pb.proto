@@ -129,11 +129,28 @@ message ReadEntriesResponse{
 	uint32 end = 4;
 }
 
+
+message DF {
+	uint64 total = 1;
+	uint64 free = 2;
+}
+
+message DfRequest{
+}
+
+message DfResponse{
+	Code code = 1;
+	string codeDes = 2;
+	DF df = 3;
+}
+
+
 service ExtentService {
 	//from stream client
 	rpc Append(AppendRequest) returns (AppendResponse){}
 	rpc ReadEntries(ReadEntriesRequest) returns (ReadEntriesResponse){}
 	rpc SmartReadBlocks(ReadBlocksRequest) returns (ReadBlocksResponse){}
+	rpc Df(DfRequest) returns (DfResponse){}
 
 	//internal rpc
 	rpc Seal(SealRequest) returns (SealResponse) {}

@@ -8,7 +8,7 @@ import (
 
 	"github.com/journeymidnight/autumn/manager"
 	"github.com/journeymidnight/autumn/manager/partitionmanager"
-	"github.com/journeymidnight/autumn/manager/streammanager"
+	"github.com/journeymidnight/autumn/manager/stream_manager"
 	"google.golang.org/grpc"
 
 	"github.com/journeymidnight/autumn/xlog"
@@ -25,7 +25,7 @@ func main() {
 		panic(err.Error())
 	}
 
-	sm := streammanager.NewStreamManager(etcd, client, config)
+	sm := stream_manager.NewStreamManager(etcd, client, config)
 	go sm.LeaderLoop()
 
 	pm := partitionmanager.NewPartitionManager(etcd, client, config)

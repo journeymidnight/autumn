@@ -252,9 +252,52 @@ PSVERSION  => {num}
 + sm : (go func)update usage and set dead flag if node is not responding in n minute
 (c) creating and assigning extents to ENs                                        DONE
 (d) performing the lazy re-replication of extent replicas that are lost due to hardware failures or unavailability 
-+ (go func)loop over extentInfo, if it has dead note, replicas the data
++ (go func)loop over extentInfo, if it has dead node, replicas the data(one by one)
 (e) garbage collecting extents that are no longer pointed to by any stream ==> (ref count) 
 + node: (go func)loop over extents, ask extentInfo, if (ref count) == 0 , delete file
 
-+ sm API, 主要变更时修改ref count
-The SM periodically polls (syncs) the state of the ENs and what extents they store. If the SM discovers that an extent is replicated on fewer than the expected number of ENs, a re-replication of the extent will lazily be created by the SM to regain the desired level of replication. For extent replica placement, the SM randomly chooses ENs across different fault domains, so that they are stored on nodes that will not have correlated failures due to power, network, or being on the same rack.
+(f) disk failure,
+f1. local copy(keep extentInfo the same, faster)
+f2. send "remove extent from node" to manager, manager schedule tasks(one by one)
+
+
+ETCD存储结构
+
+recoveryTasks / EXTENTID.tsk = "extentInfo" + replacing
+recoveryTaskLocks / EXTENTID.lk
+
+// putNewKV attempts to create the given key, only succeeding if the key did
+// not yet exist.
+func putNewKV(kv v3.KV, key, val string, leaseID v3.LeaseID) (int64, error) {
+	cmp := v3.Compare(v3.Version(key), "=", 0)
+	req := v3.OpPut(key, val, v3.WithLease(leaseID))
+	txnresp, err := kv.Txn(context.TODO()).If(cmp).Then(req).Commit()
+
+// range KV
+
+// node get tasks
+tryLock
+check version
+run tasks.
+run finish Recovery
+
+// finish Recovery
+atomic op{
+ check version
+ update extentInfo(EVERSION++)
+ delete recoveryTasks/TASK
+}
+unlock recoveryTaskLock
+
+
+revision相关:
+https://www.compose.com/articles/how-to-keep-your-etcd-lean-and-mean/
+
+目前rangepartiion, gc的bug
+GC           USER
+read V
+             write V1000
+			 MEMTABLE flushed
+write V45
+
+目前认为memtable有序, 之后的所有读, 只能读出V45
