@@ -1,4 +1,4 @@
-package streammanager
+package stream_manager
 
 import (
 	"sort"
@@ -17,12 +17,12 @@ func (sp *SimplePolicy) AllocExtent(ns []NodeStatus, count int, keepNodes []uint
 
 	xlog.Logger.Debugf("alloc extents %d from %d", count, len(ns))
 	sort.Slice(ns, func(a, b int) bool {
-		if ns[a].lastEcho.After(ns[b].lastEcho) {
+		if ns[a].LastEcho().After(ns[b].LastEcho()) {
 			return true
-		} else if ns[a].lastEcho.Before(ns[b].lastEcho) {
+		} else if ns[a].LastEcho().Before(ns[b].LastEcho()) {
 			return false
 		}
-		return ns[a].usage < ns[b].usage
+		return ns[a].Free >  ns[b].Free
 	})
 
 	set := make(map[uint64]bool)

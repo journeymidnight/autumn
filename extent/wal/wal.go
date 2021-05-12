@@ -244,6 +244,7 @@ func (wal *Wal) doWrites() {
 }
 
 //write will block until write is done
+//thread-safe
 func (wal *Wal) Write(extentID uint64, start uint32, blocks []*pb.Block) error {
 	req := requestPool.Get().(*request)
 	req.reset()

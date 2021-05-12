@@ -42,7 +42,7 @@ type ExtentNode struct {
 	nodeID     uint64
 	grcpServer *grpc.Server
 	listenUrl  string
-	diskFSs    []*diskFS
+	diskFSs    []*diskFS //read only after boot-up, so do not have locks so far
 	wal        *wal.Wal
 	extentMap  *sync.Map
 	//extentMap map[uint64]*extent.Extent //extent it owns: extentID => file

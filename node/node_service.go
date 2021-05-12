@@ -262,21 +262,6 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 	}, nil
 }
 
-/*
-func errorToCode(err error) pb.Code {
-	switch err {
-	case extent.EndOfStream:
-		return pb.Code_EndOfStream
-	case extent.EndOfExtent:
-		return pb.Code_EndOfExtent
-	case nil:
-		return pb.Code_OK
-	default:
-		xlog.Logger.Fatalf("unknown err met %v", err)
-		return pb.Code_ERROR
-	}
-}
-*/
 
 func (en *ExtentNode) SmartReadBlocks(ctx context.Context, req *pb.ReadBlocksRequest) (*pb.ReadBlocksResponse, error) {
 
@@ -479,6 +464,7 @@ func (en *ExtentNode) ReadBlocks(ctx context.Context, req *pb.ReadBlocksRequest)
 
 
 func (en *ExtentNode) AllocExtent(ctx context.Context, req *pb.AllocExtentRequest) (*pb.AllocExtentResponse, error) {
+	//Other policies
 	i := rand.Intn(len(en.diskFSs))
 	ex, err := en.diskFSs[i].AllocExtent(req.ExtentID)
 	if err != nil {
@@ -518,6 +504,36 @@ func (en *ExtentNode) CommitLength(ctx context.Context, req *pb.CommitLengthRequ
 		Length: l,
 	}, nil
 
+}
+
+
+func (en *ExtentNode) Df(ctx context.Context, req *pb.DfRequest) (*pb.DfResponse, error) {
+	
+	errDone := func(err error) (*pb.DfResponse, error){
+		code, desCode := wire_errors.ConvertToPBCode(err)
+		return &pb.DfResponse{
+			Code: code,
+			CodeDes: desCode,
+		}, nil
+	}
+
+	totalSum := uint64(0)
+	totalFree := uint64(0)
+	for _, fs := range en.diskFSs {
+		sum, free, err := fs.Df()
+		if err != nil {
+			return errDone(err)
+		}
+		totalSum += sum
+		totalFree += free
+	}
+	return &pb.DfResponse{
+		Code: pb.Code_OK,
+		Df: &pb.DF{
+			Total: totalSum,
+			Free: totalFree,
+		},
+	},nil
 }
 
 func (en *ExtentNode) ReadEntries(ctx context.Context, req *pb.ReadEntriesRequest) (*pb.ReadEntriesResponse, error) {

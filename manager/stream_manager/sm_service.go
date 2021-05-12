@@ -1,4 +1,4 @@
-package streammanager
+package stream_manager
 
 import (
 	"context"
@@ -53,7 +53,7 @@ func (sm *StreamManager) CreateStream(ctx context.Context, req *pb.CreateStreamR
 	}
 
 
-	nodes := sm.cloneNodeStatus()
+	nodes := sm.cloneNodeStatus(true)
 
 	nodes, err = sm.policy.AllocExtent(nodes, int(req.DataShard + req.ParityShard), nil)
 	if err != nil {
@@ -114,12 +114,15 @@ func (sm *StreamManager) CreateStream(ctx context.Context, req *pb.CreateStreamR
 	}, nil
 }
 
+
+func (sm *StreamManager) updateNodeDf() {
+	
+
+}
 func (sm *StreamManager) addNode(id uint64, addr string) {
 	sm.nodeLock.Lock()
 	defer sm.nodeLock.Unlock()
 	sm.nodes[id] = &NodeStatus{
-		usage:    0,
-		lastEcho: time.Now(),
 		NodeInfo: pb.NodeInfo{
 			NodeID:  id,
 			Address: addr,
@@ -236,7 +239,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	if err != nil {
 		return errDone(errors.Errorf("can not alloc a new id"))
 	}
-	nodes = sm.cloneNodeStatus()
+	nodes = sm.cloneNodeStatus(true)
 
 	//? todo
 	nodes, err = sm.policy.AllocExtent(nodes, int(req.DataShard+ req.ParityShard), nil)
@@ -362,10 +365,11 @@ func (sm *StreamManager) sendAllocToNodes(ctx context.Context, nodes []NodeStatu
 	n := int32(len(nodes))
 	var complets int32
 	for _, node := range nodes {
-		addr := node.Address
+		conn := node.GetConn()
 		stopper.RunWorker(func() {
-			pool := conn.GetPools().Connect(addr)
-			conn := pool.Get()
+			if conn == nil {
+				return
+			}
 			c := pb.NewExtentServiceClient(conn)
 			_, err := c.AllocExtent(pctx, &pb.AllocExtentRequest{
 				ExtentID: extentID,
@@ -609,11 +613,17 @@ func (sm *StreamManager) cloneStreamInfo(streamID uint64) *pb.StreamInfo {
 	return proto.Clone(stream).(*pb.StreamInfo)
 }
 
-func (sm *StreamManager) cloneNodeStatus() (ret []NodeStatus) {
+func (sm *StreamManager) cloneNodeStatus(onlyAlive bool) (ret []NodeStatus) {
 	sm.nodeLock.RLock()
 	defer sm.nodeLock.RUnlock()
 	for _, node := range sm.nodes {
-		ret = append(ret, *node)
+		if onlyAlive {
+			if node.IsHealthy() {
+				ret = append(ret, *node)
+			}
+		} else {
+			ret = append(ret, *node)
+		}
 	}
 	return
 }
