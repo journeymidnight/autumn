@@ -8,6 +8,7 @@ import (
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/embed"
+	"github.com/cornelk/hashmap"
 	"github.com/journeymidnight/autumn/conn"
 	"github.com/journeymidnight/autumn/manager"
 	"github.com/journeymidnight/autumn/proto/pb"
@@ -24,8 +25,23 @@ const (
 
 type NodeStatus struct {
 	pb.NodeInfo
-	Total    uint64
-	Free     uint64
+	//atomic 
+	total    uint64
+	free     uint64
+}
+
+//FIXME: could atomic.LoadPointer make it concise?
+func (ns *NodeStatus) Total() uint64{
+	return atomic.LoadUint64(&ns.total)
+}
+func (ns *NodeStatus) SetTotal(t uint64) {
+	atomic.StoreUint64(&ns.total, t)
+} 
+func (ns *NodeStatus) Free() uint64{
+	return atomic.LoadUint64(&ns.free)
+}
+func (ns *NodeStatus) SetFree(f uint64) {
+	atomic.StoreUint64(&ns.free, f)
 }
 
 func (ns *NodeStatus) GetConn() *grpc.ClientConn {
@@ -53,14 +69,18 @@ func (ns *NodeStatus) IsHealthy() bool {
 
 
 type StreamManager struct {
-	streamLock utils.SafeMutex
-	streams    map[uint64]*pb.StreamInfo
+	//streams    map[uint64]*pb.StreamInfo
+	streams   *hashmap.HashMap//id => *pb.StreamInfo
 
-	extentsLock utils.SafeMutex
-	extents     map[uint64]*pb.ExtentInfo
 
-	nodeLock utils.SafeMutex
-	nodes    map[uint64]*NodeStatus
+	//extents     map[uint64]*pb.ExtentInfo
+	extents   *hashmap.HashMap//id => *pb.ExtentInfo
+
+	
+	//nodeLock utils.SafeMutex
+	//nodes    map[uint64]*NodeStatus
+	nodes      *hashmap.HashMap //id => *NodeStatus
+
 
 	etcd       *embed.Etcd
 	client     *clientv3.Client
@@ -116,12 +136,12 @@ func (sm *StreamManager) AmLeader() bool {
 func (sm *StreamManager) runAsLeader() {
 	//load system
 
-	sm.streamLock.Lock()
-	defer sm.streamLock.Unlock()
-	sm.extentsLock.Lock()
-	defer sm.extentsLock.Unlock()
-	sm.nodeLock.Lock()
-	defer sm.nodeLock.Unlock()
+	//sm.streamLock.Lock()
+	//defer sm.streamLock.Unlock()
+	//sm.extentsLock.Lock()
+	//defer sm.extentsLock.Unlock()
+	//sm.nodeLock.Lock()
+	//defer sm.nodeLock.Unlock()
 
 	//load streams
 	kvs, err := manager.EtcdRange(sm.client, "streams")
@@ -129,7 +149,8 @@ func (sm *StreamManager) runAsLeader() {
 		xlog.Logger.Warnf(err.Error())
 		return
 	}
-	sm.streams = make(map[uint64]*pb.StreamInfo)
+	//sm.streams = make(map[uint64]*pb.StreamInfo)
+	sm.streams = &hashmap.HashMap{}
 
 	for _, kv := range kvs {
 		streamID, err := parseKey(string(kv.Key), "streams")
@@ -142,7 +163,8 @@ func (sm *StreamManager) runAsLeader() {
 			xlog.Logger.Warnf(err.Error())
 			return
 		}
-		sm.streams[streamID] = &streamInfo
+		sm.streams.Set(streamID, &streamInfo)
+		//sm.streams[streamID] = &streamInfo
 	}
 
 	//load extents
@@ -152,8 +174,9 @@ func (sm *StreamManager) runAsLeader() {
 		return
 	}
 
-	sm.extents = make(map[uint64]*pb.ExtentInfo)
+	//sm.extents = make(map[uint64]*pb.ExtentInfo)
 
+	sm.extents = &hashmap.HashMap{}
 	for _, kv := range kvs {
 		extentID, err := parseKey(string(kv.Key), "extents")
 		if err != nil {
@@ -165,10 +188,12 @@ func (sm *StreamManager) runAsLeader() {
 			xlog.Logger.Warnf(err.Error())
 			return
 		}
-		sm.extents[extentID] = &extentInfo
+		sm.extents.Set(extentID, &extentInfo)
 	}
 
-	sm.nodes = make(map[uint64]*NodeStatus)
+	//sm.nodes = make(map[uint64]*NodeStatus)
+
+	sm.nodes = &hashmap.HashMap{}
 
 	kvs, err = manager.EtcdRange(sm.client, "nodes")
 	if err != nil {
@@ -186,9 +211,9 @@ func (sm *StreamManager) runAsLeader() {
 			xlog.Logger.Warnf(err.Error())
 			return
 		}
-		sm.nodes[nodeID] = &NodeStatus{
+		sm.nodes.Set(nodeID, &NodeStatus{
 			NodeInfo: nodeInfo,
-		}
+		})
 	}
 
 	//start leader tasks

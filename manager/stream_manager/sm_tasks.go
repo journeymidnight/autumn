@@ -12,13 +12,6 @@ import (
 //go routine
 func (sm *StreamManager) routineUpdateDF() {
 
-	update := func(nodeID, total, free uint64) {
-		sm.nodeLock.Lock()
-		defer sm.nodeLock.Unlock()
-		sm.nodes[nodeID].Free = free
-		sm.nodes[nodeID].Total = total
-	}
-
 	ticker := utils.NewRandomTicker(time.Minute, 2 * time.Minute)
 
 	var ctx context.Context
@@ -31,11 +24,13 @@ func (sm *StreamManager) routineUpdateDF() {
 	for {
 		select {
 			case <- sm.stopper.ShouldStop():
-				cancel()
+				if cancel != nil{
+					cancel()
+				}
 				return
 			case <- ticker.C:
 				ctx, cancel = context.WithCancel(context.Background())
-				nodes := sm.cloneNodeStatus(true)
+				nodes := sm.getNodeStatus(true)
 				stopper := utils.NewStopper()
 				for i := range nodes {
 					node := nodes[i]
@@ -53,11 +48,13 @@ func (sm *StreamManager) routineUpdateDF() {
 							xlog.Logger.Infof("remote server has error %s", res.CodeDes)
 							return
 						}
-						update(node.NodeID, res.Df.Total, res.Df.Free)
+						node.SetFree(res.Df.Free)
+						node.SetTotal(res.Df.Total)
 					})
 
 				}
 				stopper.Wait()
+
 
 		}
 	}
@@ -67,6 +64,29 @@ func (sm *StreamManager) routineUpdateDF() {
 func (sm *StreamManager) routineFixReplics() {
 	//loop over all extent, if extent has dead node.
 	//insert task into "task pool"
+	/*
+	ticker := utils.NewRandomTicker(time.Minute, 2 * time.Minute)
+
+	var ctx context.Context
+	var cancel context.CancelFunc
+	defer func() {
+		xlog.Logger.Infof("routineFixReplics quit")
+	}()
+
+	xlog.Logger.Infof("routineFixReplics started")
+
+	for {
+		select {
+			case <- sm.stopper.ShouldStop():
+				cancel()
+				return
+			case <- ticker.C:
+				ctx, cancel = context.WithCancel(context.Background())
+				sm.clone
+
+		}
+	}
+	*/
 }
 
 

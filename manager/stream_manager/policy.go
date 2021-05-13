@@ -8,12 +8,12 @@ import (
 )
 
 type AllocExtentPolicy interface {
-	AllocExtent([]NodeStatus, int, []uint64) ([]NodeStatus, error)
+	AllocExtent([]*NodeStatus, int, []uint64) ([]*NodeStatus, error)
 }
 
 type SimplePolicy struct{}
 
-func (sp *SimplePolicy) AllocExtent(ns []NodeStatus, count int, keepNodes []uint64) ([]NodeStatus, error) {
+func (sp *SimplePolicy) AllocExtent(ns []*NodeStatus, count int, keepNodes []uint64) ([]*NodeStatus, error) {
 
 	xlog.Logger.Debugf("alloc extents %d from %d", count, len(ns))
 	sort.Slice(ns, func(a, b int) bool {
@@ -22,7 +22,7 @@ func (sp *SimplePolicy) AllocExtent(ns []NodeStatus, count int, keepNodes []uint
 		} else if ns[a].LastEcho().Before(ns[b].LastEcho()) {
 			return false
 		}
-		return ns[a].Free >  ns[b].Free
+		return ns[a].free >  ns[b].free
 	})
 
 	set := make(map[uint64]bool)
@@ -32,7 +32,8 @@ func (sp *SimplePolicy) AllocExtent(ns []NodeStatus, count int, keepNodes []uint
 	if len(ns) < count {
 		return nil, errors.New("not enough nodes")
 	}
-	var ret []NodeStatus
+
+	var ret []*NodeStatus
 	for i := 0; i < count; i++ {
 		if _, ok := set[ns[i].NodeID]; !ok {
 			ret = append(ret, ns[i])
