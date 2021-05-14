@@ -53,7 +53,7 @@ func (sm *StreamManager) CreateStream(ctx context.Context, req *pb.CreateStreamR
 	}
 
 
-	nodes := sm.getNodeStatus(true)
+	nodes := sm.getAllNodeStatus(true)
 
 	nodes, err = sm.policy.AllocExtent(nodes, int(req.DataShard + req.ParityShard), nil)
 	if err != nil {
@@ -240,7 +240,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		return errDone(errors.Errorf("can not alloc a new id"))
 	}
 
-	nodes = sm.getNodeStatus(true)
+	nodes = sm.getAllNodeStatus(true)
 
 	//? todo
 	nodes, err = sm.policy.AllocExtent(nodes, int(req.DataShard+ req.ParityShard), nil)
@@ -613,7 +613,15 @@ func (sm *StreamManager) getAppendExtentsAddr(streamID uint64) ([]*NodeStatus,ui
 }
 
 
-func (sm *StreamManager) getNodeStatus(onlyAlive bool) (ret []*NodeStatus) {
+
+func (sm *StreamManager) getNodeStatus(nodeID uint64) *NodeStatus {
+	v, ok  := sm.nodes.Get(nodeID)
+	if !ok {
+		return nil
+	}
+	return v.(*NodeStatus)
+}
+func (sm *StreamManager) getAllNodeStatus(onlyAlive bool) (ret []*NodeStatus) {
 	for kv := range sm.nodes.Iter() {
 		ns := kv.Value.(*NodeStatus)
 		if onlyAlive {

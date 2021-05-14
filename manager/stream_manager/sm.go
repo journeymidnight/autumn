@@ -2,7 +2,6 @@ package stream_manager
 
 import (
 	"context"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -28,9 +27,16 @@ type NodeStatus struct {
 	//atomic 
 	total    uint64
 	free     uint64
+	dead     uint32
 }
 
 //FIXME: could atomic.LoadPointer make it concise?
+func (ns *NodeStatus) Dead() bool {
+	return atomic.LoadUint32(&ns.dead) > 0
+}
+func (ns *NodeStatus) SetDead(){
+	atomic.StoreUint32(&ns.dead, 1)
+}
 func (ns *NodeStatus) Total() uint64{
 	return atomic.LoadUint64(&ns.total)
 }
@@ -70,17 +76,19 @@ func (ns *NodeStatus) IsHealthy() bool {
 
 type StreamManager struct {
 	//streams    map[uint64]*pb.StreamInfo
-	streams   *hashmap.HashMap//id => *pb.StreamInfo
+	streams   *hashmap.HashMap//id => *pb.StreamInfo, read only
 
 
 	//extents     map[uint64]*pb.ExtentInfo
-	extents   *hashmap.HashMap//id => *pb.ExtentInfo
+	extents   *hashmap.HashMap//id => *pb.ExtentInfo, read only
 
 	
 	//nodeLock utils.SafeMutex
 	//nodes    map[uint64]*NodeStatus
 	nodes      *hashmap.HashMap //id => *NodeStatus
 
+	taskPool  *hashmap.HashMap //extentID=>*RecoveryStatus
+	taskLock utils.SafeMutex
 
 	etcd       *embed.Etcd
 	client     *clientv3.Client
@@ -88,7 +96,7 @@ type StreamManager struct {
 	grcpServer *grpc.Server
 	ID         uint64 //backend ETCD server's ID
 
-	allocIdLock sync.Mutex //used in AllocID
+	allocIdLock utils.SafeMutex //used in AllocID
 
 	isLeader    int32
 	memberValue string

@@ -144,6 +144,21 @@ message DfResponse{
 	DF df = 3;
 }
 
+message RecoveryTask {
+	uint64  extentID = 1;
+	uint64  replaceID = 2;
+}
+
+
+message RequireRecoveryRequest {
+	RecoveryTask task = 1;
+}
+
+message RequireRecoveryResponse {
+	Code code = 1;
+	string codeDes = 2;
+}
+
 
 service ExtentService {
 	//from stream client
@@ -153,6 +168,7 @@ service ExtentService {
 	rpc Df(DfRequest) returns (DfResponse){}
 
 	//internal rpc
+	rpc RequireRecovery(RequireRecoveryRequest) returns (RequireRecoveryResponse) {}
 	rpc Seal(SealRequest) returns (SealResponse) {}
 	rpc CommitLength(CommitLengthRequest) returns (CommitLengthResponse) {}
 	rpc Heartbeat (Payload)  returns (stream Payload) {}
@@ -272,11 +288,6 @@ service StreamManagerService {
 	rpc CreateStream(CreateStreamRequest) returns  (CreateStreamResponse) {}
 	rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse) {}
 	rpc Truncate(TruncateRequest) returns (TruncateResponse) {}
-	//gabage colleciton
-	//1. 找到所有在stream里面不再引用的extent, rm//easy
-	//2. extent的三副本中, 如果任何一个不存在, 发relicate exent的操作
-	//2.a 在sm里面循环每一个extent,发req到en, 检查状态,(这个类似于论文中的poll)
-	//2.b EN通过heartstream上报
 }
 
 //used in Etcd Campaign
