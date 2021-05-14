@@ -301,3 +301,30 @@ read V
 write V45
 
 目前认为memtable有序, 之后的所有读, 只能读出V45
+
+重复提交task
+
+1.==========如果"创建task"在"更新extentInfo(内存)"之前运行
+
+manager                    manager_service(from node)
+
+
+创建task(如果有dead node)
+                    	 更新extentInfo (etcd)
+                	     删除etcd task    (etcd)
+						 更新extentInfo(内存)/删除recovies
+deduplicate? 
+create task(etcd)       
+
+solution: task lock in sm
+
+
+2.=========
+
+manager 
+
+创建task(内存)
+create task(etcd)
+创建task(内存)
+create task(etcd)
+
