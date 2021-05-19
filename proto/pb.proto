@@ -159,15 +159,33 @@ message RequireRecoveryResponse {
 	string codeDes = 2;
 }
 
+//maybe
+message CopyResponseHeader {
+	Code code = 1;
+	string codeDes = 2;
+	uint64 payloadLen = 3;
+}
+
+message CopyExtentRequest {
+	uint64 extentID = 1;
+}
+
+message CopyExtentResponse {
+	oneof data {
+		CopyResponseHeader header = 1;
+		bytes payload = 2;
+	}
+}
 
 service ExtentService {
 	//from stream client
 	rpc Append(AppendRequest) returns (AppendResponse){}
 	rpc ReadEntries(ReadEntriesRequest) returns (ReadEntriesResponse){}
 	rpc SmartReadBlocks(ReadBlocksRequest) returns (ReadBlocksResponse){}
-	rpc Df(DfRequest) returns (DfResponse){}
 
 	//internal rpc
+	rpc CopyExtent(CopyExtentRequest) returns (stream CopyExtentResponse){}
+	rpc Df(DfRequest) returns (DfResponse){}
 	rpc RequireRecovery(RequireRecoveryRequest) returns (RequireRecoveryResponse) {}
 	rpc Seal(SealRequest) returns (SealResponse) {}
 	rpc CommitLength(CommitLengthRequest) returns (CommitLengthResponse) {}
@@ -279,11 +297,19 @@ message TruncateResponse {
 	string codeDes = 2;
 }
 
+message CopyExtentDoneRequeset {
+	uint64 extentID = 1;
+}
+
+message CopyExtentDoneResponse {
+}
+
 service StreamManagerService {
 	rpc StreamInfo(StreamInfoRequest) returns (StreamInfoResponse) {}
 	rpc ExtentInfo(ExtentInfoRequest) returns (ExtentInfoResponse) {}
 	rpc NodesInfo(NodesInfoRequest) returns(NodesInfoResponse) {}
 
+	rpc CopyExtentDone(CopyExtentDoneRequeset) returns (CopyExtentDoneResponse) {}
 	rpc StreamAllocExtent(StreamAllocExtentRequest) returns  (StreamAllocExtentResponse) {}
 	rpc CreateStream(CreateStreamRequest) returns  (CreateStreamResponse) {}
 	rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse) {}
@@ -314,8 +340,6 @@ Extent和Stream是多对多的关系, 一个stream对应多个extent.
 
 streamAllocExtent和MultiModify, deleteStream必须修改stream每一个对应extentInfo
 sm_service什么时候删除extentInfo[ref==0]? 任何时候都可以
-
-
 */
 
 message StreamInfo {

@@ -143,6 +143,11 @@ type RandomTicker struct {
 	max   int64
 }
 
+
+func init() {
+	rand.Seed(time.Now().UnixNano()) //set global rand seed
+}
+
 // NewRandomTicker returns a pointer to an initialized instance of the
 // RandomTicker. Min and max are durations of the shortest and longest allowed
 // ticks. Ticker will run in a goroutine until explicitly stopped.
@@ -190,6 +195,7 @@ func (rt *RandomTicker) nextInterval() time.Duration {
 	interval := rand.Int63n(rt.max-rt.min) + rt.min
 	return time.Duration(interval) * time.Nanosecond
 }
+
 
 //thread-safe rand
 type LockedSource struct {

@@ -40,7 +40,7 @@ type StreamClient interface {
 	Close()
 	AppendEntries(ctx context.Context, entries []*pb.EntryInfo) (uint64, uint32, error)
     Append(ctx context.Context, blocks []*pb.Block) (extentID uint64, offsets []uint32, end uint32, err error)
-	NewLogEntryIter(opt ReadOption) LogEntryIter
+	NewLogEntryIter(opt ...ReadOption) LogEntryIter
 	Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, uint32, error)
 	Truncate(ctx context.Context, extentID uint64) (pb.StreamInfo, pb.StreamInfo, error)
 	//FIXME: stat => ([]extentID , offset)
@@ -73,7 +73,7 @@ func (br *AutumnBlockReader) Read(ctx context.Context, extentID uint64, offset u
 	if exInfo == nil {
 		return nil,  errors.Errorf("no such extent")
 	}
-	conn := br.em.GetExtentConn(extentID)
+	conn := br.em.GetExtentConn(extentID, smclient.PrimaryPolicy{})
 	if conn == nil {
 		return nil, errors.Errorf("no such extent")
 	}
@@ -90,26 +90,32 @@ func (br *AutumnBlockReader) Read(ctx context.Context, extentID uint64, offset u
 
 
 
-type ReadOption struct {
+type readOption struct {
 	ReadFromStart bool
 	ExtentID      uint64
 	Offset        uint32
 	Replay        bool
 }
 
-func (opt ReadOption) WithReplay() ReadOption {
-	opt.Replay = true
-	return opt
+type ReadOption func(*readOption)
+
+func WithReplay() ReadOption {
+	return func(opt *readOption) {
+		opt.Replay = true
+	}
 }
-func (opt ReadOption) WithReadFromStart() ReadOption {
-	opt.ReadFromStart = true
-	return opt
+func WithReadFromStart() ReadOption {
+	return func(opt *readOption) {
+		opt.ReadFromStart = true
+	}
 }
-func (opt ReadOption) WithReadFrom(extentID uint64, offset uint32) ReadOption {
-	opt.ReadFromStart = false
-	opt.ExtentID = extentID
-	opt.Offset = offset
-	return opt
+
+func WithReadFrom(extentID uint64, offset uint32) ReadOption {
+	return func(opt *readOption) {
+		opt.ReadFromStart = false
+		opt.ExtentID = extentID
+		opt.Offset = offset
+	}
 }
 
 //for single stream
@@ -134,7 +140,7 @@ func NewStreamClient(sm *smclient.SMClient, em *smclient.ExtentManager, streamID
 
 type AutumnLogEntryIter struct {
 	sc                 *AutumnStreamClient
-	opt                ReadOption
+	opt                *readOption
 	currentOffset      uint32
 	currentExtentIndex int
 	noMore             bool
@@ -222,20 +228,24 @@ retry:
 
 }
 
-func (sc *AutumnStreamClient) NewLogEntryIter(opt ReadOption) LogEntryIter {
+func (sc *AutumnStreamClient) NewLogEntryIter(opts ...ReadOption) LogEntryIter {
+	readOpt := &readOption{}
+	for _, opt := range opts {
+		opt(readOpt)
+	}
 	leIter := &AutumnLogEntryIter{
 		sc:  sc,
-		opt: opt,
+		opt: readOpt,
 	}
-	if opt.Replay {
+	if readOpt.Replay {
 		leIter.replay = 1
 	}
-	if opt.ReadFromStart {
+	if readOpt.ReadFromStart {
 		leIter.currentExtentIndex = 0
 		leIter.currentOffset = 0
 	} else {
-		leIter.currentOffset = opt.Offset
-		leIter.currentExtentIndex = sc.getExtentIndexFromID(opt.ExtentID)
+		leIter.currentOffset = readOpt.Offset
+		leIter.currentExtentIndex = sc.getExtentIndexFromID(readOpt.ExtentID)
 		/*
 			if leIter.currentExtentIndex < 0 {
 				return nil, errors.Errorf("can not find extentID %d in stream %d", opt.ExtentID, sc.streamID)
@@ -288,7 +298,7 @@ func (sc *AutumnStreamClient) getExtentConnFromIndex(extendIdIndex int) (*grpc.C
 	}
 
 	id := sc.streamInfo.ExtentIDs[extendIdIndex]
-	conn := sc.em.GetExtentConn(id)
+	conn := sc.em.GetExtentConn(id, smclient.PrimaryPolicy{})
 	if conn == nil {
 		return nil, id, errors.Errorf("not found extentID %d", id)
 	}
@@ -303,7 +313,7 @@ func (sc *AutumnStreamClient) getLastExtentConn() (uint64, *grpc.ClientConn, err
 	}
 	extentID := sc.streamInfo.ExtentIDs[len(sc.streamInfo.ExtentIDs)-1] //last extentd
 
-	return extentID, sc.em.GetExtentConn(extentID),nil
+	return extentID, sc.em.GetExtentConn(extentID, smclient.PrimaryPolicy{}),nil
 }
 
 func (sc *AutumnStreamClient) mustAllocNewExtent(oldExtentID uint64, dataShard, parityShard uint32) error{
@@ -364,7 +374,7 @@ func (sc *AutumnStreamClient) AppendEntries(ctx context.Context, entries []*pb.E
 }
 
 func (sc *AutumnStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, error) {
-	conn := sc.em.GetExtentConn(extentID)
+	conn := sc.em.GetExtentConn(extentID, smclient.PrimaryPolicy{})
 	if conn == nil {
 		return nil, errors.Errorf("no such extent")
 	}

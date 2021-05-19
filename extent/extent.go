@@ -60,7 +60,6 @@ type Extent struct {
 type extentHeader struct {
 	MagicNumber []byte
 	ID          uint64
-	ErasureCode string //"4+3"	
 }
 
 func (eh *extentHeader) Marshal() []byte {
@@ -100,6 +99,26 @@ func readExtentHeader(file *os.File) (*extentHeader, error) {
 	return eh, nil
 
 }
+
+
+func CreateCopyExtent(fileName string, ID uint64) (io.ReadWriteCloser, error) {
+	f, err := os.OpenFile(fileName, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, err
+	}
+	extentHeader := newExtentHeader(ID)
+	value := extentHeader.Marshal()
+
+	if err := xattr.FSet(f, XATTRMETA, value); err != nil {
+		return nil, err
+	}
+	if err := xattr.FSet(f, XATTRSEAL, []byte("true")); err != nil {
+		return nil, err
+	}
+
+	return f, nil
+}
+
 
 func CreateExtent(fileName string, ID uint64) (*Extent, error) {
 	//FIXME: lock file
@@ -247,7 +266,7 @@ func (ex *Extent) IsSeal() bool {
 	return atomic.LoadInt32(&ex.isSeal) == 1
 }
 
-func (ex *Extent) getReader() *extentReader {
+func (ex *Extent) GetReader() *extentReader {
 	return &extentReader{
 		extent: ex,
 		pos:    int64(0),
@@ -394,7 +413,7 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 		}
 	}
 
-	wrapReader := ex.getReader() //thread-safe
+	wrapReader := ex.GetReader() //thread-safe
 	rr := record.NewReader(wrapReader)
 	err := rr.SeekRecord(int64(offset))
 	if err != nil {

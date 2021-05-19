@@ -29,7 +29,7 @@ func TestRsCodecs(t *testing.T) {
 		
 			output[0] = nil
 			output[5] = nil
-			//output[7] = nil
+			output[7] = nil
 			//output[8] = nil
 			haha, err := ReedSolomon{}.Decode(output, 6, 3, 4 << 10)
 			require.Nil(t, err)

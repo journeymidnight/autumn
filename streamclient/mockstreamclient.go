@@ -185,26 +185,31 @@ func (client *MockStreamClient) Connect() error {
 	return blocks, end, err
 }
 
-func (client *MockStreamClient) NewLogEntryIter(opt ReadOption) LogEntryIter {
+func (client *MockStreamClient) NewLogEntryIter(opts ...ReadOption) LogEntryIter {
 
+	readOpt := &readOption{}
+	for _, opt := range opts {
+		opt(readOpt)
+	}
 	x := &MockLockEntryIter{
 		sc:  client,
-		opt: opt,
+		opt: readOpt,
 	}
-	if opt.ReadFromStart {
+
+	if readOpt.ReadFromStart {
 		x.currentOffset = 0
 		x.currentIndex = 0
 	} else {
-		x.currentOffset = opt.Offset
+		x.currentOffset = readOpt.Offset
 
 		for i := range client.exs {
-			if client.exs[i].ID == opt.ExtentID {
+			if client.exs[i].ID == readOpt.ExtentID {
 				x.currentIndex = i
 			}
 		}
 
 	}
-	if opt.Replay {
+	if readOpt.Replay {
 		x.replay = true
 	}
 
@@ -215,7 +220,7 @@ type MockLockEntryIter struct {
 	sc            *MockStreamClient
 	currentOffset uint32
 	currentIndex  int
-	opt           ReadOption
+	opt           *readOption
 	noMore        bool
 	cache         []*pb.EntryInfo
 	replay        bool
