@@ -188,7 +188,6 @@ func (suite *ExtentNodeTestSuite) TestAppendReadValue() {
 	suite.Require().Equal([]byte("hello"), ret[0].Data)
 	suite.Require().Equal([]byte("world"), ret[1].Data)
 
-
 }
 
 

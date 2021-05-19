@@ -320,6 +320,7 @@ func (sm *StreamManager) sealExtents(ctx context.Context, nodes []*NodeStatus, e
 			}
 		})
 	}
+	//save sealed information and commitLength into extentInfo
 }
 
 func (sm *StreamManager) receiveCommitlength(ctx context.Context, nodes []*NodeStatus, extentID uint64) uint32 {

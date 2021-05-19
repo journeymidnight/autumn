@@ -59,7 +59,7 @@ func TestAppendReadEntries(t *testing.T) {
 	
 
 	//GC read
-	iter := client.NewLogEntryIter(ReadOption{}.WithReadFromStart())
+	iter := client.NewLogEntryIter(WithReadFromStart())
 
 	//小value在GC时,一个block只返回自己的大小, 上面的entry全部可以GC
 	n := 0
@@ -76,7 +76,8 @@ func TestAppendReadEntries(t *testing.T) {
 	}
 	require.Equal(t,2, n)
 
-	iter = client.NewLogEntryIter(ReadOption{}.WithReadFromStart().WithReplay())
+	//iter = client.NewLogEntryIter(ReadOption{}.WithReadFromStart().WithReplay())
+	iter = client.NewLogEntryIter(WithReadFromStart(), WithReplay())
 
 	expectedKeys := [][]byte{
 		[]byte("a"),
@@ -99,7 +100,7 @@ func TestAppendReadEntries(t *testing.T) {
 	_, _, err = client.AppendEntries(context.Background(), cases)
 	require.NoError(t, err)
 
-	iter = client.NewLogEntryIter(ReadOption{}.WithReadFromStart().WithReadFrom(eID, tail).WithReplay())
+	iter = client.NewLogEntryIter(WithReadFrom(eID, tail), WithReplay())
 	for {
 		ok, err := iter.HasNext()
 		require.NoError(t, err)
@@ -133,7 +134,7 @@ func TestAppendReadBigBlocks(t *testing.T) {
 
 	require.NoError(t, err)
 
-	iter := client.NewLogEntryIter(ReadOption{}.WithReadFromStart().WithReplay())
+	iter := client.NewLogEntryIter(WithReadFromStart(), WithReplay())
 	var ans []int //value大小
 	for i :=0 ; i < len(cases) ; i ++ {
 		ok, err := iter.HasNext()
@@ -194,7 +195,7 @@ func TestSplitExtent(t *testing.T) {
 	//fmt.Printf("len[%d] split to %d vs %d\n", l, len(newStream.ExtentIDs), len(client.exs))
 	require.Equal(t, l, len(frontStream.ExtentIDs)+len(client.exs))
 
-	iter := client.NewLogEntryIter(ReadOption{}.WithReadFromStart().WithReplay())
+	iter := client.NewLogEntryIter(WithReadFromStart(), WithReplay())
 	for {
 		ok, err := iter.HasNext()
 		require.NoError(t, err)

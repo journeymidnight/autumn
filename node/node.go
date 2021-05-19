@@ -52,6 +52,7 @@ type ExtentNode struct {
 
 	smClient *smclient.SMClient
 	em       *smclient.ExtentManager
+	recoveryTaskNum  int32
 }
 
 func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl string, smAddr []string) *ExtentNode {

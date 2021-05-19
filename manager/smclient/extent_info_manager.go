@@ -2,6 +2,7 @@ package smclient
 
 import (
 	"context"
+	"math/rand"
 	"sync"
 
 	"github.com/gogo/protobuf/proto"
@@ -11,6 +12,7 @@ import (
 	"google.golang.org/grpc"
 )
 
+//TODO: LRU
 type ExtentManager struct {
 	sync.RWMutex
 	smClient   *SMClient
@@ -42,24 +44,42 @@ func (em *ExtentManager) GetPeers(extentID uint64) []string {
 	return ret
 }
 
-//always get alive node: FIXME: make sure pool healthy
-func (em *ExtentManager) GetExtentConn(extentID uint64) *grpc.ClientConn {
-	/*
-	extentInfo := em.GetExtentInfo(extentID)
-	nodeInfo := em.smClient.LookupNode(extentInfo.Replicates[0])
-	pool := conn.GetPools().Connect(nodeInfo.Address)
-	*/
+
+type SelectNodePolicy interface{
+	Choose(replics []string) *grpc.ClientConn   
+}
+
+type PrimaryPolicy struct{}
+func (PrimaryPolicy) Choose(replics []string) *grpc.ClientConn {
+	addr := replics[0]
+	pool, err := conn.GetPools().Get(addr)
+	if err != nil {
+		return nil
+	}
+	return pool.Get()
+
+}
+
+type RandomPolicy struct{}
+func (RandomPolicy) Choose(replics []string) *grpc.ClientConn{
+	for loop := 0 ; loop < 3 ; loop ++{
+		n := rand.Intn(len(replics))
+		pool, err := conn.GetPools().Get(replics[n])
+		if err == nil {
+			continue
+		}
+		return pool.Get()
+	}
+	return nil
+}
+
+func (em *ExtentManager) GetExtentConn(extentID uint64, policy SelectNodePolicy) *grpc.ClientConn {
+
 	peerAddrs := em.GetPeers(extentID)
 	if len(peerAddrs) == 0 {
 		return nil
 	}
-	for i := range peerAddrs {
-		pool := conn.GetPools().Connect(peerAddrs[i])
-		if pool != nil && pool.IsHealthy() {
-			return pool.Get()
-		}
-	}
-	return nil
+	return policy.Choose(peerAddrs)	
 }
 
 func (em *ExtentManager) Update(extentID uint64) *pb.ExtentInfo{
