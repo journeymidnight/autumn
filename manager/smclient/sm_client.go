@@ -375,3 +375,36 @@ func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, ext
 
 	return  err	
 }
+
+
+func (client *SMClient) CopyExtentDone(ctx context.Context, extentID uint64, replaceID uint64, newID uint64) error {
+	err := errors.New("can not find connection to stream manager")
+	var res *pb.CopyExtentDoneResponse
+	client.try(func(conn *grpc.ClientConn) bool {
+		c := pb.NewStreamManagerServiceClient(conn)
+		res, err = c.CopyExtentDone(ctx, &pb.CopyExtentDoneRequeset{
+			ExtentID: extentID,
+			ReplaceID: replaceID,
+			NewNode: newID,
+		})
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			return false
+		}
+		if err != nil {
+			xlog.Logger.Warnf(err.Error())
+			return true
+		}
+		if res.Code != pb.Code_OK {
+			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
+			//if remote is not a leader, retry
+			if err == wire_errors.NotLeader {
+				return true
+			}
+			return false
+		}
+
+		return false
+	}, 500*time.Millisecond)
+
+	return err
+}

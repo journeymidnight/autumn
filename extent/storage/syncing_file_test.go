@@ -22,22 +22,21 @@ func TestSyncingFile(t *testing.T) {
 	filename := tmpf.Name()
 	defer os.Remove(filename)
 
-	f, err := Default.Create(filename)
+	//f, err := Default.Create(filename)
+	f, err := os.Create(filename)
 	if err != nil {
 		t.Fatal(err)
 	}
 	s := NewSyncingFile(f, SyncingFileOptions{})
-	if s == f {
-		t.Fatalf("failed to wrap: %p != %p", f, s)
-	}
+
 	s = NewSyncingFile(f, SyncingFileOptions{BytesPerSync: 8 << 10 /* 8 KB */})
-	s.(*syncingFile).fd = 1
-	s.(*syncingFile).syncTo = func(offset int64) error {
-		s.(*syncingFile).ratchetSyncOffset(offset)
+	s.fd =1
+	s.syncTo = func(offset int64) error {
+		s.ratchetSyncOffset(offset)
 		return nil
 	}
 
-	t.Logf("sync_file_range=%t", s.(*syncingFile).useSyncRange)
+	t.Logf("sync_file_range=%t", s.useSyncRange)
 
 	testCases := []struct {
 		n              int64
@@ -54,7 +53,7 @@ func TestSyncingFile(t *testing.T) {
 		if _, err := s.Write(make([]byte, c.n)); err != nil {
 			t.Fatal(err)
 		}
-		syncTo := atomic.LoadInt64(&s.(*syncingFile).atomic.syncOffset)
+		syncTo := atomic.LoadInt64(&s.atomic.syncOffset)
 		if c.expectedSyncTo != syncTo {
 			t.Fatalf("%d: expected sync to %d, but found %d", i, c.expectedSyncTo, syncTo)
 		}
@@ -71,7 +70,7 @@ func BenchmarkSyncWrite(b *testing.B) {
 		wsizes = []int{64}
 	}
 
-	run := func(b *testing.B, wsize int, newFile func(string) File) {
+	run := func(b *testing.B, wsize int, newFile func(string) *SyncingFile) {
 		tmpf, err := ioutil.TempFile("", "pebble-db-syncing-file-")
 		if err != nil {
 			b.Fatal(err)
@@ -80,7 +79,7 @@ func BenchmarkSyncWrite(b *testing.B) {
 		_ = tmpf.Close()
 		defer os.Remove(filename)
 
-		var f File
+		var f *SyncingFile
 		var size int
 		buf := make([]byte, wsize)
 
@@ -110,7 +109,7 @@ func BenchmarkSyncWrite(b *testing.B) {
 	b.Run("no-prealloc", func(b *testing.B) {
 		for _, wsize := range wsizes {
 			b.Run(fmt.Sprintf("wsize=%d", wsize), func(b *testing.B) {
-				run(b, wsize, func(filename string) File {
+				run(b, wsize, func(filename string) *SyncingFile {
 					_ = os.Remove(filename)
 					t, err := os.Create(filename)
 					if err != nil {
@@ -125,7 +124,7 @@ func BenchmarkSyncWrite(b *testing.B) {
 	b.Run("prealloc-4MB", func(b *testing.B) {
 		for _, wsize := range wsizes {
 			b.Run(fmt.Sprintf("wsize=%d", wsize), func(b *testing.B) {
-				run(b, wsize, func(filename string) File {
+				run(b, wsize, func(filename string) *SyncingFile {
 					_ = os.Remove(filename)
 					t, err := os.Create(filename)
 					if err != nil {
@@ -141,7 +140,7 @@ func BenchmarkSyncWrite(b *testing.B) {
 		for _, wsize := range wsizes {
 			b.Run(fmt.Sprintf("wsize=%d", wsize), func(b *testing.B) {
 				init := true
-				run(b, wsize, func(filename string) File {
+				run(b, wsize, func(filename string) *SyncingFile {
 					if init {
 						init = false
 

@@ -120,6 +120,7 @@ func WithReadFrom(extentID uint64, offset uint32) ReadOption {
 
 //for single stream
 type AutumnStreamClient struct {
+	StreamClient
 	smClient     *smclient.SMClient
 	sync.RWMutex //protect streamInfo/extentInfo when called in read/write
 	streamInfo   *pb.StreamInfo

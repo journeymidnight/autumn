@@ -101,7 +101,7 @@ func readExtentHeader(file *os.File) (*extentHeader, error) {
 }
 
 
-func CreateCopyExtent(fileName string, ID uint64) (io.ReadWriteCloser, error) {
+func CreateCopyExtent(fileName string, ID uint64) (*os.File, error) {
 	f, err := os.OpenFile(fileName, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return nil, err
@@ -274,8 +274,9 @@ func (ex *Extent) GetReader() *extentReader {
 
 }
 
-//Close requeres LOCK
+//Close requeset LOCK
 func (ex *Extent) Close() {
+	ex.Lock()
 	if ex.writer != nil {
 		ex.writer.Close()
 	}

@@ -248,59 +248,89 @@ PSVERSION  => {num}
 ### sm service
 (a) maintaining the stream namespace and state of all active streams and extents DONE
 (b) monitoring the health of the ENs                                             DONE 
-+ node api: usage
++ node api: usage                                                                DONE
 + sm : (go func)update usage and set dead flag if node is not responding in n minute
 (c) creating and assigning extents to ENs                                        DONE
-(d) performing the lazy re-replication of extent replicas that are lost due to hardware failures or unavailability 
-+ (go func)loop over extentInfo, if it has dead node, replicas the data(one by one)
+(d) performing the lazy re-replication of extent replicas that are lost due to hardware failures or unavailability DONE
++ (go func)loop over extentInfo, if it has dead node, replicas the data(one by one) DONE
 (e) garbage collecting extents that are no longer pointed to by any stream ==> (ref count) 
-+ node: (go func)loop over extents, ask extentInfo, if (ref count) == 0 , delete file
++ node: (go func)loop over extents, ask extentInfo, if (ref count) == 0 , delete file TODO
 
 (f) disk failure,
-f1. local copy(keep extentInfo the same, faster)
-f2. send "remove extent from node" to manager, manager schedule tasks(one by one)
+f1. local copy(keep extentInfo the same, faster)   TODO
+f2. send "remove extent from node" to manager, manager schedule tasks(one by one) TODO
+
+
 
 
 ETCD存储结构
 
-recoveryTasks / EXTENTID.tsk = "extentInfo" + replacing
-recoveryTaskLocks / EXTENTID.lk
-
-// putNewKV attempts to create the given key, only succeeding if the key did
-// not yet exist.
-func putNewKV(kv v3.KV, key, val string, leaseID v3.LeaseID) (int64, error) {
-	cmp := v3.Compare(v3.Version(key), "=", 0)
-	req := v3.OpPut(key, val, v3.WithLease(leaseID))
-	txnresp, err := kv.Txn(context.TODO()).If(cmp).Then(req).Commit()
-
-// range KV
-
-// node get tasks
-tryLock
-check version
-run tasks.
-run finish Recovery
-
-// finish Recovery
-atomic op{
- check version
- update extentInfo(EVERSION++)
- delete recoveryTasks/TASK
-}
-unlock recoveryTaskLock
+1. 可管理
+2. 处理recovery Node失败的情况
+3. 同一个extent,只有一个进程在恢复
 
 
-revision相关:
-https://www.compose.com/articles/how-to-keep-your-etcd-lean-and-mean/
+1. 数据恢复
 
-目前rangepartiion, gc的bug
-GC           USER
-read V
-             write V1000
-			 MEMTABLE flushed
-write V45
+准备一个SET, 持久化在etcd里, 里面/recoveryTasks是需要执行的的recovery任务,
+只有在成功恢复了一个extent之后, 才在etcd里面删除这个task, 同时在leader的内存里面
+存储taskPool, 这个和SET保持一致
 
-目前认为memtable有序, 之后的所有读, 只能读出V45
+/recoveryTasks/extentID.tsk
+
+这个SET有2个来源
+1. stream manager scan得到()
+2. 由node主动提出, 比如node有一个disk failure,
+   2.a 如果是全盘raid5, raid5自行处理(目前选择)
+   2.b node自己处理, 把extent转移到其他硬盘, 这种情况不需要修改元数据
+   2.c node自己处理, 其他硬盘容量不够, node提一个api, 请上层处理
+
+/recoveryTaskLocks/extentID.lck
+
+
+stream manager运行, 主要功能是向SET里面塞任务
+routineFixReplics(每分钟一次)
+	-> 如果存在extent的node是dead状态
+	   -> queueRecoveryTask
+	   1. dlock(如果失败, 说明有其他node正在进行recovery, 直接返回)
+	   2. 再读extentInfo一遍, 确认
+	   3. 提交recovery_task到SET(如果之前有任务, 提交失败)
+	   4. dlock.unlock
+
+其中2跟一个race condition相关, 主要好处是避免过多的dlock
+
+
+routineDispatchTask(每分钟一次)
+	-> 读taskPool
+	   1. 如果说有recovery在进行, 但是启动时间很久之前, 分配任务
+	   2. 如果说recovery没有在进行, 分配任务
+	   这2个都有可能是重复任务, 依赖在node中的dlock保证唯一
+
+	   3. 如果分配任务返回OK, 说明远程正在执行恢复任务, 然后更新taskPool
+
+
+Node:
+
+RequireRecovery
+1. Dlock
+2. 如果自己的load太高, 拒绝, 然后unlock
+3. runRecoveryTask,返回已经接收任务
+    -> runRecoveryTask  拷贝一个副本到本node
+	a. 返回时Dlock.unlock
+	b. EC和Replicat的恢复有不同, 但是都返回一个在diskFS里面的File
+
+    c. 新文件加入到node管理的extent中
+	d. 返回task成功, CopyExtentDone提示manager更新元数据
+
+stream manager的逻辑
+copyExtentDone
+1. 检查dlock确实被别人锁住
+2. 更新extentInfo, version++
+3. 删除SET中的任务
+4. 更新taskPool
+
+
+
 
 重复提交task
 
@@ -313,18 +343,15 @@ manager                    manager_service(from node)
                     	 更新extentInfo (etcd)
                 	     删除etcd task    (etcd)
 						 更新extentInfo(内存)/删除recovies
-deduplicate? 
 create task(etcd)       
 
-solution: task lock in sm
 
 
-2.=========
-
-manager 
-
-创建task(内存)
-create task(etcd)
-创建task(内存)
-create task(etcd)
-
+目前rangepartiion, gc的bug
+GC           USER
+read V
+             write V1000
+			 MEMTABLE flushed
+write V45
+除了seqNum, 还有增加rotateNum, 
+目前认为memtable有序, 之后的所有读, 只能读出V45

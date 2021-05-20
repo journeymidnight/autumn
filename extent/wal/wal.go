@@ -38,7 +38,7 @@ import (
 type Wal struct {
 	dir        string
 	oldWALs    []string
-	currentWAL storage.File
+	currentWAL *storage.SyncingFile
 	last       uint64
 	writeCh    chan *request
 	stopper    *utils.Stopper
@@ -91,7 +91,8 @@ func OpenWal(dir string, userSync func()) (*Wal, error) {
 
 	//create new wal
 	last++
-	fd, err := storage.Default.Create(filepath.Join(dir, fmt.Sprintf("%016x.wal", last)))
+	fd, err := os.Create(filepath.Join(dir, fmt.Sprintf("%016x.wal", last)))
+
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +158,7 @@ func (wal *Wal) doRequest(reqs []*request) error {
 
 		wal.rotate()
 		wal.last++
-		fd, err := storage.Default.Create(filepath.Join(wal.dir, fmt.Sprintf("%016x.wal", wal.last)))
+		fd, err := os.Create(filepath.Join(wal.dir, fmt.Sprintf("%016x.wal", wal.last)))
 		if err != nil {
 			done(err)
 			return err
@@ -259,8 +260,8 @@ func (wal *Wal) Write(extentID uint64, start uint32, blocks []*pb.Block) error {
 	return req.err
 }
 
-func pathName(dir string, f storage.File) string {
-	info, _ := f.Stat()
+func pathName(dir string, f *storage.SyncingFile) string {
+	info, _ := f.File.Stat()
 	name := info.Name()
 	return filepath.Join(dir, name)
 }
@@ -282,7 +283,7 @@ func (wal *Wal) Close() {
 func (wal *Wal) Replay(callback func(uint64, uint32, []*pb.Block)) error {
 	//delete pendingWals after replay
 	for _, fname := range wal.oldWALs {
-		f, err := storage.Default.Open(fname)
+		f, err := os.Open(fname)
 		if err != nil {
 			return err
 		}

@@ -110,6 +110,11 @@ func (en *ExtentNode) getExtent(ID uint64) *extent.Extent {
 	return v.(*extent.Extent)
 }
 
+
+func (en *ExtentNode) removeExtent(ID uint64) {
+	en.extentMap.Delete(ID)
+}
+
 func (en *ExtentNode) setExtent(ID uint64, ex *extent.Extent) {
 	en.extentMap.Store(ID, ex)
 }

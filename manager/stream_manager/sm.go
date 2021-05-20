@@ -88,7 +88,6 @@ type StreamManager struct {
 	nodes      *hashmap.HashMap //id => *NodeStatus
 
 	taskPool  *hashmap.HashMap //extentID=>*RecoveryStatus
-	taskLock utils.SafeMutex
 
 	etcd       *embed.Etcd
 	client     *clientv3.Client

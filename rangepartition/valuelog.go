@@ -85,7 +85,7 @@ func (rp *RangePartition) runGC(discardRatio float64) {
 	if streamInfo == nil {
 		return
 	}
-
+	
 	var candidate streamclient.StreamClient
 
 	candidate = rp.openStream(*streamInfo)

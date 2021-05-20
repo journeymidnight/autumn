@@ -6,14 +6,14 @@
 
 package storage
 
-func (f *syncingFile) init() {
+func (f *SyncingFile) init() {
 	f.syncTo = f.syncToGeneric
 }
 
-func (f *syncingFile) syncData() error {
+func (f *SyncingFile) syncData() error {
 	return f.File.Sync()
 }
 
-func (f *syncingFile) syncToGeneric(_ int64) error {
+func (f *SyncingFile) syncToGeneric(_ int64) error {
 	return f.Sync()
 }

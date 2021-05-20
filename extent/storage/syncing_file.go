@@ -5,6 +5,7 @@
 package storage
 
 import (
+	"os"
 	"sync/atomic"
 )
 
@@ -14,8 +15,8 @@ type SyncingFileOptions struct {
 	PreallocateSize int
 }
 
-type syncingFile struct {
-	File
+type SyncingFile struct {
+	File           *os.File
 	fd              uintptr
 	useSyncRange    bool
 	bytesPerSync    int64
@@ -34,8 +35,8 @@ type syncingFile struct {
 // decides to write out a large chunk of dirty filesystem buffers. If
 // bytesPerSync is zero, the original file is returned as no syncing is
 // requested.
-func NewSyncingFile(f File, opts SyncingFileOptions) File {
-	s := &syncingFile{
+func NewSyncingFile(f *os.File, opts SyncingFileOptions) *SyncingFile {
+	s := &SyncingFile{
 		File:            f,
 		bytesPerSync:    int64(opts.BytesPerSync),
 		preallocateSize: int64(opts.PreallocateSize),
@@ -44,16 +45,24 @@ func NewSyncingFile(f File, opts SyncingFileOptions) File {
 	type fd interface {
 		Fd() uintptr
 	}
+	s.fd = f.Fd()
+	/*
 	if d, ok := f.(fd); ok {
 		s.fd = d.Fd()
 	}
+	*/
 
 	s.init()
 	return s
 }
 
+
+func (f *SyncingFile) Close() error{
+	return f.File.Close()
+}
+
 // NB: syncingFile.Write is unsafe for concurrent use!
-func (f *syncingFile) Write(p []byte) (n int, err error) {
+func (f *SyncingFile) Write(p []byte) (n int, err error) {
 	_ = f.preallocate(atomic.LoadInt64(&f.atomic.offset) + int64(n))
 
 	n, err = f.File.Write(p)
@@ -69,7 +78,7 @@ func (f *syncingFile) Write(p []byte) (n int, err error) {
 	return n, nil
 }
 
-func (f *syncingFile) preallocate(offset int64) error {
+func (f *SyncingFile) preallocate(offset int64) error {
 	if f.fd == 0 || f.preallocateSize == 0 {
 		return nil
 	}
@@ -85,7 +94,7 @@ func (f *syncingFile) preallocate(offset int64) error {
 	return preallocExtend(f.fd, offset, length)
 }
 
-func (f *syncingFile) ratchetSyncOffset(offset int64) {
+func (f *SyncingFile) ratchetSyncOffset(offset int64) {
 	for {
 		syncOffset := atomic.LoadInt64(&f.atomic.syncOffset)
 		if syncOffset >= offset {
@@ -97,7 +106,7 @@ func (f *syncingFile) ratchetSyncOffset(offset int64) {
 	}
 }
 
-func (f *syncingFile) Sync() error {
+func (f *SyncingFile) Sync() error {
 	// We update syncOffset (atomically) in order to avoid spurious syncs in
 	// maybeSync. Note that even if syncOffset is larger than the current file
 	// offset, we still need to call the underlying file's sync for persistence
@@ -106,7 +115,7 @@ func (f *syncingFile) Sync() error {
 	return f.syncData()
 }
 
-func (f *syncingFile) maybeSync() error {
+func (f *SyncingFile) maybeSync() error {
 	if f.bytesPerSync <= 0 {
 		return nil
 	}

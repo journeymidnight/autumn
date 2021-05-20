@@ -10,26 +10,15 @@ import (
 
 type ReedSolomon struct{} 
 
-func (ReedSolomon ) Reconstruct(input []io.Reader, dataShards int, parityShards int,  output []io.Writer, chunkSize int, fSize int64) error{
+func (ReedSolomon) Reconstruct(input []io.Reader, dataShards int, parityShards int, output []io.Writer) error{
 	enc, err := reedsolomon.NewStream(dataShards, parityShards)
 	if err != nil {
 		return err
-	}
-	for i := int64(0); i < fSize ; i += int64(chunkSize) {
-		in := make([]io.Reader, dataShards + parityShards)
-		for i := range in {
-			if input[i] == nil {
-				in[i] = nil
-			} else {
-				in[i] = io.LimitReader(input[i], int64(chunkSize))
-			}
-		}
-	
-		if err = enc.Reconstruct(in, output) ; err != nil {
+	}	
+	if err = enc.Reconstruct(input, output) ; err != nil {
 			return err
-		}
-		
 	}
+		
 	return nil
 }
 
