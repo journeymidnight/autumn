@@ -299,9 +299,13 @@ message TruncateResponse {
 
 message CopyExtentDoneRequeset {
 	uint64 extentID = 1;
+	uint64 replaceID = 2;
+	uint64 newNode = 3;
 }
 
 message CopyExtentDoneResponse {
+	Code code = 1;
+	string codeDes = 2;
 }
 
 service StreamManagerService {

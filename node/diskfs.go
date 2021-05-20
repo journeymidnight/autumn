@@ -3,7 +3,6 @@ package node
 import (
 	"encoding/binary"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -71,13 +70,10 @@ func (s *diskFS) pathName(extentID uint64) string {
 	return filepath.Join(fpath...)
 }
 
-func (s *diskFS) AllocCopyExtent(ID uint64) (io.ReadWriteCloser, func(), error) {
+func (s *diskFS) AllocCopyExtent(ID uint64) (*os.File, string, error) {
 	fpath := s.pathName(ID)
-	ret, err := extent.CreateCopyExtent(fpath, ID)
-	if err != nil {
-		return nil,nil, err
-	}
-	return ret, func(){os.Remove(fpath)}, nil
+	f, err := extent.CreateCopyExtent(fpath, ID)
+	return f, fpath, err
 }
 
 func (s *diskFS) AllocExtent(ID uint64) (*extent.Extent, error) {

@@ -14,6 +14,7 @@
 
 package wal
 
+/*
 import (
 	"fmt"
 	"os"
@@ -77,3 +78,4 @@ func NewFileFactory(dir string) *fileFactory {
 	})
 	return ff
 }
+*/

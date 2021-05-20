@@ -7,11 +7,15 @@ import (
 	"time"
 
 	"github.com/coreos/etcd/clientv3"
+	"github.com/gogo/protobuf/proto"
 	"github.com/journeymidnight/autumn/conn"
+	"github.com/journeymidnight/autumn/dlock"
 	"github.com/journeymidnight/autumn/manager"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
+	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/journeymidnight/autumn/xlog"
+	"github.com/pkg/errors"
 )
 
 //go routine
@@ -94,12 +98,28 @@ func (rt *RecoveryTask) SetRunningNode(x uint64) {
 	atomic.StoreUint64(&rt.runningNode, x)
 }
 
-
-
-func formatRecoveryTaskName(rt *pb.RecoveryTask) string {
-	return fmt.Sprintf("%d_%d.tsk", rt.ExtentID, rt.ReplaceID)
+func FormatRecoveryTaskLock(extentID uint64) string {
+	return fmt.Sprintf("/recoveryTaskLocks/%d.lck", extentID)
 }
 
+func FormatRecoveryTaskName(extentID uint64) string {
+	return fmt.Sprintf("/recoveryTasks/%d_%d.tsk", extentID)
+}
+
+func isReplaceIDinInfo(extentInfo *pb.ExtentInfo, replaceID uint64) bool {
+
+	for i := range extentInfo.Replicates {
+		if extentInfo.Replicates[i] == replaceID {
+			return true
+		}
+	}
+	for i := range extentInfo.Parity {
+		if extentInfo.Parity[i] == replaceID {
+			return true
+		}
+	}
+	return false
+}
 
 //non-block
 func (sm *StreamManager) queueRecoveryTask(extentID uint64, replaceNodeID uint64) {
@@ -108,12 +128,31 @@ func (sm *StreamManager) queueRecoveryTask(extentID uint64, replaceNodeID uint64
 			ExtentID: extentID,
 			ReplaceID: replaceNodeID,
 		}
-		key := formatRecoveryTaskName(rt)
+
+		lock := dlock.NewDLock(FormatRecoveryTaskLock(extentID))
+		defer lock.Close()
+
+		if err := lock.Lock(10 * time.Millisecond) ; err != nil{
+			return
+		}
+
+		key := FormatRecoveryTaskName(extentID)
 
 		//deduplicate
 		if _, ok := sm.taskPool.Get(key); ok {
 			return
 		}
+
+		//read sm.exteng again to make sure this task
+		//replaceNodeID is in extent.Replicates or extent.Parity
+		d, ok := sm.extents.Get(extentID)
+		extentInfo := d.(*pb.ExtentInfo)
+		if ok && isReplaceIDinInfo(extentInfo, replaceNodeID) {
+			
+		} else {	
+			return
+		}
+
 
 		//set etcd if isLeader && not exist, submit the task
 		data := utils.MustMarshal(rt)
@@ -136,7 +175,6 @@ func (sm *StreamManager) queueRecoveryTask(extentID uint64, replaceNodeID uint64
 
 
 //producer
-
 func (sm *StreamManager) routineFixReplics() {
 	//loop over all extent, if extent has dead node.
 	//insert task into "task pool"
@@ -153,7 +191,6 @@ func (sm *StreamManager) routineFixReplics() {
 				return
 			case <- ticker.C:
 				//FULL SEARCH
-				sm.taskLock.RLock()
 				for kv := range sm.extents.Iter() {
 					extent := kv.Value.(*pb.ExtentInfo) //extent is read only
 					for _, nodeID := range extent.Replicates {
@@ -171,13 +208,13 @@ func (sm *StreamManager) routineFixReplics() {
 					}
 					
 				}
-				sm.taskLock.RUnlock()
 		}
 	}
 	
 }
 
 //non-block
+//FIXME: if task is running, do not submit it again
 func (sm *StreamManager) submitRecoveryTask(t *RecoveryTask) {
 	go func() {
 		//find a remote node
@@ -237,7 +274,6 @@ func (sm *StreamManager) routineDispatchTask() {
 			case <- sm.stopper.ShouldStop():
 				return
 			case <- ticker.C:
-				sm.taskLock.RLock()
 				for kv := range sm.taskPool.Iter() {
 					t := kv.Value.(*RecoveryTask)
 					//FIXME, if no runningNode and startTime is long ago, retry it
@@ -245,7 +281,91 @@ func (sm *StreamManager) routineDispatchTask() {
 						sm.submitRecoveryTask(t)
 					}
 				}
-				sm.taskLock.RUnlock()
 			}
 	}
+}
+
+
+//node service, but it's about recovery task
+func (sm *StreamManager) CopyExtentDone(ctx context.Context, req *pb.CopyExtentDoneRequeset) (*pb.CopyExtentDoneResponse, error) {
+	
+	errDone := func(err error) (*pb.CopyExtentDoneResponse, error){
+		code, desCode := wire_errors.ConvertToPBCode(err)
+		return &pb.CopyExtentDoneResponse{
+			Code: code,
+			CodeDes: desCode,
+		}, nil
+	}
+
+	//client should still have the lock: check lock
+	lock := dlock.NewDLock(FormatRecoveryTaskLock(req.ExtentID))
+	if err := lock.Lock(100 * time.Millisecond); err == nil {
+		lock.Close()
+		return errDone(errors.Errorf("client should have lock"))
+	}
+	lock.Close()
+
+
+	d, ok := sm.extents.Get(req.ExtentID)
+	if !ok {
+		errDone(errors.New(""))
+	}
+	extentInfo := d.(*pb.ExtentInfo)
+
+	//valid extentInfo and replaceID//
+	//FIXME:check version as well
+	slot := -1
+	for i := range extentInfo.Replicates {
+		if extentInfo.Replicates[i] == req.ReplaceID {
+			slot = i
+		}
+	}
+
+	for j := range extentInfo.Parity {
+		if extentInfo.Parity[j] == req.ReplaceID {
+			if slot == -1 {
+				slot = j + len(extentInfo.Replicates)
+			} else {
+				return errDone(errors.Errorf("replaceID is %d, extentInfo is %v", req.ReplaceID, extentInfo))
+			}
+		}
+	}
+
+	if slot == -1 {
+		return errDone(errors.Errorf("replaceID is %d, extentInfo is %v", req.ReplaceID, extentInfo))
+	}
+
+	//replace ID
+	newExtentInfo := proto.Clone(extentInfo).(*pb.ExtentInfo)
+	if slot < len(extentInfo.Replicates) {
+		newExtentInfo.Replicates[slot] = req.NewNode
+	} else {
+		newExtentInfo.Parity[slot - len(extentInfo.Replicates)] = req.NewNode
+	}
+
+	//EVERSION inc
+	newExtentInfo.Eversion++
+
+	//submit newExtentInfo and remove taskPool to etcd
+
+	extentKey := formatExtentKey(req.ExtentID)
+	data := utils.MustMarshal(newExtentInfo)
+
+	taskKey := FormatRecoveryTaskName(req.ExtentID)
+	cmps := []clientv3.Cmp{clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue)}
+	ops := []clientv3.Op{
+		clientv3.OpDelete(taskKey),
+		clientv3.OpPut(extentKey, string(data)),
+	}
+
+	if err := manager.EtcdSetKVS(sm.client, cmps, ops); err != nil {
+		return errDone(errors.Errorf("setting etcd failed [%s]", err))
+	}
+
+	//remove from taskPool in local memory
+	sm.taskPool.Del(taskKey)
+	//return successfull
+	return &pb.CopyExtentDoneResponse{
+		Code :pb.Code_OK,
+	}, nil
 }
