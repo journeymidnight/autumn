@@ -87,7 +87,7 @@ type StreamManager struct {
 	//nodes    map[uint64]*NodeStatus
 	nodes      *hashmap.HashMap //id => *NodeStatus
 
-	taskPool  *hashmap.HashMap //extentID=>*RecoveryStatus
+	taskPool  *hashmap.HashMap //extentID=>*RecoveryTask
 
 	etcd       *embed.Etcd
 	client     *clientv3.Client
@@ -187,12 +187,12 @@ func (sm *StreamManager) runAsLeader() {
 	for _, kv := range kvs {
 		extentID, err := parseKey(string(kv.Key), "extents")
 		if err != nil {
-			xlog.Logger.Warnf(err.Error())
+			xlog.Logger.Errorf(err.Error())
 			return
 		}
 		var extentInfo pb.ExtentInfo
 		if err = extentInfo.Unmarshal(kv.Value); err != nil {
-			xlog.Logger.Warnf(err.Error())
+			xlog.Logger.Errorf(err.Error())
 			return
 		}
 		sm.extents.Set(extentID, &extentInfo)
@@ -204,24 +204,49 @@ func (sm *StreamManager) runAsLeader() {
 
 	kvs, err = manager.EtcdRange(sm.client, "nodes")
 	if err != nil {
-		xlog.Logger.Warnf(err.Error())
+		xlog.Logger.Errorf(err.Error())
 		return
 	}
 	for _, kv := range kvs {
 		nodeID, err := parseKey(string(kv.Key), "nodes")
 		if err != nil {
-			xlog.Logger.Warnf(err.Error())
+			xlog.Logger.Errorf(err.Error())
 			return
 		}
 		var nodeInfo pb.NodeInfo
 		if err = nodeInfo.Unmarshal(kv.Value); err != nil {
-			xlog.Logger.Warnf(err.Error())
+			xlog.Logger.Errorf(err.Error())
 			return
 		}
 		sm.nodes.Set(nodeID, &NodeStatus{
 			NodeInfo: nodeInfo,
 		})
 	}
+
+	sm.taskPool = &hashmap.HashMap{}
+	kvs, err = manager.EtcdRange(sm.client, "recoveryTasks")
+	if err != nil {
+		xlog.Logger.Errorf(err.Error())
+		return
+	}
+	for _, kv := range kvs {
+		extentID, err := parseKey(string(kv.Key), "recoveryTasks")
+		if err != nil {
+			xlog.Logger.Errorf(err.Error())
+			return
+		}
+
+		var task pb.RecoveryTask
+		if err = task.Unmarshal(kv.Value); err != nil {
+			xlog.Logger.Errorf(err.Error())
+			return
+		}
+
+		sm.taskPool.Set(extentID, &RecoveryTask{
+			task: &task,
+		})
+	}
+
 
 	//start leader tasks
 	sm.stopper.RunWorker(sm.routineUpdateDF)

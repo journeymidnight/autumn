@@ -99,11 +99,11 @@ func (rt *RecoveryTask) SetRunningNode(x uint64) {
 }
 
 func FormatRecoveryTaskLock(extentID uint64) string {
-	return fmt.Sprintf("/recoveryTaskLocks/%d.lck", extentID)
+	return fmt.Sprintf("recoveryTaskLocks/%d.lck", extentID)
 }
 
-func FormatRecoveryTaskName(extentID uint64) string {
-	return fmt.Sprintf("/recoveryTasks/%d_%d.tsk", extentID)
+func FormatRecoveryTaskName(extentID uint64, replaceID uint64) string {
+	return fmt.Sprintf("recoveryTasks/%d_%d.tsk", extentID)
 }
 
 func isReplaceIDinInfo(extentInfo *pb.ExtentInfo, replaceID uint64) bool {
@@ -122,37 +122,20 @@ func isReplaceIDinInfo(extentInfo *pb.ExtentInfo, replaceID uint64) bool {
 }
 
 //non-block
-func (sm *StreamManager) queueRecoveryTask(extentID uint64, replaceNodeID uint64) {
-	go func() {
+func (sm *StreamManager) queueRecoveryTask(extentID uint64, replaceNodeID uint64) error{
+		key := FormatRecoveryTaskName(extentID, replaceNodeID)
+
+		//if we have record for this task, return
+		_, ok := sm.taskPool.Get(key)
+		if ok {
+			return errors.New("duplicate task")
+		}
+
+		
 		rt := &pb.RecoveryTask{
 			ExtentID: extentID,
 			ReplaceID: replaceNodeID,
 		}
-
-		lock := dlock.NewDLock(FormatRecoveryTaskLock(extentID))
-		defer lock.Close()
-
-		if err := lock.Lock(10 * time.Millisecond) ; err != nil{
-			return
-		}
-
-		key := FormatRecoveryTaskName(extentID)
-
-		//deduplicate
-		if _, ok := sm.taskPool.Get(key); ok {
-			return
-		}
-
-		//read sm.exteng again to make sure this task
-		//replaceNodeID is in extent.Replicates or extent.Parity
-		d, ok := sm.extents.Get(extentID)
-		extentInfo := d.(*pb.ExtentInfo)
-		if ok && isReplaceIDinInfo(extentInfo, replaceNodeID) {
-			
-		} else {	
-			return
-		}
-
 
 		//set etcd if isLeader && not exist, submit the task
 		data := utils.MustMarshal(rt)
@@ -165,12 +148,13 @@ func (sm *StreamManager) queueRecoveryTask(extentID uint64, replaceNodeID uint64
 		err := manager.EtcdSetKVS(sm.client, cmps, ops)
 		if err != nil {
 			xlog.Logger.Warnf("can not submit recoverytask for %s", key)
-			return
+			return err
 		}
 		sm.taskPool.Set(key, &RecoveryTask{
 			task: rt,
 		})
-	}()
+		
+	return nil
 }
 
 
@@ -195,15 +179,19 @@ func (sm *StreamManager) routineFixReplics() {
 					extent := kv.Value.(*pb.ExtentInfo) //extent is read only
 					for _, nodeID := range extent.Replicates {
 						ns := sm.getNodeStatus(nodeID)
-						if ns == nil || ns.Dead() {
-							sm.queueRecoveryTask(extent.ExtentID, nodeID)
+						if (ns == nil || ns.Dead()) && extent.SealedLength > 0{
+							go func() {
+								sm.queueRecoveryTask(extent.ExtentID, nodeID)
+							}()
 						}
 					}
 
 					for _, nodeID := range extent.Parity {
 						ns := sm.getNodeStatus(nodeID)
-						if ns == nil || ns.Dead() {
-							sm.queueRecoveryTask(extent.ExtentID, nodeID)
+						if (ns == nil || ns.Dead()) && extent.SealedLength > 0 {
+							go func() {
+								sm.queueRecoveryTask(extent.ExtentID, nodeID)
+							}()
 						}
 					}
 					
@@ -215,7 +203,7 @@ func (sm *StreamManager) routineFixReplics() {
 
 //non-block
 //FIXME: if task is running, do not submit it again
-func (sm *StreamManager) submitRecoveryTask(t *RecoveryTask) {
+func (sm *StreamManager) dispatchRecoveryTask(t *RecoveryTask) {
 	go func() {
 		//find a remote node
 		nodes := sm.getAllNodeStatus(true)
@@ -232,7 +220,7 @@ func (sm *StreamManager) submitRecoveryTask(t *RecoveryTask) {
 
 		pool := conn.GetPools().Connect(chosenNode.Address)
 		if pool == nil || pool.IsHealthy() == false {
-			xlog.Logger.Warnf("submitRecoveryTask can not connect %v", chosenNode)
+			xlog.Logger.Warnf("can not connect %v", chosenNode)
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -245,12 +233,12 @@ func (sm *StreamManager) submitRecoveryTask(t *RecoveryTask) {
 		cancel()
 		//network error
 		if err != nil {
-			xlog.Logger.Warnf("submitRecoveryTask %s", err.Error())
+			xlog.Logger.Warnf(err.Error())
 			return
 		}
 		//logic error
 		if res.Code != pb.Code_OK {
-			xlog.Logger.Warnf("submitRecoveryTask %s", res.CodeDes)
+			xlog.Logger.Warnf(res.CodeDes)
 			return
 		}
 		t.SetRunningNode(chosenNode.NodeID)
@@ -277,14 +265,60 @@ func (sm *StreamManager) routineDispatchTask() {
 				for kv := range sm.taskPool.Iter() {
 					t := kv.Value.(*RecoveryTask)
 					//FIXME, if no runningNode and startTime is long ago, retry it
-					if t.RunningNode() == 0 && time.Now().Sub(t.StartTime()) > 30 * time.Second {
-						sm.submitRecoveryTask(t)
+					if t.RunningNode() == 0 && time.Now().Sub(t.StartTime()) > 5 * time.Minute {
+						sm.dispatchRecoveryTask(t)
 					}
 				}
 			}
 	}
 }
 
+//node service,
+//producer
+func (sm *StreamManager) SubmitRecoveryTask(ctx context.Context, req *pb.SubmitRecoveryTaskRequest) (*pb.SubmitRecoveryTaskResponse, error) {
+	errDone := func(err error) (*pb.SubmitRecoveryTaskResponse, error){
+		code, desCode := wire_errors.ConvertToPBCode(err)
+		return &pb.SubmitRecoveryTaskResponse{
+			Code: code,
+			CodeDes: desCode,
+		}, nil
+	}
+
+	if !sm.AmLeader() {
+		return errDone(wire_errors.NotLeader)
+	}
+
+	err := sm.queueRecoveryTask(req.Task.ExtentID, req.Task.ReplaceID)
+	if err != nil {
+		return errDone(err)
+	}
+	return &pb.SubmitRecoveryTaskResponse{
+		Code: pb.Code_OK,
+	}, nil
+}
+
+
+func FindReplaceSlot(extentInfo *pb.ExtentInfo, replaceID uint64) int {
+	slot := -1
+	for i := range extentInfo.Replicates {
+		if extentInfo.Replicates[i] == replaceID {
+			slot = i
+		}
+	}
+
+	for j := range extentInfo.Parity {
+		if extentInfo.Parity[j] == replaceID {
+			if slot == -1 {
+				slot = j + len(extentInfo.Replicates)
+			} else {
+				xlog.Logger.Warnf("replaceID is %d, extentInfo is %v, can not find replaceID\n", replaceID, extentInfo)
+				return -1
+			}
+		}
+	}
+
+	return slot 
+}
 
 //node service, but it's about recovery task
 func (sm *StreamManager) CopyExtentDone(ctx context.Context, req *pb.CopyExtentDoneRequeset) (*pb.CopyExtentDoneResponse, error) {
@@ -297,6 +331,11 @@ func (sm *StreamManager) CopyExtentDone(ctx context.Context, req *pb.CopyExtentD
 		}, nil
 	}
 
+
+	if !sm.AmLeader() {
+		return errDone(wire_errors.NotLeader)
+	}
+
 	//client should still have the lock: check lock
 	lock := dlock.NewDLock(FormatRecoveryTaskLock(req.ExtentID))
 	if err := lock.Lock(100 * time.Millisecond); err == nil {
@@ -305,7 +344,25 @@ func (sm *StreamManager) CopyExtentDone(ctx context.Context, req *pb.CopyExtentD
 	}
 	lock.Close()
 
+	if req.Invalid == 1 {
+		//remove task
+		taskKey := FormatRecoveryTaskName(req.ExtentID, req.ReplaceID)
+		cmps := []clientv3.Cmp{clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue)}
+		ops := []clientv3.Op{
+			clientv3.OpDelete(taskKey),
+		}	
+		if err := manager.EtcdSetKVS(sm.client, cmps, ops); err != nil {
+			return errDone(errors.Errorf("setting etcd failed [%s]", err))
+		}
 
+		sm.taskPool.Del(taskKey)
+		return &pb.CopyExtentDoneResponse{
+			Code :pb.Code_OK,
+		}, nil
+	}
+
+
+	//valid update
 	d, ok := sm.extents.Get(req.ExtentID)
 	if !ok {
 		errDone(errors.New(""))
@@ -314,23 +371,8 @@ func (sm *StreamManager) CopyExtentDone(ctx context.Context, req *pb.CopyExtentD
 
 	//valid extentInfo and replaceID//
 	//FIXME:check version as well
-	slot := -1
-	for i := range extentInfo.Replicates {
-		if extentInfo.Replicates[i] == req.ReplaceID {
-			slot = i
-		}
-	}
-
-	for j := range extentInfo.Parity {
-		if extentInfo.Parity[j] == req.ReplaceID {
-			if slot == -1 {
-				slot = j + len(extentInfo.Replicates)
-			} else {
-				return errDone(errors.Errorf("replaceID is %d, extentInfo is %v", req.ReplaceID, extentInfo))
-			}
-		}
-	}
-
+	slot := FindReplaceSlot(extentInfo, req.ReplaceID)
+	
 	if slot == -1 {
 		return errDone(errors.Errorf("replaceID is %d, extentInfo is %v", req.ReplaceID, extentInfo))
 	}
@@ -351,7 +393,7 @@ func (sm *StreamManager) CopyExtentDone(ctx context.Context, req *pb.CopyExtentD
 	extentKey := formatExtentKey(req.ExtentID)
 	data := utils.MustMarshal(newExtentInfo)
 
-	taskKey := FormatRecoveryTaskName(req.ExtentID)
+	taskKey := FormatRecoveryTaskName(req.ExtentID, req.ReplaceID)
 	cmps := []clientv3.Cmp{clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue)}
 	ops := []clientv3.Op{
 		clientv3.OpDelete(taskKey),

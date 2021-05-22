@@ -234,9 +234,13 @@ func (r *extentReader) Seek(offset int64, whence int) (int64, error) {
 //readfull
 func (r *extentReader) Read(p []byte) (n int, err error) {
 	n, err = r.extent.file.ReadAt(p, r.pos)
-	if err != nil {
-		return n, err
+	if err != nil && err != io.EOF {
+		return -1, err
 	}
+	if n == 0 {
+		return 0, io.EOF
+	}
+
 	r.pos += int64(n)
 	return n, nil
 }
@@ -244,6 +248,8 @@ func (r *extentReader) Read(p []byte) (n int, err error) {
 
 //Seal requires LOCK
 func (ex *Extent) Seal(commit uint32) error {
+	ex.Lock()
+	defer ex.Unlock()
 	atomic.StoreInt32(&ex.isSeal, 1)
 	ex.writer.Close()
 	ex.writer = nil
@@ -277,6 +283,7 @@ func (ex *Extent) GetReader() *extentReader {
 //Close requeset LOCK
 func (ex *Extent) Close() {
 	ex.Lock()
+	defer ex.Unlock()
 	if ex.writer != nil {
 		ex.writer.Close()
 	}

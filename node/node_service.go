@@ -118,7 +118,7 @@ func (en *ExtentNode) validReq(extentID uint64, version uint64) (*extent.Extent,
 		return nil, nil, errors.New("i tried 3 times to match version to you, buf failed. network partition?")
 	}
 
-	if extentInfo.IsSealed > 0 {
+	if extentInfo.SealedLength > 0 {
 		return nil, nil, errors.New("extent is sealed")
 	}
 

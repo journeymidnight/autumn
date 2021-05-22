@@ -330,7 +330,14 @@ copyExtentDone
 4. 更新taskPool
 
 
+1. manager或者node提交任务到taskPool
+2. manager从taskPool分配任务(自动或者手动)
+3. node执行任务
 
+
+//ETCD LOCK
+//https://etcd.io/docs/next/learning/why/#notes-on-the-usage-of-lock-and-lease
+//https://github.com/etcd-io/etcd/issues/11457
 
 重复提交task
 

@@ -200,7 +200,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	}
 
 
-	if lastExtentInfo.IsSealed == 0 {
+	if lastExtentInfo.SealedLength == 0 {
 		//recevied commit length
 		size := sm.receiveCommitlength(ctx, nodes, req.ExtentToSeal)
 
@@ -211,12 +211,12 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		sm.sealExtents(ctx, nodes, req.ExtentToSeal, size)
 		//save sealed info and update version number to etcd and update local-cache
 		
-		sealedExtentInfo := proto.Clone(lastExtentInfo).(*pb.ExtentInfo)
+		//sealedExtentInfo := proto.Clone(lastExtentInfo).(*pb.ExtentInfo)
 
-		sealedExtentInfo.IsSealed = 1
-		sealedExtentInfo.Eversion ++
+		lastExtentInfo.SealedLength = uint64(size)
+		lastExtentInfo.Eversion ++
 
-		data := utils.MustMarshal(sealedExtentInfo)
+		data := utils.MustMarshal(lastExtentInfo)
 	
 		ops := []clientv3.Op{
 			clientv3.OpPut(formatExtentKey(id), string(data)),
@@ -229,8 +229,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 			return errDone(errors.Errorf("can not set ETCD"))
 		}
 
-		lastExtentInfo.IsSealed = 1
-		lastExtentInfo.Eversion ++
+		sm.extents.Set(lastExtentInfo.ExtentID, lastExtentInfo)
 	}
 
 
@@ -300,20 +299,22 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 
 //sealExtents could be all failed.
 func (sm *StreamManager) sealExtents(ctx context.Context, nodes []*NodeStatus, extentID uint64, commitLength uint32) {
-	pctx, cancel := context.WithTimeout(ctx, time.Second)
-	defer cancel()
-
 	stopper := utils.NewStopper()
 	for _, node := range nodes {
 		addr := node.Address
 		stopper.RunWorker(func() {
 			pool := conn.GetPools().Connect(addr)
+			if pool == nil {
+				return
+			}
 			conn := pool.Get()
 			c := pb.NewExtentServiceClient(conn)
+			pctx, cancel := context.WithTimeout(ctx, 5 * time.Second)
 			_, err := c.Seal(pctx, &pb.SealRequest{
 				ExtentID:     extentID,
 				CommitLength: commitLength,
 			})
+			cancel()
 			if err != nil { //timeout or other error
 				xlog.Logger.Warnf(err.Error())
 				return

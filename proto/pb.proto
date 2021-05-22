@@ -147,8 +147,8 @@ message DfResponse{
 message RecoveryTask {
 	uint64  extentID = 1;
 	uint64  replaceID = 2;
+	//uint64  eversion = 3;
 }
-
 
 message RequireRecoveryRequest {
 	RecoveryTask task = 1;
@@ -301,9 +301,19 @@ message CopyExtentDoneRequeset {
 	uint64 extentID = 1;
 	uint64 replaceID = 2;
 	uint64 newNode = 3;
+	uint64 invalid = 4;
 }
 
 message CopyExtentDoneResponse {
+	Code code = 1;
+	string codeDes = 2;
+}
+
+message SubmitRecoveryTaskRequest{
+	RecoveryTask task = 1;
+}
+
+message SubmitRecoveryTaskResponse{
 	Code code = 1;
 	string codeDes = 2;
 }
@@ -313,6 +323,7 @@ service StreamManagerService {
 	rpc ExtentInfo(ExtentInfoRequest) returns (ExtentInfoResponse) {}
 	rpc NodesInfo(NodesInfoRequest) returns(NodesInfoResponse) {}
 
+	rpc SubmitRecoveryTask(SubmitRecoveryTaskRequest) returns (SubmitRecoveryTaskResponse){}
 	rpc CopyExtentDone(CopyExtentDoneRequeset) returns (CopyExtentDoneResponse) {}
 	rpc StreamAllocExtent(StreamAllocExtentRequest) returns  (StreamAllocExtentResponse) {}
 	rpc CreateStream(CreateStreamRequest) returns  (CreateStreamResponse) {}
@@ -334,7 +345,7 @@ message ExtentInfo {
  	repeated uint64 parity = 3;//partiyShard nodes
 	uint64 eversion = 4; //change version when 1, updating replicates, 2. parityNodes, 3. seal
 	uint64 refs = 5; 
-	uint64 isSealed = 6;
+	uint64 SealedLength = 6;
 }
 /*
 Extent和Stream是多对多的关系, 一个stream对应多个extent.
