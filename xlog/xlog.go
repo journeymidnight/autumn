@@ -11,6 +11,10 @@ var (
 )
 
 func InitLog(outputPath []string, level zapcore.Level) {
+
+	if Logger != nil {
+		panic("InitLog called somewhere")
+	}
 	var err error
 	cfg := zap.NewDevelopmentConfig()
 	//cfg.OutputPaths = []string{fileName, os.Stdout.Name()}

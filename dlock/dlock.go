@@ -6,6 +6,7 @@ import (
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/clientv3/concurrency"
+	"github.com/journeymidnight/autumn/utils"
 )
 type DLock struct {
 	session *concurrency.Session
@@ -15,6 +16,13 @@ type DLock struct {
 
 var client *clientv3.Client
 
+
+//stream manager reuse etcdclient
+func InitEtcdClient (xclient *clientv3.Client) {
+	client = xclient
+}
+
+//extent_node create a new etcd client
 func InitDlocks(addrs []string) {
 	var err error
 	client, err = clientv3.New(clientv3.Config{
@@ -28,6 +36,7 @@ func InitDlocks(addrs []string) {
 }
 
 func NewDLock(name string) *DLock {
+	utils.AssertTrue(client != nil)
 	session , err := concurrency.NewSession(client)
 	if err != nil {
 		panic(err)
@@ -42,6 +51,9 @@ func NewDLock(name string) *DLock {
 
 
 func (dl *DLock) Lock(to time.Duration) error {
+	if to == 0 {
+		return dl.mutex.Lock(context.Background())
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), to)
 	defer cancel()
 	return dl.mutex.Lock(ctx)
