@@ -87,8 +87,6 @@ type StreamManager struct {
 	//nodes    map[uint64]*NodeStatus
 	nodes      *hashmap.HashMap //id => *NodeStatus
 
-	taskPool  *hashmap.HashMap //extentID=>*RecoveryTask
-
 	etcd       *embed.Etcd
 	client     *clientv3.Client
 	config     *manager.Config
@@ -104,6 +102,9 @@ type StreamManager struct {
 
 	policy AllocExtentPolicy
 	stopper *utils.Stopper //leader tasks
+
+	taskPoolLock  *utils.SafeMutex
+	taskPool      *TaskPool
 }
 
 func NewStreamManager(etcd *embed.Etcd, client *clientv3.Client, config *manager.Config) *StreamManager {
@@ -223,7 +224,7 @@ func (sm *StreamManager) runAsLeader() {
 		})
 	}
 
-	sm.taskPool = &hashmap.HashMap{}
+	sm.taskPool = NewTaskPool()
 	kvs, err = manager.EtcdRange(sm.client, "recoveryTasks")
 	if err != nil {
 		xlog.Logger.Errorf(err.Error())
@@ -242,15 +243,12 @@ func (sm *StreamManager) runAsLeader() {
 			return
 		}
 
-		sm.taskPool.Set(extentID, &RecoveryTask{
-			task: &task,
-		})
+		sm.taskPool.Insert(extentID, &task)
 	}
 
 
 	//start leader tasks
 	sm.stopper.RunWorker(sm.routineUpdateDF)
-	sm.stopper.RunWorker(sm.routineFixReplics)
 	sm.stopper.RunWorker(sm.routineDispatchTask)
 
 	atomic.StoreInt32(&sm.isLeader, 1)

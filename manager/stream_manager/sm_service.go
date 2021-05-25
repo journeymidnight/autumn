@@ -115,10 +115,6 @@ func (sm *StreamManager) CreateStream(ctx context.Context, req *pb.CreateStreamR
 }
 
 
-func (sm *StreamManager) updateNodeDf() {
-	
-
-}
 func (sm *StreamManager) addNode(id uint64, addr string) {
 	sm.nodes.Set(id,&NodeStatus{
 		NodeInfo: pb.NodeInfo{

@@ -54,7 +54,6 @@ StreamAllocExtent流程:
 
 
 ```
-
 extent是否seal, 存储在文件系统的attr里面
 "seal"=>"true"
 ```
@@ -64,40 +63,6 @@ extent是否seal, 存储在文件系统的attr里面
 2. AppendBlock (需要显式调用lock, 保证只有一个写发生)
 3. ReadBlock
 4. Seal
-
-### extent node
-
-管理extents,只知道本地的extent, 和extent对应的副本位置
-
-对外API:
-
-1. AppendBlock (自动复制3副本)
-2. ReadBlock
-
-内部集群API:
-1. HeartBeat (node之间grpc conn保活)
-2. ReplicateBlocks (primary node向secondary node复制副本)
-3. AllocExtent  (创建extent, 由stream manager调用)
-4. CommitLength (由stream manager调用)
-5. Seal (由stream manager调用)
-
-主要内存结构:
-1. extendID => localFileName (在启动时打开所有extent的fd)
-
-OpenExtent首先判断Extent是否是Sealed, 如果是Sealed的就正常打开.
-如果不是Seal的, 说明Extent是正在被写入的, 打开时要检查Block的md5
-
-#### extent node通信 
-
-用```GetPool().Get(add)的场景``
-1. node之间通信
-2. stream manager连接node
-3. client到node
-
-#### 其他通信
-1. client到stream manager
-2. node到stream manager
-
 
 ### stream manager
 
@@ -109,18 +74,6 @@ streamManager1 => etcd1
 streamManager2 => etcd2
 streamManager3 => etcd3
 ```
-
-API:
-```
-	rpc StreamInfo(StreamInfoRequest) returns (StreamInfoResponse) {}
-	rpc ExtentInfo(ExtentInfoRequest) returns (ExtentInfoResponse) {}
-	rpc NodesInfo(NodesInfoRequest) returns(NodesInfoResponse) {}
-	
-	rpc StreamAllocExtent(StreamAllocExtentRequest) returns  (StreamAllocExtentResponse) {}
-	rpc CreateStream(CreateStreamRequest) returns  (CreateStreamResponse) {}
-	rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse) {}
-```
-
 
 
 ETCD存储结构:
@@ -195,17 +148,11 @@ nodes    map[uint64]*NodeStatus
 #### stream manager TODO
 
 0. pb.Block可能需要增加offset选项, 保证写入都是幂等的, 这样可以在append block操作的时候, 如果有error, 可以先重试, 而不是直接申请新的extent
-1. *实现node hearbteat, 和更精确的alloc policy*
+1. *更精确的alloc policy*
 2. *实现GC,检查extent的三副本是否完整和是否extent已经不被任何stream引用*
 3. sm的实现中有3个函数很像: sendAllocToNodes, receiveCommitlength, sealExtents 不知道能不能统一
-4. *实现Journal*
-5. *实现EC*
-6. stream manager client的代码可以简化
-7. unit test全部缺少
 8. 测试多ETCD的情况, 现在只测试了一个ETCD的情况
 9. ETCD的key应该改成/clusterKey/node/0, /clusterKey/stream/1的情况, 防止多集群冲突
-11. *node支持多硬盘*
-12. *在sm里增加version, 每次nodes变化, version加1, 并且在rpc的返回里面增加version, 这样client根据version可以自动更新*, ref count
 13. extent层用mmap,提升读性能
 
 ## partion layer
@@ -235,13 +182,20 @@ PSVERSION  => {num}
 3. 实现logstream分为2个不同的stream,一个可以在生成memtable后直接删除, 另一个长久保存(定期recycle或者EC化)
 4. ps merge / split
 
-### LOG
+### extent log format
 
 ```
 +---------+-----------+-----------+--- ... ---+
 |CRC (4B) | Size (2B) | Type (1B) | Payload   |
 +---------+-----------+-----------+--- ... ---+
 ```
+
+### WAL
+
+WAL write wal and extent at the same time.
+
+
+### EC
 
 
 
@@ -261,7 +215,7 @@ f1. local copy(keep extentInfo the same, faster)   TODO
 f2. send "remove extent from node" to manager, manager schedule tasks(one by one) TODO
 
 
-
+### stream layer data recovery
 
 ETCD存储结构
 
@@ -270,13 +224,19 @@ ETCD存储结构
 3. 同一个extent,只有一个进程在恢复
 
 
+
+准备一个SET, 持久化在etcd里, 里面/recoveryTasks是node已经接受的认为, 还没有明确完成
+只有在df之后, 才标记完成
+
+
+
 1. 数据恢复
 
 准备一个SET, 持久化在etcd里, 里面/recoveryTasks是需要执行的的recovery任务,
 只有在成功恢复了一个extent之后, 才在etcd里面删除这个task, 同时在leader的内存里面
 存储taskPool, 这个和SET保持一致
 
-/recoveryTasks/extentID.tsk
+/recoveryTasks/extentID.tsk => recoveryTask
 
 这个SET有2个来源
 1. stream manager scan得到()
@@ -285,54 +245,40 @@ ETCD存储结构
    2.b node自己处理, 把extent转移到其他硬盘, 这种情况不需要修改元数据
    2.c node自己处理, 其他硬盘容量不够, node提一个api, 请上层处理
 
-/recoveryTaskLocks/extentID.lck
-
-
-stream manager运行, 主要功能是向SET里面塞任务
-routineFixReplics(每分钟一次)
+routineDispatchTask(每分钟一次)
 	-> 如果存在extent的node是dead状态
-	   -> queueRecoveryTask
-	   1. dlock(如果失败, 说明有其他node正在进行recovery, 直接返回)
-	   2. 再读extentInfo一遍, 确认
-	   3. 提交recovery_task到SET(如果之前有任务, 提交失败)
-	   4. dlock.unlock
+	   -> routineDispatchTask
+	   1. lock dispatchlock
+	   2. taskPool deduplicat
+	   3. 再读extentInfo一遍, 确认
+	   4. 发recovery task任务
+	   5. unlock dispatchlock
 
 其中2跟一个race condition相关, 主要好处是避免过多的dlock
 
 
-routineDispatchTask(每分钟一次)
+df任务(每分钟一次)
 	-> 读taskPool
-	   1. 如果说有recovery在进行, 但是启动时间很久之前, 分配任务
-	   2. 如果说recovery没有在进行, 分配任务
-	   这2个都有可能是重复任务, 依赖在node中的dlock保证唯一
-
-	   3. 如果分配任务返回OK, 说明远程正在执行恢复任务, 然后更新taskPool
-
+	   1. 如果node上面有任务, 询问任务状态
+	   2. 如果任务已经完成
+	   3. lock dispatchlock
+	   4. 修改taskPool, 修改ETCD
+	   5. unlock dispatchLock
 
 Node:
 
+咨询是否删除某个extent(一段时间一次)
+1. node询问某一个extent是否可以删除
+2. sm_manager检查extents和dispatchLock taskPool检查 dispatchUnlock
+
+
 RequireRecovery
-1. Dlock
-2. 如果自己的load太高, 拒绝, 然后unlock
+1. 如果自己的load太高, 拒绝
+2. 读取最新extent, 判断是否合理(extentInfo里面存在replaceID), 否则拒绝
+2. 在指定文件系统中生成tmp文件
 3. runRecoveryTask,返回已经接收任务
     -> runRecoveryTask  拷贝一个副本到本node
-	a. 返回时Dlock.unlock
-	b. EC和Replicat的恢复有不同, 但是都返回一个在diskFS里面的File
-
-    c. 新文件加入到node管理的extent中
-	d. 返回task成功, CopyExtentDone提示manager更新元数据
-
-stream manager的逻辑
-copyExtentDone
-1. 检查dlock确实被别人锁住
-2. 更新extentInfo, version++
-3. 删除SET中的任务
-4. 更新taskPool
-
-
-1. manager或者node提交任务到taskPool
-2. manager从taskPool分配任务(自动或者手动)
-3. node执行任务
+	如果全部完成, 修改tmp文件成为ext文件,并且加入到extent中
 
 
 //ETCD LOCK
@@ -343,7 +289,7 @@ copyExtentDone
 
 1.==========如果"创建task"在"更新extentInfo(内存)"之前运行
 
-manager                    manager_service(from node)
+manager                  manager_service(df routine)
 
 
 创建task(如果有dead node)
