@@ -24,7 +24,7 @@ func TestPathName(t *testing.T) {
 	disk := &diskFS{
 		baseDir: "/",
 	}
-	x := disk.pathName(28)
+	x := disk.pathName(28, "ext")
 	fmt.Printf(x)
 	require.Equal(t, "/68/28.ext", x)
 }

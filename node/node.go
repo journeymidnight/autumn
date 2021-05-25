@@ -17,6 +17,9 @@ package node
 import (
 	"fmt"
 	"net"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/journeymidnight/autumn/conn"
@@ -119,32 +122,58 @@ func (en *ExtentNode) setExtent(ID uint64, ex *extent.Extent) {
 	en.extentMap.Store(ID, ex)
 }
 
-/*
-func (en *ExtentNode) getReplicates(extentID uint64) []string {
-	v, ok := en.replicates.Load(extentID)
-	if !ok {
-		return nil
-	}
-	return v.([]string)
-}
-
-func (en *ExtentNode) setReplicates(extentID uint64, addrs []string) {
-	en.replicates.Store(extentID, addrs)
-}
-*/
-
 func (en *ExtentNode) LoadExtents() error {
 	//register each extent to node
-	register := func(ex *extent.Extent) {
+	registerExt := func(path string) {
+		ex, err := extent.OpenExtent(path)
+		if err != nil {
+			xlog.Logger.Error(err)
+			return
+		}
 		en.setExtent(ex.ID, ex)
 		xlog.Logger.Debugf("found extent %d", ex.ID)
 	}
 
+	registerCopy := func(path string) {
+		//extentID.replaceID.copy
+		parts := strings.Split(path, ".")
+		if len(parts) != 3 {
+			xlog.Logger.Errorf("found extent %s: can not parse replaceID", path)
+			return
+		}
+		//restore task from filename
+		extentID , err := strconv.ParseUint(parts[0], 10, 64)
+		if err != nil {
+			xlog.Logger.Error(err)
+			return
+		}
+
+		replaceID , err := strconv.ParseUint(parts[1], 10, 64)
+		if err != nil {
+			xlog.Logger.Error(err)
+			return
+		}
+		task := pb.RecoveryTask{
+			ExtentID: extentID,
+			ReplaceID: replaceID,
+			NodeID: en.nodeID,
+		}
+
+		extentInfo := en.em.Update(task.ExtentID)
+		targetFile, err := os.OpenFile(path, os.O_RDWR|os.O_TRUNC, 0755)
+		if err != nil {
+			xlog.Logger.Error(err)
+			return
+		}
+		go en.runRecoveryTask(&task, extentInfo, targetFile, path)
+	}
+
 	var wg sync.WaitGroup
-	for _, disk := range en.diskFSs {
+	for _, d := range en.diskFSs {
 		wg.Add(1)
+		disk := d
 		go func() {
-			disk.LoadExtents(register)
+			disk.LoadExtents(registerExt, registerCopy)
 			wg.Done()
 		}()
 	}

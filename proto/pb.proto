@@ -136,18 +136,21 @@ message DF {
 }
 
 message DfRequest{
+	repeated RecoveryTask tasks = 1;
 }
 
 message DfResponse{
 	Code code = 1;
 	string codeDes = 2;
 	DF df = 3;
+	repeated RecoveryTask doneTask = 4;
 }
 
 message RecoveryTask {
 	uint64  extentID = 1;
 	uint64  replaceID = 2;
-	//uint64  eversion = 3;
+	uint64  nodeID = 3;
+	int64  startTime = 4;
 }
 
 message RequireRecoveryRequest {
@@ -297,17 +300,6 @@ message TruncateResponse {
 	string codeDes = 2;
 }
 
-message CopyExtentDoneRequeset {
-	uint64 extentID = 1;
-	uint64 replaceID = 2;
-	uint64 newNode = 3;
-	uint64 invalid = 4;
-}
-
-message CopyExtentDoneResponse {
-	Code code = 1;
-	string codeDes = 2;
-}
 
 message SubmitRecoveryTaskRequest{
 	RecoveryTask task = 1;
@@ -324,7 +316,6 @@ service StreamManagerService {
 	rpc NodesInfo(NodesInfoRequest) returns(NodesInfoResponse) {}
 
 	rpc SubmitRecoveryTask(SubmitRecoveryTaskRequest) returns (SubmitRecoveryTaskResponse){}
-	rpc CopyExtentDone(CopyExtentDoneRequeset) returns (CopyExtentDoneResponse) {}
 	rpc StreamAllocExtent(StreamAllocExtentRequest) returns  (StreamAllocExtentResponse) {}
 	rpc CreateStream(CreateStreamRequest) returns  (CreateStreamResponse) {}
 	rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse) {}

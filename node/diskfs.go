@@ -54,7 +54,7 @@ func (s *diskFS) Df() (uint64, uint64 , error){
 	return getDiskInfo(s.baseDir)
 }
 
-func (s *diskFS) pathName(extentID uint64) string {
+func (s *diskFS) pathName(extentID uint64, suffix string) string {
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], extentID)
 	h := farm.Hash32(buf[:])
@@ -65,19 +65,19 @@ func (s *diskFS) pathName(extentID uint64) string {
 		n := (h >> (4 - i) * 8) & 0xFF
 		fpath[i] = fmt.Sprintf("%02x", n)
 	}
-	fpath[pathLen-1] = fmt.Sprintf("%d.ext", extentID)
+	fpath[pathLen-1] = fmt.Sprintf("%d.%s", extentID, suffix)
 
 	return filepath.Join(fpath...)
 }
 
-func (s *diskFS) AllocCopyExtent(ID uint64) (*os.File, string, error) {
-	fpath := s.pathName(ID)
+func (s *diskFS) AllocCopyExtent(ID uint64, ReplaceID uint64) (*os.File, string, error) {
+	fpath := s.pathName(ID, fmt.Sprintf("%d.copy", ReplaceID))
 	f, err := extent.CreateCopyExtent(fpath, ID)
 	return f, fpath, err
 }
 
 func (s *diskFS) AllocExtent(ID uint64) (*extent.Extent, error) {
-	fpath := s.pathName(ID)
+	fpath := s.pathName(ID, "ext")
 	ex, err := extent.CreateExtent(fpath, ID)
 	if err != nil {
 		return nil, err
@@ -85,7 +85,7 @@ func (s *diskFS) AllocExtent(ID uint64) (*extent.Extent, error) {
 	return ex, nil
 }
 
-func (s *diskFS) LoadExtents(callback func(ex *extent.Extent)) {
+func (s *diskFS) LoadExtents(normalExt func(string), copyExt func(string)) {
 	//walk all exts files
 	filepath.Walk(s.baseDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -94,15 +94,13 @@ func (s *diskFS) LoadExtents(callback func(ex *extent.Extent)) {
 		if info.IsDir() {
 			return nil
 		}
-		if !strings.HasSuffix(info.Name(), ".ext") {
+		if strings.HasSuffix(info.Name(), ".ext") {
+			normalExt(path)
 			return nil
-		}
-		ex, err := extent.OpenExtent(path)
-		if err != nil {
-			xlog.Logger.Errorf("failed to open extent %s, %s", path, err)
-			return err
-		}
-		callback(ex)
+		} else if strings.HasSuffix(info.Name(), ".copy") {
+			copyExt(path)
+			return nil
+		} 
 		return nil
 	})
 }
