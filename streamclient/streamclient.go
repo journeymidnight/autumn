@@ -2,6 +2,7 @@ package streamclient
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"sync"
 	"time"
@@ -75,7 +76,7 @@ func (br *AutumnBlockReader) Read(ctx context.Context, extentID uint64, offset u
 	}
 	conn := br.em.GetExtentConn(extentID, smclient.PrimaryPolicy{})
 	if conn == nil {
-		return nil, errors.Errorf("no such extent")
+		return nil, errors.Errorf("unable to get extent connection.")
 	}
 	c := pb.NewExtentServiceClient(conn)
 	res, err := c.SmartReadBlocks(ctx, &pb.ReadBlocksRequest{
@@ -312,9 +313,12 @@ func (sc *AutumnStreamClient) getLastExtentConn() (uint64, *grpc.ClientConn, err
 	if sc.streamInfo == nil || len(sc.streamInfo.ExtentIDs) == 0 {
 		return 0, nil, errors.New("no streamInfo or streamInfo is not correct")
 	}
-	extentID := sc.streamInfo.ExtentIDs[len(sc.streamInfo.ExtentIDs)-1] //last extentd
-
-	return extentID, sc.em.GetExtentConn(extentID, smclient.PrimaryPolicy{}),nil
+	extentID := sc.streamInfo.ExtentIDs[len(sc.streamInfo.ExtentIDs)-1] //last extent
+	conn := sc.em.GetExtentConn(extentID, smclient.PrimaryPolicy{})
+	if conn == nil {
+		return 0, nil, fmt.Errorf("can not get extent connection with id: %d", extentID)
+	}
+	return extentID, conn, nil
 }
 
 func (sc *AutumnStreamClient) MustAllocNewExtent(oldExtentID uint64, dataShard, parityShard uint32) error{
