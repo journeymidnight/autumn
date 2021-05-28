@@ -44,25 +44,29 @@ func (em *ExtentManager) GetPeers(extentID uint64) []string {
 	return ret
 }
 
-
-type SelectNodePolicy interface{
-	Choose(replics []string) *grpc.ClientConn   
+type SelectNodePolicy interface {
+	Choose(replics []string) *grpc.ClientConn
 }
 
 type PrimaryPolicy struct{}
+
 func (PrimaryPolicy) Choose(replics []string) *grpc.ClientConn {
 	addr := replics[0]
 	pool, err := conn.GetPools().Get(addr)
 	if err != nil {
+		if err == conn.ErrNoConnection {
+			return conn.GetPools().Connect(addr).Get()
+		}
+		// TODO: Handle unhealthy connection
 		return nil
 	}
 	return pool.Get()
-
 }
 
 type RandomPolicy struct{}
-func (RandomPolicy) Choose(replics []string) *grpc.ClientConn{
-	for loop := 0 ; loop < 3 ; loop ++{
+
+func (RandomPolicy) Choose(replics []string) *grpc.ClientConn {
+	for loop := 0; loop < 3; loop++ {
 		n := rand.Intn(len(replics))
 		pool, err := conn.GetPools().Get(replics[n])
 		if err == nil {
@@ -74,22 +78,21 @@ func (RandomPolicy) Choose(replics []string) *grpc.ClientConn{
 }
 
 func (em *ExtentManager) GetExtentConn(extentID uint64, policy SelectNodePolicy) *grpc.ClientConn {
-
 	peerAddrs := em.GetPeers(extentID)
 	if len(peerAddrs) == 0 {
 		return nil
 	}
-	return policy.Choose(peerAddrs)	
+	return policy.Choose(peerAddrs)
 }
 
-func (em *ExtentManager) Update(extentID uint64) *pb.ExtentInfo{
+func (em *ExtentManager) Update(extentID uint64) *pb.ExtentInfo {
 	var ei *pb.ExtentInfo
-		//loop forever
+	//loop forever
 	m, err := em.smClient.ExtentInfo(context.Background(), []uint64{extentID})
 	if err != nil {
 		return nil
 	}
-	ei = proto.Clone(m[extentID]).(*pb.ExtentInfo)	
+	ei = proto.Clone(m[extentID]).(*pb.ExtentInfo)
 	em.Lock()
 	em.extentInfo[extentID] = ei
 	em.Unlock()
