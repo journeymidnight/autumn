@@ -23,6 +23,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -88,6 +89,12 @@ func OpenWal(dir string, userSync func()) (*Wal, error) {
 
 		oldWals = append(oldWals, filepath.Join(dir, file.Name()))
 	}
+
+	//some filesystem can not guarantee readdir is order
+	sort.Slice(oldWals, func(i,j int) bool {
+		return strings.Compare(oldWals[i], oldWals[j]) < 0
+	}) 
+
 
 	//create new wal
 	last++
