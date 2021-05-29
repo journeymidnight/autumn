@@ -262,6 +262,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	extentInfo := pb.ExtentInfo{
 		ExtentID:   extentID,
 		Replicates: extractNodeId(nodes),
+		Eversion: 1,
 	}
 
 	//set old

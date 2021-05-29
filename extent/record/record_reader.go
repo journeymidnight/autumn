@@ -98,7 +98,7 @@ const (
 )
 
 const (
-	BlockSize     = 32 * 1024
+	BlockSize     = 64 * 1024
 	BlockSizeMask = BlockSize - 1
 	HeaderSize    = 7
 )
@@ -143,12 +143,15 @@ type Reader struct {
 	buf [BlockSize]byte
 
 	offset int64 //absolute offset from start
+	seeker io.Seeker
 }
 
 // NewReader returns a new reader.
 func NewReader(r io.Reader) *Reader {
+	seeker, _ := r.(io.Seeker)
 	return &Reader{
 		r: r,
+		seeker: seeker,
 	}
 }
 
@@ -225,8 +228,9 @@ func (r *Reader) nextChunk(wantFirst bool) error {
 			return io.EOF
 		}
 
-		s, _ := r.r.(io.Seeker)
-		r.offset, _ = s.Seek(0, os.SEEK_CUR)
+		if r.seeker != nil {
+			r.offset, _ = r.seeker.Seek(0, os.SEEK_CUR)
+		}
 
 		n, err := io.ReadFull(r.r, r.buf[:])
 		if err != nil && err != io.ErrUnexpectedEOF {
@@ -295,14 +299,13 @@ func (r *Reader) SeekRecord(offset int64) error {
 		return r.err
 	}
 
-	s, ok := r.r.(io.Seeker)
-	if !ok {
+	if r.seeker == nil {
 		return ErrNotAnIOSeeker
 	}
 
 	// Only seek to an exact block offset.
 	c := int(offset & BlockSizeMask)
-	if _, r.err = s.Seek(offset&^BlockSizeMask, io.SeekStart); r.err != nil {
+	if _, r.err = r.seeker.Seek(offset&^BlockSizeMask, io.SeekStart); r.err != nil {
 		return r.err
 	}
 

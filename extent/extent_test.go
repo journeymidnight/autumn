@@ -25,56 +25,7 @@ var (
 	_ = fmt.Println
 )
 
-//struct memory is for test
-type memory struct {
-	vec  []byte
-	pos  int
-	end  int
-	size int
-}
 
-func newMemory(size int) *memory {
-	return &memory{
-		vec:  make([]byte, size),
-		pos:  0,
-		end:  0,
-		size: size,
-	}
-}
-
-func (f *memory) Seek(offset int64, whence int) (int64, error) {
-	switch whence {
-	case io.SeekCurrent:
-		f.pos += int(offset)
-	default:
-		return 0, errors.New("bytes.Reader.Seek: only support SeekCurrent")
-	}
-	return int64(f.pos), nil
-}
-
-func (f *memory) resetPos() {
-	f.pos = 0
-}
-
-func (f *memory) Read(buf []byte) (n int, err error) {
-	if f.pos >= f.end {
-		return 0, io.EOF
-	}
-	n = copy(buf, f.vec[f.pos:])
-	f.pos += n
-	return n, nil
-}
-
-func (f *memory) Write(p []byte) (n int, err error) {
-	if f.pos >= f.size {
-		return -1, io.ErrShortBuffer
-	}
-	d := utils.Min(len(p), f.size-f.end)
-	n = copy(f.vec[f.pos:], p[:d])
-	f.pos += n
-	f.end = utils.Max(f.end, f.pos)
-	return n, nil
-}
 
 func init() {
 	xlog.InitLog([]string{"extent_test.log"}, zapcore.DebugLevel)
