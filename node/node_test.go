@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/coreos/etcd/embed"
-	"github.com/journeymidnight/autumn/dlock"
 	"github.com/journeymidnight/autumn/manager"
 	smclient "github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/manager/stream_manager"
@@ -94,9 +93,6 @@ func setupStreamManager(ent *ExtentNodeTestSuite, dir string) {
 			panic(err)
 		}
 	}
-
-	//dlock.InitEtcdClient(client)
-	dlock.InitDlocks([]string{config.AdvertiseClientUrls})
 
 }
 

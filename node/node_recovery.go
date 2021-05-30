@@ -263,7 +263,7 @@ func (en *ExtentNode) runRecoveryTask(task *pb.RecoveryTask,extentInfo *pb.Exten
 		utils.Check(os.Rename(targetFilePath, extentFileName))
 		//add targetFilePath to extent
 		utils.Check(targetFile.Close())
-		ex, err := extent.OpenExtent(targetFilePath)
+		ex, err := extent.OpenExtent(extentFileName)
 		utils.Check(err)
 		en.setExtent(ex.ID, ex)
 }

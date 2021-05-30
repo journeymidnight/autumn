@@ -225,7 +225,7 @@ ETCD存储结构
 
 
 
-准备一个SET, 持久化在etcd里, 里面/recoveryTasks是node已经接受的认为, 还没有明确完成
+准备一个SET, 持久化在etcd里, 里面/recoveryTasks是node已经接受的任务, 还没有明确完成
 只有在df之后, 才标记完成
 
 
