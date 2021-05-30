@@ -91,10 +91,6 @@ func (en *ExtentNode) connPool(peers []string) ([]*conn.Pool, error) {
 	return ret, nil
 }
 
-const (
-	cellSize = 4 << 10 //4KB
-)
-
 func (en *ExtentNode) validReq(extentID uint64, version uint64) (*extent.Extent, *pb.ExtentInfo, error) {
 	extentInfo := en.em.GetExtentInfo(extentID)
 	if extentInfo == nil {
@@ -168,7 +164,7 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 		parityShard := len(extentInfo.Parity)
 
 		for i := range req.Blocks {
-			striped, err := erasure_code.ReedSolomon{}.Encode(req.Blocks[i].Data, uint32(dataShard), uint32(parityShard), cellSize)
+			striped, err := erasure_code.ReedSolomon{}.Encode(req.Blocks[i].Data, dataShard, parityShard)
 			if err != nil {
 				return errDone(err)
 			}
@@ -406,7 +402,7 @@ waitResult:
 				data[j] = dataBlocks[j][i].Data
 			}
 		}
-		output, err := erasure_code.ReedSolomon{}.Decode(data, uint32(dataShards), uint32(parityShards), cellSize)
+		output, err := erasure_code.ReedSolomon{}.Decode(data, dataShards, parityShards)
 		if err != nil {
 			return errDone(err)
 		}

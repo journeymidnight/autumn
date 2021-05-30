@@ -26,12 +26,13 @@ const (
 	metaSize = 4
 )
 
-func (ReedSolomon) Decode(input [][]byte, dataShards uint32, parityShards uint32, cellSize uint32) ([]byte, error) {
+func (ReedSolomon) Decode(input [][]byte, dataShards int, parityShards int) ([]byte, error) {
 
 	enc, err := reedsolomon.New(int(dataShards), int(parityShards))
 	if err != nil {
 		return nil, err
 	}
+
 
 	// Verify the shards
 	ok, err := enc.Verify(input)
@@ -42,55 +43,81 @@ func (ReedSolomon) Decode(input [][]byte, dataShards uint32, parityShards uint32
 			}
 	}
 
-	//join data
-	dataLength := binary.BigEndian.Uint32(input[0][:metaSize])
-	fullData := make([]byte, dataLength + metaSize)
-	actualSize := len(fullData)
-	cellNums := utils.Ceil(uint32(actualSize), uint32(cellSize)) / uint32(cellSize)
-	for k := uint32(0) ; k <  cellNums ; k ++ {
-		i := k / dataShards //row number of input
-		j := k % dataShards //column number of input
-		n := copy(fullData[(k*cellSize):], input[j][i*cellSize:])
-		utils.AssertTrue(n > 0)
+	perShards := len(input[0])
+	size := binary.BigEndian.Uint32(input[dataShards-1][perShards-4:])
+
+	ret := make([]byte, size)
+	p := ret
+	remaining := size
+	for i := 0 ;i < dataShards && remaining > 0 ; i ++ {
+		n := utils.Min(int(remaining), perShards)
+		copy(p, input[i][:n])
+		p = p[n:]
+		remaining -= uint32(n)
 	}
-	return fullData[metaSize:], nil
+	return ret, nil
 }
 
-func (ReedSolomon) Encode(input []byte, dataShards uint32, parityShards uint32, cellSize uint32) ([][]byte, error) {
+func (ReedSolomon) Encode(input []byte, dataShards int, parityShards int) ([][]byte, error) {
 
 	enc, err := reedsolomon.New(int(dataShards), int(parityShards))
 	if err != nil {
 		return nil, err
 	}
-	rawSize := uint32(len(input))
-	actualSize := rawSize + metaSize
-	groupSize := int64(dataShards * cellSize)
-	//groupSize is not power of 2, can not use utils.Ceil
-	clusterSize := (actualSize + uint32(groupSize) - 1) / uint32(groupSize) * uint32(groupSize)
-	objectSize := clusterSize / dataShards
+	
 
-	data := make([][]byte, dataShards + parityShards)
-	for i := uint32(0) ; i < dataShards + parityShards ; i++ {
-		data[i] = make([]byte, objectSize)
+	size := len(input)
+	perShard := (size + dataShards - 1) / dataShards
+
+	//at least 4 bytes to save length
+	if perShard < 4 {
+		perShard = 4
 	}
 
-	//fill the first cell
-	binary.BigEndian.PutUint32(data[0], uint32(rawSize))
-
-	//len of input could be smaller than cellSize - metaSize
-	size := utils.Min(len(input), int(cellSize) - metaSize)
-	copy(data[0][metaSize:], input[0:size])
-
-	//fill the other cell
-	cellNums := utils.Ceil(uint32(actualSize), uint32(cellSize)) / uint32(cellSize)
-	for k := uint32(1) ; k <  cellNums ; k ++ {
-		i := k / dataShards
-		j := k % dataShards
-		availData := utils.Min(int(cellSize), int(actualSize- k *cellSize))
-		copy(data[j][i*cellSize:], input[k*cellSize-metaSize:k*cellSize-metaSize+uint32(availData)])
+	leftSpace := perShard * dataShards - size
+	
+	if leftSpace < 4 {
+		perShard += (4-leftSpace) / dataShards + 1
 	}
 
-	err = enc.Encode(data)
-	return data, err
+	leftSpace = perShard * dataShards - size
+	
+	utils.AssertTrue(leftSpace >= 4)
+	
+	var padding []byte //include the last shard and all partyShards
+
+
+	shards := dataShards + parityShards
+	// calculate maximum number of full shards in `data` slice
+	fullShards := len(input) / perShard
+	if fullShards == 0 {
+		//copy all data
+		padding = make([]byte, shards * perShard)
+		copy(padding, input)
+		input= input[:0]
+	} else {
+		//copy the last shards
+		padding = make([]byte, shards*perShard-perShard*fullShards)
+		copy(padding, input[perShard*fullShards:])
+		input = input[0 : perShard*fullShards]
+	}
+	// Split into equal-length shards.
+	dst := make([][]byte, shards)
+	i := 0
+	for ; i < len(dst) && len(input) >= perShard; i++ {
+		dst[i] = input[:perShard:perShard]
+		input = input[perShard:]
+	}
+
+	for j := 0; i+j < len(dst); j++ {
+		dst[i+j] = padding[:perShard:perShard]
+		padding = padding[perShard:]
+	}
+
+	binary.BigEndian.PutUint32(dst[dataShards-1][perShard-4:], uint32(size))
+
+	err = enc.Encode(dst)
+	return dst, err
+
 }
 
