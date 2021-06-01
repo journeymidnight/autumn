@@ -502,9 +502,8 @@ func extractEntryInfo(b *pb.Block, extentID uint64, offset uint32, replay bool) 
 				ExtentID:      extentID,
 				Offset:        offset,
 			}, nil
-		} else { //gc read
-			entry.Key = nil //直接返回空entry
-			entry.Value = nil 
+		} else {  //gc read
+			entry.Value = nil //直接返回空entry
 			return &pb.EntryInfo{
 				Log:           entry,
 				EstimatedSize: uint64(entry.Size()),
@@ -517,7 +516,9 @@ func extractEntryInfo(b *pb.Block, extentID uint64, offset uint32, replay bool) 
 		//keep entry.Value and make sure BitValuePointer
 		entry.Meta |= uint32(y.BitValuePointer)
 		//set value to nil to save network bandwidth
-		entry.Value = nil
+		if replay {
+			entry.Value = nil
+		}
 		return &pb.EntryInfo{
 			Log:           entry,
 			EstimatedSize: uint64(entry.Size()),

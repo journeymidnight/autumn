@@ -4,7 +4,7 @@ ReadEntries EntryInfo:
 
 replayLog && big => {(value=nil, extentID/offset) MUST , estimatedsize COULD)
 replayLog && small => {extentID/offset/estimatedsize COULD)
-gc        && big => {value=nil, (estimatedsize,key, extentID, offset) MUST}
+gc        && big => {value=value(estimatedsize,key, extentID, offset) MUST}
 gc        && small => {nil}//{all block, key, value = nil, estimatedsize MUST}
 
 

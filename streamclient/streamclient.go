@@ -140,7 +140,7 @@ func NewStreamClient(sm *smclient.SMClient, em *smclient.ExtentManager, streamID
 	}
 }
 
-type AutumnLogEntryIter struct {
+type AutumnEntryIter struct {
 	sc                 *AutumnStreamClient
 	opt                *readOption
 	currentOffset      uint32
@@ -150,7 +150,7 @@ type AutumnLogEntryIter struct {
 	replay             uint32
 }
 
-func (iter *AutumnLogEntryIter) HasNext() (bool, error) {
+func (iter *AutumnEntryIter) HasNext() (bool, error) {
 	if len(iter.cache) == 0 {
 		if iter.noMore {
 			return false, nil
@@ -163,7 +163,7 @@ func (iter *AutumnLogEntryIter) HasNext() (bool, error) {
 	return len(iter.cache) > 0, nil
 }
 
-func (iter *AutumnLogEntryIter) Next() *pb.EntryInfo {
+func (iter *AutumnEntryIter) Next() *pb.EntryInfo {
 	if ok, err := iter.HasNext(); !ok || err != nil {
 		return nil
 	}
@@ -172,7 +172,7 @@ func (iter *AutumnLogEntryIter) Next() *pb.EntryInfo {
 	return ret
 }
 
-func (iter *AutumnLogEntryIter) receiveEntries() error {
+func (iter *AutumnEntryIter) receiveEntries() error {
 	loop := 0
 retry:
 	conn, extentID, err := iter.sc.getExtentConnFromIndex(iter.currentExtentIndex)
@@ -235,7 +235,7 @@ func (sc *AutumnStreamClient) NewLogEntryIter(opts ...ReadOption) LogEntryIter {
 	for _, opt := range opts {
 		opt(readOpt)
 	}
-	leIter := &AutumnLogEntryIter{
+	leIter := &AutumnEntryIter{
 		sc:  sc,
 		opt: readOpt,
 	}

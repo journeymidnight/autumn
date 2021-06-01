@@ -59,7 +59,7 @@ func TestLinear(t *testing.T) {
 
 
 func TestRsCodecs(t *testing.T) {
-	for _, size := range []int{8, 16, 4<<10, 6<<10, 8<<10, 100<<10, 1<<20} {
+	for _, size := range []int{8, 16, 4<<10, 6<<10, 8<<10, 100<<10, 1<<20, 8 << 20} {
 		t.Run(fmt.Sprintf("size of data %d", size), func(t *testing.T){
 			data := make([]byte, size)
 			utils.SetRandStringBytes(data)
@@ -86,7 +86,7 @@ func TestRsCodecs(t *testing.T) {
 
 func TestReconstruct(t *testing.T) {
 
-	size := 2 << 20//2M
+	size := 20 << 20//20M
 	data := make([]byte, size)
 	utils.SetRandStringBytes(data)
 	//test 6+3
