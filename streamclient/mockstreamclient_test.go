@@ -70,7 +70,7 @@ func TestAppendReadEntries(t *testing.T) {
 			break
 		}
 		ei := iter.Next()
-		require.Equal(t, []byte(nil), ei.Log.Key)
+		require.Equal(t, cases[n].Log.Key, ei.Log.Key)
 		require.Equal(t, []byte(nil), ei.Log.Value)
 		n ++
 	}

@@ -187,7 +187,7 @@ func benchmark(smAddr []string, op BenchType, duration int, size int, threadNum 
 		return err
 	}
 	stopper := utils.NewStopper()
-	s, _, err := sm.CreateStream(context.Background(), 2, 1)
+	s, _, err := sm.CreateStream(context.Background(), 3, 0)
 	if err != nil {
 		return err
 	}
@@ -237,12 +237,15 @@ func benchmark(smAddr []string, op BenchType, duration int, size int, threadNum 
 		}
 	}
 
+	//in the unit of millisecond
+	hist := utils.NewLantencyStatus(0, 1000)
 	writeDone := func(start time.Time, loop int, err error) {
 		if err != nil {
 			panic(fmt.Sprintf(err.Error()))
 		}
 		atomic.AddUint64(&totalSize, uint64(size))
 		atomic.AddUint64(&count, 1)
+		hist.Record(time.Now().Sub(start).Milliseconds())
 		if loop%3 == 0 {
 			lock.Lock()
 			results = append(results, Result{
@@ -302,7 +305,7 @@ func benchmark(smAddr []string, op BenchType, duration int, size int, threadNum 
 			fmt.Println("failed to write result.json")
 		}
 	}
-	printSummary(time.Now().Sub(start), atomic.LoadUint64(&count), atomic.LoadUint64(&totalSize), threadNum, size)
+	printSummary(time.Now().Sub(start), atomic.LoadUint64(&count), atomic.LoadUint64(&totalSize), threadNum, size, hist)
 
 	return nil
 }
@@ -334,7 +337,7 @@ func alloc(c *cli.Context) error {
 	if err := client.Connect(); err != nil {
 		return err
 	}
-	s, e, err := client.CreateStream(context.Background(), 2, 1)
+	s, e, err := client.CreateStream(context.Background(), 3, 0)
 	if err != nil {
 		return err
 	}
@@ -398,7 +401,7 @@ func wbench(c *cli.Context) error {
 	return benchmark(addrs, benchWrite, duration, size, threadNum)
 }
 
-func printSummary(elapsed time.Duration, totalCount uint64, totalSize uint64, threadNum int, size int) {
+func printSummary(elapsed time.Duration, totalCount uint64, totalSize uint64, threadNum int, size int, hist *utils.HistogramStatus) {
 	if elapsed.Seconds() < 1e-9 {
 		return
 	}
@@ -411,4 +414,6 @@ func printSummary(elapsed time.Duration, totalCount uint64, totalSize uint64, th
 	fmt.Printf("Requests per second :%.2f [#/sec]\n", float64(totalCount)/elapsed.Seconds())
 	t := float64(totalSize) / elapsed.Seconds()
 	fmt.Printf("Thoughput per sencond :%s\n", utils.HumanReadableThroughput(t))
+	fmt.Printf("latency in millisencond p50, p95, p99: %v\n", hist.Histgram([]float64{50, 95, 99}, nil))
+	fmt.Println()
 }

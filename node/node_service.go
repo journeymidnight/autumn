@@ -523,26 +523,32 @@ func (en *ExtentNode) Df(ctx context.Context, req *pb.DfRequest) (*pb.DfResponse
 
 func (en *ExtentNode) ReadEntries(ctx context.Context, req *pb.ReadEntriesRequest) (*pb.ReadEntriesResponse, error) {
 
-	return nil, errors.New("to be implemented")
-	/*
-		ex := en.getExtent(req.ExtentID)
-		if ex == nil {
-			return nil, errors.Errorf("no such extent")
-		}
-		replay := false
-		if req.Replay > 0 {
-			replay = true
-		}
-		ei, end, err := ex.ReadEntries(req.Offset, (25 << 20), replay)
-		if err != nil && err != wire_errors.EndOfExtent && err != wire_errors.EndOfExtent {
-			xlog.Logger.Infof("request ReadEntires extentID: %d, offset: %d, : %v", req.ExtentID, req.Offset, err)
-			return nil, err
-		}
-
+	errDone := func(err error) (*pb.ReadEntriesResponse, error) {
+		code, desCode := wire_errors.ConvertToPBCode(err)
 		return &pb.ReadEntriesResponse{
-			Code:      errorToCode(err),
-			Entries:   ei,
-			End: end,
+			Code:    code,
+			CodeDes: desCode,
 		}, nil
-	*/
+	}
+
+
+	ex := en.getExtent(req.ExtentID)
+	if ex == nil {
+		return errDone(errors.Errorf("no such extent %d", req.ExtentID))
+	}
+
+	replay := false
+	if req.Replay > 0 {
+		replay = true
+	}
+	ei, end, err := ex.ReadEntries(req.Offset, (25 << 20), replay)
+	if err != nil && err != wire_errors.EndOfExtent && err != wire_errors.EndOfStream {
+		xlog.Logger.Infof("request ReadEntires extentID: %d, offset: %d, : %v", req.ExtentID, req.Offset, err)
+		return errDone(err)
+	}
+	return &pb.ReadEntriesResponse{
+		Code: pb.Code_OK, 
+		Entries:   ei,
+		End: end,
+	}, nil
 }

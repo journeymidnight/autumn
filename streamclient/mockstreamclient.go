@@ -132,7 +132,9 @@ func (client *MockStreamClient) Append(ctx context.Context, blocks []*pb.Block) 
 	exID := client.exs[exIndex].ID
 	ex := client.exs[exIndex]
 
+	ex.Lock()
 	offsets,end, err := ex.AppendBlocks(blocks, true)
+	ex.Unlock()
 
 	if ex.CommitLength() > uint32(testThreshold) {
 		//seal
