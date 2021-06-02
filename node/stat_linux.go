@@ -25,7 +25,7 @@ import (
 )
 
 // GetInfo returns total and free bytes available in a directory, e.g. `/`.
-func getDiskInfo(path string) (uint64, uint64, err error) {
+func getDiskInfo(path string) (uint64, uint64, error) {
 	s := syscall.Statfs_t{}
 	err := syscall.Statfs(path, &s)
 	if err != nil {
@@ -40,7 +40,7 @@ func getDiskInfo(path string) (uint64, uint64, err error) {
 	// XFS can show wrong values at times error out
 	// in such scenarios.
 	if free > total {
-		return info, fmt.Errorf("detected free space (%d) > total disk space (%d), fs corruption at (%s). please run 'fsck'", free, total, path)
+		return 0, 0, fmt.Errorf("detected free space (%d) > total disk space (%d), fs corruption at (%s). please run 'fsck'", free, total, path)
 	}
 
 	return total, free, nil
