@@ -5,15 +5,15 @@ go 1.14
 require (
 	fyne.io/fyne v1.4.3
 	fyne.io/fyne/v2 v2.0.1
-	github.com/BurntSushi/toml v0.3.1 // indirect
-	github.com/HdrHistogram/hdrhistogram-go v0.9.0 // indirect
+	github.com/BurntSushi/toml v0.3.1
+	github.com/HdrHistogram/hdrhistogram-go v0.9.0
 	github.com/cespare/xxhash v1.1.0
 	github.com/coreos/bbolt v0.0.0-00010101000000-000000000000 // indirect
 	github.com/coreos/etcd v3.3.22+incompatible
 	github.com/coreos/go-semver v0.3.0 // indirect
 	github.com/coreos/go-systemd v0.0.0-20191104093116-d3cd4ed1dbcf // indirect
 	github.com/coreos/pkg v0.0.0-20180928190104-399ea9e2e55f // indirect
-	github.com/cornelk/hashmap v1.0.1 // indirect
+	github.com/cornelk/hashmap v1.0.1
 	github.com/dgraph-io/ristretto v0.0.3
 	github.com/dgrijalva/jwt-go v3.2.0+incompatible // indirect
 	github.com/dgryski/go-farm v0.0.0-20190423205320-6a90982ecee2
@@ -31,7 +31,7 @@ require (
 	github.com/hashicorp/go-immutable-radix v1.3.0
 	github.com/jonboulle/clockwork v0.2.2 // indirect
 	github.com/json-iterator/go v1.1.10 // indirect
-	github.com/klauspost/reedsolomon v1.9.12 // indirect
+	github.com/klauspost/reedsolomon v1.9.12
 	github.com/phf/go-queue v0.0.0-20170504031614-9abe38d0371d
 	github.com/pkg/errors v0.9.1
 	github.com/pkg/xattr v0.4.1
