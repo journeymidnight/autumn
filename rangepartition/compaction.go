@@ -30,6 +30,7 @@ func (rp *RangePartition) compact() {
 	}
 }
 
+
 //tbls已经inc
 func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 	if len(tbls) == 0 {
