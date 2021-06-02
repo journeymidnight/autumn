@@ -77,19 +77,14 @@ message RegionInfo {
 	string addr = 4;
 }
 
-enum RawBlockType {
-	data = 0;
-	meta = 1;
-}
-
 //BlockMeta will be marshaled into pb.Block.userdata
-message RawBlockMeta {
-	RawBlockType type = 1;
-	uint32  CompressedSize = 2;
-	uint32  UnCompressedSize  = 3;
-	uint64  vpExtentID = 4;
-	uint32  vpOffset = 5;
-	uint64  seqNum = 6;
+message BlockMeta {
+	TableIndex tableIndex = 1;
+    uint32  CompressedSize = 2;
+    uint32  UnCompressedSize  = 3;
+    uint64  vpExtentID = 4;
+    uint32  vpOffset = 5;
+    uint64  seqNum = 6;
 }
 
 message BlockOffset {

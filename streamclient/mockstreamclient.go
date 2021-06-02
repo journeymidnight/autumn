@@ -122,7 +122,11 @@ func (client *MockStreamClient) AppendEntries(ctx context.Context, entries []*pb
         blocks = append(blocks,  &pb.Block{
                        data,
         })}
-    extentID, _, tail, err := client.Append(ctx, blocks)
+    extentID, offsets, tail, err := client.Append(ctx, blocks)
+	for i := range entries {
+		entries[i].ExtentID = extentID
+		entries[i].Offset = offsets[i]
+	}
     return extentID, tail, err
 }
 
@@ -163,7 +167,7 @@ func (client *MockStreamClient) Connect() error {
 	return nil
 }
 
-	func (client *MockStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, uint32, error) {
+func (client *MockStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, uint32, error) {
 	var ex *extent.Extent
 	client.RLock()
 	for i := range client.exs {

@@ -18,6 +18,7 @@ package table
 
 import (
 	"context"
+	"encoding/binary"
 	"math"
 	"unsafe"
 
@@ -67,7 +68,7 @@ type Builder struct {
 	// Typically tens or hundreds of meg. This is for one single file.
 	blocks       []*pb.Block //64KB per block
 	currentBlock *pb.Block
-	sz           uint32
+	sz           int
 
 	baseKey []byte // Base key for the current block.
 	//baseOffset   uint32   // Offset for the current block.
@@ -87,6 +88,7 @@ func NewTableBuilder(stream streamclient.StreamClient) *Builder {
 		stream:     stream,
 		writeCh:    make(chan writeBlock, 16),
 		stopper:    utils.NewStopper(),
+		currentBlock: &pb.Block{Data:make([]byte, 64*KB)},
 	}
 
 	b.stopper.RunWorker(func() {
@@ -102,7 +104,7 @@ func NewTableBuilder(stream streamclient.StreamClient) *Builder {
 			slurpLoop:
 				for {
 					blocks = append(blocks, wBlock.b)
-					size += wBlock.b.BlockLength
+					size += uint32(wBlock.b.Size())
 					baseKeys = append(baseKeys, wBlock.baseKey)
 					if size > 10*MB {
 						break slurpLoop
@@ -123,7 +125,7 @@ func NewTableBuilder(stream streamclient.StreamClient) *Builder {
 					return
 				}
 
-				extentID, offsets, err := b.stream.Append(context.Background(), blocks)
+				extentID, offsets, _, err := b.stream.Append(context.Background(), blocks)
 				utils.Check(err)
 
 				for i, offset := range offsets {
@@ -166,30 +168,54 @@ type blockWriteReq struct {
 	b pb.Block
 }
 
+/*
 func blockGrow(block *pb.Block, n uint32) {
-	newSize := utils.Ceil(block.BlockLength+n, 512)
+	newSize := utils.Ceil(uint32(len(block.Data))+n, 4 * KB)
 	newBuf := make([]byte, newSize)
 	copy(newBuf, block.Data)
-	block.BlockLength = newSize
 	block.Data = newBuf
 }
+*/
+
+
+func (b *Builder) allocate(need int) []byte {
+	bb := b.currentBlock
+	if len(bb.Data[b.sz:]) < need {
+			// We need to reallocate.
+			sz := 2 * len(bb.Data)
+			if b.sz+need > sz {
+					sz = b.sz + need
+			}
+			tmp := make([]byte, sz)
+			copy(tmp, bb.Data)
+			bb.Data = tmp
+	}
+	b.sz += need
+	return bb.Data[b.sz-need : b.sz]
+}
+
 
 //append data to current block
 func (b *Builder) append(data []byte) {
+	dst := b.allocate(len(data))
+	utils.AssertTrue(len(data) == copy(dst, data))
+
+	/*
 	if b.currentBlock == nil {
 		b.currentBlock = &pb.Block{
 			Data:        make([]byte, 64*KB),
-			BlockLength: 64 * KB,
 			//BlockLength: uint32(size),
 		}
 		b.blocks = append(b.blocks, b.currentBlock)
 	}
-	// Ensure we have enough space to store new data.
-	if b.currentBlock.BlockLength < b.sz+uint32(len(data)) {
+	// Ensure we have enough spa	 to store new data.
+	if uint32(len(b.currentBlock.Data)) < b.sz+uint32(len(data)) {
 		blockGrow(b.currentBlock, uint32(len(data)))
 	}
+	
 	copy(b.currentBlock.Data[b.sz:], data)
 	b.sz += uint32(len(data))
+	*/
 }
 
 func (b *Builder) addHelper(key []byte, v y.ValueStruct) {
@@ -213,16 +239,16 @@ func (b *Builder) addHelper(key []byte, v y.ValueStruct) {
 
 	// store current entry's offset
 	utils.AssertTrue(b.sz < math.MaxUint32)
-	b.entryOffsets = append(b.entryOffsets, b.sz)
+	b.entryOffsets = append(b.entryOffsets, uint32(b.sz))
 
 	// Layout: header, diffKey, value.
 	b.append(h.Encode())
 	b.append(diffKey)
 
-	if b.currentBlock.BlockLength < b.sz+v.EncodedSize() {
-		blockGrow(b.currentBlock, v.EncodedSize())
-	}
-	b.sz += v.Encode(b.currentBlock.Data[b.sz:])
+	
+	dst := b.allocate(int(v.EncodedSize()))
+	v.Encode(dst)
+	
 
 	// Size of KV on SST.
 	sstSz := uint64(uint32(headerSize) + uint32(len(diffKey)) + v.EncodedSize())
@@ -249,15 +275,12 @@ Structure of Block.
 func (b *Builder) FinishBlock() {
 	b.append(y.U32SliceToBytes(b.entryOffsets))
 	b.append(y.U32ToBytes(uint32(len(b.entryOffsets))))
-
-	b.currentBlock.CheckSum = utils.AdlerCheckSum(b.currentBlock.Data)
-	b.currentBlock.UserData = utils.MustMarshal(&pspb.RawBlockMeta{
-		Type:             pspb.RawBlockType_data,
-		CompressedSize:   0,
-		UnCompressedSize: b.sz,
-	})
+	checksum := utils.NewCRC(b.currentBlock.Data[:b.sz]).Value()
+	b.append(y.U32ToBytes(checksum))
 
 	xlog.Logger.Debugf("real block size is %d, len of entries is %d\n", b.sz, len(b.entryOffsets))
+	//truncate block to b.sz
+	b.currentBlock.Data = b.currentBlock.Data[:b.sz]
 	b.writeCh <- writeBlock{
 		baseKey: y.Copy(b.baseKey),
 		b:       b.currentBlock,
@@ -283,21 +306,21 @@ func (b *Builder) shouldFinishBlock(key []byte, value y.ValueStruct) bool {
 	}
 	// We should include current entry also in size, that's why + 4 to len(b.entryOffsets).
 	entriesOffsetsSize := uint32(len(b.entryOffsets)*4 + 4) //size of list
+
+	//+4: crc checksum
 	estimatedSize := uint32(b.sz) + uint32(headerSize) +
-		uint32(len(key)) + uint32(value.EncodedSize()) + entriesOffsetsSize
+		uint32(len(key)) + uint32(value.EncodedSize()) + entriesOffsetsSize + 4
 	return estimatedSize > 64*KB || len(b.entryOffsets) > 1000
 }
 
 // Add adds a key-value pair to the block.
 func (b *Builder) Add(key []byte, value y.ValueStruct) {
 	if b.shouldFinishBlock(key, value) {
-
 		b.FinishBlock()
 		// Start a new block. Initialize the block.
 		b.baseKey = []byte{}
-		b.currentBlock = nil
+		b.currentBlock = &pb.Block{Data:make([]byte, 64 * KB)}
 		b.sz = 0
-		utils.AssertTrue(uint32(b.sz) <= math.MaxUint32)
 		b.entryOffsets = b.entryOffsets[:0]
 	}
 	b.addHelper(key, value)
@@ -329,28 +352,28 @@ func (b *Builder) FinishAll(headExtentID uint64, headOffset uint32, seqNum uint6
 	// Add bloom filter to the index.
 	b.tableIndex.BloomFilter = bf.JSONMarshal()
 
-	//alloc a new meta block
 
-	sz := utils.Ceil(uint32(b.tableIndex.Size()), 4*KB)
-
-	metaBlock := &pb.Block{
-		BlockLength: sz,
-		Data:        make([]byte, sz, sz),
-	}
-
-	b.tableIndex.MarshalTo(metaBlock.Data)
-
-	metaBlock.UserData = utils.MustMarshal(&pspb.RawBlockMeta{
-		Type:             pspb.RawBlockType_meta,
+	meta := &pspb.BlockMeta{
 		UnCompressedSize: uint32(b.tableIndex.Size()),
 		CompressedSize:   0,
 		VpExtentID:       headExtentID,
 		VpOffset:         headOffset,
 		SeqNum:           seqNum,
-	})
-	metaBlock.CheckSum = utils.AdlerCheckSum(metaBlock.Data)
+		TableIndex: b.tableIndex,
+	}
 
-	extentID, offsets, err := b.stream.Append(context.Background(), []*pb.Block{metaBlock})
+	metaBlock := &pb.Block{
+		Data: make([]byte, meta.Size() + 4),
+	}
+
+	_, err := meta.MarshalTo(metaBlock.Data)
+	utils.Check(err)
+
+	//write checksum
+	checkSum := utils.NewCRC(metaBlock.Data[:meta.Size()]).Value()
+	binary.BigEndian.PutUint32(metaBlock.Data[meta.Size():], checkSum)
+
+	extentID, offsets, _, err := b.stream.Append(context.Background(), []*pb.Block{metaBlock})
 	if err != nil {
 		return 0, 0, err
 	}

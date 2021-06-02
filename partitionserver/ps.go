@@ -30,7 +30,7 @@ type PartitionServer struct {
 	//grcpServer  *grpc.Server //FIXME: get command from managers
 	baseFileDir   string //store UUID
 	address       string
-	extentManager *streamclient.AutumnExtentManager
+	extentManager *smclient.ExtentManager
 	blockReader   *streamclient.AutumnBlockReader
 	grcpServer    *grpc.Server
 }
