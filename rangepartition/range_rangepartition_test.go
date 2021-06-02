@@ -55,7 +55,6 @@ func _writeToLSM(skl *skiplist.Skiplist, entires []*pb.EntryInfo) int64 {
 				y.ValueStruct{
 					Value:     entry.Log.Value,
 					Meta:      getLowerByte(entry.Log.Meta),
-					UserMeta:  getLowerByte(entry.Log.UserMeta),
 					ExpiresAt: entry.Log.ExpiresAt,
 				})
 		} else {
@@ -68,7 +67,6 @@ func _writeToLSM(skl *skiplist.Skiplist, entires []*pb.EntryInfo) int64 {
 				y.ValueStruct{
 					Value:     vp.Encode(),
 					Meta:      getLowerByte(entry.Log.Meta) | y.BitValuePointer,
-					UserMeta:  getLowerByte(entry.Log.UserMeta),
 					ExpiresAt: entry.Log.ExpiresAt,
 				})
 		}

@@ -432,9 +432,9 @@ type request struct {
 func estimatedSizeInSkl(e *pb.Entry) int {
 	sz := len(e.Key)
 	if y.ShouldWriteValueToLSM(e) {
-		sz += len(e.Value) + 2 // Meta, UserMeta
+		sz += len(e.Value) + 1 // Meta
 	} else {
-		sz += int(vptrSize) + 2 // vptrSize for valuePointer, 2 for metas.
+		sz += int(vptrSize) + 1 // vptrSize for valuePointer, 1 for meta
 	}
 
 	sz += utils.SizeVarint(e.ExpiresAt)
@@ -446,9 +446,9 @@ func estimatedSizeInSkl(e *pb.Entry) int {
 func estimatedVS(key []byte, vs y.ValueStruct) int {
 	sz := len(key)
 	if vs.Meta&y.BitValuePointer == 0 && len(vs.Value) <= y.ValueThrottle {
-		sz += len(vs.Value) + 2 // Meta, UserMeta
+		sz += len(vs.Value) + 1 // Meta
 	} else {
-		sz += int(vptrSize) + 2 // vptrSize for valuePointer, 2 for metas.
+		sz += int(vptrSize) + 1 // vptrSize for valuePointer, 1 for meta
 	}
 	sz += utils.SizeVarint(vs.ExpiresAt)
 
@@ -569,7 +569,6 @@ func (rp *RangePartition) writeToLSM(entries []*pb.EntryInfo) error {
 				y.ValueStruct{
 					Value:     entry.Log.Value,
 					Meta:      getLowerByte(entry.Log.Meta),
-					UserMeta:  getLowerByte(entry.Log.UserMeta),
 					ExpiresAt: entry.Log.ExpiresAt,
 				})
 		} else {
@@ -582,7 +581,6 @@ func (rp *RangePartition) writeToLSM(entries []*pb.EntryInfo) error {
 				y.ValueStruct{
 					Value:     vp.Encode(),
 					Meta:      getLowerByte(entry.Log.Meta) | y.BitValuePointer,
-					UserMeta:  getLowerByte(entry.Log.UserMeta),
 					ExpiresAt: entry.Log.ExpiresAt,
 				})
 		}

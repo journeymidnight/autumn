@@ -784,7 +784,7 @@ func BenchmarkReadMerged(b *testing.B) {
 			// id := i*tableSize+j (not interleaved)
 			k := fmt.Sprintf("%016x", id)
 			v := fmt.Sprintf("%d", id)
-			builder.Add([]byte(k), y.ValueStruct{Value: []byte(v), Meta: 123, UserMeta: 0}, 0)
+			builder.Add([]byte(k), y.ValueStruct{Value: []byte(v), Meta: 123}, 0)
 		}
 		_, err = f.Write(builder.Finish())
 		require.NoError(b, err, "unable to write to file")

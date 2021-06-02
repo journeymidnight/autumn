@@ -24,8 +24,7 @@ message Entry {
 	bytes  key = 1;
 	bytes  value = 2;
 	uint32 meta = 3;
-	uint32 UserMeta = 4;
-	uint64 ExpiresAt = 5;
+	uint64 ExpiresAt = 4;
 }
 
 message EntryInfo {
