@@ -167,18 +167,6 @@ service PartitionManagerService {
 
 
 
-/*
-message Entry {
-	bytes  key = 1;
-	bytes  value = 2;
-	uint32 meta = 3; //ignore meta 
-	uint32 UserMeta = 4;
-	uint64 ExpiresAt = 5;
-}
-
-func (rp *RangePartition) writeAsync(key, value []byte, f func(error)) {
-
-*/
 
 message PutRequest {
 	bytes key = 1;

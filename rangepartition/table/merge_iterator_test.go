@@ -72,7 +72,6 @@ func (s *SimpleIterator) Key() []byte { return s.keys[s.idx] }
 func (s *SimpleIterator) Value() y.ValueStruct {
 	return y.ValueStruct{
 		Value:    s.vals[s.idx],
-		UserMeta: 55,
 		Meta:     0,
 	}
 }

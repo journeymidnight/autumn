@@ -7,4 +7,6 @@ test:
 	cd extent && go test
 	cd extent/record && go test
 	cd streamclient && go test
+	cd erasure_code && go test
+	cd node && go test
 	cd rangepartition/ && go test -v  -race -coverprofile=coverage.txt -covermode=atomic
