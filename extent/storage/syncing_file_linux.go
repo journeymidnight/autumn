@@ -30,7 +30,7 @@ func isSyncRangeSupported(fd uintptr) bool {
 	return false
 }
 
-func (f *syncingFile) init() {
+func (f *SyncingFile) init() {
 	if f.fd == 0 {
 		return
 	}
@@ -42,19 +42,19 @@ func (f *syncingFile) init() {
 	}
 }
 
-func (f *syncingFile) syncData() error {
+func (f *SyncingFile) syncData() error {
 	if f.fd == 0 {
 		return f.File.Sync()
 	}
 	return syscall.Fdatasync(int(f.fd))
 }
 
-func (f *syncingFile) syncToFdatasync(_ int64) error {
+func (f *SyncingFile) syncToFdatasync(_ int64) error {
 	f.ratchetSyncOffset(atomic.LoadInt64(&f.atomic.offset))
 	return f.syncData()
 }
 
-func (f *syncingFile) syncToRange(offset int64) error {
+func (f *SyncingFile) syncToRange(offset int64) error {
 	const (
 		waitBefore = 0x1
 		write      = 0x2
