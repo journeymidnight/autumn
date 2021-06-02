@@ -120,17 +120,19 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		rp.tables = append(rp.tables, tbl)
 	}
 
-	//search all tables, find the table who has the most latest seqNum
-	seq := uint64(0)
+	//SORT all tables, by lastSeq
+	//rp.table MUST be ordered
+	sort.Slice(rp.tables, func(i,j int) bool {
+		return rp.tables[i].LastSeq < rp.tables[j].LastSeq
+	})
+
 	var lastTable *table.Table
-	for _, table := range rp.tables {
-		fmt.Printf("read table from [%s] to [%s]: seq[%d], vp[%d]\n", y.ParseKey(table.Smallest()), y.ParseKey(table.Biggest()), table.LastSeq, table.VpOffset)
-		if table.LastSeq > seq {
-			seq = table.LastSeq
-			lastTable = table
-		}
+	if len(rp.tables) > 0 {
+		lastTable = rp.tables[len(rp.tables)-1]
+		rp.seqNumber = lastTable.LastSeq
+	} else {
+		rp.seqNumber = 0
 	}
-	rp.seqNumber = seq
 
 	//FIXME:poor performace: prefetch read will be better
 	replayedLog := 0
@@ -314,6 +316,13 @@ func (rp *RangePartition) handleFlushTask(ft flushTask) error {
 
 	rp.tableLock.Lock()
 	rp.tables = append(rp.tables, tbl)
+	//run insertsort to make sure rp.tables is sorted by lastSeq
+	for j := len(rp.tables) - 1 ; j > 0 && rp.tables[j].LastSeq < rp.tables[j-1].LastSeq ; j -- {
+		//swap [j] and [j-1]
+		tmp := rp.tables[j]
+		rp.tables[j] = rp.tables[j-1]
+		rp.tables[j-1] = tmp
+	}
 	rp.tableLock.Unlock()
 
 	xlog.Logger.Debugf("flushed table %s to %s seq[%d], head %d\n", y.ParseKey(first), y.ParseKey(last), tbl.LastSeq, tbl.VpOffset)
@@ -832,7 +841,22 @@ func (rp *RangePartition) Get(userKey []byte, version uint64) ([]byte, error) {
 
 }
 
-//internal APIs/block
+/*
+internal APIs/block
+由于userKEY的seq不能保证总是最新的在后面, 所以所有的readkey操作, 需要读所有的memtable和table
+原因:
+1: gc时, seqNum不变, 导致memtale里面的seqNum比之前的小
+2: 如果做双logstream, replaystream时也会导致memtablel里面的seqNum顺序不一致
+3. 如果做多version的情况, 比如最大支持最近20个version, 也需要读所有memtable和table
+
+场景:
+1. 随机读一个key, 读所有memtable和table, 找到seqNum最高的
+2. range一部分key, 读所有memttable和table, 即使是seqNum相同, 但是不关心seqNum和对应的value
+3. 随机读一个key, 如果有2个key有相同的SeqNum, 在相同的seqnum情况下, memtable保证有序, tables也通过lastSeq保证
+有序, 首先应该读到时间更新的KEY
+
+*/
+
 func (rp *RangePartition) getValueStruct(userKey []byte, version uint64) y.ValueStruct {
 
 	mtables, decr := rp.getMemTables()
@@ -845,6 +869,8 @@ func (rp *RangePartition) getValueStruct(userKey []byte, version uint64) y.Value
 		internalKey = y.KeyWithTs(userKey, version)
 
 	}
+	var maxVs y.ValueStruct
+
 	//search in rp.mt and rp.imm
 	for i := 0; i < len(mtables); i++ {
 		//samekey and the vs is the smallest bigger than req's version
@@ -854,10 +880,16 @@ func (rp *RangePartition) getValueStruct(userKey []byte, version uint64) y.Value
 			//not found, userKey not match
 			continue
 		}
-		return vs
+		// Found the required version of the key, return immediately.
+		if vs.Version == version {
+			return vs
+		}
+		if maxVs.Version < vs.Version {
+			maxVs = vs
+		}
 	}
+	
 
-	var maxVs y.ValueStruct
 	tables, decr := rp.getTablesForKey(userKey)
 	defer decr()
 	hash := farm.Fingerprint64(userKey)
