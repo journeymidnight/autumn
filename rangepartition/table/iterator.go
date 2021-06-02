@@ -21,8 +21,6 @@ import (
 	"io"
 	"sort"
 
-	"github.com/journeymidnight/autumn/proto/pb"
-	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/rangepartition/y"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/pkg/errors"
@@ -52,21 +50,18 @@ type blockIterator struct {
 	prevOverlap uint16
 }
 
-func (itr *blockIterator) setBlock(b *pb.Block) {
+
+//FIXME:
+func (itr *blockIterator) setBlock(b * entriesBlock) {
 	itr.err = nil
 	itr.idx = 0
 	itr.baseKey = itr.baseKey[:0]
 	itr.prevOverlap = 0
 	itr.key = itr.key[:0]
 	itr.val = itr.val[:0]
-
-	var blockMeta pspb.RawBlockMeta
-	utils.MustUnMarshal(b.UserData, &blockMeta)
-	sz := blockMeta.UnCompressedSize
-	numEntries := y.BytesToU32(b.Data[sz-4 : sz])
-	entriesIndexStart := sz - 4 - numEntries*4
-	itr.entryOffsets = y.BytesToU32Slice(b.Data[entriesIndexStart : sz-4])
-	itr.data = b.Data[:entriesIndexStart]
+	
+	itr.entryOffsets = b.entryOffsets
+	itr.data = b.data[:b.entriesIndexStart]
 }
 
 // setIdx sets the iterator to the entry at index i and set it's key and value.
@@ -202,12 +197,12 @@ func (itr *Iterator) seekToFirst() {
 		return
 	}
 	itr.bpos = 0
-	block, err := itr.t.block(itr.bpos)
+	entriesblock, err := itr.t.block(itr.bpos)
 	if err != nil {
 		itr.err = err
 		return
 	}
-	itr.bi.setBlock(block)
+	itr.bi.setBlock(entriesblock)
 	itr.bi.seekToFirst()
 	itr.err = itr.bi.Error()
 }

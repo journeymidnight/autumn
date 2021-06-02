@@ -32,16 +32,17 @@ func (rp *RangePartition) writeValueLog(reqs []*request) ([]*pb.EntryInfo, value
 }
 
 func replayLog(stream streamclient.StreamClient, startExtentID uint64, startOffset uint32, replay bool, replayFunc func(*pb.EntryInfo) (bool, error)) error {
-	var opt streamclient.ReadOption
+	var opts []streamclient.ReadOption
+
 	if replay {
-		opt = opt.WithReplay()
+		opts = append(opts, streamclient.WithReplay())
 	}
 	if startOffset == 0 && startExtentID == 0 {
-		opt = opt.WithReadFromStart()
+		opts = append(opts, streamclient.WithReadFromStart())
 	} else {
-		opt = opt.WithReadFrom(startExtentID, startOffset)
+		opts = append(opts, streamclient.WithReadFrom(startExtentID, startOffset))
 	}
-	iter := stream.NewLogEntryIter(opt)
+	iter := stream.NewLogEntryIter(opts...)
 	for {
 		ok, err := iter.HasNext()
 		if err != nil {
@@ -58,7 +59,6 @@ func replayLog(stream streamclient.StreamClient, startExtentID uint64, startOffs
 		if next == false {
 			break
 		}
-
 	}
 	return nil
 }

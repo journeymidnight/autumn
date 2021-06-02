@@ -7,15 +7,14 @@ import (
 
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/streamclient"
-	"github.com/journeymidnight/autumn/xlog"
 	"github.com/stretchr/testify/require"
-
-	"go.uber.org/zap/zapcore"
 )
 
+/*
 func init() {
 	xlog.InitLog([]string{"rp.log"}, zapcore.DebugLevel)
 }
+*/
 
 func TestLogReplay(t *testing.T) {
 

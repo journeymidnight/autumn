@@ -69,14 +69,14 @@ func NewAutumnBlockReader(em *smclient.ExtentManager, sm *smclient.SMClient) *Au
 	}
 }
 
-func (br *AutumnBlockReader) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, error) {
+func (br *AutumnBlockReader) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, uint32, error) {
 	exInfo := br.em.GetExtentInfo(extentID)
 	if exInfo == nil {
-		return nil,  errors.Errorf("no such extent")
+		return nil,  0, errors.Errorf("no such extent")
 	}
 	conn := br.em.GetExtentConn(extentID, smclient.PrimaryPolicy{})
 	if conn == nil {
-		return nil, errors.Errorf("unable to get extent connection.")
+		return nil, 0, errors.Errorf("unable to get extent connection.")
 	}
 	c := pb.NewExtentServiceClient(conn)
 	res, err := c.SmartReadBlocks(ctx, &pb.ReadBlocksRequest{
@@ -86,7 +86,7 @@ func (br *AutumnBlockReader) Read(ctx context.Context, extentID uint64, offset u
 		Eversion: exInfo.Eversion ,
 	})
 	
-	return res.Blocks, err
+	return res.Blocks, res.End, err
 }
 
 
@@ -374,14 +374,18 @@ func (sc *AutumnStreamClient) AppendEntries(ctx context.Context, entries []*pb.E
                        data,
                })
     }
-	extentID, _, tail, err := sc.Append(ctx, blocks)
+	extentID, offsets , tail, err := sc.Append(ctx, blocks)
+	for i := range entries {
+		entries[i].ExtentID = extentID
+		entries[i].Offset = offsets[i]
+	}
     return extentID, tail, err
 }
 
-func (sc *AutumnStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, error) {
+func (sc *AutumnStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, uint32, error) {
 	conn := sc.em.GetExtentConn(extentID, smclient.PrimaryPolicy{})
 	if conn == nil {
-		return nil, errors.Errorf("no such extent")
+		return nil, 0,  errors.Errorf("no such extent")
 	}
 	c := pb.NewExtentServiceClient(conn)
 	res, err := c.ReadBlocks(ctx, &pb.ReadBlocksRequest{
@@ -389,7 +393,7 @@ func (sc *AutumnStreamClient) Read(ctx context.Context, extentID uint64, offset 
 		Offset:      offset,
 		NumOfBlocks: numOfBlocks,
 	})
-	return res.Blocks, err
+	return res.Blocks, res.End, err
 }
 
 func (sc *AutumnStreamClient) Append(ctx context.Context, blocks []*pb.Block) (uint64, []uint32, uint32,  error) {

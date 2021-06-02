@@ -2,7 +2,6 @@ package extent
 
 import (
 	"fmt"
-	"io"
 	"io/ioutil"
 	"os"
 	"sync"
@@ -14,7 +13,6 @@ import (
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
-	"github.com/pkg/errors"
 	"go.uber.org/zap/zapcore"
 
 	"github.com/stretchr/testify/assert"
