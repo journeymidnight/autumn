@@ -103,7 +103,10 @@ func (rp *RangePartition) runGC(discardRatio float64) {
 		}
 
 		freed += ei.EstimatedSize
-		if ei.Log.Key == nil && ei.Log.Value == nil {
+
+		//if small file, ei.Log.Value must be nil
+		//if big file, len(ei.Log.Value) > 0
+		if ei.Log.Value == nil {
 			return true, nil
 		}
 
