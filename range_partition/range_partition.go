@@ -1,4 +1,4 @@
-package rangepartition
+package range_partition
 
 import (
 	"bytes"
@@ -14,9 +14,9 @@ import (
 	"github.com/journeymidnight/autumn/manager/pmclient"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/proto/pspb"
-	"github.com/journeymidnight/autumn/rangepartition/skiplist"
-	"github.com/journeymidnight/autumn/rangepartition/table"
-	"github.com/journeymidnight/autumn/rangepartition/y"
+	"github.com/journeymidnight/autumn/range_partition/skiplist"
+	"github.com/journeymidnight/autumn/range_partition/table"
+	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/journeymidnight/autumn/streamclient"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
@@ -24,8 +24,8 @@ import (
 )
 
 const (
-	KB                = 1024
-	MB                = KB * 1024
+	KB = 1024
+	MB = KB * 1024
 
 	//1 * MB for test
 	//60 * MB for production
@@ -73,9 +73,9 @@ type RangePartition struct {
 	EndKey   []byte
 	pmClient pmclient.PMClient
 
-	closeOnce    sync.Once    // For closing DB only once.
-	vhead        valuePointer //vhead前的都在mt中
-	openStream   OpenStreamFunc
+	closeOnce  sync.Once    // For closing DB only once.
+	vhead      valuePointer //vhead前的都在mt中
+	openStream OpenStreamFunc
 }
 
 //TODO
@@ -88,18 +88,18 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	openStream OpenStreamFunc,
 ) *RangePartition {
 	rp := &RangePartition{
-		rowStream:    rowStream,
-		logStream:    logStream,
-		blockReader:  blockReader,
-		logRotates:   0,
-		mt:           skiplist.NewSkiplist(maxSkipList),
-		imm:          nil,
-		blockWrites:  0,
-		StartKey:     startKey,
-		EndKey:       endKey,
-		pmClient:     pmclient,
-		PartID:       id,
-		openStream:   openStream,
+		rowStream:   rowStream,
+		logStream:   logStream,
+		blockReader: blockReader,
+		logRotates:  0,
+		mt:          skiplist.NewSkiplist(maxSkipList),
+		imm:         nil,
+		blockWrites: 0,
+		StartKey:    startKey,
+		EndKey:      endKey,
+		pmClient:    pmclient,
+		PartID:      id,
+		openStream:  openStream,
 	}
 	rp.startMemoryFlush()
 
@@ -119,7 +119,7 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 
 	//SORT all tables, by lastSeq
 	//rp.table MUST be ordered
-	sort.Slice(rp.tables, func(i,j int) bool {
+	sort.Slice(rp.tables, func(i, j int) bool {
 		return rp.tables[i].LastSeq < rp.tables[j].LastSeq
 	})
 
@@ -190,7 +190,6 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	rp.startWriteLoop()
 
 	//do compactions:FIXME, doCompactions放到另一个goroutine里面执行
-
 
 	var tbls []*table.Table
 	rp.tableLock.RLock()
@@ -284,7 +283,7 @@ func (rp *RangePartition) handleFlushTask(ft flushTask) error {
 	rp.tableLock.Lock()
 	rp.tables = append(rp.tables, tbl)
 	//run insertsort to make sure rp.tables is sorted by lastSeq
-	for j := len(rp.tables) - 1 ; j > 0 && rp.tables[j].LastSeq < rp.tables[j-1].LastSeq ; j -- {
+	for j := len(rp.tables) - 1; j > 0 && rp.tables[j].LastSeq < rp.tables[j-1].LastSeq; j-- {
 		//swap [j] and [j-1]
 		tmp := rp.tables[j]
 		rp.tables[j] = rp.tables[j-1]
@@ -617,7 +616,7 @@ func (rp *RangePartition) doWrites() {
 		for {
 			reqs = append(reqs, r)
 
-			//FIXME: if (reqs + r) too big, send reqs, and create new reqs including r 
+			//FIXME: if (reqs + r) too big, send reqs, and create new reqs including r
 			if isReqsTooBig(reqs) {
 				pendingCh <- struct{}{} // blocking.
 				goto writeCase
@@ -641,7 +640,7 @@ func (rp *RangePartition) doWrites() {
 			select {
 			case r = <-rp.writeCh:
 				reqs = append(reqs, r)
-				/*	
+				/*
 					if isReqsTooBig(reqs) {
 						pendingCh <- struct{}{} // blocking.
 						goto writeCase
@@ -796,7 +795,7 @@ func (rp *RangePartition) Get(userKey []byte, version uint64) ([]byte, error) {
 		var vp valuePointer
 		vp.Decode(vs.Value)
 
-		blocks, _,err := rp.blockReader.Read(context.Background(), vp.extentID, vp.offset, 1)
+		blocks, _, err := rp.blockReader.Read(context.Background(), vp.extentID, vp.offset, 1)
 		if err != nil {
 			return nil, err
 		}
@@ -855,7 +854,6 @@ func (rp *RangePartition) getValueStruct(userKey []byte, version uint64) y.Value
 			maxVs = vs
 		}
 	}
-	
 
 	tables, decr := rp.getTablesForKey(userKey)
 	defer decr()

@@ -26,7 +26,7 @@ import (
 	"github.com/dgryski/go-farm"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/proto/pspb"
-	"github.com/journeymidnight/autumn/rangepartition/y"
+	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/journeymidnight/autumn/streamclient"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
@@ -83,12 +83,12 @@ type Builder struct {
 // NewTableBuilder makes a new TableBuilder.
 func NewTableBuilder(stream streamclient.StreamClient) *Builder {
 	b := &Builder{
-		tableIndex: &pspb.TableIndex{},
-		keyHashes:  make([]uint64, 0, 1024), // Avoid some malloc calls.
-		stream:     stream,
-		writeCh:    make(chan writeBlock, 16),
-		stopper:    utils.NewStopper(),
-		currentBlock: &pb.Block{Data:make([]byte, 64*KB)},
+		tableIndex:   &pspb.TableIndex{},
+		keyHashes:    make([]uint64, 0, 1024), // Avoid some malloc calls.
+		stream:       stream,
+		writeCh:      make(chan writeBlock, 16),
+		stopper:      utils.NewStopper(),
+		currentBlock: &pb.Block{Data: make([]byte, 64*KB)},
 	}
 
 	b.stopper.RunWorker(func() {
@@ -177,23 +177,21 @@ func blockGrow(block *pb.Block, n uint32) {
 }
 */
 
-
 func (b *Builder) allocate(need int) []byte {
 	bb := b.currentBlock
 	if len(bb.Data[b.sz:]) < need {
-			// We need to reallocate.
-			sz := 2 * len(bb.Data)
-			if b.sz+need > sz {
-					sz = b.sz + need
-			}
-			tmp := make([]byte, sz)
-			copy(tmp, bb.Data)
-			bb.Data = tmp
+		// We need to reallocate.
+		sz := 2 * len(bb.Data)
+		if b.sz+need > sz {
+			sz = b.sz + need
+		}
+		tmp := make([]byte, sz)
+		copy(tmp, bb.Data)
+		bb.Data = tmp
 	}
 	b.sz += need
 	return bb.Data[b.sz-need : b.sz]
 }
-
 
 //append data to current block
 func (b *Builder) append(data []byte) {
@@ -201,20 +199,20 @@ func (b *Builder) append(data []byte) {
 	utils.AssertTrue(len(data) == copy(dst, data))
 
 	/*
-	if b.currentBlock == nil {
-		b.currentBlock = &pb.Block{
-			Data:        make([]byte, 64*KB),
-			//BlockLength: uint32(size),
+		if b.currentBlock == nil {
+			b.currentBlock = &pb.Block{
+				Data:        make([]byte, 64*KB),
+				//BlockLength: uint32(size),
+			}
+			b.blocks = append(b.blocks, b.currentBlock)
 		}
-		b.blocks = append(b.blocks, b.currentBlock)
-	}
-	// Ensure we have enough spa	 to store new data.
-	if uint32(len(b.currentBlock.Data)) < b.sz+uint32(len(data)) {
-		blockGrow(b.currentBlock, uint32(len(data)))
-	}
-	
-	copy(b.currentBlock.Data[b.sz:], data)
-	b.sz += uint32(len(data))
+		// Ensure we have enough spa	 to store new data.
+		if uint32(len(b.currentBlock.Data)) < b.sz+uint32(len(data)) {
+			blockGrow(b.currentBlock, uint32(len(data)))
+		}
+
+		copy(b.currentBlock.Data[b.sz:], data)
+		b.sz += uint32(len(data))
 	*/
 }
 
@@ -245,10 +243,8 @@ func (b *Builder) addHelper(key []byte, v y.ValueStruct) {
 	b.append(h.Encode())
 	b.append(diffKey)
 
-	
 	dst := b.allocate(int(v.EncodedSize()))
 	v.Encode(dst)
-	
 
 	// Size of KV on SST.
 	sstSz := uint64(uint32(headerSize) + uint32(len(diffKey)) + v.EncodedSize())
@@ -319,7 +315,7 @@ func (b *Builder) Add(key []byte, value y.ValueStruct) {
 		b.FinishBlock()
 		// Start a new block. Initialize the block.
 		b.baseKey = []byte{}
-		b.currentBlock = &pb.Block{Data:make([]byte, 64 * KB)}
+		b.currentBlock = &pb.Block{Data: make([]byte, 64*KB)}
 		b.sz = 0
 		b.entryOffsets = b.entryOffsets[:0]
 	}
@@ -352,18 +348,17 @@ func (b *Builder) FinishAll(headExtentID uint64, headOffset uint32, seqNum uint6
 	// Add bloom filter to the index.
 	b.tableIndex.BloomFilter = bf.JSONMarshal()
 
-
 	meta := &pspb.BlockMeta{
 		UnCompressedSize: uint32(b.tableIndex.Size()),
 		CompressedSize:   0,
 		VpExtentID:       headExtentID,
 		VpOffset:         headOffset,
 		SeqNum:           seqNum,
-		TableIndex: b.tableIndex,
+		TableIndex:       b.tableIndex,
 	}
 
 	metaBlock := &pb.Block{
-		Data: make([]byte, meta.Size() + 4),
+		Data: make([]byte, meta.Size()+4),
 	}
 
 	_, err := meta.MarshalTo(metaBlock.Data)

@@ -1,4 +1,4 @@
-package rangepartition
+package range_partition
 
 import (
 	"fmt"
@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/journeymidnight/autumn/manager/pmclient"
-	"github.com/journeymidnight/autumn/rangepartition/table"
+	"github.com/journeymidnight/autumn/range_partition/table"
 	"github.com/journeymidnight/autumn/streamclient"
 )
 
@@ -38,9 +38,8 @@ func TestCompaction(t *testing.T) {
 
 	time.Sleep(time.Second)
 
-	fmt.Printf("before compaction %d\n", len(rp.tables))
-
 	rp.tableLock.RLock()
+	fmt.Printf("before compaction %d\n", len(rp.tables))
 	for _, t := range rp.tables {
 		tbls = append(tbls, t)
 	}

@@ -190,15 +190,17 @@ func TestWalExtent(t *testing.T) {
 
 	extent.Lock()
 
-	end := uint32(0)
+
 	i := 0
+	end := uint32(0)
 	for _, block := range cases {
+		start := extent.CommitLength()
 		var wg sync.WaitGroup
 		wg.Add(2) //2 tasks
 		errC := make(chan error)
 		go func() { //wal
 			defer wg.Done()
-			err := walLog.Write(100, end, []*pb.Block{block})
+			err := walLog.Write(100, start, []*pb.Block{block})
 			errC <- err
 		}()
 

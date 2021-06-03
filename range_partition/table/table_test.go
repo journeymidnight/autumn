@@ -22,7 +22,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/journeymidnight/autumn/rangepartition/y"
+	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/journeymidnight/autumn/utils"
 
 	"github.com/journeymidnight/autumn/streamclient"

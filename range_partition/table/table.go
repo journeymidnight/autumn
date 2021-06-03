@@ -8,7 +8,7 @@ import (
 	"github.com/dgraph-io/ristretto/z"
 	"github.com/gogo/protobuf/proto"
 	"github.com/journeymidnight/autumn/proto/pspb"
-	"github.com/journeymidnight/autumn/rangepartition/y"
+	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/journeymidnight/autumn/streamclient"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
@@ -68,17 +68,16 @@ func OpenTable(stream streamclient.StreamClient,
 	}
 	if len(blocks) != 1 {
 		return nil, errors.Errorf("len of block is not 1")
-	}	
+	}
 	data := blocks[0].Data
 
 	if len(data) <= 4 {
 		return nil, errors.Errorf("meta block should be bigger than 4")
 	}
 
-
 	//must?
 	//read checksum
-	expected := y.BytesToU32(data[len(data) - 4:])
+	expected := y.BytesToU32(data[len(data)-4:])
 
 	checksum := utils.NewCRC(data[:len(data)-4]).Value()
 	if checksum != expected {
@@ -103,7 +102,7 @@ func OpenTable(stream streamclient.StreamClient,
 		LastSeq:    meta.SeqNum,
 		VpExtentID: meta.VpExtentID,
 		VpOffset:   meta.VpOffset,
-		ref: 1,
+		ref:        1,
 	}
 
 	//read bloom filter
@@ -135,7 +134,7 @@ type entriesBlock struct {
 func (t *Table) block(idx int) (*entriesBlock, error) {
 	extentID := t.blockIndex[idx].ExtentID
 	offset := t.blockIndex[idx].Offset
-	blocks, _,  err := t.stream.Read(context.Background(), extentID, offset, 1)
+	blocks, _, err := t.stream.Read(context.Background(), extentID, offset, 1)
 	if err != nil {
 		return nil, err
 	}
@@ -145,27 +144,27 @@ func (t *Table) block(idx int) (*entriesBlock, error) {
 	if len(blocks[0].Data) < 8 {
 		return nil, errors.Errorf("block data should be bigger than 8")
 	}
-	
+
 	data := blocks[0].Data
-	expected := y.BytesToU32(data[len(data) - 4:])
+	expected := y.BytesToU32(data[len(data)-4:])
 	checksum := utils.NewCRC(data[:len(data)-4]).Value()
 	if checksum != expected {
 		return nil, errors.Errorf("expected crc is %d, but computed from data is %d", expected, checksum)
 	}
 
 	numEntries := y.BytesToU32(data[len(data)-8:])
-	entriesIndexStart := len(data) - 4 - 4 - int(numEntries) * 4
+	entriesIndexStart := len(data) - 4 - 4 - int(numEntries)*4
 	if entriesIndexStart < 0 {
 		return nil, errors.Errorf("entriesIndexStart cannot be less than 0")
 	}
-	entriesIndexEnd := entriesIndexStart + 4 * int(numEntries)
+	entriesIndexEnd := entriesIndexStart + 4*int(numEntries)
 
 	return &entriesBlock{
-		offset: int(offset),
-		data: data[:len(data)-4], //exclude checksum
-		entryOffsets: y.BytesToU32Slice(data[entriesIndexStart:entriesIndexEnd]),
+		offset:            int(offset),
+		data:              data[:len(data)-4], //exclude checksum
+		entryOffsets:      y.BytesToU32Slice(data[entriesIndexStart:entriesIndexEnd]),
 		entriesIndexStart: entriesIndexStart,
-		checksum: checksum,
+		checksum:          checksum,
 	}, nil
 }
 

@@ -19,7 +19,7 @@ package table
 import (
 	"bytes"
 
-	"github.com/journeymidnight/autumn/rangepartition/y"
+	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/pkg/errors"
 )
 

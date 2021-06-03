@@ -1,11 +1,11 @@
-package rangepartition
+package range_partition
 
 import (
 	"bytes"
 	"context"
 
 	"github.com/journeymidnight/autumn/proto/pb"
-	"github.com/journeymidnight/autumn/rangepartition/y"
+	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/journeymidnight/autumn/streamclient"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
@@ -85,7 +85,7 @@ func (rp *RangePartition) runGC(discardRatio float64) {
 	if streamInfo == nil {
 		return
 	}
-	
+
 	var candidate streamclient.StreamClient
 
 	candidate = rp.openStream(*streamInfo)

@@ -1,13 +1,13 @@
-package rangepartition
+package range_partition
 
 import (
 	"context"
 	"time"
 
 	"github.com/journeymidnight/autumn/proto/pspb"
-	"github.com/journeymidnight/autumn/rangepartition/skiplist"
-	"github.com/journeymidnight/autumn/rangepartition/table"
-	"github.com/journeymidnight/autumn/rangepartition/y"
+	"github.com/journeymidnight/autumn/range_partition/skiplist"
+	"github.com/journeymidnight/autumn/range_partition/table"
+	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
 )
@@ -30,9 +30,6 @@ func (rp *RangePartition) compact() {
 		}
 	}
 }
-
-
-
 
 func (rp *RangePartition) deprecateTables(tbls []*table.Table) {
 
@@ -62,7 +59,6 @@ func (rp *RangePartition) deprecateTables(tbls []*table.Table) {
 		tableLocs = append(tableLocs, &t.Loc)
 	}
 	rp.updateTableLocs(tableLocs)
-
 
 	rp.tables = newTables
 }

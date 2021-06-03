@@ -28,7 +28,7 @@ import (
 
 	"github.com/journeymidnight/autumn/extent/record"
 	"github.com/journeymidnight/autumn/proto/pb"
-	"github.com/journeymidnight/autumn/rangepartition/y"
+	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/journeymidnight/autumn/xlog"
@@ -41,8 +41,6 @@ const (
 	XATTRSEAL         = "user.XATTRSEAL"
 )
 
-
-
 type Extent struct {
 	//sync.Mutex //only one AppendBlocks could be called at a time
 	utils.SafeMutex
@@ -54,7 +52,6 @@ type Extent struct {
 	//FIXME: add SSD Chanel
 	writer *record.LogWriter
 }
-
 
 //format to JSON
 type extentHeader struct {
@@ -100,7 +97,6 @@ func readExtentHeader(file *os.File) (*extentHeader, error) {
 
 }
 
-
 func CreateCopyExtent(fileName string, ID uint64) (*os.File, error) {
 	f, err := os.OpenFile(fileName, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
@@ -119,7 +115,6 @@ func CreateCopyExtent(fileName string, ID uint64) (*os.File, error) {
 	return f, nil
 }
 
-
 func CreateExtent(fileName string, ID uint64) (*Extent, error) {
 	//FIXME: lock file
 	f, err := os.OpenFile(fileName, os.O_CREATE|os.O_RDWR, 0644)
@@ -135,7 +130,7 @@ func CreateExtent(fileName string, ID uint64) (*Extent, error) {
 
 	//f.Sync()
 	//write header of Extent
-	 ex := &Extent{
+	ex := &Extent{
 		ID:           ID,
 		isSeal:       0,
 		commitLength: 0,
@@ -245,7 +240,6 @@ func (r *extentReader) Read(p []byte) (n int, err error) {
 	return n, nil
 }
 
-
 //Seal requires LOCK
 func (ex *Extent) Seal(commit uint32) error {
 	ex.Lock()
@@ -290,7 +284,6 @@ func (ex *Extent) Close() {
 	ex.file.Close()
 }
 
-
 func (ex *Extent) resetWriter() error {
 	if ex.writer != nil {
 		ex.writer.Close()
@@ -324,7 +317,7 @@ func (ex *Extent) RecoveryData(start uint32, blocks []*pb.Block) error {
 	for _, block := range blocks {
 		expectedEnd = record.ComputeEnd(expectedEnd, uint32(len(block.Data)))
 	}
-	
+
 	currentLength := atomic.LoadUint32(&ex.commitLength)
 
 	if expectedEnd <= currentLength {
@@ -356,9 +349,7 @@ func (ex *Extent) Sync() {
 	ex.writer.Sync()
 }
 
-
-
-func (ex *Extent) AppendBlocks(blocks []*pb.Block,  doSync bool) ([]uint32, uint32, error) {
+func (ex *Extent) AppendBlocks(blocks []*pb.Block, doSync bool) ([]uint32, uint32, error) {
 
 	ex.AssertLock()
 
@@ -370,7 +361,7 @@ func (ex *Extent) AppendBlocks(blocks []*pb.Block,  doSync bool) ([]uint32, uint
 
 	truncate := func() {
 		ex.writer.Flush()
-		
+
 		utils.Check(ex.file.Truncate(int64(currentLength)))
 		ex.file.Sync()
 		atomic.StoreUint32(&ex.commitLength, currentLength)
@@ -385,8 +376,7 @@ func (ex *Extent) AppendBlocks(blocks []*pb.Block,  doSync bool) ([]uint32, uint
 	for _, block := range blocks {
 		//EC friendly
 		//if expected end > 128M, skip to 128M
-	
-		
+
 		start, end, err = ex.writer.WriteRecord(block.Data)
 		utils.AssertTrue(end <= math.MaxUint32)
 		if err != nil {
@@ -404,7 +394,6 @@ func (ex *Extent) AppendBlocks(blocks []*pb.Block,  doSync bool) ([]uint32, uint
 	atomic.StoreUint32(&ex.commitLength, uint32(end))
 	return offsets, uint32(end), nil
 }
-
 
 func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize uint32) ([]*pb.Block, []uint32, uint32, error) {
 
@@ -431,7 +420,7 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 
 	var offsets []uint32
 	var end uint32
-	for i := uint32(0); i < maxNumOfBlocks;{
+	for i := uint32(0); i < maxNumOfBlocks; {
 		reader, err := rr.Next()
 		start := rr.Offset()
 		if err == io.EOF {
@@ -443,21 +432,21 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 		}
 
 		if err != nil {
-			rr.Recover(); //ignore current block
+			rr.Recover() //ignore current block
 			continue
 		}
 
-		if rr.End() - start + size > int64(maxTotalSize) && len(ret) > 0{
+		if rr.End()-start+size > int64(maxTotalSize) && len(ret) > 0 {
 			end = uint32(start)
 			break
 		}
 
 		data, err := ioutil.ReadAll(reader)
 
-		ret = append(ret, &pb.Block{Data:data})
+		ret = append(ret, &pb.Block{Data: data})
 		offsets = append(offsets, uint32(start))
 		end = uint32(rr.End())
-		i ++
+		i++
 	}
 	return ret, offsets, end, nil
 }
@@ -502,13 +491,13 @@ func extractEntryInfo(b *pb.Block, extentID uint64, offset uint32, replay bool) 
 				ExtentID:      extentID,
 				Offset:        offset,
 			}, nil
-		} else {  //gc read
+		} else { //gc read
 			entry.Value = nil //直接返回空entry
 			return &pb.EntryInfo{
 				Log:           entry,
 				EstimatedSize: uint64(entry.Size()),
 				ExtentID:      extentID,
-				Offset: offset,
+				Offset:        offset,
 			}, nil
 		}
 	} else {
