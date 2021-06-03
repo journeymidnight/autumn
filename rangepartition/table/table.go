@@ -50,7 +50,10 @@ func (t *Table) IncrRef() {
 
 // DecrRef decrements the refcount and possibly deletes the table
 func (t *Table) DecrRef() error {
-	//FIXME:
+	ref := atomic.AddInt32(&t.ref, ^int32(0))
+	if ref == 0 {
+		//TODO: remove table
+	}
 	return nil
 }
 
@@ -100,6 +103,7 @@ func OpenTable(stream streamclient.StreamClient,
 		LastSeq:    meta.SeqNum,
 		VpExtentID: meta.VpExtentID,
 		VpOffset:   meta.VpOffset,
+		ref: 1,
 	}
 
 	//read bloom filter

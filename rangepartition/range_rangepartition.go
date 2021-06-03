@@ -43,7 +43,6 @@ var (
 )
 
 type OpenStreamFunc func(si pb.StreamInfo) streamclient.StreamClient
-type UpdateStreamFunc func([]pb.StreamInfo)
 
 type RangePartition struct {
 	discard *discardManager
@@ -77,7 +76,6 @@ type RangePartition struct {
 	closeOnce    sync.Once    // For closing DB only once.
 	vhead        valuePointer //vhead前的都在mt中
 	openStream   OpenStreamFunc
-	updateStream UpdateStreamFunc
 }
 
 //TODO
@@ -87,7 +85,7 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	logStream streamclient.StreamClient, blockReader streamclient.BlockReader,
 	startKey []byte, endKey []byte, tableLocs []*pspb.Location, blobStreams []uint64,
 	pmclient pmclient.PMClient,
-	openStream OpenStreamFunc, updateStream UpdateStreamFunc,
+	openStream OpenStreamFunc,
 ) *RangePartition {
 	rp := &RangePartition{
 		rowStream:    rowStream,
@@ -102,7 +100,6 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		pmClient:     pmclient,
 		PartID:       id,
 		openStream:   openStream,
-		updateStream: updateStream,
 	}
 	rp.startMemoryFlush()
 
@@ -193,10 +190,11 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	rp.startWriteLoop()
 
 	//do compactions:FIXME, doCompactions放到另一个goroutine里面执行
+
+
 	var tbls []*table.Table
 	rp.tableLock.RLock()
 	for _, t := range rp.tables {
-		t.IncrRef()
 		tbls = append(tbls, t)
 	}
 	rp.tableLock.RUnlock()
@@ -204,42 +202,11 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	if len(tbls) <= 1 {
 		return rp
 	}
-
 	rp.doCompact(tbls, true)
-
-	//remove tbls from rp.tables, and update etcd,
-	rp.tableLock.Lock()
-	var i, j int
-	var newTables []*table.Table
-	for i < len(tbls) && j < len(rp.tables) {
-		if tbls[i].LastSeq == rp.tables[j].LastSeq {
-			i++
-			j++ //同时存在
-		} else if tbls[i].LastSeq < rp.tables[j].LastSeq {
-			i++ //只在tbls存在
-		} else {
-			newTables = append(newTables, rp.tables[j])
-			rp.tables[j].IncrRef()
-			j++ //只在rp.tables存在
-		}
-	}
-	for ; j < len(rp.tables); j++ {
-		newTables = append(newTables, rp.tables[j])
-		rp.tables[j].IncrRef()
-	}
-
-	tableLocs = nil
-	for _, t := range newTables {
-		tableLocs = append(tableLocs, &t.Loc)
-	}
-	rp.updateTableLocs(tableLocs)
-
-	for _, t := range rp.tables {
+	rp.deprecateTables(tbls)
+	for _, t := range tbls {
 		t.DecrRef()
 	}
-	rp.tables = newTables
-	rp.tableLock.Unlock()
-
 	return rp
 }
 
@@ -941,7 +908,7 @@ func (rp *RangePartition) close(gracefull bool) error {
 				utils.AssertTrue(rp.mt != nil)
 				select {
 				case rp.flushChan <- flushTask{mt: rp.mt, vptr: rp.vhead, seqNum: rp.seqNumber + 1}:
-					fmt.Printf("submitted to chan vp %d\n", rp.vhead)
+					fmt.Printf("Gracefull stop: submitted to flushkask vp %+v\n", rp.vhead)
 					rp.imm = append(rp.imm, rp.mt) // Flusher will attempt to remove this from s.imm.
 					rp.mt = nil                    // Will segfault if we try writing!
 					return true

@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/rangepartition/skiplist"
 	"github.com/journeymidnight/autumn/rangepartition/table"
 	"github.com/journeymidnight/autumn/rangepartition/y"
@@ -31,16 +32,45 @@ func (rp *RangePartition) compact() {
 }
 
 
-//tbls已经inc
+
+
+func (rp *RangePartition) deprecateTables(tbls []*table.Table) {
+
+	rp.tableLock.Lock()
+	defer rp.tableLock.Unlock()
+
+	var i, j int
+	var newTables []*table.Table
+	for i < len(tbls) && j < len(rp.tables) {
+		if tbls[i].LastSeq == rp.tables[j].LastSeq {
+			i++
+			j++ //同时存在
+		} else if tbls[i].LastSeq < rp.tables[j].LastSeq {
+			i++ //只在tbls存在
+		} else {
+			newTables = append(newTables, rp.tables[j])
+			j++ //只在rp.tables存在
+		}
+	}
+
+	for ; j < len(rp.tables); j++ {
+		newTables = append(newTables, rp.tables[j])
+	}
+
+	var tableLocs []*pspb.Location
+	for _, t := range newTables {
+		tableLocs = append(tableLocs, &t.Loc)
+	}
+	rp.updateTableLocs(tableLocs)
+
+
+	rp.tables = newTables
+}
+
 func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 	if len(tbls) == 0 {
 		return
 	}
-	defer func() {
-		for _, table := range tbls {
-			table.DecrRef()
-		}
-	}()
 	//tbls的顺序是在stream里面的顺序
 
 	var iters []y.Iterator

@@ -76,10 +76,6 @@ func OpenMockStreamClient(si pb.StreamInfo) StreamClient {
 	}
 }
 
-func UpdateStreamMock([]pb.StreamInfo) {
-
-}
-
 func (client *MockStreamClient) Truncate(ctx context.Context, extentID uint64) (pb.StreamInfo, pb.StreamInfo, error) {
 
 	var i int
