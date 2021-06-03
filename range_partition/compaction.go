@@ -98,7 +98,7 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 	var numBuilds int
 	resultCh := make(chan struct{})
 	//ignore keep multiple versions and snapshot support
-	capacity := int64(2 * maxSkipList)
+	capacity := int64(2 * rp.opt.MaxSkipList)
 	for it.Valid() {
 		var skipKey []byte
 		timeStart := time.Now()

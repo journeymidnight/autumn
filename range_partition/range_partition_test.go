@@ -92,7 +92,7 @@ func runRPTest(t *testing.T, test func(t *testing.T, rp *RangePartition)) {
 	defer rowStream.Close()
 	pmclient := new(pmclient.MockPMClient)
 	rp := OpenRangePartition(3, rowStream, logStream, logStream.(streamclient.BlockReader),
-		[]byte(""), []byte(""), nil, nil, pmclient, streamclient.OpenMockStreamClient)
+		[]byte(""), []byte(""), nil, nil, pmclient, streamclient.OpenMockStreamClient, TestOption())
 	defer func() {
 		require.NoError(t, rp.Close())
 	}()
@@ -163,7 +163,7 @@ func TestReopenRangePartition(t *testing.T) {
 	defer rowStream.Close()
 	pmclient := new(pmclient.MockPMClient)
 	rp := OpenRangePartition(3, rowStream, logStream, logStream.(streamclient.BlockReader),
-		[]byte(""), []byte(""), nil, nil, pmclient, streamclient.OpenMockStreamClient)
+		[]byte(""), []byte(""), nil, nil, pmclient, streamclient.OpenMockStreamClient, TestOption())
 
 	var wg sync.WaitGroup
 	for i := 10; i < 100; i++ {
@@ -177,7 +177,7 @@ func TestReopenRangePartition(t *testing.T) {
 
 	//reopen with tables
 	rp = OpenRangePartition(3, rowStream, logStream, logStream.(streamclient.BlockReader),
-		[]byte(""), []byte(""), pmclient.Tables, nil, pmclient, streamclient.OpenMockStreamClient)
+		[]byte(""), []byte(""), pmclient.Tables, nil, pmclient, streamclient.OpenMockStreamClient, TestOption())
 
 	for i := 10; i < 100; i++ {
 		v, err := rp.Get([]byte(fmt.Sprintf("key%d", i)), 300)
@@ -200,7 +200,7 @@ func TestReopenRangePartitionWithBig(t *testing.T) {
 	defer rowStream.Close()
 	pmclient := new(pmclient.MockPMClient)
 	rp := OpenRangePartition(3, rowStream, logStream, logStream.(streamclient.BlockReader),
-		[]byte(""), []byte(""), nil, nil, pmclient, streamclient.OpenMockStreamClient)
+		[]byte(""), []byte(""), nil, nil, pmclient, streamclient.OpenMockStreamClient, TestOption())
 
 	var expectedValue [][]byte
 	var wg sync.WaitGroup
@@ -219,7 +219,7 @@ func TestReopenRangePartitionWithBig(t *testing.T) {
 
 	//reopen with tables
 	rp = OpenRangePartition(3, rowStream, logStream, logStream.(streamclient.BlockReader),
-		[]byte(""), []byte(""), pmclient.Tables, nil, pmclient, streamclient.OpenMockStreamClient)
+		[]byte(""), []byte(""), pmclient.Tables, nil, pmclient, streamclient.OpenMockStreamClient, TestOption())
 
 	for i := 10; i < 100; i++ {
 		v, err := rp.Get([]byte(fmt.Sprintf("key%d", i)), 300)

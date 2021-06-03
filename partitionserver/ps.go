@@ -11,7 +11,7 @@ import (
 	"github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/proto/pspb"
-	"github.com/journeymidnight/autumn/rangepartition"
+	"github.com/journeymidnight/autumn/range_partition"
 	"github.com/journeymidnight/autumn/streamclient"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
@@ -23,7 +23,7 @@ type psID_t = uint64
 
 type PartitionServer struct {
 	utils.SafeMutex //protect rangePartitions
-	rangePartitions map[partID_t]*rangepartition.RangePartition
+	rangePartitions map[partID_t]*range_partition.RangePartition
 	PSID            uint64
 	pmClient        *pmclient.AutumnPMClient
 	smClient        *smclient.SMClient
@@ -37,7 +37,7 @@ type PartitionServer struct {
 
 func NewPartitionServer(smAddr []string, pmAddr []string, baseDir string, address string) *PartitionServer {
 	return &PartitionServer{
-		rangePartitions: make(map[partID_t]*rangepartition.RangePartition),
+		rangePartitions: make(map[partID_t]*range_partition.RangePartition),
 		smClient:        smclient.NewSMClient(smAddr),
 		pmClient:        pmclient.NewAutumnPMClient(pmAddr),
 		baseFileDir:     baseDir,
@@ -119,7 +119,7 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta) error {
 	utils.AssertTrue(meta.Rg != nil)
 	utils.AssertTrue(meta.PartID != 0)
 
-	rp := rangepartition.OpenRangePartition(meta.PartID, row, log, ps.blockReader, meta.Rg.StartKey, meta.Rg.EndKey, locs,
+	rp := range_partition.OpenRangePartition(meta.PartID, row, log, ps.blockReader, meta.Rg.StartKey, meta.Rg.EndKey, locs,
 		blobs, ps.pmClient, openStream)
 
 	//FIXME: check each partID is uniq
