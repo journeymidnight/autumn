@@ -81,6 +81,7 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	openStream OpenStreamFunc, opts... OptionFunc,
 ) *RangePartition {
 
+	utils.AssertTrue(len(opts)> 0)
 	opt := &Option{}
 	for _, optf := range opts {
 		optf(opt)
@@ -736,11 +737,26 @@ func (rp *RangePartition) getTablesForKey(userKey []byte) ([]*table.Table, func(
 			t.IncrRef()
 		}
 	}
-	//返回的tables安装.SeqNUm排序, SeqNum大的在前(新的table在前), 保证如果出现vesion相同
+	//返回的tables按照SeqNum排序, SeqNum大的在前(新的table在前), 保证如果出现vesion相同
 	//的key的情况下, 总是找到新的key(为什么会出现version相同的key? 从valuelog gc而来
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].LastSeq > out[j].LastSeq
-	})
+
+	if len(out) > 1 {
+		//is ordered?
+		for i := 0 ; i < len(out) - 1 ; i ++ {
+			utils.AssertTrue(out[i].LastSeq < out[i+1].LastSeq)
+		}
+		//reverse
+		i := 0
+		j := len(out) - 1
+		for i < j {
+			tmp := out[i]
+			out[i] = out[j]
+			out[j] = tmp
+			i ++
+			j --
+		}
+	}
+
 
 	return out, func() {
 		for _, t := range out {
