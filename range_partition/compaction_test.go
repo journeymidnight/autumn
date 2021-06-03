@@ -20,7 +20,7 @@ func TestCompaction(t *testing.T) {
 	defer rowStream.Close()
 
 	rp := OpenRangePartition(3, rowStream, logStream, logStream.(streamclient.BlockReader),
-		[]byte(""), []byte(""), nil, nil, pmclient, streamclient.OpenMockStreamClient)
+		[]byte(""), []byte(""), nil, nil, pmclient, streamclient.OpenMockStreamClient, TestOption())
 	defer rp.Close()
 
 	var wg sync.WaitGroup

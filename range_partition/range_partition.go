@@ -26,20 +26,12 @@ import (
 const (
 	KB = 1024
 	MB = KB * 1024
-
-	//1 * MB for test
-	//60 * MB for production
-	maxSkipList = 1 * MB
-	//64 for production
-	//16 for test
-	writeChCapacity = 64
 )
 
 var (
 	errNoRoom         = errors.New("No room for write")
 	errNotFound       = errors.New("not found")
 	ErrBlockedWrites  = errors.New("Writes are blocked, possibly due to DropAll or Close")
-	maxEntriesInQueue = maxSkipList / (y.ValueThrottle + 20) / 2
 )
 
 type OpenStreamFunc func(si pb.StreamInfo) streamclient.StreamClient
@@ -76,6 +68,7 @@ type RangePartition struct {
 	closeOnce  sync.Once    // For closing DB only once.
 	vhead      valuePointer //vhead前的都在mt中
 	openStream OpenStreamFunc
+	opt        *Option
 }
 
 //TODO
@@ -85,14 +78,20 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	logStream streamclient.StreamClient, blockReader streamclient.BlockReader,
 	startKey []byte, endKey []byte, tableLocs []*pspb.Location, blobStreams []uint64,
 	pmclient pmclient.PMClient,
-	openStream OpenStreamFunc,
+	openStream OpenStreamFunc, opts... OptionFunc,
 ) *RangePartition {
+
+	opt := &Option{}
+	for _, optf := range opts {
+		optf(opt)
+	}
+
 	rp := &RangePartition{
 		rowStream:   rowStream,
 		logStream:   logStream,
 		blockReader: blockReader,
 		logRotates:  0,
-		mt:          skiplist.NewSkiplist(maxSkipList),
+		mt:          skiplist.NewSkiplist(int64(opt.MaxSkipList)),
 		imm:         nil,
 		blockWrites: 0,
 		StartKey:    startKey,
@@ -100,6 +99,7 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		pmClient:    pmclient,
 		PartID:      id,
 		openStream:  openStream,
+		opt:opt,
 	}
 	rp.startMemoryFlush()
 
@@ -219,7 +219,7 @@ type flushTask struct {
 
 func (rp *RangePartition) startWriteLoop() {
 	rp.writeStopper = utils.NewStopper()
-	rp.writeCh = make(chan *request, writeChCapacity)
+	rp.writeCh = make(chan *request, rp.opt.WriteChCapacity)
 
 	rp.writeStopper.RunWorker(rp.doWrites)
 }
@@ -563,7 +563,7 @@ func (rp *RangePartition) writeToLSM(entries []*pb.EntryInfo) error {
 	return nil
 }
 
-func isReqsTooBig(reqs []*request) bool {
+func (rp *RangePartition )isReqsTooBig(reqs []*request) bool {
 	//grpc limit
 	size := 0 //network size in grpc
 	n := 0
@@ -574,7 +574,7 @@ func isReqsTooBig(reqs []*request) bool {
 		}
 
 		n += len(req.entries)
-		if n > 3*writeChCapacity {
+		if n > 3*rp.opt.WriteChCapacity {
 			return true
 		}
 	}
@@ -617,7 +617,7 @@ func (rp *RangePartition) doWrites() {
 			reqs = append(reqs, r)
 
 			//FIXME: if (reqs + r) too big, send reqs, and create new reqs including r
-			if isReqsTooBig(reqs) {
+			if rp.isReqsTooBig(reqs) {
 				pendingCh <- struct{}{} // blocking.
 				goto writeCase
 			}
@@ -670,9 +670,9 @@ func (rp *RangePartition) ensureRoomForWrite(entries []*pb.EntryInfo, head value
 		n += int64(estimatedSizeInSkl(entries[i].Log))
 	}
 
-	utils.AssertTrue(n <= maxSkipList)
+	utils.AssertTrue(n <= rp.opt.MaxSkipList)
 
-	if !forceFlush && rp.mt.MemSize()+n < maxSkipList {
+	if !forceFlush && rp.mt.MemSize()+n < rp.opt.MaxSkipList {
 		return nil
 	}
 	utils.AssertTrue(rp.mt != nil)
@@ -691,7 +691,7 @@ func (rp *RangePartition) ensureRoomForWrite(entries []*pb.EntryInfo, head value
 			rp.mt.MemSize(), len(rp.flushChan))
 		rp.imm = append(rp.imm, rp.mt)
 
-		rp.mt = skiplist.NewSkiplist(maxSkipList)
+		rp.mt = skiplist.NewSkiplist(rp.opt.MaxSkipList)
 		// New memtable is empty. We certainly have room.
 
 		return nil
@@ -906,7 +906,7 @@ func (rp *RangePartition) close(gracefull bool) error {
 				utils.AssertTrue(rp.mt != nil)
 				select {
 				case rp.flushChan <- flushTask{mt: rp.mt, vptr: rp.vhead, seqNum: rp.seqNumber + 1}:
-					fmt.Printf("Gracefull stop: submitted to flushkask vp %+v\n", rp.vhead)
+					//fmt.Printf("Gracefull stop: submitted to flushkask vp %+v\n", rp.vhead)
 					rp.imm = append(rp.imm, rp.mt) // Flusher will attempt to remove this from s.imm.
 					rp.mt = nil                    // Will segfault if we try writing!
 					return true

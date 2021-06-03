@@ -131,7 +131,7 @@ func (en *ExtentNode) recoveryErasureExtent(extentInfo *pb.ExtentInfo, task *pb.
 			if conns[j] == nil {
 				return
 			}
-			if err = en.copyRemoteExtent(conns[j], extentInfo.ExtentID, tmpFiles[j]); err != nil {
+			if err := en.copyRemoteExtent(conns[j], extentInfo.ExtentID, tmpFiles[j]); err != nil {
 				xlog.Logger.Warnf("ErasureExtent can not copyRemoteExtent %v", err)
 				return
 			}

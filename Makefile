@@ -9,4 +9,4 @@ test:
 	cd streamclient && go test -race
 	cd erasure_code && go test -race
 	cd node && go test -race
-	cd rangepartition/ && go test -v  -race -coverprofile=coverage.txt -covermode=atomic
+	cd range_partition/ && go test -v  -race -coverprofile=coverage.txt -covermode=atomic

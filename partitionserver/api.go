@@ -7,11 +7,11 @@ import (
 	"fmt"
 
 	"github.com/journeymidnight/autumn/proto/pspb"
-	"github.com/journeymidnight/autumn/rangepartition"
+	"github.com/journeymidnight/autumn/range_partition"
 )
 
 //FIXME: inc and decr
-func (ps *PartitionServer) checkVersion(verison uint64, partID uint64, key []byte) *rangepartition.RangePartition {
+func (ps *PartitionServer) checkVersion(verison uint64, partID uint64, key []byte) *range_partition.RangePartition {
 	ps.RLock()
 	rp := ps.rangePartitions[partID]
 	ps.RUnlock()
