@@ -120,7 +120,7 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta) error {
 	utils.AssertTrue(meta.PartID != 0)
 
 	rp := range_partition.OpenRangePartition(meta.PartID, row, log, ps.blockReader, meta.Rg.StartKey, meta.Rg.EndKey, locs,
-		blobs, ps.pmClient, openStream)
+		blobs, ps.pmClient, openStream, range_partition.DefaultOption())
 
 	//FIXME: check each partID is uniq
 	ps.Lock()
