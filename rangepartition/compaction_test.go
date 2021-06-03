@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/journeymidnight/autumn/manager/pmclient"
 	"github.com/journeymidnight/autumn/rangepartition/table"
@@ -19,14 +20,14 @@ func TestCompaction(t *testing.T) {
 	defer rowStream.Close()
 
 	rp := OpenRangePartition(3, rowStream, logStream, logStream.(streamclient.BlockReader),
-		[]byte(""), []byte(""), nil, nil, pmclient, streamclient.OpenMockStreamClient, streamclient.UpdateStreamMock)
+		[]byte(""), []byte(""), nil, nil, pmclient, streamclient.OpenMockStreamClient)
 	defer rp.Close()
 
 	var wg sync.WaitGroup
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < 5000; i++ {
 		wg.Add(1)
 		k := fmt.Sprintf("%04d", i)
-		v := fmt.Sprintf("%d", i)
+		v := make([]byte, 1000)
 		rp.WriteAsync([]byte(k), []byte(v), func(e error) {
 			wg.Done()
 		})
@@ -35,13 +36,21 @@ func TestCompaction(t *testing.T) {
 
 	var tbls []*table.Table
 
+	time.Sleep(time.Second)
+
+	fmt.Printf("before compaction %d\n", len(rp.tables))
+
 	rp.tableLock.RLock()
 	for _, t := range rp.tables {
-		t.IncrRef()
 		tbls = append(tbls, t)
 	}
 	rp.tableLock.RUnlock()
 
 	rp.doCompact(tbls, true)
-	fmt.Printf("%d\n", len(rp.tables))
+	rp.deprecateTables(tbls)
+	for _, t := range tbls {
+		t.DecrRef()
+	}
+	fmt.Printf("after compaction %d\n", len(rp.tables))
+
 }
