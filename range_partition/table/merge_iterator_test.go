@@ -20,7 +20,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/journeymidnight/autumn/rangepartition/y"
+	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/stretchr/testify/require"
 )
@@ -71,8 +71,8 @@ func (s *SimpleIterator) Seek(key []byte) {
 func (s *SimpleIterator) Key() []byte { return s.keys[s.idx] }
 func (s *SimpleIterator) Value() y.ValueStruct {
 	return y.ValueStruct{
-		Value:    s.vals[s.idx],
-		Meta:     0,
+		Value: s.vals[s.idx],
+		Meta:  0,
 	}
 }
 func (s *SimpleIterator) Valid() bool {

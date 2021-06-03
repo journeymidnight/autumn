@@ -1,4 +1,4 @@
-package rangepartition
+package range_partition
 
 import (
 	"github.com/journeymidnight/autumn/proto/pb"

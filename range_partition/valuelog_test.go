@@ -1,4 +1,4 @@
-package rangepartition
+package range_partition
 
 import (
 	"context"

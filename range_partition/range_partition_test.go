@@ -1,4 +1,4 @@
-package rangepartition
+package range_partition
 
 import (
 	"fmt"
@@ -8,14 +8,14 @@ import (
 
 	"github.com/journeymidnight/autumn/manager/pmclient"
 	"github.com/journeymidnight/autumn/proto/pb"
-	"github.com/journeymidnight/autumn/rangepartition/skiplist"
+	"github.com/journeymidnight/autumn/range_partition/skiplist"
 	"github.com/journeymidnight/autumn/streamclient"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
 
 	"go.uber.org/zap/zapcore"
 
-	"github.com/journeymidnight/autumn/rangepartition/y"
+	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/stretchr/testify/require"
 )
 

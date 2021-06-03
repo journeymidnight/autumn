@@ -27,7 +27,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/journeymidnight/autumn/rangepartition/y"
+	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/stretchr/testify/require"
 )
 
@@ -545,7 +545,7 @@ func BenchmarkWrite(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 		for pb.Next() {
-			l.Put(randomKey(rng), y.ValueStruct{Value: data, Meta: 0,})
+			l.Put(randomKey(rng), y.ValueStruct{Value: data, Meta: 0})
 		}
 	})
 }

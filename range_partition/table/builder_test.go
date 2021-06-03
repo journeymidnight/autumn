@@ -26,7 +26,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zapcore"
 
-	"github.com/journeymidnight/autumn/rangepartition/y"
+	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/journeymidnight/autumn/streamclient"
 	"github.com/journeymidnight/autumn/xlog"
 )

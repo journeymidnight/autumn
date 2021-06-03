@@ -21,7 +21,7 @@ import (
 	"io"
 	"sort"
 
-	"github.com/journeymidnight/autumn/rangepartition/y"
+	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/pkg/errors"
 )
@@ -50,16 +50,15 @@ type blockIterator struct {
 	prevOverlap uint16
 }
 
-
 //FIXME:
-func (itr *blockIterator) setBlock(b * entriesBlock) {
+func (itr *blockIterator) setBlock(b *entriesBlock) {
 	itr.err = nil
 	itr.idx = 0
 	itr.baseKey = itr.baseKey[:0]
 	itr.prevOverlap = 0
 	itr.key = itr.key[:0]
 	itr.val = itr.val[:0]
-	
+
 	itr.entryOffsets = b.entryOffsets
 	itr.data = b.data[:b.entriesIndexStart]
 }
