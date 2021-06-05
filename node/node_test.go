@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/coreos/etcd/embed"
+	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/manager"
 	smclient "github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/manager/stream_manager"
@@ -55,7 +56,14 @@ func setupStreamManager(ent *ExtentNodeTestSuite, dir string) {
 		GrpcUrl: "127.0.0.1:3401",
 	}
 
-	etcd, client, err := manager.ServeETCD(config)
+	cfg, err := config.GetEmbedConfig()
+	if err != nil {
+		xlog.Logger.Fatal(err)
+	}
+
+
+	etcd, client, err := etcd_utils.ServeETCD(cfg)
+
 	if err != nil {
 		panic(err.Error())
 	}

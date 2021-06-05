@@ -105,7 +105,7 @@ nodes    map[uint64]*NodeStatus
 		clientv3.OpPut(extentKey, string(edata)),
 	}
 	//在ops执行前, 做判断sm.leaderkey的值等于sm.memberValue
-	err = manager.EtctSetKVS(sm.client, []clientv3.Cmp{
+	err = etcd_utils.EtctSetKVS(sm.client, []clientv3.Cmp{
 		clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
 	}, ops)
 ```
@@ -161,26 +161,37 @@ ETCD存储结构in PM(Partition Manager)
 
 ```
 
-PART/{PartID}/logStream => id <MUST>
-PART/{PartID}/rowStream => id <MUST>
-PART/{PartID}/parent = PSID <MUST>
-PART/{PartID}/range = <startKey, endKey> <MUST>
-PART/{PartID}/tables => [(extentID,offset),...,(extentID,offset)]
-PART/{PartID}/blobStreams => [id,...,id]
-PART/{PartID}/discard => <DATA>
+
+PART/{PartID} => {id, id <startKey, endKEY>}
+PARTSTATS/{PartID}/tables => [(extentID,offset),...,(extentID,offset)]
+PARTSTATS/{PartID}/blobStreams => [id,...,id]
+PARTSTATS/{PartID}/discard => <DATA>
+
 
 PSSERVER/{PSID} => {PSDETAIL}
-//when updating PART/*/range. update PSVERSION
-PSVERSION  => {num}
+
+修改为Partition到PS的映射
+Distribute/config => {
+	{part1,: ps3, region}, {part4: ps5, region}
+}
+
+//lock service
+LOCKS/XXX => //used by rangepartion and stream
 ```
 
-
+1. PS启动后watch Distribute, 如果有分到自己的pg, 载入, 如果自己的pg分走, unload
+2. Distribute由pm计算
+    2.a 如果PSSERVER变化, 重新计算
+	2.b PART有merge, bootstrap, split, 重新计算
+3.
 
 
 ## TODO
+1. 实现
 2. rp实现valuelog的truncate(*)
 3. 实现logstream分为2个不同的stream,一个可以在生成memtable后直接删除, 另一个长久保存(定期recycle或者EC化)
 4. ps merge / split
+
 
 ### extent log format
 

@@ -6,6 +6,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/manager"
 	"github.com/journeymidnight/autumn/manager/partitionmanager"
 	"github.com/journeymidnight/autumn/manager/stream_manager"
@@ -20,7 +21,13 @@ func main() {
 
 	xlog.InitLog([]string{"manager.log"}, zapcore.InfoLevel)
 
-	etcd, client, err := manager.ServeETCD(config)
+	cfg, err := config.GetEmbedConfig()
+	if err != nil {
+		xlog.Logger.Fatal(err)
+	}
+
+
+	etcd, client, err := etcd_utils.ServeETCD(cfg)
 	if err != nil {
 		panic(err.Error())
 	}

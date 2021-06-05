@@ -185,6 +185,8 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		*/
 		replayLog(rp.logStream, lastTable.VpExtentID, lastTable.VpOffset, true, replay)
 	}
+
+	xlog.Logger.Infof("replayed log number: %d\n", replayedLog)
 	fmt.Printf("replayed log number: %d\n", replayedLog)
 
 	//start real write

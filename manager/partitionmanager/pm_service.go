@@ -7,7 +7,7 @@ import (
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/gogo/protobuf/proto"
-	"github.com/journeymidnight/autumn/manager"
+	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/utils"
@@ -62,7 +62,7 @@ func (pm *PartitionManager) SetRowStreamTables(ctx context.Context, req *pspb.Se
 		clientv3.OpPut(fmt.Sprintf("PART/%d/tables", req.PartitionID), string(data)),
 	}
 
-	err = manager.EtcdSetKVS(pm.client, []clientv3.Cmp{
+	err = etcd_utils.EtcdSetKVS(pm.client, []clientv3.Cmp{
 		clientv3.Compare(clientv3.Value(pm.leaderKey), "=", pm.memberValue),
 	}, ops)
 
@@ -85,7 +85,7 @@ func (pm *PartitionManager) allocUniqID(count uint64) (uint64, uint64, error) {
 
 	pm.allocIdLock.Lock()
 	defer pm.allocIdLock.Unlock()
-	return manager.EtcdAllocUniqID(pm.client, idKey, count)
+	return etcd_utils.EtcdAllocUniqID(pm.client, idKey, count)
 }
 
 func (pm *PartitionManager) RegisterPS(ctx context.Context, req *pspb.RegisterPSRequest) (*pspb.RegisterPSResponse, error) {
@@ -129,7 +129,7 @@ func (pm *PartitionManager) RegisterPS(ctx context.Context, req *pspb.RegisterPS
 		clientv3.OpPut(PSKEY, string(data)),
 	}
 
-	err = manager.EtcdSetKVS(pm.client, []clientv3.Cmp{
+	err = etcd_utils.EtcdSetKVS(pm.client, []clientv3.Cmp{
 		clientv3.Compare(clientv3.Value(pm.leaderKey), "=", pm.memberValue),
 	}, ops)
 	if err != nil {
@@ -202,7 +202,7 @@ func (pm *PartitionManager) Bootstrap(ctx context.Context, req *pspb.BootstrapRe
 	}
 
 	//FIXME: update PSVERSION
-	err = manager.EtcdSetKVS(pm.client, []clientv3.Cmp{
+	err = etcd_utils.EtcdSetKVS(pm.client, []clientv3.Cmp{
 		clientv3.Compare(clientv3.Value(pm.leaderKey), "=", pm.memberValue),
 	}, ops)
 
