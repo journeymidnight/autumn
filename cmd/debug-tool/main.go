@@ -16,7 +16,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/mvcc/mvccpb"
-	"github.com/journeymidnight/autumn/manager"
+	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/pkg/errors"
@@ -51,7 +51,7 @@ streams/6
 //receiveData from ETCD
 func receiveData(client *clientv3.Client) []KV {
 	var data []KV
-	kvs, err := manager.EtcdRange(client, "")
+	kvs, err := etcd_utils.EtcdRange(client, "")
 	if err != nil {
 		panic(err)
 	}
@@ -116,7 +116,8 @@ func receiveData(client *clientv3.Client) []KV {
 			}
 			data = append(data, d)
 		} else {
-			panic("unkown key...")
+			continue
+			//panic("unkown key...")
 		}
 	}
 	return data

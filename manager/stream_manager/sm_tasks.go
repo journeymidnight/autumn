@@ -8,7 +8,7 @@ import (
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/journeymidnight/autumn/conn"
-	"github.com/journeymidnight/autumn/manager"
+	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/wire_errors"
@@ -48,7 +48,7 @@ func (sm *StreamManager) copyDone(task *pb.RecoveryTask, newNodeID uint64) {
 		clientv3.OpPut(extentKey, string(data)),
 	}
 
-	if err := manager.EtcdSetKVS(sm.client, cmps, ops); err != nil {
+	if err := etcd_utils.EtcdSetKVS(sm.client, cmps, ops); err != nil {
 		xlog.Logger.Warnf("setting etcd failed [%s]", err)
 		return
 	}
@@ -178,7 +178,7 @@ func (sm *StreamManager) saveRecoveryTask(task *pb.RecoveryTask) error{
 		ops := []clientv3.Op{
 			clientv3.OpPut(key, string(data)),
 		}
-		err := manager.EtcdSetKVS(sm.client, cmps, ops)
+		err := etcd_utils.EtcdSetKVS(sm.client, cmps, ops)
 		if err != nil {
 			xlog.Logger.Warnf("can not submit recoverytask for %s", key)
 			return err

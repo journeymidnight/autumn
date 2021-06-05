@@ -12,7 +12,7 @@ import (
 	"github.com/coreos/etcd/clientv3"
 	"github.com/gogo/protobuf/proto"
 	"github.com/journeymidnight/autumn/conn"
-	"github.com/journeymidnight/autumn/manager"
+	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/wire_errors"
@@ -96,7 +96,7 @@ func (sm *StreamManager) CreateStream(ctx context.Context, req *pb.CreateStreamR
 		clientv3.OpPut(extentKey, string(edata)),
 	}
 
-	err = manager.EtcdSetKVS(sm.client, []clientv3.Cmp{
+	err = etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
 		clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
 	}, ops)
 
@@ -217,7 +217,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		ops := []clientv3.Op{
 			clientv3.OpPut(formatExtentKey(id), string(data)),
 		}
-		err = manager.EtcdSetKVS(sm.client, []clientv3.Cmp{
+		err = etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
 			clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
 		}, ops)
 	
@@ -275,7 +275,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		clientv3.OpPut(extentKey, string(edata)),
 	}
 
-	err = manager.EtcdSetKVS(sm.client, []clientv3.Cmp{
+	err = etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
 		clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
 	}, ops)
 
@@ -426,7 +426,7 @@ func (sm *StreamManager) RegisterNode(ctx context.Context, req *pb.RegisterNodeR
 		clientv3.OpPut(nodeKey, string(nodeValue)),
 	}
 
-	err = manager.EtcdSetKVS(sm.client, []clientv3.Cmp{
+	err = etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
 		clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
 	}, ops)
 	if err != nil {
@@ -562,7 +562,7 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 	ops := []clientv3.Op{
 		clientv3.OpPut(streamKey, string(sdata)),
 	}
-	err = manager.EtcdSetKVS(sm.client, []clientv3.Cmp{
+	err = etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
 		clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
 	}, ops)
 

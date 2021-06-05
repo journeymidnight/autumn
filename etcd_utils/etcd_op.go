@@ -1,4 +1,4 @@
-package manager
+package etcd_utils
 
 import (
 	"context"

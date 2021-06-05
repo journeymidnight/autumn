@@ -1,4 +1,4 @@
-package manager
+package etcd_utils
 
 import (
 	"time"
@@ -9,15 +9,13 @@ import (
 	"github.com/journeymidnight/autumn/xlog"
 )
 
-func ServeETCD(config *Config) (*embed.Etcd, *clientv3.Client, error) {
+func ServeETCD(cfg *embed.Config) (*embed.Etcd, *clientv3.Client, error) {
 
 	utils.AssertTrue(xlog.Logger != nil)
 
-	cfg, err := config.GetEmbedConfig()
-	if err != nil {
-		xlog.Logger.Fatal(err)
-	}
+
 	e, err := embed.StartEtcd(cfg)
+
 	if err != nil {
 		xlog.Logger.Fatal(err)
 	}
@@ -32,6 +30,7 @@ func ServeETCD(config *Config) (*embed.Etcd, *clientv3.Client, error) {
 		Endpoints:   []string{cfg.ACUrls[0].String()},
 		DialTimeout: time.Second,
 	})
+	
 
 	return e, client, err
 

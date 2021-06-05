@@ -1,7 +1,8 @@
-package manager
+package etcd_utils
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"testing"
 
@@ -18,22 +19,27 @@ type EtcdUtilTestSuite struct {
 	client *clientv3.Client
 }
 
+func mustParseURL(s string) []url.URL {
+	u, _ := url.Parse(s)
+	return []url.URL{*u}
+}
 func (suite *EtcdUtilTestSuite) SetupSuite() {
 	xlog.InitLog([]string{"etcd.log"}, zapcore.DebugLevel)
 
-	config := &Config{
-		Name:                "etcd",
-		Dir:                 "etcd.db",
-		ClientUrls:          "http://127.0.0.1:2379",
-		PeerUrls:            "http://127.0.0.1:2380",
-		AdvertiseClientUrls: "http://127.0.0.1:2379",
-		AdvertisePeerUrls:   "http://127.0.0.1:2380",
-		InitialCluster:      "etcd=http://127.0.0.1:2380",
-		InitialClusterState: "new",
-		ClusterToken:        "cluster",
-		GrpcUrl:             "127.0.0.1:3000",
-	}
+	config := embed.NewConfig()
+	config.Name = "etcd"
+	config.Dir = "etcd.db"
+
+		config.LCUrls = mustParseURL("http://127.0.0.1:2379")
+		config.LPUrls = mustParseURL("http://127.0.0.1:2380")
+		config.ACUrls = mustParseURL("http://127.0.0.1:2379")
+		config.APUrls = mustParseURL("http://127.0.0.1:2380")
+		config.InitialCluster = "etcd=http://127.0.0.1:2380"
+		config.ClusterState = "new"
+		config.InitialClusterToken ="cluster"
+	
 	etcd, client, err := ServeETCD(config)
+	fmt.Println(err)
 	suite.Nil(err)
 	suite.etcd = etcd
 	suite.client = client

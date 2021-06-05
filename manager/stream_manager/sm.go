@@ -9,6 +9,7 @@ import (
 	"github.com/coreos/etcd/embed"
 	"github.com/cornelk/hashmap"
 	"github.com/journeymidnight/autumn/conn"
+	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/manager"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
@@ -152,7 +153,7 @@ func (sm *StreamManager) runAsLeader() {
 	//defer sm.nodeLock.Unlock()
 
 	//load streams
-	kvs, err := manager.EtcdRange(sm.client, "streams")
+	kvs, err := etcd_utils.EtcdRange(sm.client, "streams")
 	if err != nil {
 		xlog.Logger.Warnf(err.Error())
 		return
@@ -176,7 +177,7 @@ func (sm *StreamManager) runAsLeader() {
 	}
 
 	//load extents
-	kvs, err = manager.EtcdRange(sm.client, "extents")
+	kvs, err = etcd_utils.EtcdRange(sm.client, "extents")
 	if err != nil {
 		xlog.Logger.Warnf(err.Error())
 		return
@@ -203,7 +204,7 @@ func (sm *StreamManager) runAsLeader() {
 
 	sm.nodes = &hashmap.HashMap{}
 
-	kvs, err = manager.EtcdRange(sm.client, "nodes")
+	kvs, err = etcd_utils.EtcdRange(sm.client, "nodes")
 	if err != nil {
 		xlog.Logger.Errorf(err.Error())
 		return
@@ -225,7 +226,7 @@ func (sm *StreamManager) runAsLeader() {
 	}
 
 	sm.taskPool = NewTaskPool()
-	kvs, err = manager.EtcdRange(sm.client, "recoveryTasks")
+	kvs, err = etcd_utils.EtcdRange(sm.client, "recoveryTasks")
 	if err != nil {
 		xlog.Logger.Errorf(err.Error())
 		return
@@ -296,7 +297,7 @@ func (sm *StreamManager) allocUniqID(count uint64) (uint64, uint64, error) {
 	sm.allocIdLock.Lock()
 	defer sm.allocIdLock.Unlock()
 
-	return manager.EtcdAllocUniqID(sm.client, idKey, count)
+	return etcd_utils.EtcdAllocUniqID(sm.client, idKey, count)
 }
 
 func (sm *StreamManager) RegisterGRPC(grpcServer *grpc.Server) {

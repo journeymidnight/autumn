@@ -11,6 +11,7 @@ import (
 	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/embed"
 	"github.com/coreos/etcd/mvcc/mvccpb"
+	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/manager"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/proto/pspb"
@@ -162,7 +163,7 @@ func (pm *PartitionManager) runAsLeader() {
 	defer pm.partLock.Unlock()
 	//load data
 
-	kvs, err := manager.EtcdRange(pm.client, "PSSERVER")
+	kvs, err := etcd_utils.EtcdRange(pm.client, "PSSERVER")
 	if err != nil {
 		xlog.Logger.Warnf(err.Error())
 		return
@@ -182,7 +183,7 @@ func (pm *PartitionManager) runAsLeader() {
 		pm.psNodes[psid] = &detail
 	}
 
-	kvs, err = manager.EtcdRange(pm.client, "PART")
+	kvs, err = etcd_utils.EtcdRange(pm.client, "PART")
 	if err != nil {
 		xlog.Logger.Warnf(err.Error())
 		return
