@@ -153,7 +153,7 @@ func (sm *StreamManager) runAsLeader() {
 	//defer sm.nodeLock.Unlock()
 
 	//load streams
-	kvs, err := etcd_utils.EtcdRange(sm.client, "streams")
+	kvs, _, err := etcd_utils.EtcdRange(sm.client, "streams")
 	if err != nil {
 		xlog.Logger.Warnf(err.Error())
 		return
@@ -177,13 +177,11 @@ func (sm *StreamManager) runAsLeader() {
 	}
 
 	//load extents
-	kvs, err = etcd_utils.EtcdRange(sm.client, "extents")
+	kvs, _, err = etcd_utils.EtcdRange(sm.client, "extents")
 	if err != nil {
 		xlog.Logger.Warnf(err.Error())
 		return
 	}
-
-	//sm.extents = make(map[uint64]*pb.ExtentInfo)
 
 	sm.extents = &hashmap.HashMap{}
 	for _, kv := range kvs {
@@ -204,7 +202,7 @@ func (sm *StreamManager) runAsLeader() {
 
 	sm.nodes = &hashmap.HashMap{}
 
-	kvs, err = etcd_utils.EtcdRange(sm.client, "nodes")
+	kvs, _, err = etcd_utils.EtcdRange(sm.client, "nodes")
 	if err != nil {
 		xlog.Logger.Errorf(err.Error())
 		return
@@ -226,7 +224,7 @@ func (sm *StreamManager) runAsLeader() {
 	}
 
 	sm.taskPool = NewTaskPool()
-	kvs, err = etcd_utils.EtcdRange(sm.client, "recoveryTasks")
+	kvs, _, err = etcd_utils.EtcdRange(sm.client, "recoveryTasks")
 	if err != nil {
 		xlog.Logger.Errorf(err.Error())
 		return

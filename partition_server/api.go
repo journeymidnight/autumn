@@ -1,4 +1,4 @@
-package partitionserver
+package partition_server
 
 import (
 	"bytes"

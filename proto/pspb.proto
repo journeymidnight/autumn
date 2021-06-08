@@ -119,32 +119,6 @@ message SetRowStreamTablesResponse {
 	pb.Code code = 1;
 }
 
-message GetRegionsRequest {
-
-}
-message GetRegionsResponse {
-	pb.Code code = 1;
-	repeated RegionInfo regions = 2;
-}
-
-
-message RegisterPSRequest {
-	string addr = 1;
-}
-
-message RegisterPSResponse {
-	pb.Code code = 1;
-	uint64 id = 2;
-}
-
-
-message GetPSInfoRequest {
-
-}
-
-message GetPSInfoResponse {
-	repeated PSDetail servers = 1;
-}
 
 message BootstrapRequest {
 	uint64 logID = 1;
@@ -158,10 +132,7 @@ message BootstrapResponse {
 
 service PartitionManagerService {
 	rpc SetRowStreamTables(SetRowStreamTablesRequest) returns (SetRowStreamTablesResponse) {}
-	rpc RegisterPS(RegisterPSRequest) returns (RegisterPSResponse) {}
-	rpc GetRegions(GetRegionsRequest) returns (GetRegionsResponse) {}
-	rpc GetPartitionMeta(GetPartitionMetaRequest) returns (GetPartitionMetaResponse) {}
-	rpc GetPSInfo(GetPSInfoRequest) returns (GetPSInfoResponse) {}
+	
 	rpc Bootstrap(BootstrapRequest) returns (BootstrapResponse) {}
 }
 
@@ -172,8 +143,7 @@ message PutRequest {
 	bytes key = 1;
 	bytes value = 2;
 	uint64 ExpiresAt = 3; //TTL
-	uint64 psversion = 4;
-	uint64 partid = 5;
+	uint64 partid = 4;
 }
 
 message PutResponse {
@@ -183,20 +153,17 @@ message PutResponse {
 
 message DeleteRequest {
 	bytes key = 1;
-	uint64 psversion = 2;
-	uint64 partid = 5;
+	uint64 partid = 2;
 
 }
 
 message DeleteResponse {
 	bytes key = 1;
-	uint64 psversion = 2;
 }
 
 message GetRequest {
 	bytes key = 1;
-	uint64 psversion = 2;
-	uint64 partid = 5;
+	uint64 partid = 2;
 }
 
 message GetResponse {
@@ -234,7 +201,6 @@ message RangeRequest{
 	bytes start = 2;
 	uint32 limit = 3;
 	uint64 partid = 4;
-	uint64 psversion = 5;
 }
 
 message RangeResponse {

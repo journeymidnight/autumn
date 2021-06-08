@@ -150,6 +150,7 @@ message RecoveryTask {
 	uint64  replaceID = 2;
 	uint64  nodeID = 3;
 	int64  startTime = 4;
+	uint64 eversion = 5;
 }
 
 message RequireRecoveryRequest {

@@ -52,6 +52,7 @@ func (suite *EtcdUtilTestSuite) TearDownSuite() {
 }
 
 func (suite *EtcdUtilTestSuite) TestSetGetKV() {
+
 	for i := 0; i < 100; i++ {
 		key := fmt.Sprintf("key_%d", i)
 		val := fmt.Sprintf("val%d", i)
@@ -60,6 +61,34 @@ func (suite *EtcdUtilTestSuite) TestSetGetKV() {
 	data, err := EtcdGetKV(suite.client, "key_50")
 	suite.Nil(err)
 	suite.Equal("val50", string(data))
+	
+}
+
+func (suite *EtcdUtilTestSuite) TestWatch() {
+	go func(){
+		for i := 0; i < 100; i++ {
+			key := fmt.Sprintf("key/%d", i)
+			val := fmt.Sprintf("val%d", i)
+			EtcdSetKV(suite.client, key, []byte(val))
+		}
+		data, err := EtcdGetKV(suite.client, "key/50")
+		suite.Nil(err)
+		suite.Equal("val50", string(data))
+	}()
+
+	ch, closeWatch := EtcdWatchEvents(suite.client, "key", "key0", 1)
+	j := 0 
+	for e := range ch {
+		for i := range e.Events {
+			suite.Equal(fmt.Sprintf("key/%d", j), string(e.Events[i].Kv.Key))
+			j ++
+		}
+		if j == 99 {
+			break
+		}
+	}
+	closeWatch()
+
 }
 
 func TestEtcdUtil(t *testing.T) {

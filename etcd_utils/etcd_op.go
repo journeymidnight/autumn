@@ -11,11 +11,21 @@ import (
 	"github.com/pkg/errors"
 )
 
-/*
-var (
-	versionKey = "AspiraVersionKey"
-)
-*/
+
+
+func EtcdWatchEvents(c *clientv3.Client, start, end string, startRev int64) (clientv3.WatchChan, func()) {
+	watcher := clientv3.NewWatcher(c)
+
+	rch := watcher.Watch(context.Background(), start, 
+	clientv3.WithRange(end), 
+	clientv3.WithPrevKV(),
+	clientv3.WithRev(startRev))
+
+	return rch, func(){
+		watcher.Close()
+	}
+
+}
 
 func EtcdSetKV(c *clientv3.Client, key string, val []byte, opts ...clientv3.OpOption) error {
 	kv := clientv3.NewKV(c)
@@ -50,7 +60,8 @@ func EtcdGetKV(c *clientv3.Client, key string, opts ...clientv3.OpOption) ([]byt
 	return resp.Kvs[0].Value, nil
 }
 
-func EtcdRange(c *clientv3.Client, prefix string) ([]*mvccpb.KeyValue, error) {
+//EtcdRange return (KeyValue, Revision, error)
+func EtcdRange(c *clientv3.Client, prefix string) ([]*mvccpb.KeyValue, int64, error) {
 	opts := []clientv3.OpOption{
 		clientv3.WithPrefix(),
 		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend),
@@ -59,10 +70,11 @@ func EtcdRange(c *clientv3.Client, prefix string) ([]*mvccpb.KeyValue, error) {
 	kv := clientv3.NewKV(c)
 	ctx := context.Background()
 	resp, err := kv.Get(ctx, prefix, opts...)
+	
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return resp.Kvs, err
+	return resp.Kvs, resp.Header.Revision, err
 }
 
 func EtcdAllocUniqID(c *clientv3.Client, idKey string, count uint64) (uint64, uint64, error) {

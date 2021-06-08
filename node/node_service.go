@@ -92,26 +92,20 @@ func (en *ExtentNode) connPool(peers []string) ([]*conn.Pool, error) {
 }
 
 func (en *ExtentNode) validReq(extentID uint64, version uint64) (*extent.Extent, *pb.ExtentInfo, error) {
-	extentInfo := en.em.GetExtentInfo(extentID)
-	if extentInfo == nil {
-		return nil, nil, errors.Errorf("no such extent %d on etcd %d", extentID, en.nodeID)
-	}
-
+	
 	ex := en.getExtent(extentID)
 	if ex == nil {
 		return nil, nil, errors.Errorf("no such extent %d on node %d", extentID, en.nodeID)
 	}
 
-	for i := 0; i < 3 && extentInfo.Eversion != version; i++ {
-		if extentInfo.Eversion > version {
-			return nil, nil, wire_errors.VersionLow
-		} else if extentInfo.Eversion < version {
-			extentInfo = en.em.Update(extentID)
-		}
+	extentInfo := en.em.WaitVersion(extentID, version)
+	if extentInfo == nil {
+		return nil, nil, errors.Errorf("no such extent %d on etcd %d", extentID, en.nodeID)
 	}
+	
 
-	if extentInfo.Eversion != version {
-		return nil, nil, errors.New("i tried 3 times to match version to you, buf failed. network partition?")
+	if extentInfo.Eversion > version {
+		return nil, nil, wire_errors.VersionLow
 	}
 
 	if extentInfo.SealedLength > 0 {
