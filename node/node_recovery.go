@@ -256,7 +256,8 @@ func (en *ExtentNode) runRecoveryTask(task *pb.RecoveryTask,extentInfo *pb.Exten
 			}
 			xlog.Logger.Warnf(err.Error())
 			time.Sleep(30*time.Second)
-			extentInfo = en.em.Update(task.ExtentID) //get the latest extentInfo
+			//get the latest extentInfo
+			extentInfo = en.em.Update(task.ExtentID)
 		}
 		//rename file from XX.XX.copy to XX.ext
 		extentFileName := fmt.Sprintf("%s.ext", path.Dir(targetFilePath))
@@ -289,7 +290,7 @@ func (en *ExtentNode) CopyExtent(req *pb.CopyExtentRequest, stream pb.ExtentServ
 		return errDone(errors.New("no such extentID"), stream)
 	}
 
-	extentInfo := en.em.Update(req.ExtentID)
+	extentInfo := en.em.GetExtentInfo(req.ExtentID)
 	if extentInfo == nil {
 		return errDone(errors.New("no such extentInfo"), stream)
 	}
@@ -365,20 +366,25 @@ func (en *ExtentNode) RequireRecovery(ctx context.Context, req *pb.RequireRecove
 		//create
 		xlog.Logger.Infof("run recovery task %+v on node %d\n", req.Task, en.nodeID)
 
-		extentInfo := en.em.Update(req.Task.ExtentID) //get the latest extentInfo
+		//wait for the latest extentInfo
+		extentInfo := en.em.Update(req.Task.ExtentID)
+
+		if req.Task.Eversion < extentInfo.Eversion {
+			return errDone(errors.New("task version is low"))
+		}
+		if extentInfo.SealedLength == 0 {
+			return errDone(errors.New("extent should be sealed"))
+		}
 
 		if stream_manager.FindReplaceSlot(extentInfo, req.Task.ReplaceID) == -1  {
 			xlog.Logger.Infof("task %v is not valid to info %v", req.Task, extentInfo)
-		}
-
-		if extentInfo.SealedLength == 0 {
-			return errDone(errors.New("extent should be sealed"))
+			return errDone(errors.Errorf("task %v is not valid to info %v", req.Task, extentInfo))
 		}
 
 		//create targetFile
 		//choose one disk
 		i := rand.Intn(len(en.diskFSs))
-		targetFile, targetFilePath, err := en.diskFSs[i].AllocCopyExtent(extentInfo.ExtentID, req.Task.ReplaceID)
+		targetFile, targetFilePath, err := en.diskFSs[i].AllocCopyExtent(extentInfo.ExtentID, req.Task.ReplaceID, req.Task.Eversion)
 		if err != nil {
 			xlog.Logger.Warnf("can not create CopyExtent copy target [%s]", err.Error())
 			return errDone(err)

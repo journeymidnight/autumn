@@ -1,13 +1,8 @@
-package partitionserver
+package partition_server
 
 import (
-	"fmt"
-	"io/ioutil"
 	"net"
-	"path"
-	"strconv"
 
-	"github.com/journeymidnight/autumn/manager/pmclient"
 	"github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/proto/pspb"
@@ -25,54 +20,51 @@ type PartitionServer struct {
 	utils.SafeMutex //protect rangePartitions
 	rangePartitions map[partID_t]*range_partition.RangePartition
 	PSID            uint64
-	pmClient        *pmclient.AutumnPMClient
 	smClient        *smclient.SMClient
 	//grcpServer  *grpc.Server //FIXME: get command from managers
-	baseFileDir   string //store UUID
 	address       string
 	extentManager *smclient.ExtentManager
 	blockReader   *streamclient.AutumnBlockReader
 	grcpServer    *grpc.Server
 }
 
-func NewPartitionServer(smAddr []string, pmAddr []string, baseDir string, address string) *PartitionServer {
+func NewPartitionServer(smAddr []string, pmAddr []string, PSID uint64, address string) *PartitionServer {
 	return &PartitionServer{
 		rangePartitions: make(map[partID_t]*range_partition.RangePartition),
 		smClient:        smclient.NewSMClient(smAddr),
-		pmClient:        pmclient.NewAutumnPMClient(pmAddr),
-		baseFileDir:     baseDir,
+		PSID:            PSID,
 		address:         address,
 	}
 }
 
 func (ps *PartitionServer) Init() {
+
 	utils.AssertTrue(xlog.Logger != nil)
 
 	//
 	if err := ps.smClient.Connect(); err != nil {
 		xlog.Logger.Fatalf(err.Error())
 	}
-
-	if err := ps.pmClient.Connect(); err != nil {
-		xlog.Logger.Fatalf(err.Error())
-	}
-
-	ps.registerPS()
-
-	//get lease:FIXME
-
 	ps.extentManager = smclient.NewExtentManager(ps.smClient)
 	ps.blockReader = streamclient.NewAutumnBlockReader(ps.extentManager, ps.smClient)
 
-	metas := ps.pmClient.GetPartitionMeta(ps.PSID)
-	xlog.Logger.Infof("get all partitions for PS :%+v: RangePartitions", metas)
+	//create session
 
-	for _, partMeta := range metas {
-		xlog.Logger.Infof("start %+v\n", partMeta)
-		if err := ps.startRangePartition(partMeta); err != nil {
-			xlog.Logger.Fatal(err.Error())
+	
+	loadPartitions()
+	startWatch()
+
+	/*
+		metas := ps.pmClient.GetPartitionMeta(ps.PSID)
+		xlog.Logger.Infof("get all partitions for PS :%+v: RangePartitions", metas)
+
+		for _, partMeta := range metas {
+			xlog.Logger.Infof("start %+v\n", partMeta)
+			if err := ps.startRangePartition(partMeta); err != nil {
+				xlog.Logger.Fatal(err.Error())
+			}
 		}
-	}
+	*/
 
 }
 
@@ -106,6 +98,11 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta) error {
 	openStream := func(si pb.StreamInfo) streamclient.StreamClient {
 		return streamclient.NewStreamClient(ps.smClient, ps.extentManager, si.StreamID)
 	}
+
+	setRowStreamTables := func(){
+
+	}
+
 	var locs []*pspb.Location
 	if meta.Locs != nil {
 		locs = meta.Locs.Locs
@@ -136,36 +133,6 @@ func (ps *PartitionServer) stopRangePartition() {
 
 func (ps *PartitionServer) Close() {
 
-}
-
-func (ps *PartitionServer) registerPS() {
-	utils.AssertTrue(ps.address != "")
-
-	//two lines//PSID相同但是address修改的情况
-	storeIDPath := path.Join(ps.baseFileDir, "PSID")
-	//read file
-	idString, err := ioutil.ReadFile(storeIDPath)
-
-	if err == nil {
-		id, err := strconv.ParseUint(string(idString), 10, 64)
-		if err != nil {
-			xlog.Logger.Fatalf("can not read ioString")
-		}
-		ps.PSID = id
-		return
-	}
-
-	xlog.Logger.Infof("Register Partition Server")
-	id, err := ps.pmClient.RegisterSelf(ps.address)
-	if err != nil {
-		xlog.Logger.Fatalf(err.Error())
-	}
-
-	ps.PSID = id
-	if err = ioutil.WriteFile(storeIDPath, []byte(fmt.Sprintf("%d", id)), 0644); err != nil {
-		xlog.Logger.Fatalf("try to write file %s, %d, but failed, try to save it manually", storeIDPath, id)
-	}
-	xlog.Logger.Infof("success to register to sm")
 }
 
 func (ps *PartitionServer) ServeGRPC() error {

@@ -86,6 +86,7 @@ func (sm *StreamManager) CreateStream(ctx context.Context, req *pb.CreateStreamR
 		ExtentID:   extentID,
 		Replicates: nodesID[:req.DataShard],
 		Parity: nodesID[req.DataShard:],
+		Eversion: 1,
 	}
 
 	edata, err := extentInfo.Marshal()
@@ -127,6 +128,7 @@ func (sm *StreamManager) addExtent(streamID uint64, extent *pb.ExtentInfo) {
 	s, ok := sm.cloneStreamInfo(streamID)
 	if ok {
 		s.ExtentIDs = append(s.ExtentIDs, extent.ExtentID)
+		sm.streams.Set(streamID, s)
 	} else {
 		sm.streams.Set(streamID, &pb.StreamInfo{
 			StreamID:  streamID,

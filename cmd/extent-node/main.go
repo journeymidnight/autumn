@@ -25,7 +25,7 @@ func main() {
 	xlog.InitLog([]string{fmt.Sprintf("node_%d.log", config.ID)}, zap.InfoLevel)
 
 	//FIXME: sm address
-	node := node.NewExtentNode(config.ID, config.Dirs, config.WalDir, config.ListenUrl, []string{"127.0.0.1:3401"})
+	node := node.NewExtentNode(config.ID, config.Dirs, config.WalDir, config.ListenUrl, []string{"127.0.0.1:3401"}, []string{"127.0.0.1:2379"})
 
 	//open all extent files
 	err = node.LoadExtents()
