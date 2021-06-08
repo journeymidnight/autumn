@@ -29,6 +29,7 @@ import (
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
+	"go.etcd.io/etcd/clientv3"
 	"google.golang.org/grpc"
 )
 
@@ -48,17 +49,14 @@ type ExtentNode struct {
 	diskFSs    []*diskFS //read only after boot-up, so do not have locks so far
 	wal        *wal.Wal
 	extentMap  *sync.Map
-	//extentMap map[uint64]*extent.Extent //extent it owns: extentID => file
-	//TODO: cached SM date in EN
-	//replicates *sync.Map
-	//replicates map[uint64][]string //extentID => [addr1, addr2]
 
 	smClient *smclient.SMClient
 	em       *smclient.ExtentManager
 	recoveryTaskNum  int32
 }
 
-func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl string, smAddr []string) *ExtentNode {
+
+func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl string, smAddr []string, etcdAddr []string) *ExtentNode {
 	utils.AssertTrue(xlog.Logger != nil)
 
 	en := &ExtentNode{
@@ -66,14 +64,15 @@ func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl st
 		listenUrl: listenUrl,
 		smClient:  smclient.NewSMClient(smAddr),
 		nodeID:    nodeID,
+		
 	}
-
 	if err := en.smClient.Connect(); err != nil {
 		xlog.Logger.Fatal(err)
 		return nil
 	}
+	
 
-	en.em = smclient.NewExtentManager(en.smClient)
+	en.em = smclient.NewExtentManager(en.smClient, etcdAddr, nil)
 
 	//load disk
 	for _, diskDir := range diskDirs {
@@ -96,6 +95,11 @@ func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl st
 		}
 	}
 	return en
+}
+
+
+func (en *ExtentNode) ExtentInfoUpdatedfunc(event *clientv3.Event) {
+
 }
 
 func (en *ExtentNode) SyncFs() {
@@ -135,9 +139,9 @@ func (en *ExtentNode) LoadExtents() error {
 	}
 
 	registerCopy := func(path string) {
-		//extentID.replaceID.copy
+		//extentID.replaceID.Eversion.copy
 		parts := strings.Split(path, ".")
-		if len(parts) != 3 {
+		if len(parts) != 4 {
 			xlog.Logger.Errorf("found extent %s: can not parse replaceID", path)
 			return
 		}
@@ -153,13 +157,26 @@ func (en *ExtentNode) LoadExtents() error {
 			xlog.Logger.Error(err)
 			return
 		}
+		eversion, err := strconv.ParseUint(parts[2], 10, 64)
+		if err != nil {
+			xlog.Logger.Error(err)
+			return
+		}
 		task := pb.RecoveryTask{
 			ExtentID: extentID,
 			ReplaceID: replaceID,
 			NodeID: en.nodeID,
+			Eversion: eversion,
 		}
 
-		extentInfo := en.em.Update(task.ExtentID)
+		//if extent's version is updated. remove RecoveryTask
+		extentInfo := en.em.Update(extentID)
+		if extentInfo.Eversion != eversion {
+			xlog.Logger.Infof("current recovery task is deprecated")
+			os.Remove(path)
+			return
+		}
+
 		targetFile, err := os.OpenFile(path, os.O_RDWR|os.O_TRUNC, 0755)
 		if err != nil {
 			xlog.Logger.Error(err)

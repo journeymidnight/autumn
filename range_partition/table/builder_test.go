@@ -42,17 +42,6 @@ func TestTableIndex(t *testing.T) {
 	_, err := rand.Read(key)
 	require.NoError(t, err)
 
-	//already have the cluster
-	/*
-		sm := smclient.NewSMClient([]string{"127.0.0.1:3401"})
-		err = sm.Connect()
-		assert.Nil(t, err)
-
-		stream := streamclient.NewStreamClient(sm, 3, 32)
-		err = stream.Connect()
-		assert.Nil(t, err)
-	*/
-
 	stream := streamclient.NewMockStreamClient("log")
 	defer stream.Close()
 

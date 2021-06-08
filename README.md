@@ -162,7 +162,8 @@ ETCD存储结构in PM(Partition Manager)
 ```
 
 
-PART/{PartID} => {id, id <startKey, endKEY>}
+PART/{PartID} => {id, id <startKey, endKEY>} //immutable
+
 PARTSTATS/{PartID}/tables => [(extentID,offset),...,(extentID,offset)]
 PARTSTATS/{PartID}/blobStreams => [id,...,id]
 PARTSTATS/{PartID}/discard => <DATA>
@@ -171,19 +172,20 @@ PARTSTATS/{PartID}/discard => <DATA>
 PSSERVER/{PSID} => {PSDETAIL}
 
 修改为Partition到PS的映射
-Distribute/config => {
+regions/config => {
 	{part1,: ps3, region}, {part4: ps5, region}
 }
 
 //lock service
-LOCKS/XXX => //used by rangepartion and stream
+LOCKS/{PARTID}
+
 ```
 
-1. PS启动后watch Distribute, 如果有分到自己的pg, 载入, 如果自己的pg分走, unload
+1. PS启动后watch Distribute/config, 如果有分到自己的pg, 载入, 如果自己的pg分走, unload
 2. Distribute由pm计算
     2.a 如果PSSERVER变化, 重新计算
 	2.b PART有merge, bootstrap, split, 重新计算
-3.
+3. PS lock streamID
 
 
 ## TODO

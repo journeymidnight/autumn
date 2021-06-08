@@ -180,19 +180,23 @@ func doWrites(writeCh chan *writeRequest, done chan struct{}, sc *streamclient.A
 	}
 }
 
-func benchmark(smAddr []string, op BenchType, duration int, size int, threadNum int) error {
+func benchmark(etcdAddr []string, smAddr []string, op BenchType, duration int, size int, threadNum int) error {
 
 	sm := smclient.NewSMClient(smAddr)
 	if err := sm.Connect(); err != nil {
 		return err
 	}
+	defer sm.Close()
 	stopper := utils.NewStopper()
 	s, _, err := sm.CreateStream(context.Background(), 3, 0)
 	if err != nil {
 		return err
 	}
 
-	em := smclient.NewExtentManager(sm)
+	em := smclient.NewExtentManager(sm, etcdAddr, func(eventType string, cur *pb.ExtentInfo, prev *pb.ExtentInfo){
+		//fmt.Printf("updates: %s: %+v from %+v\n", eventType, cur, prev)
+	})
+	defer em.Close()
 
 	sc := streamclient.NewStreamClient(sm, em, s.StreamID)
 	if err = sc.Connect(); err != nil {
@@ -370,9 +374,10 @@ func main() {
 		},
 		{
 			Name:  "wbench",
-			Usage: "wbench --cluster <path> --thread <num> --duration <duration>",
+			Usage: "wbench --cluster <path> --etcd <path> --thread <num> --duration <duration>",
 			Flags: []cli.Flag{
 				&cli.StringFlag{Name: "cluster", Value: "127.0.0.1:3401", Aliases: []string{"c"}},
+				&cli.StringFlag{Name: "etcd", Value: "127.0.0.1:2379"},
 				&cli.IntFlag{Name: "thread", Value: 1, Aliases: []string{"t"}},
 				&cli.IntFlag{Name: "duration", Value: 10, Aliases: []string{"d"}},
 				&cli.IntFlag{Name: "size", Value: 8192, Aliases: []string{"s"}},
@@ -393,12 +398,13 @@ func main() {
 }
 
 func wbench(c *cli.Context) error {
-	cluster := c.String("cluster")
+
 	duration := c.Int("duration")
 	size := c.Int("size")
-	addrs := utils.SplitAndTrim(cluster, ",")
+	clusterAddrs := utils.SplitAndTrim(c.String("cluster"), ",")
+	etcdAddrs := utils.SplitAndTrim(c.String("etcd"), ",")
 	threadNum := c.Int("thread")
-	return benchmark(addrs, benchWrite, duration, size, threadNum)
+	return benchmark(etcdAddrs, clusterAddrs, benchWrite, duration, size, threadNum)
 }
 
 func printSummary(elapsed time.Duration, totalCount uint64, totalSize uint64, threadNum int, size int, hist *utils.HistogramStatus) {

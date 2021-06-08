@@ -31,9 +31,8 @@ const (
 	KB             = 1024
 	MB             = 1024 * KB
 	GB             = 1024 * MB
-	ValueThreshold = 4 * KB
 
-	MaxExtentSize     = 2 * GB
+	MaxExtentSize     = 32 * MB
 )
 
 type StreamClient interface {
@@ -70,6 +69,7 @@ func NewAutumnBlockReader(em *smclient.ExtentManager, sm *smclient.SMClient) *Au
 }
 
 func (br *AutumnBlockReader) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, uint32, error) {
+retry:
 	exInfo := br.em.GetExtentInfo(extentID)
 	if exInfo == nil {
 		return nil,  0, errors.Errorf("no such extent")
@@ -85,6 +85,11 @@ func (br *AutumnBlockReader) Read(ctx context.Context, extentID uint64, offset u
 		NumOfBlocks: numOfBlocks,
 		Eversion: exInfo.Eversion ,
 	})
+
+	if res.Code == pb.Code_EVersionLow {
+		br.em.WaitVersion(extentID, exInfo.Eversion+1)
+		goto retry
+	}
 	
 	return res.Blocks, res.End, err
 }
@@ -339,7 +344,7 @@ func (sc *AutumnStreamClient) MustAllocNewExtent(oldExtentID uint64, dataShard, 
 	sc.streamInfo.ExtentIDs = append(sc.streamInfo.ExtentIDs, newExInfo.ExtentID)
 	sc.Unlock()
 
-	sc.em.SetExtentInfo(newExInfo.ExtentID, newExInfo)
+	sc.em.WaitVersion(newExInfo.ExtentID, 1)
 	xlog.Logger.Debugf("created new extent %d on stream %d", newExInfo.ExtentID, sc.streamID)
 	return nil
 }

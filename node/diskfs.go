@@ -70,8 +70,8 @@ func (s *diskFS) pathName(extentID uint64, suffix string) string {
 	return filepath.Join(fpath...)
 }
 
-func (s *diskFS) AllocCopyExtent(ID uint64, ReplaceID uint64) (*os.File, string, error) {
-	fpath := s.pathName(ID, fmt.Sprintf("%d.copy", ReplaceID))
+func (s *diskFS) AllocCopyExtent(ID uint64, ReplaceID uint64, Eversion uint64) (*os.File, string, error) {
+	fpath := s.pathName(ID, fmt.Sprintf("%d.%d.copy", ReplaceID, Eversion))
 	f, err := extent.CreateCopyExtent(fpath, ID)
 	return f, fpath, err
 }

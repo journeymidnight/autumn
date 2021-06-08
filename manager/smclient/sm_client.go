@@ -27,8 +27,6 @@ type SMClient struct {
 	sync.RWMutex
 	lastLeader int32 //protected by atomic
 	addrs      []string
-	nodesLock  sync.RWMutex
-	nodes      map[uint64]*pb.NodeInfo //update nodes info
 }
 
 func NewSMClient(addrs []string) *SMClient {
@@ -36,34 +34,6 @@ func NewSMClient(addrs []string) *SMClient {
 	return &SMClient{
 		addrs: addrs,
 	}
-}
-
-func (client *SMClient) LookupNode(nodeID uint64) *pb.NodeInfo {
-	client.nodesLock.RLock()
-	info := client.nodes[nodeID]
-	client.nodesLock.RUnlock()
-	if info != nil {
-		return info
-	}
-
-	//try to update nodes
-	client.updateNodes()
-
-	client.nodesLock.RLock()
-	info = client.nodes[nodeID]
-	client.nodesLock.RUnlock()
-	return info
-}
-
-func (client *SMClient) updateNodes() {
-	x, err := client.NodesInfo(context.Background())
-	if err != nil {
-		xlog.Logger.Warn("failed to call update nodes")
-		return
-	}
-	client.nodesLock.Lock()
-	defer client.nodesLock.Unlock()
-	client.nodes = x
 }
 
 // Connect to Zero's grpc service, if all of connect failed to connnect, return error
@@ -88,16 +58,6 @@ func (client *SMClient) Connect() error {
 	}
 	atomic.StoreInt32(&client.lastLeader, 0)
 
-	//update nodes periodically
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		for {
-			select {
-			case <-ticker.C:
-				client.updateNodes()
-			}
-		}
-	}()
 	return nil
 }
 
@@ -253,6 +213,7 @@ func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64, 
 	return ei, err	
 }
 
+
 func (client *SMClient) NodesInfo(ctx context.Context) (map[uint64]*pb.NodeInfo, error) {
 	
 	err := errors.New("can not find connection to stream manager")
@@ -283,6 +244,7 @@ func (client *SMClient) NodesInfo(ctx context.Context) (map[uint64]*pb.NodeInfo,
 	return nodeInfos, err
 }
 
+
 func (client *SMClient) ExtentInfo(ctx context.Context, extentIDs []uint64) (map[uint64]*pb.ExtentInfo, error) {
 	
 	err := errors.New("can not find connection to stream manager")
@@ -312,6 +274,9 @@ func (client *SMClient) ExtentInfo(ctx context.Context, extentIDs []uint64) (map
 
 	return extentInfos, err
 }
+
+
+
 
 func (client *SMClient) StreamInfo(ctx context.Context, streamIDs []uint64) (map[uint64]*pb.StreamInfo, map[uint64]*pb.ExtentInfo, error) {
 	

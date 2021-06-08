@@ -8,7 +8,6 @@ import (
 
 	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/manager"
-	"github.com/journeymidnight/autumn/manager/partitionmanager"
 	"github.com/journeymidnight/autumn/manager/stream_manager"
 	"google.golang.org/grpc"
 
@@ -26,7 +25,6 @@ func main() {
 		xlog.Logger.Fatal(err)
 	}
 
-
 	etcd, client, err := etcd_utils.ServeETCD(cfg)
 	if err != nil {
 		panic(err.Error())
@@ -35,16 +33,12 @@ func main() {
 	sm := stream_manager.NewStreamManager(etcd, client, config)
 	go sm.LeaderLoop()
 
-	pm := partitionmanager.NewPartitionManager(etcd, client, config)
-	go pm.LeaderLoop()
-
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(8<<20),
 		grpc.MaxSendMsgSize(8<<20),
 		grpc.MaxConcurrentStreams(1000),
 	)
 
-	pm.RegisterGRPC(grpcServer)
 	sm.RegisterGRPC(grpcServer)
 
 	/*
@@ -78,7 +72,6 @@ func main() {
 			xlog.Logger.Fatal(err)
 		case <-sc:
 			sm.Close()
-			pm.Close()
 			etcd.Close()
 			return
 		}

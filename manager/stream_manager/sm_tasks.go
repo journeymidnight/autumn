@@ -11,7 +11,6 @@ import (
 	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
-	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
 )
@@ -191,7 +190,7 @@ func (sm *StreamManager) saveRecoveryTask(task *pb.RecoveryTask) error{
 
 //non-block
 //FIXME: if task is running, do not submit it again
-func (sm *StreamManager) dispatchRecoveryTask(extentID, replaceID uint64) error {
+func (sm *StreamManager) dispatchRecoveryTask(extentID, replaceID uint64, eversion uint64) error {
 
 	//duplicate?
 	if sm.taskPool.HasTask(extentID) {
@@ -227,6 +226,7 @@ func (sm *StreamManager) dispatchRecoveryTask(extentID, replaceID uint64) error 
 		ExtentID: extentID,
 		ReplaceID: replaceID,
 		NodeID: chosenNode.NodeID,
+		Eversion: eversion,
 	}
 	res, err := c.RequireRecovery(ctx, &pb.RequireRecoveryRequest{
 			Task: task})
@@ -274,7 +274,7 @@ func (sm *StreamManager) routineDispatchTask() {
 						ns := sm.getNodeStatus(nodeID)
 						if (ns == nil || ns.Dead()) && extent.SealedLength > 0{
 							go func() {
-								sm.dispatchRecoveryTask(extent.ExtentID, nodeID)
+								sm.dispatchRecoveryTask(extent.ExtentID, nodeID, extent.Eversion)
 							}()
 						}
 					}
@@ -283,7 +283,7 @@ func (sm *StreamManager) routineDispatchTask() {
 						ns := sm.getNodeStatus(nodeID)
 						if (ns == nil || ns.Dead()) && extent.SealedLength > 0 {
 							go func() {
-								sm.dispatchRecoveryTask(extent.ExtentID, nodeID)
+								sm.dispatchRecoveryTask(extent.ExtentID, nodeID, extent.Eversion)
 							}()
 						}
 					}
@@ -296,14 +296,19 @@ func (sm *StreamManager) routineDispatchTask() {
 //node service,
 //producer
 func (sm *StreamManager) SubmitRecoveryTask(ctx context.Context, req *pb.SubmitRecoveryTaskRequest) (*pb.SubmitRecoveryTaskResponse, error) {
+	/*
 	errDone := func(err error) (*pb.SubmitRecoveryTaskResponse, error){
 		code, desCode := wire_errors.ConvertToPBCode(err)
 		return &pb.SubmitRecoveryTaskResponse{
 			Code: code,
 			CodeDes: desCode,
 		}, nil
-	}
+		}*/
+		
 
+	return nil, errors.New("not implemented")
+
+	/*
 	if !sm.AmLeader() {
 		return errDone(wire_errors.NotLeader)
 	}
@@ -315,6 +320,7 @@ func (sm *StreamManager) SubmitRecoveryTask(ctx context.Context, req *pb.SubmitR
 	return &pb.SubmitRecoveryTaskResponse{
 		Code: pb.Code_OK,
 	}, nil
+	*/
 }
 
 
