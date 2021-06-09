@@ -6,7 +6,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/journeymidnight/autumn/manager/pmclient"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/range_partition/skiplist"
 	"github.com/journeymidnight/autumn/streamclient"
@@ -90,9 +89,9 @@ func runRPTest(t *testing.T, test func(t *testing.T, rp *RangePartition)) {
 
 	defer logStream.Close()
 	defer rowStream.Close()
-	pmclient := new(pmclient.MockPMClient)
+	var server streamclient.MockEtcd
 	rp := OpenRangePartition(3, rowStream, logStream, logStream.(streamclient.BlockReader),
-		[]byte(""), []byte(""), nil, nil, pmclient, streamclient.OpenMockStreamClient, TestOption())
+		[]byte(""), []byte(""), nil, nil, server.SetRowStreamTables, streamclient.OpenMockStreamClient, TestOption())
 	defer func() {
 		require.NoError(t, rp.Close())
 	}()
@@ -161,9 +160,10 @@ func TestReopenRangePartition(t *testing.T) {
 
 	defer logStream.Close()
 	defer rowStream.Close()
-	pmclient := new(pmclient.MockPMClient)
+	var server streamclient.MockEtcd
+
 	rp := OpenRangePartition(3, rowStream, logStream, logStream.(streamclient.BlockReader),
-		[]byte(""), []byte(""), nil, nil, pmclient, streamclient.OpenMockStreamClient, TestOption())
+		[]byte(""), []byte(""), nil, nil, server.SetRowStreamTables, streamclient.OpenMockStreamClient, TestOption())
 
 	var wg sync.WaitGroup
 	for i := 10; i < 100; i++ {
@@ -177,7 +177,7 @@ func TestReopenRangePartition(t *testing.T) {
 
 	//reopen with tables
 	rp = OpenRangePartition(3, rowStream, logStream, logStream.(streamclient.BlockReader),
-		[]byte(""), []byte(""), pmclient.Tables, nil, pmclient, streamclient.OpenMockStreamClient, TestOption())
+		[]byte(""), []byte(""), server.Tables, nil, server.SetRowStreamTables, streamclient.OpenMockStreamClient, TestOption())
 
 	for i := 10; i < 100; i++ {
 		v, err := rp.Get([]byte(fmt.Sprintf("key%d", i)), 300)
@@ -198,9 +198,10 @@ func TestReopenRangePartitionWithBig(t *testing.T) {
 
 	defer logStream.Close()
 	defer rowStream.Close()
-	pmclient := new(pmclient.MockPMClient)
+	var server streamclient.MockEtcd
+
 	rp := OpenRangePartition(3, rowStream, logStream, logStream.(streamclient.BlockReader),
-		[]byte(""), []byte(""), nil, nil, pmclient, streamclient.OpenMockStreamClient, TestOption())
+		[]byte(""), []byte(""), nil, nil, server.SetRowStreamTables, streamclient.OpenMockStreamClient, TestOption())
 
 	var expectedValue [][]byte
 	var wg sync.WaitGroup
@@ -217,9 +218,10 @@ func TestReopenRangePartitionWithBig(t *testing.T) {
 	wg.Wait()
 	rp.close(false)
 
+
 	//reopen with tables
 	rp = OpenRangePartition(3, rowStream, logStream, logStream.(streamclient.BlockReader),
-		[]byte(""), []byte(""), pmclient.Tables, nil, pmclient, streamclient.OpenMockStreamClient, TestOption())
+		[]byte(""), []byte(""), server.Tables, nil, server.SetRowStreamTables, streamclient.OpenMockStreamClient, TestOption())
 
 	for i := 10; i < 100; i++ {
 		v, err := rp.Get([]byte(fmt.Sprintf("key%d", i)), 300)

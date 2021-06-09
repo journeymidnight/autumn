@@ -161,7 +161,6 @@ ETCD存储结构in PM(Partition Manager)
 
 ```
 
-
 PART/{PartID} => {id, id <startKey, endKEY>} //immutable
 
 PARTSTATS/{PartID}/tables => [(extentID,offset),...,(extentID,offset)]
@@ -321,3 +320,6 @@ read V
 write V45
 除了seqNum, 还有增加rotateNum, 
 目前认为memtable有序, 之后的所有读, 只能读出V45
+
+
+增加poll extent状态的部分

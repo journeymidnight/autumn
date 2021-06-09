@@ -193,7 +193,7 @@ func benchmark(etcdAddr []string, smAddr []string, op BenchType, duration int, s
 		return err
 	}
 
-	em := smclient.NewExtentManager(sm, etcdAddr, func(eventType string, cur *pb.ExtentInfo, prev *pb.ExtentInfo){
+	em := smclient.NewExtentManager(sm, etcdAddr, func(eventType string, cur *pb.ExtentInfo, prev *pb.ExtentInfo) {
 		//fmt.Printf("updates: %s: %+v from %+v\n", eventType, cur, prev)
 	})
 	defer em.Close()

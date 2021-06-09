@@ -11,7 +11,6 @@ import (
 	"unsafe"
 
 	"github.com/dgryski/go-farm"
-	"github.com/journeymidnight/autumn/manager/pmclient"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/range_partition/skiplist"
@@ -35,6 +34,7 @@ var (
 )
 
 type OpenStreamFunc func(si pb.StreamInfo) streamclient.StreamClient
+type SetRowStreamTableFunc func(id uint64, tables []*pspb.Location) error
 
 type RangePartition struct {
 	discard *discardManager
@@ -63,12 +63,15 @@ type RangePartition struct {
 	PartID   uint64
 	StartKey []byte
 	EndKey   []byte
-	pmClient pmclient.PMClient
 
 	closeOnce  sync.Once    // For closing DB only once.
 	vhead      valuePointer //vhead前的都在mt中
-	openStream OpenStreamFunc
+			 
 	opt        *Option
+
+	//functions
+	openStream OpenStreamFunc
+	setLocs    SetRowStreamTableFunc
 }
 
 //TODO
@@ -77,7 +80,7 @@ type RangePartition struct {
 func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	logStream streamclient.StreamClient, blockReader streamclient.BlockReader,
 	startKey []byte, endKey []byte, tableLocs []*pspb.Location, blobStreams []uint64,
-	pmclient pmclient.PMClient,
+	setlocs SetRowStreamTableFunc,
 	openStream OpenStreamFunc, opts... OptionFunc,
 ) *RangePartition {
 
@@ -97,9 +100,9 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		blockWrites: 0,
 		StartKey:    startKey,
 		EndKey:      endKey,
-		pmClient:    pmclient,
 		PartID:      id,
 		openStream:  openStream,
+		setLocs: setlocs,
 		opt:opt,
 	}
 	rp.startMemoryFlush()
@@ -373,7 +376,7 @@ func (rp *RangePartition) updateTableLocs(tableLocs []*pspb.Location) {
 		return
 	}
 	for {
-		err := rp.pmClient.SetRowStreamTables(rp.PartID, tableLocs)
+		err := rp.setLocs(rp.PartID, tableLocs) //rp.pmClient.SetRowStreamTables(rp.PartID, tableLocs)
 		if err != nil {
 			xlog.Logger.Errorf("failed to set tableLocs for %d, retry...", rp.PartID)
 			time.Sleep(100 * time.Millisecond)
