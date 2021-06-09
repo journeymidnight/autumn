@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/journeymidnight/autumn/manager/pmclient"
 	"github.com/journeymidnight/autumn/range_partition/table"
 	"github.com/journeymidnight/autumn/streamclient"
 )
@@ -14,13 +13,13 @@ import (
 func TestCompaction(t *testing.T) {
 	logStream := streamclient.NewMockStreamClient("log")
 	rowStream := streamclient.NewMockStreamClient("sst")
-	pmclient := new(pmclient.MockPMClient)
 
 	defer logStream.Close()
 	defer rowStream.Close()
-
+	
+	var server streamclient.MockEtcd
 	rp := OpenRangePartition(3, rowStream, logStream, logStream.(streamclient.BlockReader),
-		[]byte(""), []byte(""), nil, nil, pmclient, streamclient.OpenMockStreamClient, TestOption())
+		[]byte(""), []byte(""), nil, nil, server.SetRowStreamTables, streamclient.OpenMockStreamClient, TestOption())
 	defer rp.Close()
 
 	var wg sync.WaitGroup

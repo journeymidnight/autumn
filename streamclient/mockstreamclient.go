@@ -9,6 +9,7 @@ import (
 
 	"github.com/journeymidnight/autumn/extent"
 	"github.com/journeymidnight/autumn/proto/pb"
+	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/pkg/errors"
@@ -111,19 +112,20 @@ func (client *MockStreamClient) Truncate(ctx context.Context, extentID uint64) (
 
 //block API, entries has been batched
 func (client *MockStreamClient) AppendEntries(ctx context.Context, entries []*pb.EntryInfo) (uint64, uint32, error) {
-	blocks := make([]*pb.Block,0, len(entries))
+	blocks := make([]*pb.Block, 0, len(entries))
 
-    for _, entry := range entries {
-        data := utils.MustMarshal(entry.Log)
-        blocks = append(blocks,  &pb.Block{
-                       data,
-        })}
-    extentID, offsets, tail, err := client.Append(ctx, blocks)
+	for _, entry := range entries {
+		data := utils.MustMarshal(entry.Log)
+		blocks = append(blocks, &pb.Block{
+			data,
+		})
+	}
+	extentID, offsets, tail, err := client.Append(ctx, blocks)
 	for i := range entries {
 		entries[i].ExtentID = extentID
 		entries[i].Offset = offsets[i]
 	}
-    return extentID, tail, err
+	return extentID, tail, err
 }
 
 //block API
@@ -133,7 +135,7 @@ func (client *MockStreamClient) Append(ctx context.Context, blocks []*pb.Block) 
 	ex := client.exs[exIndex]
 
 	ex.Lock()
-	offsets,end, err := ex.AppendBlocks(blocks, true)
+	offsets, end, err := ex.AppendBlocks(blocks, true)
 	ex.Unlock()
 
 	if ex.CommitLength() > uint32(testThreshold) {
@@ -174,12 +176,12 @@ func (client *MockStreamClient) Read(ctx context.Context, extentID uint64, offse
 	}
 	client.RUnlock()
 	if ex == nil {
-		return nil,0, errors.New("extentID not good")
+		return nil, 0, errors.New("extentID not good")
 	}
 
-	blocks,_,end, err := ex.ReadBlocks(offset, numOfBlocks, (32 << 20))
-	if err == wire_errors.EndOfExtent || err ==  wire_errors.EndOfStream {
-		return blocks,end, io.EOF
+	blocks, _, end, err := ex.ReadBlocks(offset, numOfBlocks, (32 << 20))
+	if err == wire_errors.EndOfExtent || err == wire_errors.EndOfStream {
+		return blocks, end, io.EOF
 	}
 	if err != nil {
 		return nil, 0, err
@@ -276,4 +278,13 @@ func (iter *MockLockEntryIter) Next() *pb.EntryInfo {
 	ret := iter.cache[0]
 	iter.cache = iter.cache[1:]
 	return ret
+}
+
+type MockEtcd struct {
+	Tables []*pspb.Location
+}
+
+func (c *MockEtcd) SetRowStreamTables(id uint64, tables []*pspb.Location) error {
+	c.Tables = tables
+	return nil
 }

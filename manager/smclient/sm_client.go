@@ -342,6 +342,7 @@ func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, ext
 }
 	
 
+/*
 func (client *SMClient) SubmitRecoveryTask(ctx context.Context, extentID uint64, replaceID uint64) error {
 	
 	err := errors.New("can not find connection to stream manager")
@@ -376,3 +377,4 @@ func (client *SMClient) SubmitRecoveryTask(ctx context.Context, extentID uint64,
 	return err
 
 }
+*/

@@ -24,13 +24,38 @@ message MixedLog {
 }
 
 
+
+
 /*
-PART_%d/range => [startKey, endKey]
-PART_%d/blobStreams => [id,...,id]
-PART_%d/logStream => id
-PART_%d/rowStream => id
-PART_%d/tables => [(extentID,offset),...,(extentID,offset)]
+
+PART/{PartID} => {id, id <startKey, endKEY>} //immutable
+
+PARTSTATS/{PartID}/tables => [(extentID,offset),...,(extentID,offset)]
+PARTSTATS/{PartID}/blobStreams => [id,...,id]
+PARTSTATS/{PartID}/discard => <DATA>
+
+
+PSSERVER/{PSID} => {PSDETAIL}
+
+修改为Partition到PS的映射
+regions/config => {
+	{part1,: ps3, region}, {part4: ps5, region}
+}
+
 */
+
+
+//<startKey, endKey, PartID, PSID, address>
+
+message RegionInfo {
+	Range rg = 1;
+	uint64 PartID = 2;
+	uint64 PSID = 3;
+}
+
+message Regions {
+	repeated RegionInfo regions = 1;
+}
 
 message Range {
 	bytes startKey = 1;
@@ -46,19 +71,14 @@ message BlobStreams {
 	repeated uint64 blob = 1;
 }
 
-
 message TableLocations {
 	repeated Location locs = 1;
 }
 
 
 message PartitionMeta {
-	BlobStreams blobs = 1;
 	uint64 logStream = 2;
 	uint64 rowStream = 3;
-	TableLocations locs = 4;
-	uint64 parent = 5;
-	bytes  discard = 6;
 	Range  rg = 7;
 	uint64 PartID = 8;
 }
@@ -68,14 +88,7 @@ message PartitionMeta {
 	string address = 2;
 }
 
-//<startKey, endKey, PartID, PSID, address>
 
-message RegionInfo {
-	Range rg = 1;
-	uint64 PartID = 2;
-	uint64 PSID = 3;
-	string addr = 4;
-}
 
 //BlockMeta will be marshaled into pb.Block.userdata
 message BlockMeta {

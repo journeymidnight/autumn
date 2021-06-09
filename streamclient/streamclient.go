@@ -344,7 +344,7 @@ func (sc *AutumnStreamClient) MustAllocNewExtent(oldExtentID uint64, dataShard, 
 	sc.streamInfo.ExtentIDs = append(sc.streamInfo.ExtentIDs, newExInfo.ExtentID)
 	sc.Unlock()
 
-	sc.em.WaitVersion(newExInfo.ExtentID, 1)
+	//sc.em.WaitVersion(newExInfo.ExtentID, 1)
 	xlog.Logger.Debugf("created new extent %d on stream %d", newExInfo.ExtentID, sc.streamID)
 	return nil
 }
