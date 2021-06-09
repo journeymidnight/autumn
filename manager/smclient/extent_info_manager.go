@@ -35,6 +35,7 @@ type extentInfoUpdatedFunc func(eventType string, cur *pb.ExtentInfo, prev *pb.E
 type nodesInfoUpdatedFunc func(event *clientv3.Event)
 
 
+
 func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate extentInfoUpdatedFunc) *ExtentManager {
 
 	client, err := clientv3.New(clientv3.Config{
@@ -181,7 +182,6 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 		stopper.Close()
 		close1()
 		close2()
-		client.Close()
 	}
 
 	em.closeEtcdResource = close
@@ -189,6 +189,10 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 	return em	
 }
 
+
+func (em *ExtentManager) EtcdClient() *clientv3.Client {
+	return em.client
+}
 
 func (em *ExtentManager) Close() {
 	em.closeEtcdResource()

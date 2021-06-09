@@ -290,7 +290,7 @@ func (en *ExtentNode) CopyExtent(req *pb.CopyExtentRequest, stream pb.ExtentServ
 		return errDone(errors.New("no such extentID"), stream)
 	}
 
-	extentInfo := en.em.GetExtentInfo(req.ExtentID)
+	extentInfo := en.em.Update(req.ExtentID)
 	if extentInfo == nil {
 		return errDone(errors.New("no such extentInfo"), stream)
 	}
@@ -300,9 +300,11 @@ func (en *ExtentNode) CopyExtent(req *pb.CopyExtentRequest, stream pb.ExtentServ
 			extent.Seal(uint32(extentInfo.SealedLength))
 		} else {
 			//find local node's data should be recoveried
+			/*
 			ctx, cancel := context.WithTimeout(context.Background(), 5 * time.Second)
 			en.smClient.SubmitRecoveryTask(ctx, extent.ID, en.nodeID)
 			cancel()
+			*/
 			return errDone(errors.Errorf("extent %d on node %d is not complete", req.ExtentID, en.nodeID), stream)
 		}
 	} else if extent.CommitLength() != uint32(extentInfo.SealedLength){
