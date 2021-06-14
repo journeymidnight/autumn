@@ -51,6 +51,7 @@ type Extent struct {
 	file         *os.File
 	//FIXME: add SSD Chanel
 	writer *record.LogWriter
+	lastRevision int64
 }
 
 //format to JSON
@@ -199,6 +200,7 @@ func OpenExtent(fileName string) (*Extent, error) {
 		fileName:     fileName,
 		file:         f,
 		ID:           eh.ID,
+		lastRevision: 0,
 	}
 	ex.resetWriter()
 	return ex, nil
@@ -282,6 +284,17 @@ func (ex *Extent) Close() {
 		ex.writer.Close()
 	}
 	ex.file.Close()
+}
+
+
+func (ex *Extent) HasLock(revision int64) bool {
+	if ex.lastRevision == revision {
+		return true
+	} else if ex.lastRevision < revision {
+		ex.lastRevision = revision
+		return true
+	}
+	return false
 }
 
 func (ex *Extent) resetWriter() error {

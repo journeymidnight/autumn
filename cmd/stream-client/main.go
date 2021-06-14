@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/coreos/etcd/clientv3/concurrency"
 	"github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/streamclient"
@@ -19,6 +20,7 @@ import (
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
 	"github.com/urfave/cli/v2"
+
 	"go.uber.org/zap/zapcore"
 )
 
@@ -198,7 +200,17 @@ func benchmark(etcdAddr []string, smAddr []string, op BenchType, duration int, s
 	})
 	defer em.Close()
 
-	sc := streamclient.NewStreamClient(sm, em, s.StreamID)
+	session , err := concurrency.NewSession(em.EtcdClient(), concurrency.WithTTL(30))
+	if err != nil {
+		panic(err.Error())
+	}
+	defer session.Close()
+
+	mutex := concurrency.NewMutex(session, "lockCouldHaveAnyName")
+	mutex.Lock(context.Background())
+	defer mutex.Unlock(context.Background())
+
+	sc := streamclient.NewStreamClient(sm, em, s.StreamID, streamclient.MutexToLock(mutex))
 	if err = sc.Connect(); err != nil {
 		return err
 	}

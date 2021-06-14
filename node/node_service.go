@@ -56,6 +56,7 @@ func (en *ExtentNode) Heartbeat(in *pb.Payload, stream pb.ExtentService_Heartbea
 	}
 }
 
+
 func (en *ExtentNode) ReplicateBlocks(ctx context.Context, req *pb.ReplicateBlocksRequest) (*pb.ReplicateBlocksResponse, error) {
 
 	ex := en.getExtent((req.ExtentID))
@@ -64,6 +65,11 @@ func (en *ExtentNode) ReplicateBlocks(ctx context.Context, req *pb.ReplicateBloc
 	}
 	ex.Lock()
 	defer ex.Unlock()
+
+	if ex.HasLock(req.Revision) == false {
+		return nil, errors.Errorf("lock by others")
+	}
+
 	if ex.CommitLength() != req.Commit {
 		return nil, errors.Errorf("primary commitlength is different with replicates %d vs %d", req.Commit, ex.CommitLength())
 	}
@@ -133,6 +139,10 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 
 	ex.Lock()
 	defer ex.Unlock()
+
+	if ex.HasLock(req.Revision) == false {
+		return errDone(wire_errors.LockedByOther)
+	}
 
 	//extentInfo.Replicates : list of extent node'ID
 	//extentInfo.Parity:
@@ -462,6 +472,13 @@ func (en *ExtentNode) Seal(ctx context.Context, req *pb.SealRequest) (*pb.SealRe
 	if ex == nil {
 		return nil, errors.Errorf("do not have extent %d, can not alloc new", req.ExtentID)
 	}
+	ex.Lock()
+	defer ex.Unlock()
+
+	if ex.HasLock(req.Revision) == false {
+		return nil, errors.Errorf("lock by others")
+	}
+	
 	err := ex.Seal(req.CommitLength)
 	if err != nil {
 		xlog.Logger.Warnf(err.Error())

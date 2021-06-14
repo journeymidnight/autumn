@@ -51,7 +51,7 @@ streams/6
 //receiveData from ETCD
 func receiveData(client *clientv3.Client) []KV {
 	var data []KV
-	kvs, err := etcd_utils.EtcdRange(client, "")
+	kvs,_, err := etcd_utils.EtcdRange(client, "")
 	if err != nil {
 		panic(err)
 	}
@@ -116,6 +116,7 @@ func receiveData(client *clientv3.Client) []KV {
 			}
 			data = append(data, d)
 		} else {
+			fmt.Printf("%s\n", kv.Key)
 			continue
 			//panic("unkown key...")
 		}

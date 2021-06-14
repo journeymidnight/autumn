@@ -54,7 +54,7 @@ message RegionInfo {
 }
 
 message Regions {
-	repeated RegionInfo regions = 1;
+	map<uint64, RegionInfo> regions = 1;
 }
 
 message Range {
@@ -87,8 +87,6 @@ message PartitionMeta {
 	uint64 PSID = 1;
 	string address = 2;
 }
-
-
 
 //BlockMeta will be marshaled into pb.Block.userdata
 message BlockMeta {
@@ -136,17 +134,26 @@ message SetRowStreamTablesResponse {
 message BootstrapRequest {
 	uint64 logID = 1;
 	uint64 rowID = 2;
-	uint64 parent = 3; //PSID
 }
 
 message BootstrapResponse {
 	uint64 partID = 1;
+	string codeDes = 2;
+	pb.Code code = 3;
 }
 
-service PartitionManagerService {
-	rpc SetRowStreamTables(SetRowStreamTablesRequest) returns (SetRowStreamTablesResponse) {}
-	
+message AllocPSIDRequest {
+}
+
+message AllocPSIDResponse {
+	uint64 PSID = 1;
+	pb.Code code = 2;
+	string codeDes = 3;
+}
+
+service PartitionManagerService {	
 	rpc Bootstrap(BootstrapRequest) returns (BootstrapResponse) {}
+	rpc AllocPSID(AllocPSIDRequest) returns (AllocPSIDResponse) {}
 }
 
 

@@ -206,7 +206,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 			return errDone(errors.New("seal can not get Commitlength"))
 		}
 
-		sm.sealExtents(ctx, nodes, req.ExtentToSeal, size)
+		sm.sealExtents(ctx, nodes, req.ExtentToSeal, size, req.Revision)
 		//save sealed info and update version number to etcd and update local-cache
 		
 		//sealedExtentInfo := proto.Clone(lastExtentInfo).(*pb.ExtentInfo)
@@ -221,6 +221,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		}
 		err = etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
 			clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
+			clientv3.Compare(clientv3.CreateRevision(req.OwnerKey), "=", req.Revision),
 		}, ops)
 	
 		if err != nil {
@@ -297,7 +298,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 }
 
 //sealExtents could be all failed.
-func (sm *StreamManager) sealExtents(ctx context.Context, nodes []*NodeStatus, extentID uint64, commitLength uint32) {
+func (sm *StreamManager) sealExtents(ctx context.Context, nodes []*NodeStatus, extentID uint64, commitLength uint32, revision int64) {
 	stopper := utils.NewStopper()
 	for _, node := range nodes {
 		addr := node.Address
@@ -312,6 +313,7 @@ func (sm *StreamManager) sealExtents(ctx context.Context, nodes []*NodeStatus, e
 			_, err := c.Seal(pctx, &pb.SealRequest{
 				ExtentID:     extentID,
 				CommitLength: commitLength,
+				Revision: revision,
 			})
 			cancel()
 			if err != nil { //timeout or other error

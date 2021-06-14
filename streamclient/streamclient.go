@@ -7,11 +7,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/coreos/etcd/clientv3/concurrency"
 	"github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -124,24 +126,37 @@ func WithReadFrom(extentID uint64, offset uint32) ReadOption {
 	}
 }
 
+type StreamLock struct {
+	revision int64
+	ownerKey  string
+}
+
+func MutexToLock(mutex *concurrency.Mutex) StreamLock {
+	return StreamLock{
+		revision: mutex.Header().Revision,
+		ownerKey: mutex.Key(),
+	}
+}
+
 //for single stream
 type AutumnStreamClient struct {
 	StreamClient
 	smClient     *smclient.SMClient
 	sync.RWMutex //protect streamInfo/extentInfo when called in read/write
 	streamInfo   *pb.StreamInfo
-	//FIXME: move extentInfo output StreamClient
-	//extentInfo  map[uint64]*pb.ExtentInfo
+
 	em       *smclient.ExtentManager
 	streamID uint64
+	streamLock StreamLock
 }
 
-func NewStreamClient(sm *smclient.SMClient, em *smclient.ExtentManager, streamID uint64) *AutumnStreamClient {
+func NewStreamClient(sm *smclient.SMClient, em *smclient.ExtentManager, streamID uint64, streamLock StreamLock) *AutumnStreamClient {
 	utils.AssertTrue(xlog.Logger != nil)
 	return &AutumnStreamClient{
 		smClient: sm,
 		em:       em,
 		streamID: streamID,
+		streamLock: streamLock,
 	}
 }
 
@@ -326,11 +341,13 @@ func (sc *AutumnStreamClient) getLastExtentConn() (uint64, *grpc.ClientConn, err
 	return extentID, conn, nil
 }
 
+
 func (sc *AutumnStreamClient) MustAllocNewExtent(oldExtentID uint64, dataShard, parityShard uint32) error{
 	var newExInfo *pb.ExtentInfo
 	var err error
 	for i := 0 ; i < 10 ; i ++{
-		newExInfo, err = sc.smClient.StreamAllocExtent(context.Background(), sc.streamID, oldExtentID, dataShard, parityShard)
+		newExInfo, err = sc.smClient.StreamAllocExtent(context.Background(), sc.streamID, 
+		oldExtentID, dataShard, parityShard, sc.streamLock.ownerKey, sc.streamLock.revision)
 		if err == nil {
 			break
 		}
@@ -419,6 +436,7 @@ retry:
 		ExtentID: extentID,
 		Blocks:   blocks,
 		Eversion: exInfo.Eversion,
+		Revision: sc.streamLock.revision,
 	})
 	cancel()
 

@@ -8,6 +8,7 @@ import (
 
 	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/manager"
+	"github.com/journeymidnight/autumn/manager/partitionmanager"
 	"github.com/journeymidnight/autumn/manager/stream_manager"
 	"google.golang.org/grpc"
 
@@ -41,6 +42,11 @@ func main() {
 
 	sm.RegisterGRPC(grpcServer)
 
+	pm := partitionmanager.NewPartitionManager(etcd, client, config)
+	go pm.LeaderLoop()
+
+	pm.RegisterGRPC(grpcServer)
+
 	/*
 		if err = pm.ServeGRPC(grpc); err != nil {
 			xlog.Logger.Fatalf(err.Error())
@@ -72,6 +78,7 @@ func main() {
 			xlog.Logger.Fatal(err)
 		case <-sc:
 			sm.Close()
+			pm.Close()
 			etcd.Close()
 			return
 		}

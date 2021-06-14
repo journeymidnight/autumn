@@ -13,18 +13,26 @@ import (
 
 
 
+
 func EtcdWatchEvents(c *clientv3.Client, start, end string, startRev int64) (clientv3.WatchChan, func()) {
 	watcher := clientv3.NewWatcher(c)
 
-	rch := watcher.Watch(context.Background(), start, 
-	clientv3.WithRange(end), 
-	clientv3.WithPrevKV(),
-	clientv3.WithRev(startRev))
+	var rch clientv3.WatchChan
+	if len(end) > 0 {
+		rch = watcher.Watch(context.Background(), start, 
+		clientv3.WithRange(end), 
+		clientv3.WithPrevKV(),
+		clientv3.WithRev(startRev))
+	} else {
+		rch = watcher.Watch(context.Background(), start, 
+		clientv3.WithPrevKV(),
+		clientv3.WithRev(startRev))
+
+	}
 
 	return rch, func(){
 		watcher.Close()
 	}
-
 }
 
 func EtcdSetKV(c *clientv3.Client, key string, val []byte, opts ...clientv3.OpOption) error {
@@ -47,17 +55,18 @@ func EtcdSetKVS(c *clientv3.Client, cmps []clientv3.Cmp, ops []clientv3.Op) erro
 	return nil
 }
 
-func EtcdGetKV(c *clientv3.Client, key string, opts ...clientv3.OpOption) ([]byte, error) {
+func EtcdGetKV(c *clientv3.Client, key string, opts ...clientv3.OpOption) ([]byte, int64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	resp, err := clientv3.NewKV(c).Get(ctx, key, opts...)
 	if err != nil {
-		return nil, err
+		return nil, 0,  err
 	}
 	if resp == nil || len(resp.Kvs) == 0 {
-		return nil, nil
+		return nil, 0, nil
 	}
-	return resp.Kvs[0].Value, nil
+	
+	return resp.Kvs[0].Value,resp.Header.Revision, nil
 }
 
 //EtcdRange return (KeyValue, Revision, error)
@@ -79,7 +88,7 @@ func EtcdRange(c *clientv3.Client, prefix string) ([]*mvccpb.KeyValue, int64, er
 
 func EtcdAllocUniqID(c *clientv3.Client, idKey string, count uint64) (uint64, uint64, error) {
 
-	curValue, err := EtcdGetKV(c, idKey)
+	curValue, _, err := EtcdGetKV(c, idKey)
 	if err != nil {
 		return 0, 0, err
 	}
