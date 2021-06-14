@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coreos/etcd/clientv3/concurrency"
 	"github.com/coreos/etcd/embed"
 	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/manager"
@@ -39,9 +40,11 @@ type ExtentNodeTestSuite struct {
 	sm       *stream_manager.StreamManager
 	smServer *grpc.Server
 	etcd     *embed.Etcd
+	mutex    *concurrency.Mutex
+	session  *concurrency.Session
 }
 
-func setupStreamManager(ent *ExtentNodeTestSuite, dir string) {
+func setupStreamManager(suite *ExtentNodeTestSuite, dir string) {
 	var config = &manager.Config{
 		Name:                "sm1",
 		Dir:                 fmt.Sprintf("%s/sm1.db", dir),
@@ -68,6 +71,10 @@ func setupStreamManager(ent *ExtentNodeTestSuite, dir string) {
 	sm := stream_manager.NewStreamManager(etcd, client, config)
 	go sm.LeaderLoop()
 
+
+
+
+
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(64<<20),
 		grpc.MaxSendMsgSize(64<<20),
@@ -85,9 +92,9 @@ func setupStreamManager(ent *ExtentNodeTestSuite, dir string) {
 		}
 	}()
 
-	ent.sm = sm
-	ent.smServer = grpcServer
-	ent.etcd = etcd
+	suite.sm = sm
+	suite.smServer = grpcServer
+	suite.etcd = etcd
 	time.Sleep(17 * time.Second) //wait to be leader
 
 	smc := smclient.NewSMClient([]string{"127.0.0.1:3401"})
@@ -103,6 +110,14 @@ func setupStreamManager(ent *ExtentNodeTestSuite, dir string) {
 		}
 	}
 
+	session , err := concurrency.NewSession(client, concurrency.WithTTL(30))
+	if err != nil {
+		panic(err.Error())
+	}
+	suite.session = session
+
+	suite.mutex = concurrency.NewMutex(session, "lockCouldHaveAnyName")
+
 }
 
 func (suite *ExtentNodeTestSuite) SetupSuite() {
@@ -114,6 +129,7 @@ func (suite *ExtentNodeTestSuite) SetupSuite() {
 		panic(err)
 	}
 	setupStreamManager(suite, tmpdir)
+
 
 	//start node
 	for i := 1; i <= 4; i++ {
@@ -170,7 +186,9 @@ func (suite *ExtentNodeTestSuite) TestAppendReadValue() {
 		fmt.Printf("updates: %s: %+v from %+v\n", eventType, cur, prev)
 	})
 
-	sc := streamclient.NewStreamClient(sm, em, si.StreamID)
+	suite.mutex.Lock(context.Background())
+	defer suite.mutex.Unlock(context.Background())
+	sc := streamclient.NewStreamClient(sm, em, si.StreamID, streamclient.MutexToLock(suite.mutex))
 	err = sc.Connect()
 	suite.Require().Nil(err)
 	extentID, offsets, _, err := sc.Append(context.Background(),
@@ -207,7 +225,11 @@ func (suite *ExtentNodeTestSuite) TestCopy() {
 		fmt.Printf("%s: %+v from %+v", eventType, cur, prev)
 	})
 
-	sc := streamclient.NewStreamClient(sm, em, si.StreamID)
+
+	suite.mutex.Lock(context.Background())
+	defer suite.mutex.Unlock(context.Background())
+	
+	sc := streamclient.NewStreamClient(sm, em, si.StreamID, streamclient.MutexToLock(suite.mutex))
 	err = sc.Connect()
 	suite.Require().Nil(err)
 	extentID, offsets, _, err := sc.Append(context.Background(),

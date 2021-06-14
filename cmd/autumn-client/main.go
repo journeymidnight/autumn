@@ -42,13 +42,13 @@ const (
 	WRITE_T           = "write"
 )
 
-func benchmark(pmAddrs []string, op BenchType, threadNum int, duration int, size int) error {
+func benchmark(etcdAddrs []string, op BenchType, threadNum int, duration int, size int) error {
 
-	pm := pmclient.NewAutumnPMClient(pmAddrs)
+	pm := pmclient.NewAutumnPMClient(etcdAddrs)
 	if err := pm.Connect(); err != nil {
 		return err
 	}
-	client := NewAutumnLib(pmAddrs)
+	client := NewAutumnLib(etcdAddrs)
 	//defer client.Close()
 
 	if err := client.Connect(); err != nil {
@@ -199,22 +199,15 @@ func benchmark(pmAddrs []string, op BenchType, threadNum int, duration int, size
 
 func bootstrap(c *cli.Context) error {
 	smAddrs := utils.SplitAndTrim(c.String("smAddr"), ",")
-	pmAddrs := utils.SplitAndTrim(c.String("pmAddr"), ",")
 
 	smc := smclient.NewSMClient(smAddrs)
 	if err := smc.Connect(); err != nil {
 		return err
 	}
 
-	pmc := pmclient.NewAutumnPMClient(pmAddrs)
+	pmc := pmclient.NewAutumnPMClient(smAddrs)
 	if err := pmc.Connect(); err != nil {
 		return err
-	}
-	fmt.Println("Bootstrap")
-	pss := pmc.GetPSInfo()
-
-	if len(pss) == 0 {
-		return errors.New("no Partition Servers...")
 	}
 	//choose the first one
 
@@ -227,17 +220,17 @@ func bootstrap(c *cli.Context) error {
 		return err
 	}
 
-	partID, err := pmc.Bootstrap(log.StreamID, row.StreamID, pss[0].PSID)
+	partID, err := pmc.Bootstrap(log.StreamID, row.StreamID)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("bootstrap succeed, created new range partition %d on %d\n", partID, pss[0].PSID)
+	fmt.Printf("bootstrap succeed, created new range partition %d on %d\n", partID)
 	return nil
 }
 
 func del(c *cli.Context) error {
-	pmAddr := utils.SplitAndTrim(c.String("pmAddr"), ",")
-	client := NewAutumnLib(pmAddr)
+	etcdAddr := utils.SplitAndTrim(c.String("etcdAddr"), ",")
+	client := NewAutumnLib(etcdAddr)
 	//defer client.Close()
 	if err := client.Connect(); err != nil {
 		return err
@@ -252,8 +245,8 @@ func del(c *cli.Context) error {
 }
 
 func get(c *cli.Context) error {
-	pmAddr := utils.SplitAndTrim(c.String("pmAddr"), ",")
-	client := NewAutumnLib(pmAddr)
+	etcdAddr := utils.SplitAndTrim(c.String("etcdAddr"), ",")
+	client := NewAutumnLib(etcdAddr)
 	//defer client.Close()
 
 	if err := client.Connect(); err != nil {
@@ -275,11 +268,11 @@ func get(c *cli.Context) error {
 }
 
 func autumnRange(c *cli.Context) error {
-	pmAddr := utils.SplitAndTrim(c.String("pmAddr"), ",")
-	if len(pmAddr) == 0 {
-		return errors.Errorf("pmAddr is nil")
+	etcdAddr := utils.SplitAndTrim(c.String("etcdAddr"), ",")
+	if len(etcdAddr) == 0 {
+		return errors.Errorf("etcdAddr is nil")
 	}
-	client := NewAutumnLib(pmAddr)
+	client := NewAutumnLib(etcdAddr)
 	//defer client.Close()
 
 	if err := client.Connect(); err != nil {
@@ -303,11 +296,11 @@ func autumnRange(c *cli.Context) error {
 
 //FIXME: grpc stream is better to send big values
 func put(c *cli.Context) error {
-	pmAddr := utils.SplitAndTrim(c.String("pmAddr"), ",")
-	if len(pmAddr) == 0 {
-		return errors.Errorf("pmAddr is nil")
+	etcdAddr := utils.SplitAndTrim(c.String("etcdAddr"), ",")
+	if len(etcdAddr) == 0 {
+		return errors.Errorf("etcdAddr is nil")
 	}
-	client := NewAutumnLib(pmAddr)
+	client := NewAutumnLib(etcdAddr)
 	//defer client.Close()
 
 	if err := client.Connect(); err != nil {
@@ -370,43 +363,42 @@ func main() {
 
 		{
 			Name:  "bootstrap",
-			Usage: "bootstrap --pmAddr <addrs> --smAddr <addrs>",
+			Usage: "bootstrap -smAddr <addrs>",
 			Flags: []cli.Flag{
 				&cli.StringFlag{Name: "smAddr", Value: "127.0.0.1:3401"},
-				&cli.StringFlag{Name: "pmAddr", Value: "127.0.0.1:3401"},
 			},
 			Action: bootstrap,
 		},
 
 		{
 			Name:  "put",
-			Usage: "put --pmAddr <addrs> <KEY> <FILE>",
+			Usage: "put --etcdAddr <addrs> <KEY> <FILE>",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "pmAddr", Value: "127.0.0.1:3401"},
+				&cli.StringFlag{Name: "etcdAddr", Value: "127.0.0.1:2379"},
 			},
 			Action: put,
 		},
 		{
 			Name:  "get",
-			Usage: "get --pmAddr <addrs> <KEY>",
+			Usage: "get --etcdAddr <addrs> <KEY>",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "pmAddr", Value: "127.0.0.1:3401"},
+				&cli.StringFlag{Name: "etcdAddr", Value: "127.0.0.1:2379"},
 			},
 			Action: get,
 		},
 		{
 			Name:  "del",
-			Usage: "del --pmAddr <addrs> <KEY>",
+			Usage: "del --etcdAddr <addrs> <KEY>",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "pmAddr", Value: "127.0.0.1:3401"},
+				&cli.StringFlag{Name: "etcdAddr", Value: "127.0.0.1:2379"},
 			},
 			Action: del,
 		},
 		{
 			Name:  "wbench",
-			Usage: "wbench --pmAddr <addrs> --thread <num> --duration <duration>",
+			Usage: "wbench --etcdAddr <addrs> --thread <num> --duration <duration>",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "pmAddr", Value: "127.0.0.1:3401"},
+				&cli.StringFlag{Name: "etcdAddr", Value: "127.0.0.1:2379"},
 				&cli.IntFlag{Name: "thread", Value: 4, Aliases: []string{"t"}},
 				&cli.IntFlag{Name: "duration", Value: 10, Aliases: []string{"d"}},
 				&cli.IntFlag{Name: "size", Value: 8192, Aliases: []string{"s"}},
@@ -420,9 +412,9 @@ func main() {
 		},
 		{
 			Name:  "ls",
-			Usage: "ls --pmAddr <addrs> <prefix>",
+			Usage: "ls --etcdAddr <addrs> <prefix>",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "pmAddr", Value: "127.0.0.1:3401"},
+				&cli.StringFlag{Name: "etcdAddr", Value: "127.0.0.1:2379"},
 			},
 			Action: autumnRange,
 		},
@@ -430,7 +422,7 @@ func main() {
 			Name: "format",
 			Usage: "format --walDir <dir> --listenUrl <addr> --smAddr <addrs> <dir list> ",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "smAddr", Value: "127.0.0.1:3401"},
+				&cli.StringFlag{Name: "etcdAddr", Value: "127.0.0.1:3401"},
 				&cli.StringFlag{Name: "listenUrl"},
 				&cli.StringFlag{Name: "walDir"},
 
@@ -537,11 +529,11 @@ func format(c *cli.Context) error {
 
 func wbench(c *cli.Context) error {
 	threadNum := c.Int("thread")
-	pmAddr := c.String("pmAddr")
+	etcdAddr := c.String("etcdAddr")
 	duration := c.Int("duration")
 	size := c.Int("size")
-	pmAddrs := utils.SplitAndTrim(pmAddr, ",")
-	return benchmark(pmAddrs, WRITE_T, threadNum, duration, size)
+	etcdAddrs := utils.SplitAndTrim(etcdAddr, ",")
+	return benchmark(etcdAddrs, WRITE_T, threadNum, duration, size)
 }
 
 func printSummary(elapsed time.Duration, totalCount uint64, totalSize uint64, threadNum int, size int) {

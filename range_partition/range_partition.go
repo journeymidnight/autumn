@@ -376,7 +376,7 @@ func (rp *RangePartition) updateTableLocs(tableLocs []*pspb.Location) {
 		return
 	}
 	for {
-		err := rp.setLocs(rp.PartID, tableLocs) //rp.pmClient.SetRowStreamTables(rp.PartID, tableLocs)
+		err := rp.setLocs(rp.PartID, tableLocs)
 		if err != nil {
 			xlog.Logger.Errorf("failed to set tableLocs for %d, retry...", rp.PartID)
 			time.Sleep(100 * time.Millisecond)

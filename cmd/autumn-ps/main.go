@@ -4,9 +4,10 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
-	"github.com/journeymidnight/autumn/partitionserver"
+	"github.com/journeymidnight/autumn/partition_server"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/urfave/cli/v2"
@@ -16,9 +17,9 @@ import (
 func main() {
 
 	var listen string
-	var dir string
+	var psID string
 	var smAddr string
-	var pmAddr string
+	var etcdAddr string
 
 	app := &cli.App{
 		HelpName: "",
@@ -30,9 +31,9 @@ func main() {
 				Required:    true,
 			},
 			&cli.StringFlag{
-				Name:        "dir",
-				Usage:       "dir",
-				Destination: &dir,
+				Name:        "psID",
+				Usage:       "psID",
+				Destination: &psID,
 				Required:    true,
 			},
 			&cli.StringFlag{
@@ -41,8 +42,8 @@ func main() {
 				Required:    true,
 			},
 			&cli.StringFlag{
-				Name:        "pmAddr",
-				Destination: &pmAddr,
+				Name:        "etcdAddr",
+				Destination: &etcdAddr,
 				Required:    true,
 			},
 		},
@@ -53,12 +54,13 @@ func main() {
 	}
 
 	smAddrs := utils.SplitAndTrim(smAddr, ",")
-	pmAddrs := utils.SplitAndTrim(pmAddr, ",")
+	etcdAddrs := utils.SplitAndTrim(etcdAddr, ",")
 	xlog.InitLog([]string{fmt.Sprintf("ps.log")}, zap.DebugLevel)
-
-	//FIXME: sm address
-	//
-	ps := partitionserver.NewPartitionServer(smAddrs, pmAddrs, dir, "127.0.0.1:9951")
+	id, err := strconv.ParseUint(psID, 10, 64)
+	if err != nil || id == 0 {
+		panic(fmt.Sprint("psid can not be zero"))
+	}
+	ps := partition_server.NewPartitionServer(smAddrs, etcdAddrs, id, listen)
 
 	ps.Init()
 

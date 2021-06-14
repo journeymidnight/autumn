@@ -112,7 +112,10 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 							xlog.Logger.Errorf("reflect: can not get pb.extentInfo")
 							continue
 						}
-						em.extentInfo[info.ExtentID] = &info
+						p := em.getExtentInfo(info.ExtentID)
+						if p ==nil || (p !=nil && info.Eversion > p.Eversion) {
+							em.extentInfo[info.ExtentID] = &info
+						}
 
 						var prevInfo *pb.ExtentInfo
 						if e.PrevKv != nil{
@@ -132,7 +135,11 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 							xlog.Logger.Errorf("reflect: can not get pb.NodeInfo")
 							continue
 						}
-						delete(em.extentInfo, info.ExtentID)
+						p := em.getExtentInfo(info.ExtentID)
+						if p != nil && info.Eversion >= p.Eversion {
+							delete(em.extentInfo, info.ExtentID)
+
+						}
 
 						var prevInfo pb.ExtentInfo
 						if err := prevInfo.Unmarshal(e.PrevKv.Value); err != nil {

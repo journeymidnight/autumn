@@ -11,11 +11,14 @@ var (
 	EndOfStream = errors.New("EndOfStream")
 	VersionLow = errors.New("version too low")
 	NotLeader = errors.New("not a leader")
+	LockedByOther = errors.New("LockedByOther")
 )
 
 
 func FromPBCode(code pb.Code, des string) error {
 	switch code {
+	case pb.Code_LockedByOther:
+		return LockedByOther
 	case pb.Code_EndOfExtent:
 		return EndOfExtent
 	case pb.Code_EndOfStream:
@@ -33,6 +36,8 @@ func FromPBCode(code pb.Code, des string) error {
 }
 func ConvertToPBCode(err error) (pb.Code, string) {
 	switch err {
+	case LockedByOther:
+		return pb.Code_LockedByOther, err.Error()
 	case EndOfExtent:
 		return pb.Code_EndOfExtent, err.Error()
 	case EndOfStream:
