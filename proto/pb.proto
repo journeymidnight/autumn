@@ -42,6 +42,7 @@ enum Code {
 	EndOfStream = 3;
 	EVersionLow = 4;
 	NotLEADER = 5;
+	LockedByOther = 6;
 }
 
 
@@ -54,6 +55,7 @@ message AppendRequest {
 	uint64 extentID = 1;
 	repeated Block blocks = 2;
 	uint64 eversion = 3;
+	int64  revision = 4;
 }
 
 message AppendResponse {
@@ -106,6 +108,7 @@ message CommitLengthResponse {
 message SealRequest {
 	uint64 extentID = 1;
 	uint32 commitLength = 2;
+	int64 revision = 3;
 }
 
 message SealResponse {
@@ -202,6 +205,7 @@ message ReplicateBlocksRequest {
 	uint64 extentID = 1;
 	uint32 commit = 2;
 	repeated Block blocks = 3;
+	int64 revision = 4;
 }
 
 message ReplicateBlocksResponse {
@@ -226,7 +230,8 @@ message StreamAllocExtentRequest{
 	uint64 extentToSeal = 2;
 	uint32 dataShard = 3;
 	uint32 parityShard =4;
-
+	string ownerKey = 5;
+	int64  revision = 6;
 }
 
 

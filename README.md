@@ -310,16 +310,19 @@ manager                  manager_service(df routine)
 						 更新extentInfo(内存)/删除recovies
 create task(etcd)       
 
+## stream lock
+stream增加stream lock, 在分布式环境保证同时只有一个writer
+写入包括:
+1. append
+2. seal/
+3. alloc new extent
+4. truncate
 
+1. append不经过manager, 所以需要用revision当方式, 当etcd得到某一个stream的锁以后, 生成
+的revision一定比之前的高
+2. seal虽然经过manager, 但是manager的方式中是先seal extent, 再修改etcd数据, 所以也需要
+检查revision和检查ownerkey, 如果检查revision成功, 检查ownerkey失败, 会在node留下extent垃圾
+3. alloc new extent需要在manager校验client是lock的owner
+4. truncate还没做
 
-目前rangepartiion, gc的bug
-GC           USER
-read V
-             write V1000
-			 MEMTABLE flushed
-write V45
-除了seqNum, 还有增加rotateNum, 
-目前认为memtable有序, 之后的所有读, 只能读出V45
-
-
-增加poll extent状态的部分
+stream lock也要有超时

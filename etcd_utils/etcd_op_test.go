@@ -58,7 +58,7 @@ func (suite *EtcdUtilTestSuite) TestSetGetKV() {
 		val := fmt.Sprintf("val%d", i)
 		EtcdSetKV(suite.client, key, []byte(val))
 	}
-	data, err := EtcdGetKV(suite.client, "key_50")
+	data, _, err := EtcdGetKV(suite.client, "key_50")
 	suite.Nil(err)
 	suite.Equal("val50", string(data))
 	
@@ -71,7 +71,7 @@ func (suite *EtcdUtilTestSuite) TestWatch() {
 			val := fmt.Sprintf("val%d", i)
 			EtcdSetKV(suite.client, key, []byte(val))
 		}
-		data, err := EtcdGetKV(suite.client, "key/50")
+		data,_, err := EtcdGetKV(suite.client, "key/50")
 		suite.Nil(err)
 		suite.Equal("val50", string(data))
 	}()

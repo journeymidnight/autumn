@@ -10,8 +10,7 @@ import (
 	"github.com/journeymidnight/autumn/range_partition"
 )
 
-//FIXME: inc and decr
-func (ps *PartitionServer) checkVersion(verison uint64, partID uint64, key []byte) *range_partition.RangePartition {
+func (ps *PartitionServer) checkVersion(partID uint64, key []byte) *range_partition.RangePartition {
 	ps.RLock()
 	rp := ps.rangePartitions[partID]
 	ps.RUnlock()
@@ -31,7 +30,7 @@ func (ps *PartitionServer) Batch(ctx context.Context, req *pspb.BatchRequest) (*
 }
 
 func (ps *PartitionServer) Put(ctx context.Context, req *pspb.PutRequest) (*pspb.PutResponse, error) {
-	rp := ps.checkVersion(req.Psversion, req.Partid, req.Key)
+	rp := ps.checkVersion(req.Partid, req.Key)
 	if rp == nil {
 		return nil, errors.New("no such partid")
 	}
@@ -44,7 +43,7 @@ func (ps *PartitionServer) Put(ctx context.Context, req *pspb.PutRequest) (*pspb
 
 func (ps *PartitionServer) Get(ctx context.Context, req *pspb.GetRequest) (*pspb.GetResponse, error) {
 
-	rp := ps.checkVersion(req.Psversion, req.Partid, req.Key)
+	rp := ps.checkVersion(req.Partid, req.Key)
 	if rp == nil {
 		return nil, errors.New("no such partid")
 	}
@@ -60,7 +59,7 @@ func (ps *PartitionServer) Get(ctx context.Context, req *pspb.GetRequest) (*pspb
 }
 
 func (ps *PartitionServer) Delete(ctx context.Context, req *pspb.DeleteRequest) (*pspb.DeleteResponse, error) {
-	rp := ps.checkVersion(req.Psversion, req.Partid, req.Key)
+	rp := ps.checkVersion(req.Partid, req.Key)
 	if rp == nil {
 		return nil, errors.New("no such partid")
 	}
@@ -76,7 +75,7 @@ func (ps *PartitionServer) Delete(ctx context.Context, req *pspb.DeleteRequest) 
 }
 
 func (ps *PartitionServer) Range(ctx context.Context, req *pspb.RangeRequest) (*pspb.RangeResponse, error) {
-	rp := ps.checkVersion(req.Psversion, req.Partid, req.Start)
+	rp := ps.checkVersion(req.Partid, req.Start)
 	if rp == nil {
 		return nil, errors.New("no such partid")
 	}
