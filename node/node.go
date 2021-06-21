@@ -197,13 +197,13 @@ func (en *ExtentNode) LoadExtents() error {
 	wg.Wait()
 
 	//read the wal, and replay writes to extents
-	replay := func(ID uint64, start uint32, data []*pb.Block) {
+	replay := func(ID uint64, start uint32, rev int64, data []*pb.Block) {
 		ex := en.getExtent(ID)
 		if ex == nil {
 			xlog.Logger.Warnf("extentID %d not exist", ID)
 			return
 		}
-		ex.RecoveryData(start, data)
+		ex.RecoveryData(start,rev, data)
 		//ex.CommitLength()
 	}
 
@@ -256,7 +256,7 @@ func (en *ExtentNode) ServeGRPC() error {
 }
 
 //AppendWithWal will write wal and extent in the same time.
-func (en *ExtentNode) AppendWithWal(ex *extent.Extent, blocks []*pb.Block) ([]uint32, uint32, error) {
+func (en *ExtentNode) AppendWithWal(ex *extent.Extent, rev int64, blocks []*pb.Block) ([]uint32, uint32, error) {
 
 	if en.wal == nil || utils.SizeOfBlocks(blocks) > (2<<20) {
 		//force sync write
@@ -273,7 +273,7 @@ func (en *ExtentNode) AppendWithWal(ex *extent.Extent, blocks []*pb.Block) ([]ui
 	var err error
 	go func() { //write wal
 		defer wg.Done()
-		err := en.wal.Write(ex.ID, start, blocks)
+		err := en.wal.Write(ex.ID, start, rev, blocks)
 		errC <- err
 	}()
 

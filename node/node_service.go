@@ -73,7 +73,7 @@ func (en *ExtentNode) ReplicateBlocks(ctx context.Context, req *pb.ReplicateBloc
 	if ex.CommitLength() != req.Commit {
 		return nil, errors.Errorf("primary commitlength is different with replicates %d vs %d", req.Commit, ex.CommitLength())
 	}
-	ret, end, err := en.AppendWithWal(ex, req.Blocks)
+	ret, end, err := en.AppendWithWal(ex, req.Revision, req.Blocks)
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +196,7 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 	//primary
 	stopper.RunWorker(func() {
 		//ret, err := ex.AppendBlocks(req.Blocks, &offset)
-		ret, end, err := en.AppendWithWal(ex, dataBlocks[0])
+		ret, end, err := en.AppendWithWal(ex, req.Revision, dataBlocks[0])
 
 		if ret != nil {
 			retChan <- Result{Error: err, Offsets: ret, End: end}
@@ -216,6 +216,7 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 				ExtentID: req.ExtentID,
 				Commit:   offset,
 				Blocks:   dataBlocks[j],
+				Revision: req.Revision,
 			})
 			if res != nil {
 				retChan <- Result{Error: err, Offsets: res.Offsets, End: res.End}

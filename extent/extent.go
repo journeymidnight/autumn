@@ -17,6 +17,7 @@ package extent
 import (
 	"io"
 	"io/ioutil"
+	"strconv"
 
 	"github.com/pkg/errors"
 
@@ -39,6 +40,7 @@ const (
 	extentMagicNumber = "EXTENTXX"
 	XATTRMETA         = "user.EXTENTMETA"
 	XATTRSEAL         = "user.XATTRSEAL"
+	XATTRREV          = "user.REV"
 )
 
 type Extent struct {
@@ -194,13 +196,18 @@ func OpenExtent(fileName string) (*Extent, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	var rev = int64(0)
+	hex, _ := xattr.FGet(f, XATTRREV)
+	rev, _ = strconv.ParseInt(string(hex), 10, 64)
+	
 	ex := &Extent{
 		isSeal:       0,
 		commitLength: currentSize,
 		fileName:     fileName,
 		file:         f,
 		ID:           eh.ID,
-		lastRevision: 0,
+		lastRevision: rev,
 	}
 	ex.resetWriter()
 	return ex, nil
@@ -292,6 +299,7 @@ func (ex *Extent) HasLock(revision int64) bool {
 		return true
 	} else if ex.lastRevision < revision {
 		ex.lastRevision = revision
+		xattr.FSet(ex.file, XATTRREV, []byte(strconv.FormatInt(revision, 10)))
 		return true
 	}
 	return false
@@ -324,8 +332,14 @@ func (ex *Extent) ResetWriter() error {
 	return ex.resetWriter()
 }
 
-func (ex *Extent) RecoveryData(start uint32, blocks []*pb.Block) error {
+func (ex *Extent) RecoveryData(start uint32, rev int64, blocks []*pb.Block) error {
+
+	//因为如果能写入log, 说明rev一定是更高的, 这里调用
+	//HasLock更新lastRevision
+	ex.HasLock(rev)
+
 	expectedEnd := start
+
 
 	for _, block := range blocks {
 		expectedEnd = record.ComputeEnd(expectedEnd, uint32(len(block.Data)))
