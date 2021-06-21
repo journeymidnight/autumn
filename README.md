@@ -326,3 +326,20 @@ stream增加stream lock, 在分布式环境保证同时只有一个writer
 4. truncate还没做
 
 stream lock也要有超时
+
+
+(a) transactions/second, 
+(b) average pending transaction count
+(c) throttling rate
+(d) CPU usage
+(e) network usage
+(f) request latency
+(g) data size of the RangePartition
+
+1. offload
+2. split due to cpu load or size of row or blob streams
+
+
+At the start of a partition load, the partition server sends a “check for commit length” to the primary EN of the last extent of these two streams. This checks whether all the replicas are available and that they all have the same length. 
+If not, the extent is sealed and reads are only performed, during partition load, against a replica sealed by the SM. 
+This ensures that the partition load will see all of its data and the exact same view, even if we were to repeatedly load the same partition reading from different sealed replicas for the last extent of the stream

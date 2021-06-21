@@ -32,6 +32,7 @@ func TestWalEncode(t *testing.T) {
 		extentID: 10,
 		start:    3,
 		data:     make([]*pb.Block, 2),
+		rev: 1000,
 	}
 	x.data[0] = &pb.Block{make([]byte, 99)}
 	x.data[1] = &pb.Block{make([]byte, 567)}
@@ -47,6 +48,7 @@ func TestWalEncode(t *testing.T) {
 	require.Equal(t, 2, len(y.data))
 	require.Equal(t, 99, len(y.data[0].Data))
 	require.Equal(t, 567, len(y.data[1].Data))
+	require.Equal(t, int64(1000), y.rev)
 }
 
 func init() {
@@ -64,14 +66,14 @@ func TestWalWrite(t *testing.T) {
 	require.Nil(t, err)
 
 	for i := 0; i < 10; i++ {
-		wal.Write(10, 10, []*pb.Block{&pb.Block{Data: make([]byte, 100)}, &pb.Block{Data: make([]byte, 9)}})
+		wal.Write(10, 10, 0, []*pb.Block{&pb.Block{Data: make([]byte, 100)}, &pb.Block{Data: make([]byte, 9)}})
 	}
 	wal.Close()
 
 	wal, err = OpenWal(p, func() {})
 	require.Nil(t, err)
 
-	wal.Replay(func(id uint64, start uint32, data []*pb.Block) {
+	wal.Replay(func(id uint64, start uint32, rev int64, data []*pb.Block) {
 		require.Equal(t, uint32(10), start)
 		require.Equal(t, 2, len(data))
 	})
@@ -87,7 +89,7 @@ func TestMultiWal(t *testing.T) {
 	maxWalSize = (1 << 20) //for debug
 	require.Nil(t, err)
 	for i := 0; i < 100; i++ {
-		wal.Write(10, 10, []*pb.Block{&pb.Block{Data: make([]byte, 50240)}, &pb.Block{Data: make([]byte, 9)}})
+		wal.Write(10, 10, 0,[]*pb.Block{&pb.Block{Data: make([]byte, 50240)}, &pb.Block{Data: make([]byte, 9)}})
 	}
 
 	wal.Close()
@@ -118,7 +120,7 @@ func BenchmarkRecordWrite(b *testing.B) {
 			b.SetBytes(int64(len(buf)))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				err := wal.Write(10, 10, []*pb.Block{{Data: buf}})
+				err := wal.Write(10, 10, 0, []*pb.Block{{Data: buf}})
 				if err != nil {
 					b.Fatal(err)
 				}

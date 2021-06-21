@@ -253,12 +253,13 @@ func (wal *Wal) doWrites() {
 
 //write will block until write is done
 //thread-safe
-func (wal *Wal) Write(extentID uint64, start uint32, blocks []*pb.Block) error {
+func (wal *Wal) Write(extentID uint64, start uint32, rev int64, blocks []*pb.Block) error {
 	req := requestPool.Get().(*request)
 	req.reset()
 	req.data = blocks
 	req.extentID = extentID
 	req.start = start
+	req.rev = rev
 	req.wg.Add(1)
 	wal.writeCh <- req
 
@@ -287,7 +288,7 @@ func (wal *Wal) Close() {
 	}
 }
 
-func (wal *Wal) Replay(callback func(uint64, uint32, []*pb.Block)) error {
+func (wal *Wal) Replay(callback func(uint64, uint32, int64, []*pb.Block)) error {
 	//delete pendingWals after replay
 	for _, fname := range wal.oldWALs {
 		f, err := os.Open(fname)
@@ -307,7 +308,7 @@ func (wal *Wal) Replay(callback func(uint64, uint32, []*pb.Block)) error {
 			}
 			s, err := ioutil.ReadAll(rec)
 			req.decode(s)
-			callback(req.extentID, req.start, req.data)
+			callback(req.extentID, req.start, req.rev, req.data)
 		}
 	}
 	wal.cleanPendingWal()
@@ -318,6 +319,7 @@ type request struct {
 	extentID uint64      //encoding
 	start    uint32      //encoding
 	data     []*pb.Block //encoding
+	rev      int64       //encoding
 
 	//return value
 	err error
@@ -329,6 +331,7 @@ func (req *request) reset() {
 	req.start = 0
 	req.data = nil
 	req.err = nil
+	req.rev = 0
 	req.wg = sync.WaitGroup{}
 }
 
@@ -337,6 +340,8 @@ func (r *request) encodeTo(buf *bytes.Buffer) {
 	sz := binary.PutUvarint(enc[:], r.extentID)
 	buf.Write(enc[:sz])
 	sz = binary.PutUvarint(enc[:], uint64(r.start))
+	buf.Write(enc[:sz])
+	sz = binary.PutVarint(enc[:], r.rev)
 	buf.Write(enc[:sz])
 	for _, block := range r.data {
 		sz := binary.PutUvarint(enc[:], uint64(len(block.Data)))
@@ -353,6 +358,8 @@ func (r *request) decode(buf []byte) {
 	off += sz
 	start, sz = binary.Uvarint(buf[off:])
 	r.start = uint32(start)
+	off += sz
+	r.rev, sz = binary.Varint(buf[off:])
 	off += sz
 	buf = buf[off:]
 	for len(buf) > 0 {

@@ -200,7 +200,7 @@ func TestWalExtent(t *testing.T) {
 		errC := make(chan error)
 		go func() { //wal
 			defer wg.Done()
-			err := walLog.Write(100, start, []*pb.Block{block})
+			err := walLog.Write(100, start, 0, []*pb.Block{block})
 			errC <- err
 		}()
 
@@ -235,8 +235,8 @@ func TestWalExtent(t *testing.T) {
 	walLog, err = wal.OpenWal(p, func() {})
 	require.Nil(t, err)
 
-	err = walLog.Replay(func(_ uint64, start uint32, blocks []*pb.Block) {
-		if err := extent.RecoveryData(start, blocks); err != nil {
+	err = walLog.Replay(func(_ uint64, start uint32, rev int64, blocks []*pb.Block) {
+		if err := extent.RecoveryData(start, rev, blocks); err != nil {
 			t.Fatal(err.Error())
 		}
 	})

@@ -44,10 +44,6 @@ const (
 
 func benchmark(etcdAddrs []string, op BenchType, threadNum int, duration int, size int) error {
 
-	pm := pmclient.NewAutumnPMClient(etcdAddrs)
-	if err := pm.Connect(); err != nil {
-		return err
-	}
 	client := NewAutumnLib(etcdAddrs)
 	//defer client.Close()
 
@@ -96,7 +92,7 @@ func benchmark(etcdAddrs []string, op BenchType, threadNum int, duration int, si
 			t := i
 			stopper.RunWorker(func() {
 				j := 0
-				var ctx context.Context	
+				var ctx context.Context
 				var cancel context.CancelFunc
 				for {
 
@@ -211,11 +207,11 @@ func bootstrap(c *cli.Context) error {
 	}
 	//choose the first one
 
-	log, _, err := smc.CreateStream(context.Background(),3,0)
+	log, _, err := smc.CreateStream(context.Background(), 3, 0)
 	if err != nil {
 		return err
 	}
-	row, _, err := smc.CreateStream(context.Background(),3,0)
+	row, _, err := smc.CreateStream(context.Background(), 3, 0)
 	if err != nil {
 		return err
 	}
@@ -419,15 +415,14 @@ func main() {
 			Action: autumnRange,
 		},
 		{
-			Name: "format",
+			Name:  "format",
 			Usage: "format --walDir <dir> --listenUrl <addr> --smAddr <addrs> <dir list> ",
 			Flags: []cli.Flag{
 				&cli.StringFlag{Name: "etcdAddr", Value: "127.0.0.1:3401"},
 				&cli.StringFlag{Name: "listenUrl"},
 				&cli.StringFlag{Name: "walDir"},
-
 			},
-			Action :format,
+			Action: format,
 		},
 	}
 	err := app.Run(os.Args)
@@ -450,11 +445,10 @@ func format(c *cli.Context) error {
 				}
 			}
 		}
-		return 
+		return
 	}
 	smAddr := utils.SplitAndTrim(c.String("smAddr"), ",")
 	listenUrl := c.String("listenUrl")
-	
 
 	walDir := c.String("walDir")
 	if len(walDir) > 0 {
@@ -486,7 +480,6 @@ func format(c *cli.Context) error {
 		}
 	}
 
-
 	//register a new NodeID
 
 	fmt.Printf("format on disks : %+v", dirList)
@@ -507,15 +500,14 @@ func format(c *cli.Context) error {
 		}
 	}
 
-
 	//generate config file for node
 	var config node.Config
-	config.Dirs  = dirList
+	config.Dirs = dirList
 	config.ID = nodeID
 	config.ListenUrl = listenUrl
 	config.WalDir = walDir
-	
-	f , err := os.Create(fmt.Sprintf("en_%d.toml", nodeID))
+
+	f, err := os.Create(fmt.Sprintf("en_%d.toml", nodeID))
 	if err != nil {
 		return err
 	}
