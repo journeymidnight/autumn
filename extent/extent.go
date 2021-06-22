@@ -251,18 +251,20 @@ func (r *extentReader) Read(p []byte) (n int, err error) {
 
 //Seal requires LOCK
 func (ex *Extent) Seal(commit uint32) error {
-	ex.Lock()
-	defer ex.Unlock()
+
+	ex.AssertLock()
+
 	atomic.StoreInt32(&ex.isSeal, 1)
 	ex.writer.Close()
 	ex.writer = nil
 	currentLength := atomic.LoadUint32(&ex.commitLength)
 	if currentLength < commit {
-		return errors.Errorf("commit is less than current commit length")
+		xlog.Logger.Warnf("commit is less than current commit length")
 	} else if currentLength > commit {
-		ex.file.Truncate(int64(commit))
+		xlog.Logger.Warnf("seal's commit length is less than current data")
 	}
 
+	ex.file.Truncate(int64(commit))
 	if err := xattr.FSet(ex.file, XATTRSEAL, []byte("true")); err != nil {
 		return err
 	}
@@ -483,15 +485,18 @@ func (ex *Extent) CommitLength() uint32 {
 }
 
 //helper function, block could be pb.Entries, support ReadEntries
+//ReadEntries can only be called on replicated extent
+//node_service will never call this function, this function is only for test
 func (ex *Extent) ReadEntries(offset uint32, maxTotalSize uint32, replay bool) ([]*pb.EntryInfo, uint32, error) {
 
+	
 	blocks, offsets, end, err := ex.ReadBlocks(offset, 10, maxTotalSize)
 	if err != nil && err != wire_errors.EndOfStream && err != wire_errors.EndOfExtent {
 		return nil, 0, err
 	}
 	var ret []*pb.EntryInfo
 	for i := range blocks {
-		e, err := extractEntryInfo(blocks[i], ex.ID, offsets[i], replay)
+		e, err := ExtractEntryInfo(blocks[i], ex.ID, offsets[i], replay)
 		if err != nil {
 			xlog.Logger.Error(err)
 			continue
@@ -504,7 +509,7 @@ func (ex *Extent) ReadEntries(offset uint32, maxTotalSize uint32, replay bool) (
 
 }
 
-func extractEntryInfo(b *pb.Block, extentID uint64, offset uint32, replay bool) (*pb.EntryInfo, error) {
+func ExtractEntryInfo(b *pb.Block, extentID uint64, offset uint32, replay bool) (*pb.EntryInfo, error) {
 	entry := new(pb.Entry)
 	if err := entry.Unmarshal(b.Data); err != nil {
 		return nil, err

@@ -292,6 +292,7 @@ func (en *ExtentNode) SmartReadBlocks(ctx context.Context, req *pb.ReadBlocksReq
 		Error error
 		End   uint32
 		Len   int
+		Offsets []uint32
 	}
 
 	stopper := utils.NewStopper()
@@ -322,6 +323,7 @@ func (en *ExtentNode) SmartReadBlocks(ctx context.Context, req *pb.ReadBlocksReq
 			Error: err,
 			End:   res.End,
 			Len:   len(res.Blocks),
+			Offsets: res.Offsets,
 		}
 	}
 
@@ -380,17 +382,19 @@ waitResult:
 	var lenOfBlocks int
 	var end uint32
 	var finalErr error
+	var offsets []uint32
 	if success {
-		//collect successRet, END/ERROR should be the save
+		//collect successRet, END/ERROR should be the saved
 		for i := 0; i < dataShards-1; i++ {
 			//if err is EndExtent or EndStream, err must be the save
-			if successRet[i] != successRet[i+1] {
+			if successRet[i].End != successRet[i+1].End {
 				return errDone(errors.Errorf("wrong successRet, %v != %v ", successRet[i], successRet[i+1]))
 			}
 		}
 		lenOfBlocks = successRet[0].Len
 		end = successRet[0].End
 		finalErr = successRet[0].Error
+		offsets = successRet[0].Offsets
 	} else {
 		//FIXME collect errChan, find err
 		r := <-errChan
@@ -419,6 +423,8 @@ waitResult:
 		Code:   code,
 		Blocks: retBlocks,
 		End:    end,
+		Offsets: offsets,
+
 	}, nil
 }
 
@@ -436,7 +442,7 @@ func (en *ExtentNode) ReadBlocks(ctx context.Context, req *pb.ReadBlocksRequest)
 	if ex == nil {
 		return nil, errors.Errorf("node %d have no such extent :%d", en.nodeID, req.ExtentID)
 	}
-	blocks, _, end, err := ex.ReadBlocks(req.Offset, req.NumOfBlocks, (32 << 20))
+	blocks, offsets, end, err := ex.ReadBlocks(req.Offset, req.NumOfBlocks, (32 << 20))
 	if err != nil && err != wire_errors.EndOfStream && err != wire_errors.EndOfExtent {
 		return errDone(err)
 	}
@@ -450,6 +456,7 @@ func (en *ExtentNode) ReadBlocks(ctx context.Context, req *pb.ReadBlocksRequest)
 		CodeDes: desCode,
 		Blocks:  blocks,
 		End:     end,
+		Offsets: offsets,
 	}, nil
 }
 
@@ -535,6 +542,7 @@ func (en *ExtentNode) Df(ctx context.Context, req *pb.DfRequest) (*pb.DfResponse
 
 func (en *ExtentNode) ReadEntries(ctx context.Context, req *pb.ReadEntriesRequest) (*pb.ReadEntriesResponse, error) {
 
+	
 	errDone := func(err error) (*pb.ReadEntriesResponse, error) {
 		code, desCode := wire_errors.ConvertToPBCode(err)
 		return &pb.ReadEntriesResponse{
@@ -542,7 +550,7 @@ func (en *ExtentNode) ReadEntries(ctx context.Context, req *pb.ReadEntriesReques
 			CodeDes: desCode,
 		}, nil
 	}
-
+	
 
 	ex := en.getExtent(req.ExtentID)
 	if ex == nil {
@@ -553,14 +561,38 @@ func (en *ExtentNode) ReadEntries(ctx context.Context, req *pb.ReadEntriesReques
 	if req.Replay > 0 {
 		replay = true
 	}
-	ei, end, err := ex.ReadEntries(req.Offset, (25 << 20), replay)
-	if err != nil && err != wire_errors.EndOfExtent && err != wire_errors.EndOfStream {
-		xlog.Logger.Infof("request ReadEntires extentID: %d, offset: %d, : %v", req.ExtentID, req.Offset, err)
-		return errDone(err)
+
+	res, _ := en.SmartReadBlocks(ctx, &pb.ReadBlocksRequest{
+		ExtentID: req.ExtentID,
+		Offset: req.Offset,
+		NumOfBlocks: 10,
+		Eversion: req.Eversion,
+	})
+
+
+	if res.Code != pb.Code_OK && res.Code != pb.Code_EndOfExtent && res.Code != pb.Code_EndOfStream {
+		return &pb.ReadEntriesResponse{
+			Code:    res.Code,
+			CodeDes: res.CodeDes,
+		}, nil
 	}
+
+	utils.AssertTrue(len(res.Blocks)>0)
+	
+	entries := make([]*pb.EntryInfo, len(res.Blocks))
+	for i := 0 ; i < len(res.Blocks); i ++ {
+		entry, err := extent.ExtractEntryInfo(res.Blocks[i], ex.ID, res.Offsets[i], replay)
+		if err != nil {
+			xlog.Logger.Errorf("unmarshal entries error %v\n", err)
+			continue
+		}
+		fmt.Printf("Read entries %v\n", entry)
+		entries[i] = entry
+	}
+
 	return &pb.ReadEntriesResponse{
-		Code: pb.Code_OK, 
-		Entries:   ei,
-		End: end,
+		Code: res.Code,
+		Entries: entries,
+		End:res.End,
 	}, nil
 }

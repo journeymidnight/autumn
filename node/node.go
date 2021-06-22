@@ -29,7 +29,6 @@ import (
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
-	"go.etcd.io/etcd/clientv3"
 	"google.golang.org/grpc"
 )
 
@@ -72,7 +71,7 @@ func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl st
 	}
 	
 
-	en.em = smclient.NewExtentManager(en.smClient, etcdAddr, nil)
+	en.em = smclient.NewExtentManager(en.smClient, etcdAddr, en.extentInfoUpdatedfunc)
 
 	//load disk
 	for _, diskDir := range diskDirs {
@@ -98,8 +97,31 @@ func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl st
 }
 
 
-func (en *ExtentNode) ExtentInfoUpdatedfunc(event *clientv3.Event) {
+func (en *ExtentNode) extentInfoUpdatedfunc(eventType string, cur *pb.ExtentInfo, prev *pb.ExtentInfo) {
+	switch eventType {
+	case "PUT":
+		//sealed
+		if prev != nil && (prev.SealedLength == 0 && cur.SealedLength > 0) {
+			ex := en.getExtent(cur.ExtentID)
+			if ex != nil && ex.IsSeal() == false {
+				//we lost the last SEAL cmd?
+				xlog.Logger.Infof("SEAL extent %d", cur.ExtentID)
+				ex.Lock()
+				if err := ex.Seal(uint32(cur.SealedLength)) ;err != nil {
+					xlog.Logger.Errorf(err.Error())
+				}
+				ex.Unlock()
+			}
 
+		}
+	case "DELETE":
+		//FIXME, TODO
+		ex := en.getExtent(cur.ExtentID)
+		if ex != nil {
+			fmt.Printf("you should delete extent %d...", prev.ExtentID)
+		}
+	}
+	
 }
 
 func (en *ExtentNode) SyncFs() {

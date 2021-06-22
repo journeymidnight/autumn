@@ -201,6 +201,7 @@ retry:
 		return err
 	}
 
+	eversion := iter.sc.em.GetExtentInfo(extentID).Eversion
 	xlog.Logger.Debugf("read extentID %d, offset : %d\n", extentID, iter.currentOffset)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	c := pb.NewExtentServiceClient(conn)
@@ -208,16 +209,21 @@ retry:
 		ExtentID: extentID,
 		Offset:   iter.currentOffset,
 		Replay:   uint32(iter.replay),
+		Eversion: eversion,
 	})
 	cancel()
-	//if err == context.DeadlineExceeded {
-	if err != nil {
+
+	if err != nil { //network error
 		if loop > 5 {
 			return errors.New("finally timeout")
 		}
 		loop++
 		time.Sleep(1 * time.Second)
 		goto retry
+	}
+
+	if res.Code == pb.Code_EVersionLow {
+		iter.sc.em.WaitVersion(extentID,eversion+1)
 	}
 
 	//fmt.Printf("ans: %v, %v\n", err, err == context.DeadlineExceeded)
