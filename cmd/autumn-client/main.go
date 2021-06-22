@@ -207,12 +207,14 @@ func bootstrap(c *cli.Context) error {
 	}
 	//choose the first one
 
-	log, _, err := smc.CreateStream(context.Background(), 3, 0)
+	log, _, err := smc.CreateStream(context.Background(), 2, 1)
 	if err != nil {
+		fmt.Printf("can not create log stream\n")
 		return err
 	}
-	row, _, err := smc.CreateStream(context.Background(), 3, 0)
+	row, _, err := smc.CreateStream(context.Background(), 2, 1)
 	if err != nil {
+		fmt.Printf("can not create row stream\n")
 		return err
 	}
 
@@ -418,7 +420,7 @@ func main() {
 			Name:  "format",
 			Usage: "format --walDir <dir> --listenUrl <addr> --smAddr <addrs> <dir list> ",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "etcdAddr", Value: "127.0.0.1:3401"},
+				&cli.StringFlag{Name: "smAddr", Value: "127.0.0.1:3401"},
 				&cli.StringFlag{Name: "listenUrl"},
 				&cli.StringFlag{Name: "walDir"},
 			},

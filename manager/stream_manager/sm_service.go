@@ -612,6 +612,15 @@ func (sm *StreamManager) getAppendExtentsAddr(streamID uint64) ([]*NodeStatus,ui
 		ns := d.(*NodeStatus)
 		ret = append(ret, ns)
 	}
+	for _, nodeID := range extInfo.Parity {
+		d, ok := sm.nodes.Get(nodeID)
+		if !ok {
+			return nil, 0, nil, errors.Errorf("no such nodeID %d in %v", nodeID, extInfo.Replicates)
+		}
+		ns := d.(*NodeStatus)
+		ret = append(ret, ns)
+	}
+	
 	return ret, lastExtentID, extInfo, nil
 }
 

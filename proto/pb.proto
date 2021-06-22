@@ -87,6 +87,7 @@ message ReadBlocksResponse {
 	string codeDes = 2;
 	repeated Block blocks = 3;
 	uint32 end = 4;
+	repeated uint32 offsets = 5;
 }
 
 
@@ -121,6 +122,7 @@ message ReadEntriesRequest {
 	uint64 extentID = 1;
 	uint32 offset = 2;
 	uint32 replay = 3;
+	uint64 eversion = 4;
 }
 
 
@@ -325,6 +327,7 @@ service StreamManagerService {
 	rpc CreateStream(CreateStreamRequest) returns  (CreateStreamResponse) {}
 	rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse) {}
 	rpc Truncate(TruncateRequest) returns (TruncateResponse) {}
+	//rpc CheckCommitLength(CheckCommitLengthRequest) returns CheckCommitLength{}
 }
 
 //used in Etcd Campaign

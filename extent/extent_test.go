@@ -146,7 +146,9 @@ func TestReplayExtent(t *testing.T) {
 
 	assert.Nil(t, err)
 	commit := ex.CommitLength()
+	ex.Lock()
 	err = ex.Seal(ex.commitLength)
+	ex.Unlock()
 	assert.Nil(t, err)
 	defer os.Remove("localtest.idx")
 	ex.Close()
