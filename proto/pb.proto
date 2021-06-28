@@ -43,6 +43,7 @@ enum Code {
 	EVersionLow = 4;
 	NotLEADER = 5;
 	LockedByOther = 6;
+	StreamVersionLow = 7;
 }
 
 
@@ -92,7 +93,7 @@ message ReadBlocksResponse {
 
 
 message Payload {
-        bytes Data = 1;
+    bytes Data = 1;
 }
 
 
@@ -234,6 +235,7 @@ message StreamAllocExtentRequest{
 	uint32 parityShard =4;
 	string ownerKey = 5;
 	int64  revision = 6;
+	uint32 checkCommitLength = 7;
 }
 
 
@@ -307,7 +309,7 @@ message TruncateResponse {
 	string codeDes = 2;
 }
 
-
+/*
 message SubmitRecoveryTaskRequest{
 	RecoveryTask task = 1;
 }
@@ -316,18 +318,19 @@ message SubmitRecoveryTaskResponse{
 	Code code = 1;
 	string codeDes = 2;
 }
+*/
+
 
 service StreamManagerService {
 	rpc StreamInfo(StreamInfoRequest) returns (StreamInfoResponse) {}
 	rpc ExtentInfo(ExtentInfoRequest) returns (ExtentInfoResponse) {}
 	rpc NodesInfo(NodesInfoRequest) returns(NodesInfoResponse) {}
 
-	rpc SubmitRecoveryTask(SubmitRecoveryTaskRequest) returns (SubmitRecoveryTaskResponse){}
+	//rpc SubmitRecoveryTask(SubmitRecoveryTaskRequest) returns (SubmitRecoveryTaskResponse){}
 	rpc StreamAllocExtent(StreamAllocExtentRequest) returns  (StreamAllocExtentResponse) {}
 	rpc CreateStream(CreateStreamRequest) returns  (CreateStreamResponse) {}
 	rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse) {}
 	rpc Truncate(TruncateRequest) returns (TruncateResponse) {}
-	//rpc CheckCommitLength(CheckCommitLengthRequest) returns CheckCommitLength{}
 }
 
 //used in Etcd Campaign
@@ -345,6 +348,7 @@ message ExtentInfo {
 	uint64 eversion = 4; //change version when 1, updating replicates, 2. parityNodes, 3. seal
 	uint64 refs = 5; 
 	uint64 SealedLength = 6;
+	uint32 avali = 7; //bitmap to indicat if node is avaliable when sealing
 }
 /*
 Extent和Stream是多对多的关系, 一个stream对应多个extent.

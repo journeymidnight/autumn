@@ -4,13 +4,13 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"sync"
 	"time"
 
 	"github.com/coreos/etcd/clientv3/concurrency"
 	"github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
+	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
 
@@ -56,6 +56,7 @@ type BlockReader interface {
 type LogEntryIter interface {
 	HasNext() (bool, error)
 	Next() *pb.EntryInfo
+	CheckCommitLength() error
 }
 
 type AutumnBlockReader struct {
@@ -142,7 +143,7 @@ func MutexToLock(mutex *concurrency.Mutex) StreamLock {
 type AutumnStreamClient struct {
 	StreamClient
 	smClient     *smclient.SMClient
-	sync.RWMutex //protect streamInfo/extentInfo when called in read/write
+	//sync.RWMutex //protect streamInfo/extentInfo when called in read/write
 	streamInfo   *pb.StreamInfo
 
 	em       *smclient.ExtentManager
@@ -170,6 +171,61 @@ type AutumnEntryIter struct {
 	replay             uint32
 }
 
+
+//CheckCommitLength is called only when read entries on logStream
+func (iter *AutumnEntryIter) CheckCommitLength() error {
+	//if last extent is not sealed, we must 'Check Commit length' for all replicates,
+	//if any error happend, we seal and create a new extent
+	if len(iter.sc.streamInfo.ExtentIDs) == 0 {
+		return nil
+	}
+	extentID := iter.sc.streamInfo.ExtentIDs[len(iter.sc.streamInfo.ExtentIDs)-1] //last extent
+	exInfo := iter.sc.em.Update(extentID) 
+
+	if exInfo.SealedLength > 0 {
+		return nil
+	}
+
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 5 * time.Second)
+		newExInfo, err := iter.sc.smClient.StreamAllocExtent(ctx, iter.sc.streamID, extentID, 
+			uint32(len(exInfo.Replicates)), uint32(len(exInfo.Parity)), 
+			iter.sc.streamLock.ownerKey, iter.sc.streamLock.revision, 1)
+		
+		cancel()
+		if err == nil {
+			if newExInfo != nil {
+				//update local streaminfo
+				iter.sc.streamInfo.ExtentIDs = append(iter.sc.streamInfo.ExtentIDs, newExInfo.ExtentID)
+				iter.sc.em.Update(newExInfo.ExtentID)
+			}
+			break
+		} else if err == wire_errors.LockedByOther {
+			return err
+		} else if err == wire_errors.StreamVersionLow {
+			si, _, err := iter.sc.smClient.StreamInfo(context.Background(), []uint64{iter.sc.streamID})
+			if err != nil {
+				xlog.Logger.Error(err)
+				continue
+			}
+			//update local streaminfo
+			iter.sc.streamInfo.ExtentIDs = si[iter.sc.streamID].ExtentIDs
+			allExtents := iter.sc.streamInfo.ExtentIDs
+			if len(allExtents) >= 2 && allExtents[len(allExtents) - 2] == extentID {
+				iter.sc.em.Update(allExtents[len(allExtents) - 1])
+				return nil
+			}
+
+			xlog.Logger.Error("check commit length may have duplicated, but oldExtentID not match")
+			continue
+		}
+
+		xlog.Logger.Warnf(err.Error())
+		time.Sleep(time.Second)
+	}
+	return nil
+
+} 
 func (iter *AutumnEntryIter) HasNext() (bool, error) {
 	if len(iter.cache) == 0 {
 		if iter.noMore {
@@ -192,6 +248,9 @@ func (iter *AutumnEntryIter) Next() *pb.EntryInfo {
 	return ret
 }
 
+
+
+
 func (iter *AutumnEntryIter) receiveEntries() error {
 	loop := 0
 retry:
@@ -201,15 +260,17 @@ retry:
 		return err
 	}
 
-	eversion := iter.sc.em.GetExtentInfo(extentID).Eversion
-	xlog.Logger.Debugf("read extentID %d, offset : %d\n", extentID, iter.currentOffset)
+	exInfo := iter.sc.em.GetExtentInfo(extentID)
+	xlog.Logger.Debugf("read extentID %d, offset : %d, eversion is %d\n", extentID, iter.currentOffset, exInfo.Eversion)
+
+
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	c := pb.NewExtentServiceClient(conn)
 	res, err := c.ReadEntries(ctx, &pb.ReadEntriesRequest{
 		ExtentID: extentID,
 		Offset:   iter.currentOffset,
 		Replay:   uint32(iter.replay),
-		Eversion: eversion,
+		Eversion: exInfo.Eversion,
 	})
 	cancel()
 
@@ -223,7 +284,8 @@ retry:
 	}
 
 	if res.Code == pb.Code_EVersionLow {
-		iter.sc.em.WaitVersion(extentID,eversion+1)
+		iter.sc.em.Update(extentID)
+		goto retry
 	}
 
 	//fmt.Printf("ans: %v, %v\n", err, err == context.DeadlineExceeded)
@@ -284,8 +346,7 @@ func (sc *AutumnStreamClient) NewLogEntryIter(opts ...ReadOption) LogEntryIter {
 }
 
 func (sc *AutumnStreamClient) Truncate(ctx context.Context, extentID uint64) (pb.StreamInfo, pb.StreamInfo, error) {
-	sc.Lock()
-	defer sc.Unlock()
+
 	var i int
 	for i = range sc.streamInfo.ExtentIDs {
 		if sc.streamInfo.ExtentIDs[i] == extentID {
@@ -304,8 +365,7 @@ func (sc *AutumnStreamClient) Truncate(ctx context.Context, extentID uint64) (pb
 }
 
 func (sc *AutumnStreamClient) getExtentIndexFromID(extentID uint64) int {
-	sc.RLock()
-	defer sc.RUnlock()
+
 	for i := range sc.streamInfo.ExtentIDs {
 		if extentID == sc.streamInfo.ExtentIDs[i] {
 			return i
@@ -315,8 +375,7 @@ func (sc *AutumnStreamClient) getExtentIndexFromID(extentID uint64) int {
 }
 
 func (sc *AutumnStreamClient) getExtentConnFromIndex(extendIdIndex int) (*grpc.ClientConn, uint64, error) {
-	sc.RLock()
-	defer sc.RUnlock()
+
 	if extendIdIndex == len(sc.streamInfo.ExtentIDs) {
 		return nil, 0, io.EOF
 	}
@@ -334,8 +393,7 @@ func (sc *AutumnStreamClient) getExtentConnFromIndex(extendIdIndex int) (*grpc.C
 }
 
 func (sc *AutumnStreamClient) getLastExtentConn() (uint64, *grpc.ClientConn, error) {
-	sc.RLock()
-	defer sc.RUnlock()
+
 	if sc.streamInfo == nil || len(sc.streamInfo.ExtentIDs) == 0 {
 		return 0, nil, errors.New("no streamInfo or streamInfo is not correct")
 	}
@@ -352,22 +410,42 @@ func (sc *AutumnStreamClient) MustAllocNewExtent(oldExtentID uint64, dataShard, 
 	var newExInfo *pb.ExtentInfo
 	var err error
 	for i := 0 ; i < 10 ; i ++{
-		newExInfo, err = sc.smClient.StreamAllocExtent(context.Background(), sc.streamID, 
-		oldExtentID, dataShard, parityShard, sc.streamLock.ownerKey, sc.streamLock.revision)
+		ctx , cancel := context.WithTimeout(context.Background(), 5 * time.Second)
+		newExInfo, err = sc.smClient.StreamAllocExtent(ctx, sc.streamID, 
+		oldExtentID, dataShard, parityShard, sc.streamLock.ownerKey, sc.streamLock.revision, 0)
+		cancel()
 		if err == nil {
 			break
 		}
 		xlog.Logger.Warn(err.Error())
+
+		//maybe we lost the ACK message.
+		if err == wire_errors.StreamVersionLow {
+			si, _, err := sc.smClient.StreamInfo(context.Background(), []uint64{sc.streamID})
+			if err != nil {
+				return errors.Errorf("meet duplicated AllocExtent and can not get latest StreamInfo %s", err.Error())
+			}
+			sc.streamInfo.ExtentIDs = si[sc.streamID].ExtentIDs
+			if len(sc.streamInfo.ExtentIDs) >= 2 && sc.streamInfo.ExtentIDs[len(sc.streamInfo.ExtentIDs) - 2] == oldExtentID {
+				sc.em.Update(sc.streamInfo.ExtentIDs[len(sc.streamInfo.ExtentIDs) - 1])
+				xlog.Logger.Info("MustAllocNewExtent may have duplicated, new extent was created")
+				return nil
+			}
+			return errors.New("MustAllocNewExtent may have duplicated, oldExtentID not match")
+			
+		}
+		if err == wire_errors.LockedByOther {
+			return err
+		}
 		time.Sleep(200 * time.Millisecond)
 	}
+
 	if err != nil {
 		return err
 	}
-	sc.Lock()
 	sc.streamInfo.ExtentIDs = append(sc.streamInfo.ExtentIDs, newExInfo.ExtentID)
-	sc.Unlock()
 
-	//sc.em.WaitVersion(newExInfo.ExtentID, 1)
+	sc.em.WaitVersion(newExInfo.ExtentID, 1)
 	xlog.Logger.Debugf("created new extent %d on stream %d", newExInfo.ExtentID, sc.streamID)
 	return nil
 }
@@ -452,10 +530,10 @@ retry:
 			loop ++
 			goto retry
 		}
-		sc.MustAllocNewExtent(extentID, uint32(len(exInfo.Replicates)), uint32(len(exInfo.Parity)))
-		loop = 0
-		goto retry
+		err = sc.MustAllocNewExtent(extentID, uint32(len(exInfo.Replicates)), uint32(len(exInfo.Parity)))
 	}
+
+
 	if err != nil {//other errors
 		return 0,nil,0, err
 	}

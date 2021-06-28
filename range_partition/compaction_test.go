@@ -18,7 +18,7 @@ func TestCompaction(t *testing.T) {
 	defer rowStream.Close()
 	
 	var server streamclient.MockEtcd
-	rp := OpenRangePartition(3, rowStream, logStream, logStream.(streamclient.BlockReader),
+	rp, _ := OpenRangePartition(3, rowStream, logStream, logStream.(streamclient.BlockReader),
 		[]byte(""), []byte(""), nil, nil, server.SetRowStreamTables, streamclient.OpenMockStreamClient, TestOption())
 	defer rp.Close()
 

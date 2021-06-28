@@ -259,12 +259,12 @@ func (ex *Extent) Seal(commit uint32) error {
 	ex.writer = nil
 	currentLength := atomic.LoadUint32(&ex.commitLength)
 	if currentLength < commit {
-		xlog.Logger.Warnf("commit is less than current commit length")
+		xlog.Logger.Fatal("commit is less than current commit length")
 	} else if currentLength > commit {
+		ex.file.Truncate(int64(commit))
 		xlog.Logger.Warnf("seal's commit length is less than current data")
 	}
 
-	ex.file.Truncate(int64(commit))
 	if err := xattr.FSet(ex.file, XATTRSEAL, []byte("true")); err != nil {
 		return err
 	}

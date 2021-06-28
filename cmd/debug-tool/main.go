@@ -33,11 +33,7 @@ AutumnPMIDKey
 AutumnPMLeader/34e78663bbfa104
 AutumnSMIDKey
 AutumnSMLeader/34e78663bbfa106
-PART/2/logStream
-PART/2/parent
-PART/2/range
-PART/2/rowStream
-PART/2/tables
+PART/2
 PSSERVER/1
 extents/5
 extents/7
@@ -51,13 +47,24 @@ streams/6
 //receiveData from ETCD
 func receiveData(client *clientv3.Client) []KV {
 	var data []KV
-	kvs,_, err := etcd_utils.EtcdRange(client, "")
+	kvs, _, err := etcd_utils.EtcdRange(client, "")
 	if err != nil {
 		panic(err)
 	}
 	for _, kv := range kvs {
 		if strings.HasPrefix(string(kv.Key), "PART") {
-			data = append(data, parseParts(kv))
+			var meta pspb.PartitionMeta
+			if err = meta.Unmarshal(kv.Value) ; err != nil {
+				fmt.Printf("can not parse %s", kv.Key)
+				continue
+			}
+			d := KV{
+				Key: string(kv.Key),
+				Value: fmt.Sprintf("%+v", meta),
+			}
+
+			data = append(data, d)
+			//data = append(data, parseParts(kv))
 		} else if strings.HasPrefix(string(kv.Key), "AutumnSMIDKey") || strings.HasPrefix(string(kv.Key), "AutumnPMIDKey") {
 			d := KV{
 				Key:   string(kv.Key),
