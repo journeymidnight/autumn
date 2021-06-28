@@ -3,6 +3,7 @@ package smclient
 import (
 	"context"
 	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/coreos/etcd/clientv3"
@@ -28,6 +29,9 @@ type ExtentManager struct {
 	client       *clientv3.Client
 	closeEtcdResource   func()
 	stoper      *utils.Stopper  
+
+	//condition lock to notify WaitVersion
+	cond   *sync.Cond
 }
 
 
@@ -58,6 +62,7 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 		nodesLock: &utils.SafeMutex{},
 		client: client,
 		smClient : smclient,
+		cond: sync.NewCond(new(sync.Mutex)),
 	}
 	
 	//load latest data
@@ -154,6 +159,7 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 						panic("")
 					}
 					em.extentLock.Unlock()
+					em.cond.Broadcast()
 				}
 
 			case res := <- nodesChan:
@@ -264,20 +270,27 @@ func (em *ExtentManager) GetExtentConn(extentID uint64, policy SelectNodePolicy)
 }
 
 
-
-//Update will wait 5 millisecond to get the latest data
+/*
+//    c.L.Lock()
+//    for !condition() {
+//        c.Wait()
+//    }
+//    ... make use of condition ...
+//    c.L.Unlock()
+*/
 func (em *ExtentManager) WaitVersion(extentID uint64, version uint64) *pb.ExtentInfo {
 	
 	var ei *pb.ExtentInfo
-	//loop forever
+	em.cond.L.Lock()
 	for {
 		ei = em.GetExtentInfo(extentID)
 		if ei != nil && ei.Eversion >= version{
 			break
 		} else {
-			time.Sleep(5 * time.Millisecond)
+			em.cond.Wait()
 		}
 	}
+	em.cond.L.Unlock()
 	return ei
 }
 

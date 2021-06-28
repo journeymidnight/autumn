@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"math/bits"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -194,37 +195,71 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		return errDone(err)
 	}
 	if id != req.ExtentToSeal {
-		return errDone(errors.Errorf("extentID no match %d vs %d", id, req.ExtentToSeal))
+		return errDone(wire_errors.StreamVersionLow)
 	}
 
+	if req.CheckCommitLength > 0 {
+		haveToCreateNewExtent := false
+		sizes := sm.receiveCommitlength(ctx, nodes, req.ExtentToSeal)
+		for i := range sizes {
+			if sizes[i] == -1 {
+				haveToCreateNewExtent = true
+				break			
+			}
+		}
+		if haveToCreateNewExtent == false {
+			return  &pb.StreamAllocExtentResponse{
+				Code: pb.Code_OK,
+				StreamID: req.StreamID,
+			}, nil
+		}
+	}
 
 	if lastExtentInfo.SealedLength == 0 {
 		//recevied commit length
-		size := sm.receiveCommitlength(ctx, nodes, req.ExtentToSeal)
 
-		if size == 0 || size == math.MaxUint32 {
-			return errDone(errors.New("seal can not get Commitlength"))
+		var minSize int
+		//if EC, we have to get datashards results to decide the minimal length
+		//if replicated, only one returns can work, but if we want the system more stable
+		//use 2 insdead of 1
+		if len(lastExtentInfo.Parity) > 0  {
+			minSize = len(lastExtentInfo.Replicates)
+		} else {
+			minSize = 2
 		}
 
-		sm.sealExtents(ctx, nodes, req.ExtentToSeal, size, req.Revision)
-		//save sealed info and update version number to etcd and update local-cache
+		avali := uint32(0)
+		var minimalLength int64 = math.MaxInt64
+		var sizes []int64
 		
-		//sealedExtentInfo := proto.Clone(lastExtentInfo).(*pb.ExtentInfo)
-
-		lastExtentInfo.SealedLength = uint64(size)
+		sizes = sm.receiveCommitlength(ctx, nodes, req.ExtentToSeal)
+		for i := range sizes {
+			if sizes[i] != -1 {
+				avali |= (1 << i)
+				if minimalLength > sizes[i] {
+					minimalLength = sizes[i]
+				}					
+			}
+		}
+		if bits.OnesCount32(avali) < minSize {
+			return errDone(errors.Errorf("avali nodes is %d , less than minSize %d", avali, minSize))
+		}
+		
+		
+		//set extent
+		lastExtentInfo.SealedLength = uint64(minimalLength)
 		lastExtentInfo.Eversion ++
+		lastExtentInfo.Avali = avali
 
 		data := utils.MustMarshal(lastExtentInfo)
 	
 		ops := []clientv3.Op{
 			clientv3.OpPut(formatExtentKey(id), string(data)),
 		}
-		err = etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
+		if err = etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
 			clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
 			clientv3.Compare(clientv3.CreateRevision(req.OwnerKey), "=", req.Revision),
-		}, ops)
-	
-		if err != nil {
+		}, ops) ; err != nil {
 			return errDone(errors.Errorf("can not set ETCD"))
 		}
 
@@ -280,6 +315,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 
 	err = etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
 		clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
+		clientv3.Compare(clientv3.CreateRevision(req.OwnerKey), "=", req.Revision),
 	}, ops)
 
 	if err != nil {
@@ -325,16 +361,22 @@ func (sm *StreamManager) sealExtents(ctx context.Context, nodes []*NodeStatus, e
 	//save sealed information and commitLength into extentInfo
 }
 
-func (sm *StreamManager) receiveCommitlength(ctx context.Context, nodes []*NodeStatus, extentID uint64) uint32 {
+//receiveCommitlength returns minimal commitlength and all node who give us response and who did not
+//-1 if no response
+func (sm *StreamManager) receiveCommitlength(ctx context.Context, nodes []*NodeStatus, extentID uint64) ([]int64) {
 	pctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
 
 	stopper := utils.NewStopper()
-	reCh := make(chan uint32)
-	for _, node := range nodes {
+	result := make([]int64, len(nodes))
+	for i, node := range nodes {
 		addr := node.Address
 		stopper.RunWorker(func() {
 			pool := conn.GetPools().Connect(addr)
+			if pool == nil {
+				result[i] = -1
+				return
+			}
 			conn := pool.Get()
 			c := pb.NewExtentServiceClient(conn)
 			res, err := c.CommitLength(pctx, &pb.CommitLengthRequest{
@@ -342,26 +384,17 @@ func (sm *StreamManager) receiveCommitlength(ctx context.Context, nodes []*NodeS
 			})
 			if err != nil { //timeout or other error
 				xlog.Logger.Warnf(err.Error())
-				reCh <- math.MaxUint32
+				result[i] = -1
 				return
 			}
-			reCh <- res.Length
+			result[i] = int64(res.Length)
+			//reCh <- res.Length
 		})
 	}
-	go func(){
-		stopper.Wait()
-		close(reCh)
-	}()
-
-	//choose minimal of all size
-	ret := uint32(math.MaxUint32)
-	for size := range reCh {
-		if size < ret {
-			ret = size
-		}
-	}
-
-	return ret
+	
+	stopper.Wait()
+	
+	return result
 }
 
 func (sm *StreamManager) sendAllocToNodes(ctx context.Context, nodes []*NodeStatus, extentID uint64) error {

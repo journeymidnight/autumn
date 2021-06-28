@@ -5,9 +5,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/range_partition"
+	"github.com/journeymidnight/autumn/wire_errors"
+	"github.com/journeymidnight/autumn/xlog"
 )
 
 func (ps *PartitionServer) checkVersion(partID uint64, key []byte) *range_partition.RangePartition {
@@ -35,6 +38,19 @@ func (ps *PartitionServer) Put(ctx context.Context, req *pspb.PutRequest) (*pspb
 		return nil, errors.New("no such partid")
 	}
 	if err := rp.Write(req.Key, req.Value); err != nil {
+		if err == wire_errors.LockedByOther {
+			partID := req.Partid
+			defer func(){
+				xlog.Logger.Errorf("range partition %s was locked by other ps..close")
+				delete(ps.rangePartitions, partID)
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				ps.rangePartitionLocks[partID].Unlock(ctx)
+				cancel()
+				delete(ps.rangePartitionLocks, partID)
+			}()
+		}
+	
+		
 		return nil, err
 	}
 	return &pspb.PutResponse{Key: req.Key}, nil

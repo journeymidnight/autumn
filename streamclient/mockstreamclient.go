@@ -190,6 +190,7 @@ func (client *MockStreamClient) Read(ctx context.Context, extentID uint64, offse
 	return blocks, end, err
 }
 
+
 func (client *MockStreamClient) NewLogEntryIter(opts ...ReadOption) LogEntryIter {
 
 	readOpt := &readOption{}
@@ -229,6 +230,10 @@ type MockLockEntryIter struct {
 	noMore        bool
 	cache         []*pb.EntryInfo
 	replay        bool
+}
+
+func (iter *MockLockEntryIter) CheckCommitLength() error {
+	return nil
 }
 
 func (iter *MockLockEntryIter) HasNext() (bool, error) {

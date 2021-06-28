@@ -18,6 +18,7 @@ import (
 	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/journeymidnight/autumn/streamclient"
 	"github.com/journeymidnight/autumn/utils"
+	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
 )
@@ -70,7 +71,7 @@ type RangePartition struct {
 	opt        *Option
 
 	//functions
-	openStream OpenStreamFunc
+	openStream OpenStreamFunc //doGC的时候, 
 	setLocs    SetRowStreamTableFunc
 }
 
@@ -82,7 +83,7 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	startKey []byte, endKey []byte, tableLocs []*pspb.Location, blobStreams []uint64,
 	setlocs SetRowStreamTableFunc,
 	openStream OpenStreamFunc, opts... OptionFunc,
-) *RangePartition {
+) (*RangePartition, error) {
 
 	utils.AssertTrue(len(opts)> 0)
 	opt := &Option{}
@@ -177,7 +178,10 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	}
 
 	if lastTable == nil {
-		replayLog(rp.logStream, 0, 0, true, replay)
+		err := replayLog(rp.logStream, 0, 0, true, replay)
+		if err == wire_errors.LockedByOther {
+			return nil, err
+		}
 	} else {
 		fmt.Printf("replay log from vp offset [%d]\n", lastTable.VpOffset)
 		/*
@@ -186,7 +190,10 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 				offset:   lastTable.VpOffset,
 			}
 		*/
-		replayLog(rp.logStream, lastTable.VpExtentID, lastTable.VpOffset, true, replay)
+		err := replayLog(rp.logStream, lastTable.VpExtentID, lastTable.VpOffset, true, replay)
+		if err == wire_errors.LockedByOther {
+			return nil, err
+		}
 	}
 
 	xlog.Logger.Infof("replayed log number: %d\n", replayedLog)
@@ -205,14 +212,14 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	rp.tableLock.RUnlock()
 
 	if len(tbls) <= 1 {
-		return rp
+		return rp, nil
 	}
 	rp.doCompact(tbls, true)
 	rp.deprecateTables(tbls)
 	for _, t := range tbls {
 		t.DecrRef()
 	}
-	return rp
+	return rp,nil
 }
 
 type flushTask struct {

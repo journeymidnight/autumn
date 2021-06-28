@@ -287,11 +287,21 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, locs []
 	utils.AssertTrue(meta.Rg != nil)
 	utils.AssertTrue(meta.PartID != 0)
 
-	rp := range_partition.OpenRangePartition(meta.PartID, row, log, ps.blockReader, meta.Rg.StartKey, meta.Rg.EndKey, locs,
-		blobs, setRowStreamTables, openStream, range_partition.DefaultOption())
+	/*
+	closeCallback := func(partID partID_t){
+		delete(ps.rangePartitions, partID)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		ps.rangePartitionLocks[partID].Unlock(ctx)
+		cancel()
+		delete(ps.rangePartitionLocks, partID)
+	}
+	*/
 
-	xlog.Logger.Infof("open range partition %d, StartKey:[%s], EndKey:[%s]", meta.PartID, meta.Rg.StartKey, meta.Rg.EndKey)
-	return rp, nil
+	rp, err := range_partition.OpenRangePartition(meta.PartID, row, log, ps.blockReader, meta.Rg.StartKey, meta.Rg.EndKey, locs,
+		blobs, setRowStreamTables, openStream, range_partition.DefaultOption())
+	
+	xlog.Logger.Infof("open range partition %d, StartKey:[%s], EndKey:[%s]: err is %v", meta.PartID, meta.Rg.StartKey, meta.Rg.EndKey, err)
+	return rp, err
 }
 
 func (ps *PartitionServer) stopRangePartition() {

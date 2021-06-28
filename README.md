@@ -343,3 +343,13 @@ stream lock也要有超时
 At the start of a partition load, the partition server sends a “check for commit length” to the primary EN of the last extent of these two streams. This checks whether all the replicas are available and that they all have the same length. 
 If not, the extent is sealed and reads are only performed, during partition load, against a replica sealed by the SM. 
 This ensures that the partition load will see all of its data and the exact same view, even if we were to repeatedly load the same partition reading from different sealed replicas for the last extent of the stream
+
+
+ This ensures that once an extent is sealed, all its available replicas (the ones the SM can eventually reach) are bitwise identical.
+
+ 1. Once a record is appended and acknowledged back to the client, any later reads of that record from any replica will see the same data (the data is immutable).
+2. Once an extent is sealed, any reads from any sealed replica will always see the same contents of the extent.	
+
+
+If an EN was not reachable by the SM during the sealing process but later becomes reachable
+the SM will force the EN to synchronize the given extent to the chosen commit length

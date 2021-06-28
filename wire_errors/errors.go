@@ -9,14 +9,17 @@ import (
 var (
 	EndOfExtent = errors.New("EndOfExtent")
 	EndOfStream = errors.New("EndOfStream")
-	VersionLow = errors.New("version too low")
+	VersionLow = errors.New("extent version too low")
 	NotLeader = errors.New("not a leader")
 	LockedByOther = errors.New("LockedByOther")
+	StreamVersionLow = errors.New("stream version low")
 )
 
 
 func FromPBCode(code pb.Code, des string) error {
 	switch code {
+	case pb.Code_StreamVersionLow:
+		return StreamVersionLow
 	case pb.Code_LockedByOther:
 		return LockedByOther
 	case pb.Code_EndOfExtent:
@@ -36,6 +39,8 @@ func FromPBCode(code pb.Code, des string) error {
 }
 func ConvertToPBCode(err error) (pb.Code, string) {
 	switch err {
+	case StreamVersionLow:
+		return pb.Code_StreamVersionLow, err.Error()
 	case LockedByOther:
 		return pb.Code_LockedByOther, err.Error()
 	case EndOfExtent:

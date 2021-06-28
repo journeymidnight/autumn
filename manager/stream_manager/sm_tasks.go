@@ -60,7 +60,6 @@ func (sm *StreamManager) copyDone(task *pb.RecoveryTask, newNodeID uint64) {
 
 
 //go routine
-//or use gossip protocol in the future
 func (sm *StreamManager) routineUpdateDF() {
 
 	ticker := utils.NewRandomTicker(time.Minute, 2 * time.Minute)
@@ -291,36 +290,6 @@ func (sm *StreamManager) routineDispatchTask() {
 				}
 			}
 	}
-}
-
-//node service,
-//producer
-func (sm *StreamManager) SubmitRecoveryTask(ctx context.Context, req *pb.SubmitRecoveryTaskRequest) (*pb.SubmitRecoveryTaskResponse, error) {
-	/*
-	errDone := func(err error) (*pb.SubmitRecoveryTaskResponse, error){
-		code, desCode := wire_errors.ConvertToPBCode(err)
-		return &pb.SubmitRecoveryTaskResponse{
-			Code: code,
-			CodeDes: desCode,
-		}, nil
-		}*/
-		
-
-	return nil, errors.New("not implemented")
-
-	/*
-	if !sm.AmLeader() {
-		return errDone(wire_errors.NotLeader)
-	}
-
-	if err := sm.dispatchRecoveryTask(req.Task.ExtentID, req.Task.ReplaceID); err != nil {
-		return errDone(err)
-	}
-
-	return &pb.SubmitRecoveryTaskResponse{
-		Code: pb.Code_OK,
-	}, nil
-	*/
 }
 
 

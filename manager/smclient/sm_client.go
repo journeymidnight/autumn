@@ -178,7 +178,9 @@ func (client *SMClient) CreateStream(ctx context.Context, dataShard uint32, pari
 	return si, ei, err
 }
 
-func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64, extentToSeal uint64, dataShard, parityShard uint32, ownerKey string, revision int64) (*pb.ExtentInfo, error) {
+func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64, 
+	extentToSeal uint64, dataShard, parityShard uint32, ownerKey string, revision int64, checkCommitLength uint32) (*pb.ExtentInfo, error) {
+
 	err := errors.New("can not find connection to stream manager")
 	var res *pb.StreamAllocExtentResponse
 	var ei *pb.ExtentInfo
@@ -191,6 +193,7 @@ func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64, 
 			ParityShard: parityShard,
 			OwnerKey: ownerKey,
 			Revision: revision,
+			CheckCommitLength: checkCommitLength,
 		})
 		if err == context.Canceled || err == context.DeadlineExceeded {
 			return false

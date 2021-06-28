@@ -67,6 +67,9 @@ func (ReedSolomon) Encode(input []byte, dataShards int, parityShards int) ([][]b
 	
 
 	size := len(input)
+	/*
+	leftSpace和perShard至少是4, 保证存储长度
+	solution1:
 	perShard := (size + dataShards - 1) / dataShards
 
 	//at least 4 bytes to save length
@@ -79,9 +82,12 @@ func (ReedSolomon) Encode(input []byte, dataShards int, parityShards int) ([][]b
 	if leftSpace < 4 {
 		perShard += (4-leftSpace) / dataShards + 1
 	}
-
-	leftSpace = perShard * dataShards - size
-	
+	*/
+	perShard := (size  + dataShards + 4 - 1)/dataShards
+    if perShard < 4 {
+        perShard = 4
+	}
+	leftSpace := perShard * dataShards - size
 	utils.AssertTrue(leftSpace >= 4)
 	
 	var padding []byte //include the last shard and all partyShards
