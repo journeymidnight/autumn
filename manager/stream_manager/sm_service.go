@@ -215,7 +215,10 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		}
 	}
 
-	if lastExtentInfo.SealedLength == 0 {
+	var ops []clientv3.Op
+
+	//seal the oldExtent, update lastExtentInfo
+	{
 		//recevied commit length
 
 		var minSize int
@@ -242,6 +245,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 			}
 		}
 		if bits.OnesCount32(avali) < minSize {
+			xlog.Logger.Warnf("avali nodes is %d , less than minSize %d", avali, minSize)
 			return errDone(errors.Errorf("avali nodes is %d , less than minSize %d", avali, minSize))
 		}
 		
@@ -253,17 +257,9 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 
 		data := utils.MustMarshal(lastExtentInfo)
 	
-		ops := []clientv3.Op{
+		ops = append(ops, 
 			clientv3.OpPut(formatExtentKey(id), string(data)),
-		}
-		if err = etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
-			clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
-			clientv3.Compare(clientv3.CreateRevision(req.OwnerKey), "=", req.Revision),
-		}, ops) ; err != nil {
-			return errDone(errors.Errorf("can not set ETCD"))
-		}
-
-		sm.extents.Set(lastExtentInfo.ExtentID, lastExtentInfo)
+		)
 	}
 
 
@@ -308,10 +304,10 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	edata, err := extentInfo.Marshal()
 	utils.Check(err)
 
-	ops := []clientv3.Op{
+	ops = append(ops, 
 		clientv3.OpPut(streamKey, string(sdata)),
 		clientv3.OpPut(extentKey, string(edata)),
-	}
+	)
 
 	err = etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
 		clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
@@ -324,6 +320,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 
 	//update memory
 	//update streams and extents
+	sm.extents.Set(lastExtentInfo.ExtentID, lastExtentInfo)
 	sm.addExtent(req.StreamID, &extentInfo)
 
 	return &pb.StreamAllocExtentResponse{
@@ -371,10 +368,11 @@ func (sm *StreamManager) receiveCommitlength(ctx context.Context, nodes []*NodeS
 	result := make([]int64, len(nodes))
 	for i, node := range nodes {
 		addr := node.Address
+		j := i
 		stopper.RunWorker(func() {
 			pool := conn.GetPools().Connect(addr)
 			if pool == nil {
-				result[i] = -1
+				result[j] = -1
 				return
 			}
 			conn := pool.Get()
@@ -384,16 +382,14 @@ func (sm *StreamManager) receiveCommitlength(ctx context.Context, nodes []*NodeS
 			})
 			if err != nil { //timeout or other error
 				xlog.Logger.Warnf(err.Error())
-				result[i] = -1
+				result[j] = -1
 				return
 			}
-			result[i] = int64(res.Length)
-			//reCh <- res.Length
+			result[j] = int64(res.Length)			
 		})
 	}
-	
 	stopper.Wait()
-	
+	xlog.Logger.Debugf("get commitlenght of extent %d, the sizes is %+v", extentID, result)
 	return result
 }
 
