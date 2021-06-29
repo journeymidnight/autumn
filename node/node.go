@@ -116,7 +116,7 @@ func (en *ExtentNode) extentInfoUpdatedfunc(eventType string, cur *pb.ExtentInfo
 		}
 	case "DELETE":
 		//FIXME, TODO
-		ex := en.getExtent(cur.ExtentID)
+		ex := en.getExtent(prev.ExtentID)
 		if ex != nil {
 			fmt.Printf("you should delete extent %d...", prev.ExtentID)
 		}

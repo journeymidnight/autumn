@@ -167,7 +167,6 @@ func (w *LogWriter) Close() error {
 	w.flusher.closed = true
 	w.flusher.ready.Signal()
 	w.flusher.Unlock()
-
 	if err := w.Sync(); err != nil {
 		return err
 	}

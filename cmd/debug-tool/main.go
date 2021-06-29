@@ -52,7 +52,16 @@ func receiveData(client *clientv3.Client) []KV {
 		panic(err)
 	}
 	for _, kv := range kvs {
-		if strings.HasPrefix(string(kv.Key), "PART") {
+		if strings.HasPrefix(string(kv.Key), "regions/config") {
+			var config pspb.Regions
+			config.Unmarshal(kv.Value)
+			d := KV {
+				Key: string(kv.Key),
+				Value: fmt.Sprintf("%+v", config),
+			}
+			data = append(data, d)
+
+		}else if strings.HasPrefix(string(kv.Key), "PART") {
 			var meta pspb.PartitionMeta
 			if err = meta.Unmarshal(kv.Value) ; err != nil {
 				fmt.Printf("can not parse %s", kv.Key)
@@ -62,9 +71,7 @@ func receiveData(client *clientv3.Client) []KV {
 				Key: string(kv.Key),
 				Value: fmt.Sprintf("%+v", meta),
 			}
-
 			data = append(data, d)
-			//data = append(data, parseParts(kv))
 		} else if strings.HasPrefix(string(kv.Key), "AutumnSMIDKey") || strings.HasPrefix(string(kv.Key), "AutumnPMIDKey") {
 			d := KV{
 				Key:   string(kv.Key),

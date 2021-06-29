@@ -336,6 +336,9 @@ func (ex *Extent) ResetWriter() error {
 
 func (ex *Extent) RecoveryData(start uint32, rev int64, blocks []*pb.Block) error {
 
+	if ex.IsSeal() {
+		return nil
+	}
 	//因为如果能写入log, 说明rev一定是更高的, 这里调用
 	//HasLock更新lastRevision
 	ex.HasLock(rev)

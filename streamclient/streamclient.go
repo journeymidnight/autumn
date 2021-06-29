@@ -310,10 +310,8 @@ retry:
 	case pb.Code_EndOfStream:
 		iter.noMore = true
 		return nil
-	case pb.Code_ERROR:
-		return err
 	default:
-		return errors.Errorf("unexpected error")
+		return errors.Errorf(res.CodeDes)
 	}
 
 }
@@ -428,10 +426,10 @@ func (sc *AutumnStreamClient) MustAllocNewExtent(oldExtentID uint64, dataShard, 
 			sc.streamInfo.ExtentIDs = si[sc.streamID].ExtentIDs
 			if len(sc.streamInfo.ExtentIDs) >= 2 && sc.streamInfo.ExtentIDs[len(sc.streamInfo.ExtentIDs) - 2] == oldExtentID {
 				sc.em.Update(sc.streamInfo.ExtentIDs[len(sc.streamInfo.ExtentIDs) - 1])
-				xlog.Logger.Info("MustAllocNewExtent may have duplicated, new extent was created")
+				xlog.Logger.Infof("MustAllocNewExtent may have duplicated, new extent was created")
 				return nil
 			}
-			return errors.New("MustAllocNewExtent may have duplicated, oldExtentID not match")
+			return errors.Errorf("MustAllocNewExtent may have duplicated, oldExtentID %d not match", oldExtentID)
 			
 		}
 		if err == wire_errors.LockedByOther {
@@ -481,6 +479,9 @@ func (sc *AutumnStreamClient) AppendEntries(ctx context.Context, entries []*pb.E
                })
     }
 	extentID, offsets , tail, err := sc.Append(ctx, blocks)
+	if err != nil {
+		return 0, 0, err
+	}
 	for i := range entries {
 		entries[i].ExtentID = extentID
 		entries[i].Offset = offsets[i]
@@ -514,6 +515,7 @@ retry:
 		return extentID, nil, 0, errors.New("not such extent")
 	}
 
+
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	c := pb.NewExtentServiceClient(conn)
 	res, err := c.Append(ctx, &pb.AppendRequest{
@@ -534,11 +536,22 @@ retry:
 	}
 
 
-	if err != nil {//other errors
+	if err != nil {//may have other network errors
 		return 0,nil,0, err
 	}
-	//检查offset结果, 如果已经超过2GB, 调用StreamAllocExtent
+
+	if res.Code == pb.Code_EVersionLow {
+		sc.em.WaitVersion(extentID, exInfo.Eversion+1)
+		goto retry
+	}
 	
+	//logic errors
+	err = wire_errors.FromPBCode(res.Code, res.CodeDes)
+	if err != nil {
+		return 0, nil, 0, err
+	}
+
+	//检查offset结果, 如果已经超过2GB, 调用StreamAllocExtent
 	utils.AssertTrue(res.End > 0)
 	if res.End > MaxExtentSize {
 		

@@ -18,7 +18,6 @@ import (
 	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/journeymidnight/autumn/streamclient"
 	"github.com/journeymidnight/autumn/utils"
-	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
 )
@@ -179,7 +178,7 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 
 	if lastTable == nil {
 		err := replayLog(rp.logStream, 0, 0, true, replay)
-		if err == wire_errors.LockedByOther {
+		if err != nil {
 			return nil, err
 		}
 	} else {
@@ -191,7 +190,7 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 			}
 		*/
 		err := replayLog(rp.logStream, lastTable.VpExtentID, lastTable.VpOffset, true, replay)
-		if err == wire_errors.LockedByOther {
+		if err != nil {
 			return nil, err
 		}
 	}

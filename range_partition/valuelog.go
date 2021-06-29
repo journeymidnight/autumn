@@ -46,6 +46,7 @@ func replayLog(stream streamclient.StreamClient, startExtentID uint64, startOffs
 	if err := iter.CheckCommitLength(); err != nil {
 		return err
 	}
+
 	for {
 		ok, err := iter.HasNext()
 		if err != nil {

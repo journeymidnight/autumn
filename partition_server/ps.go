@@ -80,7 +80,7 @@ func (ps *PartitionServer) getPartitionMeta(partID uint64) (int64, *pspb.Partiti
 	if err = meta.Unmarshal(data); err != nil {
 		return 0, nil, nil, nil, err
 	}
-
+	
 	kvs, newRev, err := etcd_utils.EtcdRange(ps.etcdClient, fmt.Sprintf("PARTSTATS/%d", partID))
 	if err != nil {
 		return 0, nil, nil, nil, err
@@ -159,6 +159,8 @@ func (ps *PartitionServer) parseRegionAndStart(regions *pspb.Regions) int64{
 			mutex.Unlock(context.Background())
 			continue
 		}
+		fmt.Printf("partid is %d, meta is %+v\n",region.PartID,  meta)
+
 		rp, err := ps.startRangePartition(meta, locs, blobs, mutex)
 		if err != nil {
 			xlog.Logger.Errorf(err.Error())

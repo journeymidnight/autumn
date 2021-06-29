@@ -114,10 +114,6 @@ func (en *ExtentNode) validReq(extentID uint64, version uint64) (*extent.Extent,
 		return nil, nil, wire_errors.VersionLow
 	}
 
-	if extentInfo.SealedLength > 0 {
-		return nil, nil, errors.New("extent is sealed")
-	}
-
 	return ex, extentInfo, nil
 }
 
@@ -137,6 +133,10 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 		return errDone(err)
 	}
 
+	if extentInfo.SealedLength > 0 {
+		return errDone(errors.Errorf("extent %d is sealed", req.ExtentID))
+	}
+
 	ex.Lock()
 	defer ex.Unlock()
 
@@ -149,7 +149,7 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 
 	pools, err := en.connPool(en.em.GetPeers(req.ExtentID))
 	if err != nil {
-		return errDone(err)
+		return errDone(errors.Errorf("extent %d is sealed", req.ExtentID))
 	}
 
 	//prepare data
@@ -334,9 +334,13 @@ func (en *ExtentNode) SmartReadBlocks(ctx context.Context, req *pb.ReadBlocksReq
 		return errDone(err)
 	}
 
+	//only read from avali data
 	//read data shards
 	for i := 0; i < dataShards; i++ {
 		j := i
+		if 1 << j & exInfo.Avali == 0 {
+			continue
+		}
 		stopper.RunWorker(func() {
 			conn := pools[j].Get()
 			submitReq(conn, j)
@@ -577,8 +581,8 @@ func (en *ExtentNode) ReadEntries(ctx context.Context, req *pb.ReadEntriesReques
 		}, nil
 	}
 
-	utils.AssertTrue(len(res.Blocks)>0)
-	
+	//utils.AssertTrue(len(res.Blocks)>0)
+
 	entries := make([]*pb.EntryInfo, len(res.Blocks))
 	for i := 0 ; i < len(res.Blocks); i ++ {
 		entry, err := extent.ExtractEntryInfo(res.Blocks[i], ex.ID, res.Offsets[i], replay)
