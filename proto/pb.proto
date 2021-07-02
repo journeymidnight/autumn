@@ -278,12 +278,14 @@ message NodesInfoResponse{
 
 message RegisterNodeRequest{
 	string addr = 1;
+	repeated string diskUUIDs = 2;
 }
 
 message RegisterNodeResponse {
 	Code code = 1;
 	string codeDes = 2;
 	uint64 nodeId = 3;
+	map<string, uint64> diskUUIDs = 4; //uuid=>diskID
 }
 
 
@@ -309,18 +311,6 @@ message TruncateResponse {
 	string codeDes = 2;
 }
 
-/*
-message SubmitRecoveryTaskRequest{
-	RecoveryTask task = 1;
-}
-
-message SubmitRecoveryTaskResponse{
-	Code code = 1;
-	string codeDes = 2;
-}
-*/
-
-
 service StreamManagerService {
 	rpc StreamInfo(StreamInfoRequest) returns (StreamInfoResponse) {}
 	rpc ExtentInfo(ExtentInfoRequest) returns (ExtentInfoResponse) {}
@@ -345,10 +335,12 @@ message ExtentInfo {
     uint64 extentID = 1;
     repeated uint64 replicates = 2; //dataShard nodes
  	repeated uint64 parity = 3;//partiyShard nodes
-	uint64 eversion = 4; //change version when 1, updating replicates, 2. parityNodes, 3. seal
+	uint64 eversion = 4; //eversion should equal to ETCD's version
 	uint64 refs = 5; 
 	uint64 SealedLength = 6;
 	uint32 avali = 7; //bitmap to indicat if node is avaliable when sealing
+	repeated uint64 replicateDisks = 8;
+	repeated uint64 parityDisk = 9;
 }
 /*
 Extent和Stream是多对多的关系, 一个stream对应多个extent.
@@ -368,4 +360,11 @@ message StreamInfo {
 message NodeInfo {
 	uint64 nodeID = 1;
 	string address = 2;
+	repeated uint64 disks = 3; 
+}
+
+message DiskInfo {
+	uint64 diskID = 1;
+	uint32 online = 2;
+	string uuid = 3;
 }

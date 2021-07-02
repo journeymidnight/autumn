@@ -117,12 +117,16 @@ func (sm *StreamManager) CreateStream(ctx context.Context, req *pb.CreateStreamR
 }
 
 
-func (sm *StreamManager) addNode(id uint64, addr string) {
-	sm.nodes.Set(id,&NodeStatus{
-		NodeInfo: pb.NodeInfo{
-			NodeID:  id,
-			Address: addr,
-		}})
+func (sm *StreamManager) addDisk(info pb.DiskInfo) {
+	sm.disks.Set(info.DiskID, &DiskStatus{
+		DiskInfo: info,
+	})
+}
+
+func (sm *StreamManager) addNode(info pb.NodeInfo) {
+	sm.nodes.Set(info.NodeID ,&NodeStatus{
+		NodeInfo: info,
+	})
 }
 
 func (sm *StreamManager) addExtent(streamID uint64, extent *pb.ExtentInfo) {
@@ -442,22 +446,58 @@ func (sm *StreamManager) RegisterNode(ctx context.Context, req *pb.RegisterNodeR
 		return errDone(errors.New("duplicated addr"))
 	}
 
-	id, _, err := sm.allocUniqID(1)
+	//TODO: duplicated disk UUID?
+
+	id, _, err := sm.allocUniqID(uint64(1+len(req.DiskUUIDs)))
 	if err != nil {
 		return errDone(errors.New("failed to alloc uniq id"))
 	}
+
+
+
 	//modify etcd
+	//add node and disks
+	disks := make([]pb.DiskInfo,len(req.DiskUUIDs))
+	for i := range req.DiskUUIDs {
+		disks[i] = pb.DiskInfo{
+			DiskID: id+uint64(i)+1,
+			Online: 1,
+			Uuid: req.DiskUUIDs[i],
+		}
+	}
+	
+	seq := func(start uint64, count int) []uint64 {
+		a := make([]uint64, count)
+		for i := range a {
+			a[i] = start + uint64(i)
+		}
+		return a
+	}
+
 	nodeInfo := &pb.NodeInfo{
 		NodeID:  id,
 		Address: req.Addr,
+		Disks: seq(id+1, len(req.DiskUUIDs)),
 	}
+
 	data, err := nodeInfo.Marshal()
 	utils.Check(err)
 	nodeKey := formatNodeKey(id)
 	nodeValue := data
+
 	ops := []clientv3.Op{
 		clientv3.OpPut(nodeKey, string(nodeValue)),
 	}
+
+	for i := range disks {
+		data := utils.MustMarshal(&disks[i])
+		ops = append(ops, clientv3.OpPut(
+			formatDiskKey(id+1+uint64(i)),
+			string(data),
+		))
+	}
+
+
 
 	err = etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
 		clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
@@ -467,10 +507,19 @@ func (sm *StreamManager) RegisterNode(ctx context.Context, req *pb.RegisterNodeR
 	}
 
 	//modify memory
-	sm.addNode(id, req.Addr)
+	for i := range disks {
+		sm.addDisk(disks[i])
+	}
+	sm.addNode(*nodeInfo)
+	
+	uuidToDiskID := make(map[string]uint64)
+	for _, disk := range disks {
+		uuidToDiskID[disk.Uuid] = disk.DiskID
+	}
 	return &pb.RegisterNodeResponse{
 		Code:   pb.Code_OK,
 		NodeId: id,
+		DiskUUIDs: uuidToDiskID,
 	}, nil
 }
 
@@ -705,6 +754,10 @@ func formatNodeKey(ID uint64) string {
 
 func formatExtentKey(ID uint64) string {
 	return fmt.Sprintf("extents/%d", ID)
+}
+
+func formatDiskKey(ID uint64) string {
+	return fmt.Sprintf("disks/%d", ID)
 }
 
 func parseKey(s string, prefix string) (uint64, error) {

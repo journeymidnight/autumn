@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/journeymidnight/autumn/extent"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
+	uuid "github.com/satori/go.uuid"
 )
 
 const (
@@ -22,6 +24,7 @@ const (
 type diskFS struct {
 	baseDir string
 	baseFd  *os.File
+	diskID uint64
 }
 
 func OpenDiskFS(dir string, nodeID uint64) (*diskFS, error) {
@@ -39,6 +42,7 @@ func OpenDiskFS(dir string, nodeID uint64) (*diskFS, error) {
 		return nil, errors.Errorf("can not parse file: node_id %v", err)
 	}
 
+
 	id, err := strconv.ParseUint(string(idString), 10, 64)
 	if err != nil {
 		return nil, errors.Errorf("can not parse file: node_id %v", err)
@@ -47,6 +51,17 @@ func OpenDiskFS(dir string, nodeID uint64) (*diskFS, error) {
 		return nil, errors.Errorf("the node_id on disk is different,%d != %d", id, nodeID)
 	}
 
+	diskIDString, err := ioutil.ReadFile(filepath.Join(dir, "disk_id"))
+	if err != nil {
+		return nil, errors.Errorf("can not parse file: disk_id %v", err)
+	}
+
+	diskID, err := strconv.ParseUint(string(diskIDString), 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	s.diskID = diskID
+	
 	return s, nil
 }
 
@@ -135,9 +150,19 @@ func mkHashDir(dir string, level int) error {
 	return nil
 }
 
-func FormatDisk(dir string) error {
-	if err := mkHashDir(dir, diskLevel); err != nil {
-		return err
+func FormatDisk(dir string) (string, error) {
+	var err error
+	if err = mkHashDir(dir, diskLevel); err != nil {
+		return "", err
 	}
-	return nil
+	//create uuid
+	//TODO: use filesystem's UUID
+	us := uuid.NewV4().String()
+	var f *os.File
+
+	if f, err = os.OpenFile(path.Join(dir, us), os.O_CREATE, 0644); err != nil {
+		return "", err
+	}
+	f.Close()
+	return us, nil
 }

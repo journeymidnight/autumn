@@ -449,6 +449,7 @@ func format(c *cli.Context) error {
 		}
 		return
 	}
+	var err error
 	smAddr := utils.SplitAndTrim(c.String("smAddr"), ",")
 	listenUrl := c.String("listenUrl")
 
@@ -471,12 +472,16 @@ func format(c *cli.Context) error {
 
 	sm := smclient.NewSMClient(smAddr)
 
-	if err := sm.Connect(); err != nil {
+	if err = sm.Connect(); err != nil {
 		return err
 	}
-
-	for _, dir := range dirList {
-		if err := node.FormatDisk(dir); err != nil {
+	dirToUuid := make(map[string]string)
+	uuids := make([]string, len(dirList))
+	for i, dir := range dirList {
+		uuid, err := node.FormatDisk(dir)
+		dirToUuid[dir] = uuid
+		uuids[i] = uuid
+		if err != nil {
 			revert(dirList)
 			return err
 		}
@@ -485,18 +490,29 @@ func format(c *cli.Context) error {
 	//register a new NodeID
 
 	fmt.Printf("format on disks : %+v", dirList)
-
+	
 	fmt.Printf("register node on stream manager ..\n")
-	nodeID, err := sm.RegisterNode(context.Background(), listenUrl)
+	nodeID, uuidToDiskID, err := sm.RegisterNode(context.Background(), uuids, listenUrl)
 	if err != nil {
 		revert(dirList)
 		return err
 	}
 
 	fmt.Printf("node %d is registered\n", nodeID)
+	
 	for _, dir := range dirList {
-		storeIDPath := path.Join(dir, "node_id")
-		if err := ioutil.WriteFile(storeIDPath, []byte(fmt.Sprintf("%d", nodeID)), 0644); err != nil {
+		nodeIDPath := path.Join(dir, "node_id")
+		if err := ioutil.WriteFile(nodeIDPath, []byte(fmt.Sprintf("%d", nodeID)), 0644); err != nil {
+			revert(dirList)
+			return err
+		}
+
+		diskIDPath := path.Join(dir, "disk_id")
+		diskID := uuidToDiskID[dirToUuid[dir]]
+		if diskID == 0 {
+			return errors.Errorf("diskID is nil")
+		}
+		if err := ioutil.WriteFile(diskIDPath, []byte(fmt.Sprintf("%d", diskID)), 0644); err != nil {
 			revert(dirList)
 			return err
 		}

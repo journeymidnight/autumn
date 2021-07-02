@@ -2,8 +2,6 @@ package streamclient
 
 import (
 	"context"
-	"fmt"
-	"io"
 	"time"
 
 	"github.com/coreos/etcd/clientv3/concurrency"
@@ -77,7 +75,8 @@ retry:
 	if exInfo == nil {
 		return nil,  0, errors.Errorf("no such extent")
 	}
-	conn := br.em.GetExtentConn(extentID, smclient.PrimaryPolicy{})
+	//BlockReader.Read should be a random read
+	conn := br.em.GetExtentConn(extentID, smclient.AlivePolicy{})
 	if conn == nil {
 		return nil, 0, errors.Errorf("unable to get extent connection.")
 	}
@@ -89,12 +88,20 @@ retry:
 		Eversion: exInfo.Eversion ,
 	})
 
-	if res.Code == pb.Code_EVersionLow {
-		br.em.WaitVersion(extentID, exInfo.Eversion+1)
-		goto retry
+	//network error
+	if err != nil {
+		return nil, 0, err
 	}
-	
-	return res.Blocks, res.End, err
+
+	err = wire_errors.FromPBCode(res.Code, res.CodeDes)
+	if err == wire_errors.VersionLow {
+		br.em.Update(extentID)
+		goto retry
+	} else if err != nil {
+		return nil, 0, err
+	}
+
+	return res.Blocks, res.End, nil
 }
 
 
@@ -169,6 +176,7 @@ type AutumnEntryIter struct {
 	noMore             bool
 	cache              []*pb.EntryInfo
 	replay             uint32
+	conn               *grpc.ClientConn
 }
 
 
@@ -253,11 +261,23 @@ func (iter *AutumnEntryIter) Next() *pb.EntryInfo {
 
 func (iter *AutumnEntryIter) receiveEntries() error {
 	loop := 0
-retry:
-	conn, extentID, err := iter.sc.getExtentConnFromIndex(iter.currentExtentIndex)
+
+
+	extentID, err := iter.sc.getExtentFromIndex(iter.currentExtentIndex)
 	if err != nil {
 		//utils.AssertTrue(!iter.noMore)
 		return err
+	}
+retry:
+	for loop := 0 ; iter.conn == nil ; loop ++ {
+		iter.conn = iter.sc.em.GetExtentConn(extentID, smclient.AlivePolicy{})
+		if iter.conn == nil {
+			time.Sleep(3*time.Second)
+			xlog.Logger.Warnf("retry to get connect to %d", extentID)
+			if loop > 100 {
+				return errors.New("retries too many time to get extent connection")
+			}
+		}
 	}
 
 	exInfo := iter.sc.em.GetExtentInfo(extentID)
@@ -265,7 +285,7 @@ retry:
 
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	c := pb.NewExtentServiceClient(conn)
+	c := pb.NewExtentServiceClient(iter.conn)
 	res, err := c.ReadEntries(ctx, &pb.ReadEntriesRequest{
 		ExtentID: extentID,
 		Offset:   iter.currentOffset,
@@ -279,7 +299,8 @@ retry:
 			return errors.New("finally timeout")
 		}
 		loop++
-		time.Sleep(1 * time.Second)
+		time.Sleep(3 * time.Second)
+		iter.conn = nil
 		goto retry
 	}
 
@@ -372,42 +393,31 @@ func (sc *AutumnStreamClient) getExtentIndexFromID(extentID uint64) int {
 	return -1
 }
 
-func (sc *AutumnStreamClient) getExtentConnFromIndex(extendIdIndex int) (*grpc.ClientConn, uint64, error) {
+func (sc *AutumnStreamClient) getExtentFromIndex(extendIdIndex int) (uint64, error) {
 
-	if extendIdIndex == len(sc.streamInfo.ExtentIDs) {
-		return nil, 0, io.EOF
-	}
-
-	if extendIdIndex > len(sc.streamInfo.ExtentIDs) {
-		return nil, 0, errors.Errorf("extentID too big %d", extendIdIndex)
+	if extendIdIndex >= len(sc.streamInfo.ExtentIDs) {
+		return 0, errors.Errorf("extentID too big %d", extendIdIndex)
 	}
 
 	id := sc.streamInfo.ExtentIDs[extendIdIndex]
-	conn := sc.em.GetExtentConn(id, smclient.PrimaryPolicy{})
-	if conn == nil {
-		return nil, id, errors.Errorf("not found extentID %d", id)
-	}
-	return conn, id, nil
+	return id, nil
 }
 
-func (sc *AutumnStreamClient) getLastExtentConn() (uint64, *grpc.ClientConn, error) {
+func (sc *AutumnStreamClient) getLastExtent() (uint64, error) {
 
 	if sc.streamInfo == nil || len(sc.streamInfo.ExtentIDs) == 0 {
-		return 0, nil, errors.New("no streamInfo or streamInfo is not correct")
+		return 0, errors.New("no streamInfo or streamInfo is not correct")
 	}
 	extentID := sc.streamInfo.ExtentIDs[len(sc.streamInfo.ExtentIDs)-1] //last extent
-	conn := sc.em.GetExtentConn(extentID, smclient.PrimaryPolicy{})
-	if conn == nil {
-		return 0, nil, fmt.Errorf("can not get extent connection with id: %d", extentID)
-	}
-	return extentID, conn, nil
+	return extentID, nil
 }
 
 
 func (sc *AutumnStreamClient) MustAllocNewExtent(oldExtentID uint64, dataShard, parityShard uint32) error{
 	var newExInfo *pb.ExtentInfo
 	var err error
-	for i := 0 ; i < 10 ; i ++{
+	loop := 0
+	for {
 		ctx , cancel := context.WithTimeout(context.Background(), 5 * time.Second)
 		newExInfo, err = sc.smClient.StreamAllocExtent(ctx, sc.streamID, 
 		oldExtentID, dataShard, parityShard, sc.streamLock.ownerKey, sc.streamLock.revision, 0)
@@ -415,7 +425,7 @@ func (sc *AutumnStreamClient) MustAllocNewExtent(oldExtentID uint64, dataShard, 
 		if err == nil {
 			break
 		}
-		xlog.Logger.Warn(err.Error())
+		xlog.Logger.Errorf(err.Error())
 
 		//maybe we lost the ACK message.
 		if err == wire_errors.StreamVersionLow {
@@ -435,7 +445,11 @@ func (sc *AutumnStreamClient) MustAllocNewExtent(oldExtentID uint64, dataShard, 
 		if err == wire_errors.LockedByOther {
 			return err
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(5 * time.Second)
+		loop ++
+		if loop > 1000 {
+			return errors.New("retries too many times to allocNewExtent")
+		}
 	}
 
 	if err != nil {
@@ -506,8 +520,10 @@ func (sc *AutumnStreamClient) Read(ctx context.Context, extentID uint64, offset 
 func (sc *AutumnStreamClient) Append(ctx context.Context, blocks []*pb.Block) (uint64, []uint32, uint32,  error) {
 	loop := 0
 retry:
-	extentID, conn, err := sc.getLastExtentConn()
+
+	extentID, err := sc.getLastExtent()
 	if err != nil {
+		xlog.Logger.Error(err)
 		return 0, nil, 0, err
 	}
 	exInfo := sc.em.GetExtentInfo(extentID)
@@ -515,6 +531,13 @@ retry:
 		return extentID, nil, 0, errors.New("not such extent")
 	}
 
+	conn := sc.em.GetExtentConn(extentID, smclient.PrimaryPolicy{})
+	if conn == nil {
+		if err = sc.MustAllocNewExtent(extentID, uint32(len(exInfo.Replicates)), uint32(len(exInfo.Parity))) ; err != nil {
+			return 0, nil, 0, err
+		}
+
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	c := pb.NewExtentServiceClient(conn)
@@ -537,7 +560,7 @@ retry:
 
 
 	if err != nil {//may have other network errors
-		return 0,nil,0, err
+		return 0, nil, 0, err
 	}
 
 	if res.Code == pb.Code_EVersionLow {
@@ -554,9 +577,8 @@ retry:
 	//检查offset结果, 如果已经超过2GB, 调用StreamAllocExtent
 	utils.AssertTrue(res.End > 0)
 	if res.End > MaxExtentSize {
-		
-		if err := sc.MustAllocNewExtent(extentID, uint32(len(exInfo.Replicates)), uint32(len(exInfo.Parity))); err != nil {
-			return 0,nil,0, err
+		if err = sc.MustAllocNewExtent(extentID, uint32(len(exInfo.Replicates)), uint32(len(exInfo.Parity))); err != nil {
+			return 0, nil, 0, err
 		}
 	}
 	return extentID, res.Offsets,res.End, nil
