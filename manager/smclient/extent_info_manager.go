@@ -2,7 +2,6 @@ package smclient
 
 import (
 	"context"
-	"math/rand"
 	"sync"
 	"time"
 
@@ -229,32 +228,47 @@ func (em *ExtentManager) GetPeers(extentID uint64) []string {
 }
 
 type SelectNodePolicy interface {
-	Choose(replics []string) *grpc.ClientConn
+	Choose(em *ExtentManager, extentID uint64) *grpc.ClientConn
 }
 
 type PrimaryPolicy struct{}
 
-func (PrimaryPolicy) Choose(replics []string) *grpc.ClientConn {
-	addr := replics[0]
-	pool, err := conn.GetPools().Get(addr)
+func (PrimaryPolicy) Choose(em *ExtentManager, extentID uint64) *grpc.ClientConn {
+	exInfo := em.getExtentInfo(extentID)
+	if exInfo == nil {
+		return nil
+	}
+	nodeInfo := em.GetNodeInfo(exInfo.Replicates[0])
+	pool, err := conn.GetPools().Get(nodeInfo.Address)
 	if err != nil {
 		if err == conn.ErrNoConnection {
-			return conn.GetPools().Connect(addr).Get()
+			return conn.GetPools().Connect(nodeInfo.Address).Get()
 		}
-		// TODO: Handle unhealthy connection
 		return nil
 	}
 	return pool.Get()
 }
 
-type RandomPolicy struct{}
+type AlivePolicy struct{}
 
-func (RandomPolicy) Choose(replics []string) *grpc.ClientConn {
-	for loop := 0; loop < 3; loop++ {
-		n := rand.Intn(len(replics))
-		pool, err := conn.GetPools().Get(replics[n])
-		if err == nil {
+func (AlivePolicy) Choose(em *ExtentManager, extentID uint64) *grpc.ClientConn {	
+	exInfo := em.getExtentInfo(extentID)
+	if exInfo == nil {
+		return nil
+	}
+	//in EC, if all replicates do not work, so it is meaningless to connect parity nodes
+	for i := range exInfo.Replicates {
+		if exInfo.SealedLength > 0 && ((1 << i) & exInfo.Avali) == 0 {
 			continue
+		}
+		nodeInfo := em.GetNodeInfo(exInfo.Replicates[i])
+
+		pool, err := conn.GetPools().Get(nodeInfo.Address)
+		if err != nil {
+			if err == conn.ErrNoConnection {
+				return conn.GetPools().Connect(nodeInfo.Address).Get()
+			}
+			return nil
 		}
 		return pool.Get()
 	}
@@ -262,11 +276,7 @@ func (RandomPolicy) Choose(replics []string) *grpc.ClientConn {
 }
 
 func (em *ExtentManager) GetExtentConn(extentID uint64, policy SelectNodePolicy) *grpc.ClientConn {
-	peerAddrs := em.GetPeers(extentID)
-	if len(peerAddrs) == 0 {
-		return nil
-	}
-	return policy.Choose(peerAddrs)
+	return policy.Choose(em, extentID)
 }
 
 

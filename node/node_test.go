@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/clientv3/concurrency"
 	"github.com/coreos/etcd/embed"
 	"github.com/journeymidnight/autumn/etcd_utils"
@@ -42,6 +43,7 @@ type ExtentNodeTestSuite struct {
 	etcd     *embed.Etcd
 	mutex    *concurrency.Mutex
 	session  *concurrency.Session
+	client   *clientv3.Client
 }
 
 func setupStreamManager(suite *ExtentNodeTestSuite, dir string) {
@@ -95,29 +97,8 @@ func setupStreamManager(suite *ExtentNodeTestSuite, dir string) {
 	suite.sm = sm
 	suite.smServer = grpcServer
 	suite.etcd = etcd
+	suite.client = client
 	time.Sleep(17 * time.Second) //wait to be leader
-
-	smc := smclient.NewSMClient([]string{"127.0.0.1:3401"})
-	err = smc.Connect()
-	if err != nil {
-		panic(err)
-	}
-	for i := 0; i < 4; i++ {
-		url := fmt.Sprintf("127.0.0.1:400%d", i+1)
-		_, err := smc.RegisterNode(context.Background(), url)
-		if err != nil {
-			panic(err)
-		}
-	}
-
-	session , err := concurrency.NewSession(client, concurrency.WithTTL(30))
-	if err != nil {
-		panic(err.Error())
-	}
-	suite.session = session
-
-	suite.mutex = concurrency.NewMutex(session, "lockCouldHaveAnyName")
-
 }
 
 func (suite *ExtentNodeTestSuite) SetupSuite() {
@@ -131,27 +112,56 @@ func (suite *ExtentNodeTestSuite) SetupSuite() {
 	setupStreamManager(suite, tmpdir)
 
 
-	//start node
-	for i := 1; i <= 4; i++ {
+	smc := smclient.NewSMClient([]string{"127.0.0.1:3401"})
+	err = smc.Connect()
+	if err != nil {
+		panic(err)
+	}
+
+
+
+	session , err := concurrency.NewSession(suite.client, concurrency.WithTTL(30))
+	if err != nil {
+		panic(err.Error())
+	}
+	suite.session = session
+
+	suite.mutex = concurrency.NewMutex(session, "lockCouldHaveAnyName")
+
+
+	var nodeIDs []uint64
+	//format disk, generate dirs
+	for i := 0; i < 4; i++ {
 		dir := fmt.Sprintf("%s/store%d", tmpdir, i)
 		os.Mkdir(dir, 0777)
 
-		err = FormatDisk(dir)
+		_, err := FormatDisk(dir)
 		if err != nil {
 			panic(err)
 		}
-		err = ioutil.WriteFile(dir+"/node_id", []byte(fmt.Sprintf("%d", i)), 0644)
+		url := fmt.Sprintf("127.0.0.1:400%d", i)
+
+		nodeID, uuidToDiskID, err := smc.RegisterNode(context.Background(), []string{fmt.Sprintf("uuid%d", i)}, url)
+
+
+		err = ioutil.WriteFile(dir+"/node_id", []byte(fmt.Sprintf("%d", nodeID)), 0644)
+		if err != nil {
+			panic(err)
+		}
+		nodeIDs = append(nodeIDs, nodeID)
+		err = ioutil.WriteFile(dir+"/disk_id", []byte(fmt.Sprintf("%d", uuidToDiskID[fmt.Sprintf("uuid%d", i)])), 0644)
 		if err != nil {
 			panic(err)
 		}
 	}
 
+	
 	for i := range suite.ens {
-		dir := fmt.Sprintf("%s/store%d", tmpdir, i+1)
-		url := fmt.Sprintf("127.0.0.1:400%d", i+1)
+		dir := fmt.Sprintf("%s/store%d", tmpdir, i)
+		url := fmt.Sprintf("127.0.0.1:400%d", i)
 		//register to stream manager
 
-		suite.ens[i] = NewExtentNode(uint64(i+1), []string{dir}, "", url, []string{"127.0.0.1:3401"}, []string{"127.0.0.1:2379"})
+		suite.ens[i] = NewExtentNode(nodeIDs[i], []string{dir}, "", url, []string{"127.0.0.1:3401"}, []string{"127.0.0.1:2379"})
 		err := suite.ens[i].LoadExtents()
 		if err != nil {
 			panic(err)
@@ -191,7 +201,7 @@ func (suite *ExtentNodeTestSuite) TestAppendReadValue() {
 	sc := streamclient.NewStreamClient(sm, em, si.StreamID, streamclient.MutexToLock(suite.mutex))
 	err = sc.Connect()
 	suite.Require().Nil(err)
-	extentID, offsets, _, err := sc.Append(context.Background(),
+	extentID, offsets, end, err := sc.Append(context.Background(),
 		[]*pb.Block{
 			{[]byte("hello")},
 			{[]byte("world")},
@@ -201,9 +211,10 @@ func (suite *ExtentNodeTestSuite) TestAppendReadValue() {
 	//fmt.Printf("%d=>%d, on extent %d\n", offsets[0], end, extentID)
 
 	blockReader := streamclient.NewAutumnBlockReader(em, sm)
-	ret, _, err := blockReader.Read(context.Background(), extentID, offsets[0], 2)
+	ret, end, err := blockReader.Read(context.Background(), extentID, offsets[0], 2)
 	suite.Require().Nil(err)
-
+	
+	fmt.Printf("ret:%v, end %d\n", ret, end)
 	suite.Require().Equal([]byte("hello"), ret[0].Data)
 	suite.Require().Equal([]byte("world"), ret[1].Data)
 
@@ -263,7 +274,6 @@ func (suite *ExtentNodeTestSuite) TestCopy() {
 
 	time.Sleep(20 * time.Second)
 }
-
 
 func TestNode(t *testing.T) {
 	suite.Run(t, new(ExtentNodeTestSuite))

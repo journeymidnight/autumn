@@ -109,14 +109,16 @@ func (client *SMClient) try(f func(conn *grpc.ClientConn) bool, x time.Duration)
 	}
 }
 
-func (client *SMClient) RegisterNode(ctx context.Context, addr string) (uint64, error) {
+func (client *SMClient) RegisterNode(ctx context.Context, uuids []string, addr string) (uint64, map[string]uint64, error) {
 	err := errors.New("can not find connection to stream manager")
 	var res *pb.RegisterNodeResponse
 	nodeID := uint64(0)
+	var uuidToDiskID map[string]uint64
 	client.try(func(conn *grpc.ClientConn) bool {
 		c := pb.NewStreamManagerServiceClient(conn)
 		res, err = c.RegisterNode(ctx, &pb.RegisterNodeRequest{
 			Addr: addr,
+			DiskUUIDs: uuids,
 		})
 		if err == context.Canceled || err == context.DeadlineExceeded {
 			return false
@@ -135,10 +137,11 @@ func (client *SMClient) RegisterNode(ctx context.Context, addr string) (uint64, 
 		}
 
 		nodeID = res.NodeId
+		uuidToDiskID = res.DiskUUIDs
 		return false
 	}, 500*time.Millisecond)
 
-	return nodeID, err
+	return nodeID, uuidToDiskID,  err
 }
 
 

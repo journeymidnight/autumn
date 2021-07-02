@@ -79,7 +79,8 @@ streamManager3 => etcd3
 ETCD存储结构:
 ```
 streams/{id} => pb.StreamInfo
-nodes/{id}   =>pb.NodeInfo
+nodes/{id}   => pb.NodeInfo
+disks/{id}   => pb.DiskInfo
 extents/{id} => pb.ExtentInfo
 AutumnSmIDKey 存储已经分配的最大ID
 AutumnSmLeader/xxx 存储当前leader的memberValue, 用来在leader写入时校验是否真的是leader

@@ -19,6 +19,7 @@ import (
 	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/proto/pspb"
+	"github.com/journeymidnight/autumn/utils"
 	"github.com/pkg/errors"
 )
 
@@ -129,8 +130,17 @@ func receiveData(client *clientv3.Client) []KV {
 				Value: fmt.Sprintf("%+v", x),
 			}
 			data = append(data, d)
+		} else if strings.HasPrefix(string(kv.Key), "disks") {
+			var x pb.DiskInfo
+			utils.MustUnMarshal(kv.Value, &x)
+			d := KV{
+				Key: string(kv.Key),
+				Value: fmt.Sprintf("%+v", x),
+			}
+			data = append(data, d)
+
 		} else {
-			fmt.Printf("%s\n", kv.Key)
+			fmt.Printf("skip %s\n", kv.Key)
 			continue
 			//panic("unkown key...")
 		}

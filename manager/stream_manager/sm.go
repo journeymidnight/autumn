@@ -31,6 +31,10 @@ type NodeStatus struct {
 	dead     uint32
 }
 
+type DiskStatus struct {
+	pb.DiskInfo
+}
+
 //FIXME: could atomic.LoadPointer make it concise?
 func (ns *NodeStatus) Dead() bool {
 	return atomic.LoadUint32(&ns.dead) > 0
@@ -86,7 +90,9 @@ type StreamManager struct {
 	
 	//nodeLock utils.SafeMutex
 	//nodes    map[uint64]*NodeStatus
-	nodes      *hashmap.HashMap //id => *NodeStatus
+	nodes     *hashmap.HashMap //id => *NodeStatus
+	
+	disks     *hashmap.HashMap  //id => *DiskStatus
 
 	etcd       *embed.Etcd
 	client     *clientv3.Client
@@ -144,13 +150,6 @@ func (sm *StreamManager) AmLeader() bool {
 
 func (sm *StreamManager) runAsLeader() {
 	//load system
-
-	//sm.streamLock.Lock()
-	//defer sm.streamLock.Unlock()
-	//sm.extentsLock.Lock()
-	//defer sm.extentsLock.Unlock()
-	//sm.nodeLock.Lock()
-	//defer sm.nodeLock.Unlock()
 
 	//load streams
 	kvs, _, err := etcd_utils.EtcdRange(sm.client, "streams")
@@ -243,6 +242,28 @@ func (sm *StreamManager) runAsLeader() {
 		}
 
 		sm.taskPool.Insert(extentID, &task)
+	}
+
+	sm.disks = &hashmap.HashMap{}
+	kvs, _, err = etcd_utils.EtcdRange(sm.client, "disks")
+	if err != nil {
+		xlog.Logger.Errorf(err.Error())
+		return
+	}
+	for _, kv := range kvs {
+		diskID, err := parseKey(string(kv.Key), "disks")
+		if err != nil {
+			xlog.Logger.Errorf(err.Error())
+			return
+		}
+		var diskInfo pb.DiskInfo
+		if err = diskInfo.Unmarshal(kv.Value); err != nil {
+			xlog.Logger.Errorf(err.Error())
+			return
+		}
+		sm.disks.Set(diskID, &DiskStatus{
+			DiskInfo: diskInfo,
+		})
 	}
 
 

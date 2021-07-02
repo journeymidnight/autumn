@@ -109,11 +109,10 @@ func (en *ExtentNode) validReq(extentID uint64, version uint64) (*extent.Extent,
 		return nil, nil, errors.Errorf("no such extent %d on etcd %d", extentID, en.nodeID)
 	}
 	
-
 	if extentInfo.Eversion > version {
 		return nil, nil, wire_errors.VersionLow
 	}
-
+	
 	return ex, extentInfo, nil
 }
 
@@ -338,7 +337,7 @@ func (en *ExtentNode) SmartReadBlocks(ctx context.Context, req *pb.ReadBlocksReq
 	//read data shards
 	for i := 0; i < dataShards; i++ {
 		j := i
-		if 1 << j & exInfo.Avali == 0 {
+		if exInfo.SealedLength > 0 &&  (1 << j) & exInfo.Avali == 0 {
 			continue
 		}
 		stopper.RunWorker(func() {
@@ -347,9 +346,13 @@ func (en *ExtentNode) SmartReadBlocks(ctx context.Context, req *pb.ReadBlocksReq
 		})
 	}
 
+
 	//read parity data
 	for i := 0; i < parityShards; i++ {
 		j := i
+		if exInfo.SealedLength > 0 && (1 << (j + dataShards)) & exInfo.Avali == 0 {
+			continue
+		}
 		stopper.RunWorker(func() {
 			conn := pools[dataShards+j].Get()
 			select {
@@ -401,8 +404,12 @@ waitResult:
 		offsets = successRet[0].Offsets
 	} else {
 		//FIXME collect errChan, find err
-		r := <-errChan
-		return errDone(r.Error)
+		for r := range errChan {
+			if r.Error != nil {
+				return errDone(r.Error)
+			}
+		}
+		return errDone(errors.New("read timeout, not enough nodes response"))
 	}
 
 	//join each block
@@ -590,7 +597,7 @@ func (en *ExtentNode) ReadEntries(ctx context.Context, req *pb.ReadEntriesReques
 			xlog.Logger.Errorf("unmarshal entries error %v\n", err)
 			continue
 		}
-		fmt.Printf("Read entries %v\n", entry)
+		//fmt.Printf("Read entries %v\n", entry)
 		entries[i] = entry
 	}
 
