@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"math/rand"
 	"os"
 	"path"
 	"sync/atomic"
@@ -24,13 +23,17 @@ import (
 	"google.golang.org/grpc"
 )
 
-func (en *ExtentNode) copyRemoteExtent(conn *grpc.ClientConn, extentID uint64, targetFile *os.File) error{
+
+func (en *ExtentNode) copyRemoteExtent(conn *grpc.ClientConn, exInfo *pb.ExtentInfo, targetFile *os.File, offset uint64, size uint64) error{
 	c := pb.NewExtentServiceClient(conn)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	copyStream, err := c.CopyExtent(ctx, &pb.CopyExtentRequest{
-		ExtentID: extentID,
+		ExtentID: exInfo.ExtentID,
+		Eversion: exInfo.Eversion,
+		Offset: offset,
+		Size_: size,
 	})
 	//copyStream will close when met non-nil error
 
@@ -81,12 +84,13 @@ func (en *ExtentNode) copyRemoteExtent(conn *grpc.ClientConn, extentID uint64, t
 
 func (en *ExtentNode) recoveryReplicateExtent(extentInfo *pb.ExtentInfo, task *pb.RecoveryTask, targetFile *os.File) error {
 	conn := en.chooseAliveNode(extentInfo, task.ReplaceID)
+
 	if conn == nil {
 		xlog.Logger.Warnf("runRecoveryTask: can not find remote connect")
 		return errors.Errorf("runRecoveryTask: can not find remote connect")
 	}
 
-	if err := en.copyRemoteExtent(conn, extentInfo.ExtentID, targetFile) ; err != nil {
+	if err := en.copyRemoteExtent(conn, extentInfo , targetFile, 0, extentInfo.SealedLength) ; err != nil {
 		xlog.Logger.Warnf("recoveryReplicateExtent: [%s]", err.Error())
 		return  err
 	}
@@ -95,15 +99,14 @@ func (en *ExtentNode) recoveryReplicateExtent(extentInfo *pb.ExtentInfo, task *p
 
 func (en *ExtentNode) recoveryErasureExtent(extentInfo *pb.ExtentInfo, task *pb.RecoveryTask, targetFile *os.File) error {
 
-	conns, replacingIndex := en.chooseECAliveNode(extentInfo, task.ReplaceID)
-	if conns == nil {
-		return errors.Errorf("ErasureExtent: can not find remote nodes")
+	conns, replacingIndex, err := en.chooseECAliveNode(extentInfo, task.ReplaceID)
+	if err != nil {
+		return err
 	}
 	if replacingIndex == -1 {
 		return errors.Errorf("task.ReplaceID is %d, not find int extentInfo", task.ReplaceID)
 	}
 
-	fmt.Printf("replacingIndex is %d\n", replacingIndex)
 	//FIXME: do not use tmp dir
 	tmpDir, err := ioutil.TempDir(os.TempDir(), "recoveryEC")
 	if err != nil {
@@ -131,7 +134,7 @@ func (en *ExtentNode) recoveryErasureExtent(extentInfo *pb.ExtentInfo, task *pb.
 			if conns[j] == nil {
 				return
 			}
-			if err := en.copyRemoteExtent(conns[j], extentInfo.ExtentID, tmpFiles[j]); err != nil {
+			if err := en.copyRemoteExtent(conns[j], extentInfo, tmpFiles[j], 0, extentInfo.SealedLength); err != nil {
 				xlog.Logger.Warnf("ErasureExtent can not copyRemoteExtent %v", err)
 				return
 			}
@@ -179,7 +182,7 @@ func (en *ExtentNode) chooseAliveNode(extentInfo *pb.ExtentInfo, except uint64) 
 	}
 	utils.AssertTrue(len(addrs) == len(extentInfo.Replicates))
 	for i := range extentInfo.Replicates {
-		if extentInfo.Replicates[i] == except {
+		if extentInfo.Replicates[i] == except || (1 << i) & extentInfo.Avali == 0 {
 			continue
 		}
 		pool , err := conn.GetPools().Get(addrs[i])
@@ -192,12 +195,12 @@ func (en *ExtentNode) chooseAliveNode(extentInfo *pb.ExtentInfo, except uint64) 
 	return nil
 }
 
-func (en *ExtentNode) chooseECAliveNode(extentInfo *pb.ExtentInfo, except uint64) ([]*grpc.ClientConn, int){
+func (en *ExtentNode) chooseECAliveNode(extentInfo *pb.ExtentInfo, except uint64) ([]*grpc.ClientConn, int, error){
 	var missingIndex = -1
 
 	addrs := en.em.GetPeers(extentInfo.ExtentID)
 	if addrs == nil {
-		return nil, missingIndex
+		return nil, 0, errors.New("can not get enough addrs")
 	}
 	utils.AssertTrue(len(addrs) == len(extentInfo.Replicates) + len(extentInfo.Parity))
 	activeConns := 0
@@ -208,10 +211,15 @@ func (en *ExtentNode) chooseECAliveNode(extentInfo *pb.ExtentInfo, except uint64
 	copy(nodes[len(extentInfo.Replicates):], extentInfo.Parity)
 	for i := 0;i  < len(nodes);i ++ {
 		//skip
-		if nodes[i] == except {
+		if nodes[i] == except || (1 << i) & extentInfo.Avali == 0{
 			missingIndex = i
 			continue
 		}
+
+		if (1 << i) & extentInfo.Avali == 0 {
+			continue
+		}
+
 		pool , err := conn.GetPools().Get(addrs[i])
 		if err != nil {
 			conns[i] = nil
@@ -222,14 +230,14 @@ func (en *ExtentNode) chooseECAliveNode(extentInfo *pb.ExtentInfo, except uint64
 	}
 
 	if activeConns == len(extentInfo.Replicates) {
-		return conns, missingIndex
+		return conns, missingIndex, nil
 	}
 
-	return nil, missingIndex
+	return nil, missingIndex, errors.New("can not find enough nodes to recover")
 }
 
 
-func (en *ExtentNode) runRecoveryTask(task *pb.RecoveryTask,extentInfo *pb.ExtentInfo, targetFile *os.File, targetFilePath string) {
+func (en *ExtentNode) runRecoveryTask(task *pb.RecoveryTask,extentInfo *pb.ExtentInfo, targetFile *os.File, targetFilePath string, diskID uint64) {
 	
 		atomic.AddInt32(&en.recoveryTaskNum, 1)
 		defer func(){
@@ -266,10 +274,14 @@ func (en *ExtentNode) runRecoveryTask(task *pb.RecoveryTask,extentInfo *pb.Exten
 		utils.Check(targetFile.Close())
 		ex, err := extent.OpenExtent(extentFileName)
 		utils.Check(err)
-		en.setExtent(ex.ID, ex)
+		en.setExtent(ex.ID, &ExtentOnDisk{
+			Extent: ex,
+			diskID: diskID,
+		})
 }
 
 
+//
 func (en *ExtentNode) CopyExtent(req *pb.CopyExtentRequest, stream pb.ExtentService_CopyExtentServer) error {
 	errDone := func(err error, stream pb.ExtentService_CopyExtentServer) (error) {
 		code, desCode := wire_errors.ConvertToPBCode(err)
@@ -285,35 +297,24 @@ func (en *ExtentNode) CopyExtent(req *pb.CopyExtentRequest, stream pb.ExtentServ
 		return io.EOF
 	}
 
-	extent := en.getExtent(req.ExtentID)
-	if extent == nil {
-		return errDone(errors.New("no such extentID"), stream)
-	}
 
-	extentInfo := en.em.Update(req.ExtentID)
+	extentInfo := en.em.WaitVersion(req.ExtentID, req.Eversion)
 	if extentInfo == nil {
 		return errDone(errors.New("no such extentInfo"), stream)
 	}
 
-	if !extent.IsSeal() {
-		if extent.CommitLength() >= uint32(extentInfo.SealedLength) {
-			extent.Seal(uint32(extentInfo.SealedLength))
-		} else {
-			//find local node's data should be recoveried
-			/*
-			ctx, cancel := context.WithTimeout(context.Background(), 5 * time.Second)
-			en.smClient.SubmitRecoveryTask(ctx, extent.ID, en.nodeID)
-			cancel()
-			*/
-			return errDone(errors.Errorf("extent %d on node %d is not complete", req.ExtentID, en.nodeID), stream)
-		}
-	} else if extent.CommitLength() != uint32(extentInfo.SealedLength){
-		//extent.CommitLength() < extentInfo.SealedLength
-		//node_service.go would NEVER seal this extent
-		//check code "func (ex *Extent) Seal"
-		return errDone(errors.New("should never happen"), stream)
+	//BUGONs
+	extent := en.getExtent(req.ExtentID)
+	if extent == nil {
+		return errDone(errors.Errorf("node %d do not have extent %d", en.nodeID, req.ExtentID), stream)
 	}
-
+	if !extent.IsSeal() {
+		return errDone(errors.Errorf("BUGON: extent %d on node %d is not sealed", req.ExtentID, en.nodeID), stream)
+	}
+	if req.Offset + req.Size_ > uint64(extent.CommitLength()) {
+		return errDone(errors.Errorf("BUGON: extent %d on node %d's length is %d , less than requested", req.ExtentID, en.nodeID, extent.CommitLength()), stream)
+	}
+	
 
 	stream.Send(&pb.CopyExtentResponse{
 		Data:&pb.CopyExtentResponse_Header{
@@ -327,6 +328,7 @@ func (en *ExtentNode) CopyExtent(req *pb.CopyExtentRequest, stream pb.ExtentServ
 	fmt.Printf("extent size is %d\n\n", extent.CommitLength())
 
 	reader := extent.GetReader()
+	reader.Seek(int64(req.Offset), io.SeekStart)
 	buf := make([]byte, 512 << 10)
 	for {
 		n, err := reader.Read(buf)
@@ -371,9 +373,6 @@ func (en *ExtentNode) RequireRecovery(ctx context.Context, req *pb.RequireRecove
 		//wait for the latest extentInfo
 		extentInfo := en.em.Update(req.Task.ExtentID)
 
-		if req.Task.Eversion < extentInfo.Eversion {
-			return errDone(errors.New("task version is low"))
-		}
 		if extentInfo.SealedLength == 0 {
 			return errDone(errors.New("extent should be sealed"))
 		}
@@ -385,13 +384,13 @@ func (en *ExtentNode) RequireRecovery(ctx context.Context, req *pb.RequireRecove
 
 		//create targetFile
 		//choose one disk
-		i := rand.Intn(len(en.diskFSs))
-		targetFile, targetFilePath, err := en.diskFSs[i].AllocCopyExtent(extentInfo.ExtentID, req.Task.ReplaceID, req.Task.Eversion)
+		i := en.chooseDisktoAlloc()
+		targetFile, targetFilePath, err := en.diskFSs[i].AllocCopyExtent(extentInfo.ExtentID, req.Task.ReplaceID)
 		if err != nil {
 			xlog.Logger.Warnf("can not create CopyExtent copy target [%s]", err.Error())
 			return errDone(err)
 		}
-		go en.runRecoveryTask(req.Task, extentInfo, targetFile, targetFilePath)
+		go en.runRecoveryTask(req.Task, extentInfo, targetFile, targetFilePath, i)
 
 		return &pb.RequireRecoveryResponse{
 			Code: pb.Code_OK,

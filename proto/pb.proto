@@ -138,17 +138,19 @@ message ReadEntriesResponse{
 message DF {
 	uint64 total = 1;
 	uint64 free = 2;
+	uint32 online = 3;
 }
 
 message DfRequest{
 	repeated RecoveryTask tasks = 1;
+	repeated uint64 diskIDs = 2;
 }
 
 message DfResponse{
 	Code code = 1;
 	string codeDes = 2;
-	DF df = 3;
 	repeated RecoveryTask doneTask = 4;
+	map<uint64, DF> diskStatus = 5;
 }
 
 message RecoveryTask {
@@ -156,7 +158,7 @@ message RecoveryTask {
 	uint64  replaceID = 2;
 	uint64  nodeID = 3;
 	int64  startTime = 4;
-	uint64 eversion = 5;
+	uint64 readyDiskID = 5;
 }
 
 message RequireRecoveryRequest {
@@ -177,6 +179,9 @@ message CopyResponseHeader {
 
 message CopyExtentRequest {
 	uint64 extentID = 1;
+	uint64 offset = 2;
+	uint64 size = 3;
+	uint64 eversion = 4;
 }
 
 message CopyExtentResponse {
@@ -225,6 +230,7 @@ message AllocExtentRequest {
 message AllocExtentResponse {
 	Code code = 1;
 	string codeDes = 2;
+	uint64 diskID = 3;
 }
 
 
@@ -315,8 +321,9 @@ service StreamManagerService {
 	rpc StreamInfo(StreamInfoRequest) returns (StreamInfoResponse) {}
 	rpc ExtentInfo(ExtentInfoRequest) returns (ExtentInfoResponse) {}
 	rpc NodesInfo(NodesInfoRequest) returns(NodesInfoResponse) {}
+	//verify extent should exist on this node...
+	//rpc verifyExtent
 
-	//rpc SubmitRecoveryTask(SubmitRecoveryTaskRequest) returns (SubmitRecoveryTaskResponse){}
 	rpc StreamAllocExtent(StreamAllocExtentRequest) returns  (StreamAllocExtentResponse) {}
 	rpc CreateStream(CreateStreamRequest) returns  (CreateStreamResponse) {}
 	rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse) {}

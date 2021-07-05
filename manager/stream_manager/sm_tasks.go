@@ -3,6 +3,7 @@ package stream_manager
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -16,11 +17,16 @@ import (
 )
 
 //extent is copied from replaceID to newNodeID
-func (sm *StreamManager) copyDone(task *pb.RecoveryTask, newNodeID uint64) {
+func (sm *StreamManager) copyDone(task *pb.RecoveryTask) {
+
+	sm.lockExtent(task.ExtentID)
+	defer sm.unlockExtent(task.ExtentID)
+
 	extentInfo, ok := sm.cloneExtentInfo(task.ExtentID)
 	if !ok {
 		return
 	}
+	newNodeID := task.NodeID
 
 	slot := FindReplaceSlot(extentInfo, task.ReplaceID)
 	if slot == -1 {
@@ -71,6 +77,7 @@ func (sm *StreamManager) routineUpdateDF() {
 		xlog.Logger.Infof("routineUpdateDF quit")
 	}()
 
+
 	df := func(node *NodeStatus){
 		defer func(){
 			if time.Now().Sub(node.LastEcho()) > 20 * time.Minute {
@@ -94,12 +101,24 @@ func (sm *StreamManager) routineUpdateDF() {
 			xlog.Logger.Infof("remote server has error %s", res.CodeDes)
 			return
 		}
-		node.SetFree(res.Df.Free)
-		node.SetTotal(res.Df.Total)
+
+		sumFree := uint64(0)
+		sumTotal := uint64(0)
+		for diskID, df := range res.DiskStatus {
+			disk := sm.getDiskStatus(diskID)
+			atomic.StoreUint64(&disk.total, df.Total)
+			atomic.StoreUint64(&disk.free, df.Free)
+		}
+
+		node.SetFree(sumFree)
+		node.SetTotal(sumTotal)
+		
 		for i := range res.DoneTask {
-			sm.copyDone(res.DoneTask[i], node.NodeID)
+			sm.copyDone(res.DoneTask[i])
 		}
 	}
+
+
 
 	xlog.Logger.Infof("routineUpdateDF started")
 	for {
@@ -114,7 +133,7 @@ func (sm *StreamManager) routineUpdateDF() {
 				nodes := sm.getAllNodeStatus(true)
 				for i := range nodes {
 					node := nodes[i]
-					df(node)
+					go df(node)
 				}	
 		}
 	}
@@ -186,10 +205,29 @@ func (sm *StreamManager) saveRecoveryTask(task *pb.RecoveryTask) error{
 	return nil
 }
 
+//FIXME: delete Extent
 
-//non-block
-//FIXME: if task is running, do not submit it again
-func (sm *StreamManager) dispatchRecoveryTask(extentID, replaceID uint64, eversion uint64) error {
+//lockExtent returns error to indicate extent has been deleted
+func (sm *StreamManager) lockExtent(extentID uint64) error {
+	v, ok := sm.extentsLocks.Load(extentID)
+	if !ok {
+		return errors.New("extent has been deleted")
+	}
+	v.(*sync.Mutex).Lock()
+	return nil
+}
+
+func (sm *StreamManager) unlockExtent(extentID uint64) {
+	v, ok := sm.extentsLocks.Load(extentID)
+	if ok {
+		v.(*sync.Mutex).Lock()
+	}
+}
+
+//dispatchRecoveryTask already have extentLock, ask one node to do recovery
+func (sm *StreamManager) dispatchRecoveryTask(extentID, replaceID uint64) error {
+
+	defer sm.unlockExtent(extentID)
 
 	//duplicate?
 	if sm.taskPool.HasTask(extentID) {
@@ -225,7 +263,6 @@ func (sm *StreamManager) dispatchRecoveryTask(extentID, replaceID uint64, eversi
 		ExtentID: extentID,
 		ReplaceID: replaceID,
 		NodeID: chosenNode.NodeID,
-		Eversion: eversion,
 	}
 	res, err := c.RequireRecovery(ctx, &pb.RequireRecoveryRequest{
 			Task: task})
@@ -267,26 +304,48 @@ func (sm *StreamManager) routineDispatchTask() {
 			case <- sm.stopper.ShouldStop():
 				return
 			case <- ticker.C:
+				OUTER:
 				for kv := range sm.extents.Iter() {
 					extent := kv.Value.(*pb.ExtentInfo) //extent is read only
-					for _, nodeID := range extent.Replicates {
+					
+					//only check sealed extent
+					if extent.SealedLength == 0 {
+						continue 
+					}
+					
+					sm.lockExtent(extent.ExtentID)
+
+					allCopies := append(extent.Replicates, extent.Parity...)
+					for i, nodeID := range allCopies {
+						//check disk health
+						var diskID uint64
+						if i >= len(extent.Replicates) {
+							diskID = extent.ParityDisk[i - len(extent.Replicates)]
+						} else {
+							diskID = extent.ReplicateDisks[i]
+						}
+						
+						diskInfo, ok := sm.cloneDiskInfo(diskID)
+						if !ok || diskInfo.Online == 0 {
+							go func() {
+								sm.dispatchRecoveryTask(extent.ExtentID, nodeID)
+							}()
+							continue OUTER
+						}
+
+
+						//check node health
 						ns := sm.getNodeStatus(nodeID)
 						if (ns == nil || ns.Dead()) && extent.SealedLength > 0{
 							go func() {
-								sm.dispatchRecoveryTask(extent.ExtentID, nodeID, extent.Eversion)
+								sm.dispatchRecoveryTask(extent.ExtentID, nodeID)
 							}()
+							continue OUTER
 						}
 					}
 
-					for _, nodeID := range extent.Parity {
-						ns := sm.getNodeStatus(nodeID)
-						if (ns == nil || ns.Dead()) && extent.SealedLength > 0 {
-							go func() {
-								sm.dispatchRecoveryTask(extent.ExtentID, nodeID, extent.Eversion)
-							}()
-						}
-					}
-					
+					//FIXME: FIXAVALI data/check commit length 优化
+					sm.unlockExtent(extent.ExtentID)
 				}
 			}
 	}

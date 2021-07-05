@@ -2,6 +2,7 @@ package stream_manager
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -33,6 +34,18 @@ type NodeStatus struct {
 
 type DiskStatus struct {
 	pb.DiskInfo
+	total    uint64
+	free     uint64
+	//avg lantency
+}
+
+func (ds *DiskStatus) Total() uint64 {
+	return atomic.LoadUint64(&ds.total)
+}
+
+func (ds *DiskStatus) Free() uint64 {
+	return atomic.LoadUint64(&ds.free)
+
 }
 
 //FIXME: could atomic.LoadPointer make it concise?
@@ -85,13 +98,14 @@ type StreamManager struct {
 
 
 	//extents     map[uint64]*pb.ExtentInfo
+	//locks is used only for sealed extents when updating avali field and replicates/parities
 	extents   *hashmap.HashMap//id => *pb.ExtentInfo, read only
-
+	extentsLocks *sync.Map
+	
 	
 	//nodeLock utils.SafeMutex
 	//nodes    map[uint64]*NodeStatus
 	nodes     *hashmap.HashMap //id => *NodeStatus
-	
 	disks     *hashmap.HashMap  //id => *DiskStatus
 
 	etcd       *embed.Etcd
@@ -183,6 +197,7 @@ func (sm *StreamManager) runAsLeader() {
 	}
 
 	sm.extents = &hashmap.HashMap{}
+	sm.extentsLocks = new(sync.Map)
 	for _, kv := range kvs {
 		extentID, err := parseKey(string(kv.Key), "extents")
 		if err != nil {
@@ -195,6 +210,7 @@ func (sm *StreamManager) runAsLeader() {
 			return
 		}
 		sm.extents.Set(extentID, &extentInfo)
+		sm.extentsLocks.Store(extentID, new(sync.Mutex))
 	}
 
 	//sm.nodes = make(map[uint64]*NodeStatus)

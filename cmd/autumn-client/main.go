@@ -434,6 +434,8 @@ func main() {
 
 }
 
+
+//FIXME: detect disk and verify , then register first, then write down uuid, node_id, directory level
 func format(c *cli.Context) error {
 	//if any error happend, revert.
 	revert := func(dirList []string) {

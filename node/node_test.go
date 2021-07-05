@@ -265,7 +265,6 @@ func (suite *ExtentNodeTestSuite) TestCopy() {
 		&pb.RecoveryTask{
 			ExtentID:  extentID,
 			ReplaceID: 4,
-			Eversion: 2,
 		},
 	})
 

@@ -163,7 +163,12 @@ func (lib *AutumnLib) getConn(addr string) *grpc.ClientConn {
 
 	var err error
 	for {
-		conn, err = grpc.Dial(addr, grpc.WithBackoffMaxDelay(time.Second), grpc.WithInsecure())
+		conn, err = grpc.Dial(addr, 
+			grpc.WithDefaultCallOptions(
+				grpc.MaxCallRecvMsgSize(33<<20),
+				grpc.MaxCallSendMsgSize(33<<20)),
+			grpc.WithBackoffMaxDelay(time.Second),
+			grpc.WithInsecure())
 		if err == nil {
 			break
 		}
