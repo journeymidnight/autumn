@@ -37,23 +37,24 @@ var (
 	_ = fmt.Printf
 )
 
-/*
-view about the extents it owns and where the peer replicas are for a given extent
-extentID:[nodeID, nodeID, nodeID]
-*/
+
+type ExtentOnDisk struct{
+	*extent.Extent
+	diskID uint64
+}
+
 type ExtentNode struct {
 	nodeID     uint64
 	grcpServer *grpc.Server
 	listenUrl  string
-	diskFSs    []*diskFS //read only after boot-up, so do not have locks so far
+	diskFSs    map[uint64]*diskFS //read only after boot-up, so do not have locks so far
 	wal        *wal.Wal
-	extentMap  *sync.Map
+	extentMap  *sync.Map //extentID => ExtentOnDisk
 
 	smClient *smclient.SMClient
 	em       *smclient.ExtentManager
 	recoveryTaskNum  int32
 }
-
 
 func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl string, smAddr []string, etcdAddr []string) *ExtentNode {
 	utils.AssertTrue(xlog.Logger != nil)
@@ -63,6 +64,7 @@ func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl st
 		listenUrl: listenUrl,
 		smClient:  smclient.NewSMClient(smAddr),
 		nodeID:    nodeID,
+		diskFSs: make(map[uint64]*diskFS),
 		
 	}
 	if err := en.smClient.Connect(); err != nil {
@@ -81,7 +83,7 @@ func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl st
 			//FIXME: if one disk failed, can we continue?
 		}
 		//FIXME: validate dirs
-		en.diskFSs = append(en.diskFSs, disk)
+		en.diskFSs[disk.diskID] = disk
 	}
 
 	//load wal
@@ -130,40 +132,42 @@ func (en *ExtentNode) SyncFs() {
 	}
 }
 
-func (en *ExtentNode) getExtent(ID uint64) *extent.Extent {
-
+func (en *ExtentNode) getExtent(ID uint64) *ExtentOnDisk {
 	v, ok := en.extentMap.Load(ID)
 	if !ok {
 		return nil
 	}
-	return v.(*extent.Extent)
+	return v.(*ExtentOnDisk)
 }
-
 
 func (en *ExtentNode) removeExtent(ID uint64) {
 	en.extentMap.Delete(ID)
 }
 
-func (en *ExtentNode) setExtent(ID uint64, ex *extent.Extent) {
-	en.extentMap.Store(ID, ex)
+func (en *ExtentNode) setExtent(ID uint64, eod *ExtentOnDisk) {
+	en.extentMap.Store(ID, eod)
 }
+
 
 func (en *ExtentNode) LoadExtents() error {
 	//register each extent to node
-	registerExt := func(path string) {
+	registerExt := func(path string, diskID uint64) {
 		ex, err := extent.OpenExtent(path)
 		if err != nil {
 			xlog.Logger.Error(err)
 			return
 		}
-		en.setExtent(ex.ID, ex)
+		en.setExtent(ex.ID, &ExtentOnDisk{
+			Extent: ex,
+			diskID: diskID,
+		})
 		xlog.Logger.Debugf("found extent %d", ex.ID)
 	}
 
-	registerCopy := func(path string) {
-		//extentID.replaceID.Eversion.copy
+	registerCopy := func(path string, diskID uint64) {
+		//extentID.replaceID.copy
 		parts := strings.Split(path, ".")
-		if len(parts) != 4 {
+		if len(parts) != 3 {
 			xlog.Logger.Errorf("found extent %s: can not parse replaceID", path)
 			return
 		}
@@ -179,32 +183,22 @@ func (en *ExtentNode) LoadExtents() error {
 			xlog.Logger.Error(err)
 			return
 		}
-		eversion, err := strconv.ParseUint(parts[2], 10, 64)
-		if err != nil {
-			xlog.Logger.Error(err)
-			return
-		}
+
 		task := pb.RecoveryTask{
 			ExtentID: extentID,
 			ReplaceID: replaceID,
 			NodeID: en.nodeID,
-			Eversion: eversion,
 		}
 
 		//if extent's version is updated. remove RecoveryTask
 		extentInfo := en.em.Update(extentID)
-		if extentInfo.Eversion != eversion {
-			xlog.Logger.Infof("current recovery task is deprecated")
-			os.Remove(path)
-			return
-		}
 
 		targetFile, err := os.OpenFile(path, os.O_RDWR|os.O_TRUNC, 0755)
 		if err != nil {
 			xlog.Logger.Error(err)
 			return
 		}
-		go en.runRecoveryTask(&task, extentInfo, targetFile, path)
+		go en.runRecoveryTask(&task, extentInfo, targetFile, path, diskID)
 	}
 
 	var wg sync.WaitGroup
@@ -235,7 +229,7 @@ func (en *ExtentNode) LoadExtents() error {
 	}
 
 	en.extentMap.Range(func(k, v interface{}) bool {
-		ex := v.(*extent.Extent)
+		ex := v.(*ExtentOnDisk)
 		if err := ex.ResetWriter(); err != nil {
 			xlog.Logger.Warnf("reset writer %s", err.Error())
 		}
@@ -250,7 +244,7 @@ func (en *ExtentNode) Shutdown() {
 	//loop over all extent to close
 
 	en.extentMap.Range(func(k, v interface{}) bool {
-		ex := v.(*extent.Extent)
+		ex := v.(*ExtentOnDisk)
 		ex.Close()
 		return true
 	})

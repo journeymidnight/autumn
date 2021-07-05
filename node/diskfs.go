@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/dgryski/go-farm"
 	"github.com/journeymidnight/autumn/extent"
@@ -25,6 +26,9 @@ type diskFS struct {
 	baseDir string
 	baseFd  *os.File
 	diskID uint64
+	online uint32  //atomic value
+	total uint64
+	free uint64
 }
 
 func OpenDiskFS(dir string, nodeID uint64) (*diskFS, error) {
@@ -61,12 +65,27 @@ func OpenDiskFS(dir string, nodeID uint64) (*diskFS, error) {
 		return nil, err
 	}
 	s.diskID = diskID
-	
+	s.online = 1
 	return s, nil
 }
-
+//Df() return (total, free, error)
 func (s *diskFS) Df() (uint64, uint64 , error){
-	return getDiskInfo(s.baseDir)
+	total, free,  err := getDiskInfo(s.baseDir)
+	if err != nil {
+		return 0,0, err
+	}
+	s.total = total
+	s.free = free
+	return total, free, err
+}
+
+func (s *diskFS) SetOffline() {
+	atomic.StoreUint32(&s.online, 0)
+	//FIXME: write flag on disk. bad sector or bad file?
+}
+
+func (s *diskFS) Online() uint32 {
+	return atomic.LoadUint32(&s.online)
 }
 
 func (s *diskFS) pathName(extentID uint64, suffix string) string {
@@ -85,8 +104,8 @@ func (s *diskFS) pathName(extentID uint64, suffix string) string {
 	return filepath.Join(fpath...)
 }
 
-func (s *diskFS) AllocCopyExtent(ID uint64, ReplaceID uint64, Eversion uint64) (*os.File, string, error) {
-	fpath := s.pathName(ID, fmt.Sprintf("%d.%d.copy", ReplaceID, Eversion))
+func (s *diskFS) AllocCopyExtent(ID uint64, ReplaceID uint64) (*os.File, string, error) {
+	fpath := s.pathName(ID, fmt.Sprintf("%d.copy", ReplaceID))
 	f, err := extent.CreateCopyExtent(fpath, ID)
 	return f, fpath, err
 }
@@ -100,7 +119,7 @@ func (s *diskFS) AllocExtent(ID uint64) (*extent.Extent, error) {
 	return ex, nil
 }
 
-func (s *diskFS) LoadExtents(normalExt func(string), copyExt func(string)) {
+func (s *diskFS) LoadExtents(normalExt func(string, uint64), copyExt func(string, uint64)) {
 	//walk all exts files
 	filepath.Walk(s.baseDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -110,10 +129,10 @@ func (s *diskFS) LoadExtents(normalExt func(string), copyExt func(string)) {
 			return nil
 		}
 		if strings.HasSuffix(info.Name(), ".ext") {
-			normalExt(path)
+			normalExt(path, s.diskID)
 			return nil
 		} else if strings.HasSuffix(info.Name(), ".copy") {
-			copyExt(path)
+			copyExt(path, s.diskID)
 			return nil
 		} 
 		return nil

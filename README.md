@@ -354,3 +354,9 @@ This ensures that the partition load will see all of its data and the exact same
 
 If an EN was not reachable by the SM during the sealing process but later becomes reachable
 the SM will force the EN to synchronize the given extent to the chosen commit length
+
+1. 增加avali恢复
+2. node增加过期extent检查
+3. 修复truncate stream
+4. 增加split stream
+5. 增加删除stream

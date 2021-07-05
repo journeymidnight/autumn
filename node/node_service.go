@@ -17,7 +17,6 @@ package node
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"time"
 
 	"github.com/journeymidnight/autumn/conn"
@@ -73,7 +72,7 @@ func (en *ExtentNode) ReplicateBlocks(ctx context.Context, req *pb.ReplicateBloc
 	if ex.CommitLength() != req.Commit {
 		return nil, errors.Errorf("primary commitlength is different with replicates %d vs %d", req.Commit, ex.CommitLength())
 	}
-	ret, end, err := en.AppendWithWal(ex, req.Revision, req.Blocks)
+	ret, end, err := en.AppendWithWal(ex.Extent, req.Revision, req.Blocks)
 	if err != nil {
 		return nil, err
 	}
@@ -113,7 +112,7 @@ func (en *ExtentNode) validReq(extentID uint64, version uint64) (*extent.Extent,
 		return nil, nil, wire_errors.VersionLow
 	}
 	
-	return ex, extentInfo, nil
+	return ex.Extent, extentInfo, nil
 }
 
 func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.AppendResponse, error) {
@@ -265,6 +264,7 @@ func (en *ExtentNode) SmartReadBlocks(ctx context.Context, req *pb.ReadBlocksReq
 		}, nil
 	}
 
+	xlog.Logger.Debugf("SmartRead of extentID %d, offset %d", req.ExtentID, req.Offset)
 	//FIXME: local read
 	_, exInfo, err := en.validReq(req.ExtentID, req.Eversion)
 	if err != nil {
@@ -471,18 +471,44 @@ func (en *ExtentNode) ReadBlocks(ctx context.Context, req *pb.ReadBlocksRequest)
 	}, nil
 }
 
+
+func (en *ExtentNode) chooseDisktoAlloc() uint64 {
+	//Other policies choose disk
+	var i uint64 //diskID
+	//only choose the first disk
+	for _, disk := range en.diskFSs {
+		if disk.Online() == 0 {
+			continue
+		}
+		i = disk.diskID
+		break
+	}
+	return i
+}
+
 func (en *ExtentNode) AllocExtent(ctx context.Context, req *pb.AllocExtentRequest) (*pb.AllocExtentResponse, error) {
-	//Other policies
-	i := rand.Intn(len(en.diskFSs))
+
+	i := en.chooseDisktoAlloc()
+	if i == 0 {
+		xlog.Logger.Warnf("can not alloc extent %d", req.ExtentID)
+		return nil, errors.Errorf("can not alloc extent %d", req.ExtentID)
+	}
+
+
 	ex, err := en.diskFSs[i].AllocExtent(req.ExtentID)
 	if err != nil {
 		xlog.Logger.Warnf("can not alloc extent %d, [%s]", req.ExtentID, err.Error())
 		return nil, err
 	}
-	en.extentMap.Store(req.ExtentID, ex)
+
+	en.setExtent(req.ExtentID, &ExtentOnDisk{
+		Extent: ex,
+		diskID: 10,
+	})
 
 	return &pb.AllocExtentResponse{
 		Code: pb.Code_OK,
+		DiskID: en.diskFSs[i].diskID,
 	}, nil
 }
 
@@ -523,7 +549,7 @@ func (en *ExtentNode) CommitLength(ctx context.Context, req *pb.CommitLengthRequ
 
 
 func (en *ExtentNode) Df(ctx context.Context, req *pb.DfRequest) (*pb.DfResponse, error) {
-
+/*
 	errDone := func(err error) (*pb.DfResponse, error) {
 		code, desCode := wire_errors.ConvertToPBCode(err)
 		return &pb.DfResponse{
@@ -531,23 +557,50 @@ func (en *ExtentNode) Df(ctx context.Context, req *pb.DfRequest) (*pb.DfResponse
 			CodeDes: desCode,
 		}, nil
 	}
+*/
 
-	totalSum := uint64(0)
-	totalFree := uint64(0)
-	for _, fs := range en.diskFSs {
-		sum, free, err := fs.Df()
-		if err != nil {
-			return errDone(err)
+	dfStatus := make(map[uint64]*pb.DF)
+	for _, diskID := range req.DiskIDs {
+		disk, ok := en.diskFSs[diskID]
+		if ok {
+			total, free, err := disk.Df()
+			if err != nil {
+				dfStatus[diskID] = &pb.DF{
+					0,0,0,
+				}
+				continue
+			}
+			dfStatus[diskID] = &pb.DF{
+				Total: total,
+				Free: free,
+				Online: disk.Online(),
+			}
+		} else {//no such disk
+			dfStatus[diskID] = &pb.DF{0,0,0}
 		}
-		totalSum += sum
-		totalFree += free
 	}
+
+
+	var doneTasks []*pb.RecoveryTask
+	for _, task := range req.Tasks {
+		eod := en.getExtent(task.ExtentID)
+		if eod == nil {
+			continue
+		}
+		//recovery task is done
+		doneTasks = append(doneTasks, &pb.RecoveryTask{	
+			ExtentID: task.ExtentID,
+			ReplaceID: task.ReplaceID,
+			NodeID: en.nodeID,
+			ReadyDiskID: eod.diskID,
+		})
+	}
+	
+
 	return &pb.DfResponse{
 		Code: pb.Code_OK,
-		Df: &pb.DF{
-			Total: totalSum,
-			Free:  totalFree,
-		},
+		DiskStatus: dfStatus,
+		DoneTask: doneTasks,
 	}, nil
 }
 
