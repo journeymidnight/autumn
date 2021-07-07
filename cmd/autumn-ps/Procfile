@@ -1,2 +1,1 @@
 ps:./autumn-ps --listen 127.0.0.1:9951 --psID 10 --smAddr 127.0.0.1:3401 --etcdAddr 127.0.0.1:2379
-ps2:./autumn-ps --listen 127.0.0.1:9952 --psID 100 --smAddr 127.0.0.1:3401 --etcdAddr 127.0.0.1:2379

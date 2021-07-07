@@ -225,12 +225,64 @@ func (sm *StreamManager) unlockExtent(extentID uint64) {
 }
 
 
-func (sm *StreamManager) ReAvali(extentID, nodeID uint64) {
-	sm.unlockExtent(extentID)
+func (sm *StreamManager) reAvali(exInfo *pb.ExtentInfo, nodeID uint64) {
 
+	ns := sm.getNodeStatus(nodeID)
+	pool, err := conn.GetPools().Get(ns.Address)
+	if err != nil {
+		return
+	}
 
-	//sm.lockExtent(extentID)
-	//defer sm.unlock(extentID)
+	ctx, cancel := context.WithTimeout(context.Background(), 30 * time.Second)
+	c := pb.NewExtentServiceClient(pool.Get())
+	res, err := c.ReAvali(ctx, &pb.ReAvaliRequest{
+		ExtentID: exInfo.ExtentID,
+		Eversion: exInfo.ExtentID,
+	})
+	cancel()
+	if err != nil {
+		xlog.Logger.Error(err.Error())
+		return 
+	}
+	if res.Code != pb.Code_OK {
+		xlog.Logger.Error(res.CodeDes)
+		return
+	}
+
+	sm.lockExtent(exInfo.ExtentID)
+	defer sm.unlockExtent(exInfo.ExtentID)
+
+	exInfo, ok := sm.cloneExtentInfo(exInfo.ExtentID)
+	if !ok {
+		//BUGON
+		xlog.Logger.Fatal("reAvali returns an extent which does not exist")
+		return
+	}
+	slot := FindReplaceSlot(exInfo, nodeID)
+	if slot == -1 {
+		xlog.Logger.Error("maybe updated by others..")
+		return
+	}
+	//update exInfo
+	exInfo.Eversion ++
+	exInfo.Avali |= (1 << slot)
+
+	//update etcd
+	extentKey := formatExtentKey(exInfo.ExtentID)
+	data := utils.MustMarshal(exInfo)
+
+	cmps := []clientv3.Cmp{clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue)}
+	ops := []clientv3.Op{
+		clientv3.OpPut(extentKey, string(data)),
+	}
+	err = etcd_utils.EtcdSetKVS(sm.client, cmps, ops)
+	if err != nil {
+		xlog.Logger.Warnf("setting etcd failed [%s]", err)
+		return
+	}
+
+	//update extent
+	sm.extents.Set(exInfo, exInfo)
 }
 
 //dispatchRecoveryTask already have extentLock, ask one node to do recovery
@@ -351,6 +403,14 @@ func (sm *StreamManager) routineDispatchTask() {
 							}()
 							continue OUTER
 						}
+
+						//check node is avali
+						if extent.Avali & uint32(i << 1) == 0 {
+							go func(){
+								sm.reAvali(extent, nodeID)
+							}()
+						}
+
 					}
 
 					//FIXME: FIXAVALI data/check commit length 优化
