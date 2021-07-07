@@ -135,7 +135,7 @@ func (pm *PartitionManager) runAsLeader() {
 
 	fmt.Printf("psNodes is %+v\n", pm.psNodes)
 
-	kvs, rev ,err = etcd_utils.EtcdRange(pm.client, "PART")
+	kvs, rev ,err = etcd_utils.EtcdRange(pm.client, "PART/")
 	if err != nil {
 		xlog.Logger.Warnf(err.Error())
 		return
@@ -154,7 +154,6 @@ func (pm *PartitionManager) runAsLeader() {
 
 	var regions pspb.Regions
 	utils.MustUnMarshal(data, &regions)
-	//if err = regions.Unmarshal(data) ; err == nil {
 	
 	for _, region := range regions.Regions {
 		part := pm.partMeta[region.PartID]
@@ -170,6 +169,7 @@ func (pm *PartitionManager) runAsLeader() {
 	
 	partsAlloc := make([]uint64, 0, 10)
 	for partID := range pm.partMeta {
+		utils.AssertTrue(partID != 0)
 		regionInfo, ok := regions.Regions[partID]
 		if !ok {
 			//part没有在config里面分配, 记录下来, 准备修改
@@ -189,6 +189,7 @@ func (pm *PartitionManager) runAsLeader() {
 	for _, node := range pm.psNodes {
 		nodes = append(nodes, node)
 	}
+
 	//重新分配partsAlloc
 	for _, partID := range partsAlloc {
 		//已知psNodes状态, 
@@ -208,7 +209,10 @@ func (pm *PartitionManager) runAsLeader() {
 
 	//if regions changed, set "config"
 	if len(partsAlloc) > 0 {
-		fmt.Printf("run as leader: set regions/config %+v", regions)
+		fmt.Printf("run as leader: set regions/config:\n")
+		for _, v := range regions.Regions {
+			fmt.Printf("partID: %d , rg is %v is on ps %d\n",v.PartID, v.Rg, v.PSID )
+		}
 		ops := []clientv3.Op{
 			clientv3.OpPut(fmt.Sprintf("regions/config"), string(utils.MustMarshal(&regions))),
 		}		
@@ -219,6 +223,9 @@ func (pm *PartitionManager) runAsLeader() {
 			xlog.Logger.Warnf("this pm is not leader , can not set 'regions/config'")
 			return
 		}
+	} else {
+		fmt.Printf("run as leader: regions/config remain the same %+v\n", regions.Regions)
+
 	}
 	pm.currentRegions = &regions
 	
@@ -241,14 +248,20 @@ func (pm *PartitionManager) runAsLeader() {
 						
 						//if there is any PART who is not allocated, allocated to psDetail.PSID
 						var anyChange bool
-						for _, region := range pm.currentRegions.Regions {
-							if region.PSID == 0 {
-								region.PSID = psDetail.PSID
+						for _, part := range pm.partMeta {
+							_, ok := pm.currentRegions.Regions[part.PartID]
+							if !ok {
+								pm.currentRegions.Regions[part.PartID] = &pspb.RegionInfo{
+									Rg: part.Rg,
+									PartID: part.PartID,
+									PSID: psDetail.PSID,
+								}
 								anyChange = true
 							}
 						}
+
 						if anyChange {
-							fmt.Printf("NEW PS: set regions/config %+v", pm.currentRegions)
+							fmt.Printf("NEW PS: set regions/config %+v", pm.currentRegions.Regions)
 							ops := []clientv3.Op{
 								clientv3.OpPut(fmt.Sprintf("regions/config"), string(utils.MustMarshal(pm.currentRegions))),
 							}
@@ -257,8 +270,10 @@ func (pm *PartitionManager) runAsLeader() {
 							}, ops) ; err != nil {
 								xlog.Logger.Warnf("this pm is not leader , can not set 'regions/config'")
 							}
+						} else {
+							fmt.Printf("NEW PS: nothing changed\n")
 						}
-						
+
 					case "DELETE":
 						if err = psDetail.Unmarshal(e.PrevKv.Value) ; err != nil {
 							break
@@ -282,14 +297,14 @@ func (pm *PartitionManager) runAsLeader() {
 								if err != nil {
 									xlog.Logger.Errorf("can not alloc parts to partition servers")
 									//set error somewhere
+									//will set region's PSID = 0
+									delete(pm.currentRegions.Regions, region.PartID)
+								} else {
+									moves = append(moves, MovePartition{partID: region.PartID, to:psID})
 								}
-								moves = append(moves, MovePartition{partID: region.PartID, to:psID})
 							}
 						}
 
-						if len(moves) == 0 {
-							continue
-						}
 						//先clone pm.currentRegions, 然后setETCD, 再更新pm.currentRegions更好
 						//但是这样写更加简单, 并且只会导致监控看region数据时, 有可能有错误数据
 						for _, move := range moves {
@@ -298,7 +313,7 @@ func (pm *PartitionManager) runAsLeader() {
 						data := utils.MustMarshal(pm.currentRegions)
 
 						//set etcd
-						fmt.Printf("DELETE PS: set regions/config %+v", pm.currentRegions)
+						fmt.Printf("DELETE PS: set regions/config %+v", pm.currentRegions.Regions)
 						ops := []clientv3.Op{
 							clientv3.OpPut(fmt.Sprintf("regions/config"), string(data)),
 						}

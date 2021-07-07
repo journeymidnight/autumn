@@ -117,13 +117,14 @@ func (ps *PartitionServer) getPartitionMeta(partID uint64) (int64, *pspb.Partiti
 	return rev, &meta, locs, blob, nil
 }
 
-
 func (ps *PartitionServer) parseRegionAndStart(regions *pspb.Regions) int64{
 	var rev int64
 	var meta *pspb.PartitionMeta
 	var blobs []uint64
 	var locs []*pspb.Location
 	var err error
+	fmt.Printf("region: %+v\n", regions.Regions)
+
 	for _, region := range regions.Regions {
 		//ok : if we have activated PART
 		var ok bool
@@ -131,7 +132,8 @@ func (ps *PartitionServer) parseRegionAndStart(regions *pspb.Regions) int64{
 		_, ok = ps.rangePartitions[region.PartID]
 		ps.RUnlock()
 
-
+		utils.AssertTrue(region.PartID != 0)
+		
 		if region.PSID != ps.PSID{
 			if ok {
 				//如果merge或者split存在, 会先close range_partion, 然后再修改regions. 
