@@ -425,6 +425,8 @@ func (en *ExtentNode) ReAvali(ctx context.Context, req *pb.ReAvaliRequest) (*pb.
 		return errDone(errors.Errorf("can not find extent %d",req.ExtentID))
 	}
 
+	ex.Lock()
+	defer ex.Unlock()
 	if ex.IsSeal() {
 		return &pb.ReAvaliResponse{
 			Code: pb.Code_OK,
@@ -449,6 +451,8 @@ func (en *ExtentNode) ReAvali(ctx context.Context, req *pb.ReAvaliRequest) (*pb.
 	if err != nil {
 		return errDone(err)
 	}
+	
+	utils.Check(ex.Seal(uint32(exInfo.SealedLength)))
 
 	return &pb.ReAvaliResponse{
 		Code: pb.Code_OK,

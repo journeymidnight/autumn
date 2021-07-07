@@ -106,20 +106,6 @@ func (en *ExtentNode) extentInfoUpdatedfunc(eventType string, cur *pb.ExtentInfo
 		if cur.SealedLength > 0 {
 			ex := en.getExtent(cur.ExtentID)
 			if ex != nil && ex.IsSeal() == false {
-				//Am I avali in extentInfo?
-				/*
-				allCopies := append(cur.Replicates, cur.Parity...)
-				isAvali := false
-				for i := range allCopies {
-					if allCopies[i] == en.nodeID && ((1 << i) & cur.Avali) > 0 {
-						isAvali = true
-						break
-					}
-				}
-				if !isAvali {
-					return
-				}
-				*/
 				xlog.Logger.Infof("SEAL extent %d", cur.ExtentID)
 				ex.Lock()
 				if err := ex.Seal(uint32(cur.SealedLength)) ;err != nil {
