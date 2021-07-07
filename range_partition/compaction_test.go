@@ -6,20 +6,28 @@ import (
 	"testing"
 	"time"
 
+	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/range_partition/table"
 	"github.com/journeymidnight/autumn/streamclient"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCompaction(t *testing.T) {
-	logStream := streamclient.NewMockStreamClient("log")
-	rowStream := streamclient.NewMockStreamClient("sst")
+
+	br := streamclient.NewMockBlockReader()
+	logStream := streamclient.NewMockStreamClient("log", br)
+	rowStream := streamclient.NewMockStreamClient("sst", br)
 
 	defer logStream.Close()
 	defer rowStream.Close()
-	
+
 	var server streamclient.MockEtcd
-	rp, _ := OpenRangePartition(3, rowStream, logStream, logStream.(streamclient.BlockReader),
-		[]byte(""), []byte(""), nil, nil, server.SetRowStreamTables, streamclient.OpenMockStreamClient, TestOption())
+	rp, err := OpenRangePartition(3, rowStream, logStream, br,
+		[]byte(""), []byte(""), nil, nil, server.SetRowStreamTables, func(si pb.StreamInfo) streamclient.StreamClient {
+			return streamclient.OpenMockStreamClient(si, br)
+		}, TestOption())
+
+	require.Nil(t, err)
 	defer rp.Close()
 
 	var wg sync.WaitGroup

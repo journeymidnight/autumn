@@ -250,25 +250,25 @@ func (r *extentReader) Read(p []byte) (n int, err error) {
 }
 
 //Seal requires LOCK
+//if commit is bigger than currentLength, return error
 func (ex *Extent) Seal(commit uint32) error {
 
 	ex.AssertLock()
 
-	atomic.StoreInt32(&ex.isSeal, 1)
 	ex.writer.Close()
 	ex.writer = nil
 	currentLength := atomic.LoadUint32(&ex.commitLength)
 	if currentLength < commit {
-		xlog.Logger.Fatal("commit is less than current commit length")
+		return errors.New("commit is less than current commit length")
 	} else if currentLength > commit {
 		ex.file.Truncate(int64(commit))
-		xlog.Logger.Warnf("seal's commit length is less than current data")
 	}
 
 	if err := xattr.FSet(ex.file, XATTRSEAL, []byte("true")); err != nil {
 		return err
 	}
 
+	atomic.StoreInt32(&ex.isSeal, 1)
 	return nil
 
 }
@@ -283,6 +283,38 @@ func (ex *Extent) GetReader() *extentReader {
 		pos:    int64(0),
 	}
 
+}
+type fixWriter struct{
+	io.WriteSeeker
+	extent *Extent
+}
+
+func (fw *fixWriter) Write(p []byte) (n int, err error) {
+	//extent will be sealed, no need to update lastRevision
+	n, err = fw.extent.file.Write(p)
+	fw.extent.commitLength += uint32(n)
+	return n, err
+}
+
+func (fw *fixWriter) Seek(offset int64, whence int) (int64, error) {
+	//no-op
+	return 0, nil
+}
+
+
+//fixWriter is used to fill gaps between
+func (ex *Extent) GetFixWriter() *fixWriter{
+	ex.Lock()
+	defer ex.Unlock()
+
+	if ex.writer != nil {
+		utils.Check(ex.writer.Close())
+		ex.writer = nil
+	}
+	ex.file.Seek(int64(ex.commitLength), io.SeekStart)
+	return &fixWriter{
+		extent: ex,
+	}
 }
 
 //Close requeset LOCK
@@ -406,8 +438,6 @@ func (ex *Extent) AppendBlocks(blocks []*pb.Block, doSync bool) ([]uint32, uint3
 	end := int64(currentLength)
 	var err error
 	for _, block := range blocks {
-		//EC friendly
-		//if expected end > 128M, skip to 128M
 
 		start, end, err = ex.writer.WriteRecord(block.Data)
 		utils.AssertTrue(end <= math.MaxUint32)
@@ -511,6 +541,7 @@ func (ex *Extent) ReadEntries(offset uint32, maxTotalSize uint32, replay bool) (
 	return ret, end, err
 
 }
+
 
 func ExtractEntryInfo(b *pb.Block, extentID uint64, offset uint32, replay bool) (*pb.EntryInfo, error) {
 	entry := new(pb.Entry)

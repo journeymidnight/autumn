@@ -173,8 +173,9 @@ func (sm *StreamManager) cloneDiskInfo(diskID uint64) (*pb.DiskInfo, bool) {
 	if !ok {
 		return nil, false
 	}
-	v := d.(*pb.DiskInfo)
-	return proto.Clone(v).(*pb.DiskInfo), true
+	v := d.(*DiskStatus)
+	ret := v.DiskInfo //copy diskInfo
+	return &ret, true
 }
 
 func (sm *StreamManager) cloneStreamInfo(streamID uint64) (*pb.StreamInfo, bool) {
@@ -356,6 +357,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 }
 
 //sealExtents could be all failed.
+/*
 func (sm *StreamManager) sealExtents(ctx context.Context, nodes []*NodeStatus, extentID uint64, commitLength uint32, revision int64) {
 	stopper := utils.NewStopper()
 	for _, node := range nodes {
@@ -382,6 +384,7 @@ func (sm *StreamManager) sealExtents(ctx context.Context, nodes []*NodeStatus, e
 	}
 	//save sealed information and commitLength into extentInfo
 }
+*/
 
 //receiveCommitlength returns minimal commitlength and all node who give us response and who did not
 //-1 if no response

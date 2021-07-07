@@ -20,23 +20,41 @@ var (
 	errNoTrucate  = errors.New("not have to truncate")
 )
 
-type MockStreamClient struct {
+
+type MockBlockReader struct {
+	exs             map[uint64]*extent.Extent
 	utils.SafeMutex //protect exs
-	exs             []*extent.Extent
+}
+
+
+func (br *MockBlockReader) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, uint32, error) {
+	br.RLock()
+	ex := br.exs[extentID]
+	br.RUnlock()
+	
+	if ex == nil {
+		fmt.Printf("extentID is %d", extentID)
+		return nil, 0, errors.New("extentID not good")
+	}
+
+	blocks, _, end, err := ex.ReadBlocks(offset, numOfBlocks, (32 << 20))
+	if err == wire_errors.EndOfExtent || err == wire_errors.EndOfStream {
+		return blocks, end, io.EOF
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	return blocks, end, err
+}
+
+type MockStreamClient struct {
+	stream          []uint64
 	names           []string
 	ID              uint64
 	suffix          string
+	br              *MockBlockReader
 }
 
-/*
-
-type saved struct {
-	exs   []*extent.Extent
-	names []string
-}
-
-var  map[uint64]saved
-*/
 
 var (
 	fileNamePrefix = "mockextent"
@@ -46,32 +64,42 @@ func fileName(id uint64, suffix string) string {
 	return fmt.Sprintf("%s_%d.%s", fileNamePrefix, id, suffix)
 }
 
-func NewMockStreamClient(suffix string) StreamClient {
+
+func NewMockBlockReader() *MockBlockReader{
+	return &MockBlockReader{
+		exs: make(map[uint64]*extent.Extent),
+	}
+}
+
+func NewMockStreamClient(suffix string, br *MockBlockReader) StreamClient {
 	sID := uint64(rand.Uint32())
 	name := fileName(sID, suffix)
 
+
 	ex, err := extent.CreateExtent(name, sID)
+
+	br.exs[ex.ID] = ex
 	utils.Check(err)
 	return &MockStreamClient{
-		exs:    []*extent.Extent{ex},
 		ID:     sID,
 		suffix: suffix,
+		br : br,
+		stream: []uint64{ex.ID},
 	}
 }
 
 //only open log file
-func OpenMockStreamClient(si pb.StreamInfo) StreamClient {
+func OpenMockStreamClient(si pb.StreamInfo, br *MockBlockReader) StreamClient {
 	sID := si.StreamID
-	var exs []*extent.Extent
 	for _, eID := range si.ExtentIDs {
 		name := fileName(eID, "log")
 		ex, err := extent.OpenExtent(name)
 		utils.Check(err)
-		exs = append(exs, ex)
-
+		br.exs[ex.ID] = ex
 	}
+	
 	return &MockStreamClient{
-		exs:    exs,
+		br: br,
 		ID:     sID,
 		suffix: "log",
 	}
@@ -80,19 +108,19 @@ func OpenMockStreamClient(si pb.StreamInfo) StreamClient {
 func (client *MockStreamClient) Truncate(ctx context.Context, extentID uint64) (pb.StreamInfo, pb.StreamInfo, error) {
 
 	var i int
-	for i = range client.exs {
-		if client.exs[i].ID == extentID {
+	for i = range client.stream {
+		if client.stream[i] == extentID {
 			break
 		}
 	}
-	if i == 0 {
+	if i == len(client.stream) {
 		return pb.StreamInfo{}, pb.StreamInfo{}, errNoTrucate
 	}
 
 	f := func(id uint64, start int, end int) pb.StreamInfo {
 		var array []uint64
 		for i := start; i < end; i++ {
-			array = append(array, client.exs[i].ID)
+			array = append(array, client.stream[i])
 		}
 		return pb.StreamInfo{
 			StreamID:  id,
@@ -104,8 +132,8 @@ func (client *MockStreamClient) Truncate(ctx context.Context, extentID uint64) (
 	blobStreamID := rand.Uint64()
 	blobStreamInfo := f(blobStreamID, 0, i)
 
-	myStreamInfo := f(client.ID, i, len(client.exs))
-	client.exs = client.exs[i:] //升级自己
+	myStreamInfo := f(client.ID, i, len(client.stream))
+	client.stream = client.stream[i:]//升级自己
 	//生成新的blobstream,
 	return blobStreamInfo, myStreamInfo, nil
 }
@@ -125,14 +153,17 @@ func (client *MockStreamClient) AppendEntries(ctx context.Context, entries []*pb
 		entries[i].ExtentID = extentID
 		entries[i].Offset = offsets[i]
 	}
+	//fmt.Printf("append return extentID %d\n", extentID)
 	return extentID, tail, err
 }
 
 //block API
 func (client *MockStreamClient) Append(ctx context.Context, blocks []*pb.Block) (uint64, []uint32, uint32, error) {
-	exIndex := len(client.exs) - 1
-	exID := client.exs[exIndex].ID
-	ex := client.exs[exIndex]
+	exIndex := len(client.stream) - 1
+	exID := client.stream[exIndex]
+	client.br.Lock()
+	ex := client.br.exs[exID]
+	client.br.Unlock()
 
 	ex.Lock()
 	defer ex.Unlock()
@@ -147,47 +178,30 @@ func (client *MockStreamClient) Append(ctx context.Context, blocks []*pb.Block) 
 		name := fileName(eID, client.suffix)
 		newEx, err := extent.CreateExtent(name, eID)
 		utils.Check(err)
-		client.Lock()
-		client.exs = append(client.exs, newEx)
-		client.Unlock()
+
+		client.br.Lock()
+		client.br.exs[newEx.ID] = newEx
+		client.br.Unlock()
+
+		client.stream = append(client.stream, newEx.ID)
 	}
 	return uint64(exID), offsets, end, err
 }
 
 func (client *MockStreamClient) Close() {
-	for _, ex := range client.exs {
-		name := fileName(ex.ID, client.suffix)
+	for _, exID := range client.stream {
+		name := fileName(exID, client.suffix)
+		client.br.Lock()
+		ex := client.br.exs[exID]
 		ex.Close()
+		delete(client.br.exs, exID)
+		client.br.Unlock()
 		os.Remove(name)
 	}
 }
 
 func (client *MockStreamClient) Connect() error {
 	return nil
-}
-
-func (client *MockStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, uint32, error) {
-	var ex *extent.Extent
-	client.RLock()
-	for i := range client.exs {
-		if client.exs[i].ID == extentID {
-			ex = client.exs[i]
-			break
-		}
-	}
-	client.RUnlock()
-	if ex == nil {
-		return nil, 0, errors.New("extentID not good")
-	}
-
-	blocks, _, end, err := ex.ReadBlocks(offset, numOfBlocks, (32 << 20))
-	if err == wire_errors.EndOfExtent || err == wire_errors.EndOfStream {
-		return blocks, end, io.EOF
-	}
-	if err != nil {
-		return nil, 0, err
-	}
-	return blocks, end, err
 }
 
 
@@ -208,8 +222,8 @@ func (client *MockStreamClient) NewLogEntryIter(opts ...ReadOption) LogEntryIter
 	} else {
 		x.currentOffset = readOpt.Offset
 
-		for i := range client.exs {
-			if client.exs[i].ID == readOpt.ExtentID {
+		for i := range client.stream {
+			if client.stream[i]== readOpt.ExtentID {
 				x.currentIndex = i
 			}
 		}
@@ -250,7 +264,11 @@ func (iter *MockLockEntryIter) HasNext() (bool, error) {
 }
 
 func (iter *MockLockEntryIter) receiveEntries() error {
-	ex := iter.sc.exs[iter.currentIndex]
+
+	exID := iter.sc.stream[iter.currentIndex]
+	iter.sc.br.RLock()
+	ex := iter.sc.br.exs[exID]
+	iter.sc.br.RUnlock()
 
 	res, tail, err := ex.ReadEntries(iter.currentOffset, 16*KB, iter.replay)
 
@@ -265,7 +283,7 @@ func (iter *MockLockEntryIter) receiveEntries() error {
 	case wire_errors.EndOfExtent:
 		iter.currentOffset = 0
 		iter.currentIndex++
-		if iter.currentIndex == len(iter.sc.exs) {
+		if iter.currentIndex == len(iter.sc.stream) {
 			iter.noMore = true
 		}
 		return nil

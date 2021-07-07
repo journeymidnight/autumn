@@ -103,13 +103,27 @@ func (en *ExtentNode) extentInfoUpdatedfunc(eventType string, cur *pb.ExtentInfo
 	switch eventType {
 	case "PUT":
 		//sealed
-		if prev != nil && (prev.SealedLength == 0 && cur.SealedLength > 0) {
+		if cur.SealedLength > 0 {
 			ex := en.getExtent(cur.ExtentID)
 			if ex != nil && ex.IsSeal() == false {
-				//we lost the last SEAL cmd?
+				//Am I avali in extentInfo?
+				/*
+				allCopies := append(cur.Replicates, cur.Parity...)
+				isAvali := false
+				for i := range allCopies {
+					if allCopies[i] == en.nodeID && ((1 << i) & cur.Avali) > 0 {
+						isAvali = true
+						break
+					}
+				}
+				if !isAvali {
+					return
+				}
+				*/
 				xlog.Logger.Infof("SEAL extent %d", cur.ExtentID)
 				ex.Lock()
 				if err := ex.Seal(uint32(cur.SealedLength)) ;err != nil {
+					//if error happend, wait for manager send a ReAvali msg to recovery data
 					xlog.Logger.Errorf(err.Error())
 				}
 				ex.Unlock()

@@ -224,6 +224,15 @@ func (sm *StreamManager) unlockExtent(extentID uint64) {
 	}
 }
 
+
+func (sm *StreamManager) ReAvali(extentID, nodeID uint64) {
+	sm.unlockExtent(extentID)
+
+
+	//sm.lockExtent(extentID)
+	//defer sm.unlock(extentID)
+}
+
 //dispatchRecoveryTask already have extentLock, ask one node to do recovery
 func (sm *StreamManager) dispatchRecoveryTask(extentID, replaceID uint64) error {
 

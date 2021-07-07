@@ -24,7 +24,7 @@ type TableInterface interface {
 
 type Table struct {
 	utils.SafeMutex
-	stream     streamclient.BlockReader
+	blockReader streamclient.BlockReader //only to read
 	blockIndex []*pspb.BlockOffset
 	ref        int32 // For file garbage collection. Atomic.
 
@@ -57,12 +57,12 @@ func (t *Table) DecrRef() error {
 	return nil
 }
 
-func OpenTable(stream streamclient.StreamClient,
+func OpenTable(blockReader streamclient.BlockReader,
 	extentID uint64, offset uint32) (*Table, error) {
 
 	utils.AssertTrue(xlog.Logger != nil)
 
-	blocks, _, err := stream.Read(context.Background(), extentID, offset, 1)
+	blocks, _, err := blockReader.Read(context.Background(), extentID, offset, 1)
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +75,7 @@ func OpenTable(stream streamclient.StreamClient,
 		return nil, errors.Errorf("meta block should be bigger than 4")
 	}
 
-	//must?
+	//fmt.Printf("opentable read size is %d\n", len(data))
 	//read checksum
 	expected := y.BytesToU32(data[len(data)-4:])
 
@@ -93,7 +93,7 @@ func OpenTable(stream streamclient.StreamClient,
 
 	t := &Table{
 		blockIndex:    make([]*pspb.BlockOffset, len(meta.TableIndex.Offsets)),
-		stream:        stream,
+		blockReader:        blockReader,
 		estimatedSize: meta.TableIndex.EstimatedSize,
 		Loc: pspb.Location{
 			ExtentID: extentID,
@@ -134,7 +134,7 @@ type entriesBlock struct {
 func (t *Table) block(idx int) (*entriesBlock, error) {
 	extentID := t.blockIndex[idx].ExtentID
 	offset := t.blockIndex[idx].Offset
-	blocks, _, err := t.stream.Read(context.Background(), extentID, offset, 1)
+	blocks, _, err := t.blockReader.Read(context.Background(), extentID, offset, 1)
 	if err != nil {
 		return nil, err
 	}

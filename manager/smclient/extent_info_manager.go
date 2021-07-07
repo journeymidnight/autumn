@@ -191,7 +191,7 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 
 
 	close := func() {
-		stopper.Close()
+		stopper.Stop()
 		close1()
 		close2()
 	}
