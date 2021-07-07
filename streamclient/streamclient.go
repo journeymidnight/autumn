@@ -2,7 +2,6 @@ package streamclient
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/coreos/etcd/clientv3/concurrency"
@@ -295,7 +294,6 @@ retry:
 	})
 	cancel()
 
-	fmt.Printf("res: %+v, err : %+v", res, err)
 	if err != nil { //network error
 		if loop > 5 {
 			return errors.New("finally timeout")

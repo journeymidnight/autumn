@@ -280,8 +280,17 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, locs []
 	}
 
 	setRowStreamTables :=  func(id uint64, tables []*pspb.Location) error {
-		//FIXME
-		return nil
+		utils.AssertTrue(id == meta.PartID)
+
+		var locations pspb.TableLocations
+		locations.Locs = tables
+		data := utils.MustMarshal(&locations)
+		//make sure lock
+	
+		return etcd_utils.EtcdSetKVS(ps.etcdClient, 
+			[]clientv3.Cmp{clientv3.Compare(clientv3.CreateRevision(mutex.Key()), "=", mutex.Header().Revision)},
+		    []clientv3.Op{clientv3.OpPut(fmt.Sprintf("PARTSTATS/%d/tables", meta.PartID), string(data)),
+		})
 	}
 
 
@@ -289,18 +298,9 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, locs []
 	utils.AssertTrue(meta.Rg != nil)
 	utils.AssertTrue(meta.PartID != 0)
 
-	/*
-	closeCallback := func(partID partID_t){
-		delete(ps.rangePartitions, partID)
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		ps.rangePartitionLocks[partID].Unlock(ctx)
-		cancel()
-		delete(ps.rangePartitionLocks, partID)
-	}
-	*/
 
 	rp, err := range_partition.OpenRangePartition(meta.PartID, row, log, ps.blockReader, meta.Rg.StartKey, meta.Rg.EndKey, locs,
-		blobs, setRowStreamTables, openStream, range_partition.TestOption())
+		blobs, setRowStreamTables, openStream, range_partition.DefaultOption(), range_partition.WithMaxSkipList(2<<20))
 	
 	xlog.Logger.Infof("open range partition %d, StartKey:[%s], EndKey:[%s]: err is %v", meta.PartID, meta.Rg.StartKey, meta.Rg.EndKey, err)
 	return rp, err

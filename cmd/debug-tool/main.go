@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -15,12 +14,10 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"github.com/coreos/etcd/clientv3"
-	"github.com/coreos/etcd/mvcc/mvccpb"
 	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/utils"
-	"github.com/pkg/errors"
 )
 
 type KV struct {
@@ -53,7 +50,15 @@ func receiveData(client *clientv3.Client) []KV {
 		panic(err)
 	}
 	for _, kv := range kvs {
-		if strings.HasPrefix(string(kv.Key), "regions/config") {
+		if strings.HasSuffix(string(kv.Key), "tables") {
+			var table pspb.TableLocations
+			table.Unmarshal(kv.Value)
+			d := KV {
+				Key: string(kv.Key),
+				Value: fmt.Sprintf("%+v", table.Locs),
+			}
+			data = append(data, d)
+		} else if strings.HasPrefix(string(kv.Key), "regions/config") {
 			var config pspb.Regions
 			config.Unmarshal(kv.Value)
 			d := KV {
@@ -229,66 +234,6 @@ func main() {
 	myWindow.ShowAndRun()
 }
 
-//mainly copy from pm.go
-func parseParts(kv *mvccpb.KeyValue) KV {
-	parse := func(s string) (uint64, string, error) {
-		parts := strings.Split(s, "/")
-		if len(parts) != 3 {
-			return 0, "", errors.New("len(parts) not 3")
-		}
-		id, err := strconv.ParseUint(parts[1], 10, 64)
-		if err != nil {
-			return 0, "", err
-		}
 
-		return id, parts[2], nil
-	}
 
-	_, suffix, err := parse(string(kv.Key))
-	if err != nil {
-		panic(err)
-	}
 
-	var ret KV
-
-	switch suffix {
-	case "blobStreams":
-		var blobs pspb.BlobStreams
-		if err := blobs.Unmarshal(kv.Value); err != nil {
-			panic(err)
-		}
-		ret.Key = string(kv.Key)
-		ret.Value = fmt.Sprintf("%+v", blobs)
-	case "logStream":
-		ret.Key = string(kv.Key)
-		ret.Value = fmt.Sprintf("%+v", binary.BigEndian.Uint64(kv.Value))
-	case "rowStream":
-		ret.Key = string(kv.Key)
-		ret.Value = fmt.Sprintf("%+v", binary.BigEndian.Uint64(kv.Value))
-	case "tables":
-		var tables pspb.TableLocations
-		if err = tables.Unmarshal(kv.Value); err != nil {
-			panic(err)
-		}
-		ret.Key = string(kv.Key)
-		ret.Value = fmt.Sprintf("%+v", tables.Locs)
-	case "discard":
-		ret.Key = string(kv.Key)
-		ret.Value = fmt.Sprintf("%+v", kv.Value)
-	case "parent":
-		ret.Key = string(kv.Key)
-		ret.Value = fmt.Sprintf("%+v", binary.BigEndian.Uint64(kv.Value))
-	case "range":
-		var rg pspb.Range
-		if err = rg.Unmarshal(kv.Value); err != nil {
-			panic(err)
-		}
-		ret.Key = string(kv.Key)
-		ret.Value = fmt.Sprintf("%+v", rg)
-	default:
-		panic("can not parse")
-	}
-
-	return ret
-
-}
