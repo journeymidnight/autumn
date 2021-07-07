@@ -107,6 +107,7 @@ message CommitLengthResponse {
 	uint32 length = 3;
 }
 
+/*
 message SealRequest {
 	uint64 extentID = 1;
 	uint32 commitLength = 2;
@@ -117,7 +118,7 @@ message SealResponse {
 	Code code = 1;
 	string codeDes = 2;
 }
-
+*/
 
 message ReadEntriesRequest {
 	uint64 extentID = 1;
@@ -191,6 +192,17 @@ message CopyExtentResponse {
 	}
 }
 
+message ReAvaliRequest {
+	uint64 extentID  = 1;
+	uint64 eversion  = 2;
+}
+
+message ReAvaliResponse {
+	Code code = 1;
+	string codeDes = 2;
+}
+
+
 service ExtentService {
 	//from stream client
 	rpc Append(AppendRequest) returns (AppendResponse){}
@@ -198,10 +210,11 @@ service ExtentService {
 	rpc SmartReadBlocks(ReadBlocksRequest) returns (ReadBlocksResponse){}
 
 	//internal rpc
+	rpc ReAvali(ReAvaliRequest) returns (ReAvaliResponse){}
 	rpc CopyExtent(CopyExtentRequest) returns (stream CopyExtentResponse){}
 	rpc Df(DfRequest) returns (DfResponse){}
 	rpc RequireRecovery(RequireRecoveryRequest) returns (RequireRecoveryResponse) {}
-	rpc Seal(SealRequest) returns (SealResponse) {}
+	//rpc Seal(SealRequest) returns (SealResponse) {}
 	rpc CommitLength(CommitLengthRequest) returns (CommitLengthResponse) {}
 	rpc Heartbeat (Payload)  returns (stream Payload) {}
 	rpc ReplicateBlocks(ReplicateBlocksRequest) returns (ReplicateBlocksResponse) {}

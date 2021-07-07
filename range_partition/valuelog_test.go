@@ -42,7 +42,7 @@ func TestLogReplay(t *testing.T) {
 		},
 	}
 
-	logStream := streamclient.NewMockStreamClient("log")
+	logStream := streamclient.NewMockStreamClient("log", streamclient.NewMockBlockReader())
 	defer logStream.Close()
 
 	extentID, offset, err := logStream.AppendEntries(context.Background(), cases)

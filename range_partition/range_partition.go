@@ -112,7 +112,7 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	//tableLocs的顺序就是在logStream里面的顺序
 	for _, tLoc := range tableLocs {
 	retry:
-		tbl, err := table.OpenTable(rp.rowStream, tLoc.ExtentID, tLoc.Offset)
+		tbl, err := table.OpenTable(rp.blockReader, tLoc.ExtentID, tLoc.Offset)
 		if err != nil {
 			xlog.Logger.Error(err)
 			time.Sleep(1 * time.Second)
@@ -283,8 +283,7 @@ func (rp *RangePartition) handleFlushTask(ft flushTask) error {
 		return err
 	}
 
-	//todo
-	tbl, err := table.OpenTable(rp.rowStream, id, offset)
+	tbl, err := table.OpenTable(rp.blockReader, id, offset)
 	if err != nil {
 		xlog.Logger.Errorf("ERROR while opening table: %v", err)
 		return err

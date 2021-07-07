@@ -42,7 +42,7 @@ type StreamClient interface {
 	AppendEntries(ctx context.Context, entries []*pb.EntryInfo) (uint64, uint32, error)
     Append(ctx context.Context, blocks []*pb.Block) (extentID uint64, offsets []uint32, end uint32, err error)
 	NewLogEntryIter(opt ...ReadOption) LogEntryIter
-	Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, uint32, error)
+	//Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, uint32, error)
 	Truncate(ctx context.Context, extentID uint64) (pb.StreamInfo, pb.StreamInfo, error)
 	//FIXME: stat => ([]extentID , offset)
 }
@@ -505,6 +505,7 @@ func (sc *AutumnStreamClient) AppendEntries(ctx context.Context, entries []*pb.E
     return extentID, tail, err
 }
 
+/*
 func (sc *AutumnStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, uint32, error) {
 	conn := sc.em.GetExtentConn(extentID, smclient.PrimaryPolicy{})
 	if conn == nil {
@@ -518,6 +519,7 @@ func (sc *AutumnStreamClient) Read(ctx context.Context, extentID uint64, offset 
 	})
 	return res.Blocks, res.End, err
 }
+*/
 
 func (sc *AutumnStreamClient) Append(ctx context.Context, blocks []*pb.Block) (uint64, []uint32, uint32,  error) {
 	loop := 0

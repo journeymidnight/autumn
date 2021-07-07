@@ -24,7 +24,7 @@ import (
 )
 
 
-func (en *ExtentNode) copyRemoteExtent(conn *grpc.ClientConn, exInfo *pb.ExtentInfo, targetFile *os.File, offset uint64, size uint64) error{
+func (en *ExtentNode) copyRemoteExtent(conn *grpc.ClientConn, exInfo *pb.ExtentInfo, targetWriter io.WriteSeeker, offset uint64, size uint64) error{
 	c := pb.NewExtentServiceClient(conn)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -61,7 +61,7 @@ func (en *ExtentNode) copyRemoteExtent(conn *grpc.ClientConn, exInfo *pb.ExtentI
 		}
 		payload := res.GetPayload()
 		if len(payload) > 0 {
-			if _, err = targetFile.Write(payload); err != nil {
+			if _, err = targetWriter.Write(payload); err != nil {
 				return err
 			}
 			n += len(payload)
@@ -78,36 +78,38 @@ func (en *ExtentNode) copyRemoteExtent(conn *grpc.ClientConn, exInfo *pb.ExtentI
 	}
 
 	//rewind to start for reading
-	targetFile.Seek(0, os.SEEK_SET)
+	targetWriter.Seek(0, os.SEEK_SET)
 	return nil
 }
 
-func (en *ExtentNode) recoveryReplicateExtent(extentInfo *pb.ExtentInfo, task *pb.RecoveryTask, targetFile *os.File) error {
-	conn := en.chooseAliveNode(extentInfo, task.ReplaceID)
+//func (en *ExtentNode) recoveryReplicateExtent(extentInfo *pb.ExtentInfo, task *pb.RecoveryTask, targetWriter *os.File) error {
+func (en *ExtentNode) recoveryReplicateExtent(extentInfo *pb.ExtentInfo, exceptID, offset, size uint64, targetWriter io.WriteSeeker) error {
+
+	conn := en.chooseAliveNode(extentInfo, exceptID)
 
 	if conn == nil {
 		xlog.Logger.Warnf("runRecoveryTask: can not find remote connect")
 		return errors.Errorf("runRecoveryTask: can not find remote connect")
 	}
 
-	if err := en.copyRemoteExtent(conn, extentInfo , targetFile, 0, extentInfo.SealedLength) ; err != nil {
+	if err := en.copyRemoteExtent(conn, extentInfo , targetWriter, 0, extentInfo.SealedLength) ; err != nil {
 		xlog.Logger.Warnf("recoveryReplicateExtent: [%s]", err.Error())
 		return  err
 	}
     return nil
 }
 
-func (en *ExtentNode) recoveryErasureExtent(extentInfo *pb.ExtentInfo, task *pb.RecoveryTask, targetFile *os.File) error {
+func (en *ExtentNode) recoveryErasureExtent(extentInfo *pb.ExtentInfo, exceptID, offset, size uint64, targetWriter io.WriteSeeker) error {
 
-	conns, replacingIndex, err := en.chooseECAliveNode(extentInfo, task.ReplaceID)
+	conns, replacingIndex, err := en.chooseECAliveNode(extentInfo, exceptID)
 	if err != nil {
 		return err
 	}
 	if replacingIndex == -1 {
-		return errors.Errorf("task.ReplaceID is %d, not find int extentInfo", task.ReplaceID)
+		return errors.Errorf("task.ReplaceID is %d, not find in extentInfo", exceptID)
 	}
 
-	//FIXME: do not use tmp dir
+	//FIXME: do not use tmp dirs
 	tmpDir, err := ioutil.TempDir(os.TempDir(), "recoveryEC")
 	if err != nil {
 		xlog.Logger.Warnf("ErasureExtent: can not create tmpDir")
@@ -134,7 +136,7 @@ func (en *ExtentNode) recoveryErasureExtent(extentInfo *pb.ExtentInfo, task *pb.
 			if conns[j] == nil {
 				return
 			}
-			if err := en.copyRemoteExtent(conns[j], extentInfo, tmpFiles[j], 0, extentInfo.SealedLength); err != nil {
+			if err := en.copyRemoteExtent(conns[j], extentInfo, tmpFiles[j], offset, size); err != nil {
 				xlog.Logger.Warnf("ErasureExtent can not copyRemoteExtent %v", err)
 				return
 			}
@@ -158,7 +160,7 @@ func (en *ExtentNode) recoveryErasureExtent(extentInfo *pb.ExtentInfo, task *pb.
 	}
 
 	output := make([]io.Writer, len(conns))
-	output[replacingIndex] = targetFile
+	output[replacingIndex] = targetWriter
 	
 	//successfull to get data, reconstruct
 	fmt.Printf("input is %+v", input)
@@ -237,7 +239,7 @@ func (en *ExtentNode) chooseECAliveNode(extentInfo *pb.ExtentInfo, except uint64
 }
 
 
-func (en *ExtentNode) runRecoveryTask(task *pb.RecoveryTask,extentInfo *pb.ExtentInfo, targetFile *os.File, targetFilePath string, diskID uint64) {
+func (en *ExtentNode) runRecoveryTask(task *pb.RecoveryTask, extentInfo *pb.ExtentInfo, targetFile *os.File, targetFilePath string, diskID uint64) {
 	
 		atomic.AddInt32(&en.recoveryTaskNum, 1)
 		defer func(){
@@ -248,25 +250,29 @@ func (en *ExtentNode) runRecoveryTask(task *pb.RecoveryTask,extentInfo *pb.Exten
 		var err error
 		//loop 
 		for {
+			//有可能manager等的太久了,或者网络parttion, 找另外一个
+			//node做完了recovery任务, 这个任务自动取消
 			if stream_manager.FindReplaceSlot(extentInfo, task.ReplaceID) == -1  {
 				targetFile.Close()
 				os.Remove(targetFilePath)
 				return
 			}
 			if isEC == false {
-				err = en.recoveryReplicateExtent(extentInfo, task, targetFile)
+				err = en.recoveryReplicateExtent(extentInfo, task.ReplaceID, 0, extentInfo.SealedLength, targetFile)
 			} else {
-				err = en.recoveryErasureExtent(extentInfo, task, targetFile)
+				err = en.recoveryErasureExtent(extentInfo, task.ReplaceID, 0, extentInfo.SealedLength, targetFile)
 			}
 
 			if err == nil {
 				break
 			}
 			xlog.Logger.Warnf(err.Error())
-			time.Sleep(30*time.Second)
+
+			time.Sleep(60*time.Second)
 			//get the latest extentInfo
 			extentInfo = en.em.Update(task.ExtentID)
 		}
+
 		//rename file from XX.XX.copy to XX.ext
 		extentFileName := fmt.Sprintf("%s.ext", path.Dir(targetFilePath))
 		utils.Check(os.Rename(targetFilePath, extentFileName))
@@ -399,4 +405,53 @@ func (en *ExtentNode) RequireRecovery(ctx context.Context, req *pb.RequireRecove
 
 	//reply will not accept
 	return errDone(errors.New("exceed MaxConcurrentTask, please wait..."))
+}
+
+func (en *ExtentNode) ReAvali(ctx context.Context, req *pb.ReAvaliRequest) (*pb.ReAvaliResponse, error) {
+	errDone := func(err error) (*pb.ReAvaliResponse, error) {
+		code, desCode := wire_errors.ConvertToPBCode(err)
+		return &pb.ReAvaliResponse{
+			Code:    code,
+			CodeDes: desCode,
+		}, nil
+	}
+	
+	exInfo := en.em.WaitVersion(req.ExtentID, req.Eversion)
+	//en will truncated and seal extent in en.extentInfoUpdatedfunc
+	ex := en.getExtent(req.ExtentID)
+	if ex == nil {
+		//BUGON
+		xlog.Logger.Errorf("BUGON: can not find extent %d", req.ExtentID)
+		return errDone(errors.Errorf("can not find extent %d",req.ExtentID))
+	}
+
+	if ex.IsSeal() {
+		return &pb.ReAvaliResponse{
+			Code: pb.Code_OK,
+		}, nil
+	}
+
+	//extent's length is less than CommitLength...
+	xlog.Logger.Warnf("Reavali: extent's length is %d, commitLength is %d", ex.CommitLength(), exInfo.SealedLength)
+	utils.AssertTrue(ex.CommitLength() < uint32(exInfo.SealedLength))
+
+
+	isEC := len(exInfo.Parity) > 0
+	size := exInfo.SealedLength - uint64(ex.CommitLength())
+	var err error
+	appendWriter := ex.GetFixWriter()
+	//ex.Extent.
+	if isEC == false {
+		err = en.recoveryReplicateExtent(exInfo, en.nodeID, 0, size, appendWriter)
+	} else {
+		err = en.recoveryErasureExtent(exInfo, en.nodeID, 0, size, appendWriter)
+	}
+	if err != nil {
+		return errDone(err)
+	}
+
+	return &pb.ReAvaliResponse{
+		Code: pb.Code_OK,
+	}, nil
+
 }

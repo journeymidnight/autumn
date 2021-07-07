@@ -296,20 +296,26 @@ func (en *ExtentNode) SmartReadBlocks(ctx context.Context, req *pb.ReadBlocksReq
 
 	stopper := utils.NewStopper()
 	retChan := make(chan Result, n)
-	errChan := make(chan Result, n)
 
 	submitReq := func(conn *grpc.ClientConn, pos int) {
 		if conn == nil {
-			errChan <- Result{
+			retChan <- Result{
 				Error: errors.New("can not get conn"),
 			}
 			return
 		}
 		c := pb.NewExtentServiceClient(conn)
 		res, err := c.ReadBlocks(pctx, req)
+
+		if err != nil { //network error
+			retChan <- Result{
+				Error: err,}
+			return
+		}
+
 		err = wire_errors.FromPBCode(res.Code, res.CodeDes)
 		if err != nil && err != context.Canceled && err != wire_errors.EndOfExtent && err != wire_errors.EndOfStream {
-			errChan <- Result{
+			retChan <- Result{
 				Error: err,
 			}
 			return
@@ -327,7 +333,6 @@ func (en *ExtentNode) SmartReadBlocks(ctx context.Context, req *pb.ReadBlocksReq
 	}
 
 	pools, err := en.connPool(en.em.GetPeers(req.ExtentID))
-
 	if err != nil {
 		cancel()
 		return errDone(err)
@@ -358,7 +363,7 @@ func (en *ExtentNode) SmartReadBlocks(ctx context.Context, req *pb.ReadBlocksReq
 			select {
 			case <-stopper.ShouldStop():
 				return
-			case <-time.After(100 * time.Millisecond):
+			case <-time.After(10 * time.Millisecond):
 				submitReq(conn, j+dataShards)
 			}
 		})
@@ -382,9 +387,8 @@ waitResult:
 	}
 
 	cancel()
-	stopper.Close()
+	stopper.Stop()
 	close(retChan)
-	close(errChan)
 
 	var lenOfBlocks int
 	var end uint32
@@ -403,12 +407,6 @@ waitResult:
 		finalErr = successRet[0].Error
 		offsets = successRet[0].Offsets
 	} else {
-		//FIXME collect errChan, find err
-		for r := range errChan {
-			if r.Error != nil {
-				return errDone(r.Error)
-			}
-		}
 		return errDone(errors.New("read timeout, not enough nodes response"))
 	}
 
@@ -512,6 +510,7 @@ func (en *ExtentNode) AllocExtent(ctx context.Context, req *pb.AllocExtentReques
 	}, nil
 }
 
+/*
 func (en *ExtentNode) Seal(ctx context.Context, req *pb.SealRequest) (*pb.SealResponse, error) {
 	ex := en.getExtent(req.ExtentID)
 	if ex == nil {
@@ -532,6 +531,9 @@ func (en *ExtentNode) Seal(ctx context.Context, req *pb.SealRequest) (*pb.SealRe
 	return &pb.SealResponse{Code: pb.Code_OK}, nil
 
 }
+*/
+
+
 
 func (en *ExtentNode) CommitLength(ctx context.Context, req *pb.CommitLengthRequest) (*pb.CommitLengthResponse, error) {
 	ex := en.getExtent(req.ExtentID)
