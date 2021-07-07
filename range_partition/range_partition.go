@@ -90,6 +90,7 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		optf(opt)
 	}
 
+	fmt.Printf("opt is %+v\n", opt)
 	rp := &RangePartition{
 		rowStream:   rowStream,
 		logStream:   logStream,
@@ -380,6 +381,7 @@ func (rp *RangePartition) updateTableLocs(tableLocs []*pspb.Location) {
 	if len(tableLocs) == 0 {
 		return
 	}
+	fmt.Printf("updating tables %+v\n", tableLocs)
 	for {
 		err := rp.setLocs(rp.PartID, tableLocs)
 		if err != nil {
