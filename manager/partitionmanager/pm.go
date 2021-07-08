@@ -41,17 +41,19 @@ type PartitionManager struct {
 	leaderKey string
 	config    *manager.Config
 
-	pslock  utils.SafeMutex           //protect
+	//pslock  utils.SafeMutex           //protect
 	psNodes map[uint64]*pspb.PSDetail //cache from etcd, read lasted PSNodes when became leader
 
-	partLock utils.SafeMutex
+	//partLock utils.SafeMutex
 	partMeta map[uint64]*pspb.PartitionMeta
 
 	currentRegions  *pspb.Regions
-	allocIdLock utils.SafeMutex
+	//allocIdLock utils.SafeMutex
 
 	policy AllocPartPolicy
-	stopWatch func()
+	stopper *utils.Stopper //all pm logic in this stopper's routine
+
+	utils.SafeMutex
 }
 
 type AllocPartPolicy interface {
@@ -65,6 +67,7 @@ func NewPartitionManager(etcd *embed.Etcd, client *clientv3.Client, config *mana
 		config: config,
 		ID:     uint64(etcd.Server.ID()),
 		policy: SimplePolicy{},
+		stopper: utils.NewStopper(),
 	}
 
 	v := pb.MemberValue{
@@ -102,12 +105,123 @@ func parseParts(kvs []*mvccpb.KeyValue) map[uint64]*pspb.PartitionMeta {
 	return ret
 }
 
-func (pm *PartitionManager) runAsLeader() {
-	pm.pslock.Lock()
-	defer pm.pslock.Unlock()
+func (pm *PartitionManager) watchEvents(watchServerCh clientv3.WatchChan, closeWatch func()) {
+	var err error
+	for {
+		select {
+		case <- pm.stopper.ShouldStop():
+			pm.Lock()
+			closeWatch()
+			pm.currentRegions = nil
+			pm.psNodes = nil
+			pm.partMeta = nil
+			pm.Unlock()
+		case res := <- watchServerCh:
+			pm.Lock()
+			for _, e := range res.Events {
+				var psDetail pspb.PSDetail
+				switch e.Type.String() {
+					case "PUT":
+						if err = psDetail.Unmarshal(e.Kv.Value) ; err != nil {
+							break
+						}
+						//pm.pslock.Lock()
+						pm.psNodes[psDetail.PSID] = &psDetail
+						//pm.pslock.Unlock()
+						
+						//if there is any PART who is not allocated, allocated to psDetail.PSID
+						var anyChange bool
+	
+						//pm.partLock.RLock()
+						for _, part := range pm.partMeta {
+							_, ok := pm.currentRegions.Regions[part.PartID]
+							if !ok {
+								pm.currentRegions.Regions[part.PartID] = &pspb.RegionInfo{
+									Rg: part.Rg,
+									PartID: part.PartID,
+									PSID: psDetail.PSID,
+								}
+								anyChange = true
+							}
+						}
+						//pm.partLock.RUnlock()
+	
+	
+						if anyChange {
+							fmt.Printf("NEW PS: set regions/config %+v", pm.currentRegions.Regions)
+							ops := []clientv3.Op{
+								clientv3.OpPut(fmt.Sprintf("regions/config"), string(utils.MustMarshal(pm.currentRegions))),
+							}
+							if err = etcd_utils.EtcdSetKVS(pm.client, []clientv3.Cmp{
+								clientv3.Compare(clientv3.Value(pm.leaderKey), "=", pm.memberValue),
+							}, ops) ; err != nil {
+								xlog.Logger.Warnf("this pm is not leader , can not set 'regions/config'")
+							}
+						} else {
+							fmt.Printf("NEW PS: nothing changed\n")
+						}
+	
+					case "DELETE":
+						if err = psDetail.Unmarshal(e.PrevKv.Value) ; err != nil {
+							break
+						}
+						//pm.pslock.Lock()
+						delete(pm.psNodes, psDetail.PSID)
+						//pm.pslock.Unlock()
+	
+						//change regions
+						//move partition [partID] from psDetail.ps to "to"
+						type MovePartition struct {
+							partID uint64
+							to     uint64
+						} 
+	
+						var moves []MovePartition
+						for _, region := range pm.currentRegions.Regions {
+							if region.PSID == psDetail.PSID {
+								//move region.PartID to other ps
+								psID, err := pm.policy.AllocPart(pm.psNodes)
+								if err != nil {
+									xlog.Logger.Errorf("can not alloc parts to partition servers")
+									//set error somewhere
+									//will set region's PSID = 0
+									delete(pm.currentRegions.Regions, region.PartID)
+								} else {
+									moves = append(moves, MovePartition{partID: region.PartID, to:psID})
+								}
+							}
+						}
+	
+						//先clone pm.currentRegions, 然后setETCD, 再更新pm.currentRegions更好
+						//但是这样写更加简单, 并且只会导致监控看region数据时, 有可能有错误数据
+						for _, move := range moves {
+							pm.currentRegions.Regions[move.partID].PSID = move.to
+						}
+						data := utils.MustMarshal(pm.currentRegions)
+	
+						//set etcd
+						fmt.Printf("DELETE PS: set regions/config %+v", pm.currentRegions.Regions)
+						ops := []clientv3.Op{
+							clientv3.OpPut(fmt.Sprintf("regions/config"), string(data)),
+						}
+						if err = etcd_utils.EtcdSetKVS(pm.client, []clientv3.Cmp{
+							clientv3.Compare(clientv3.Value(pm.leaderKey), "=", pm.memberValue),
+						}, ops) ; err != nil {
+							xlog.Logger.Warnf("this pm is not leader , can not set 'regions/config'")
+						}		
+				}
+			}
+			pm.Unlock()	
+		}
+	}
+}
 
-	pm.partLock.Lock()
-	defer pm.partLock.Unlock()
+func (pm *PartitionManager) runAsLeader() {
+	//pm.pslock.Lock()
+	//defer pm.pslock.Unlock()
+
+	//pm.partLock.Lock()
+	//defer pm.partLock.Unlock()
 	//load data
 
 	var maxRev int64
@@ -234,107 +348,10 @@ func (pm *PartitionManager) runAsLeader() {
 	//start watch PSSERVER
 	watchServerCh, closeWatchCh := etcd_utils.EtcdWatchEvents(pm.client, "PSSERVER/", "PSSERVER0", maxRev)
 
-	go func() {
-		for res := range watchServerCh {
-			for _, e := range res.Events {
-				var psDetail pspb.PSDetail
-				switch e.Type.String() {
-					case "PUT":
-						if err = psDetail.Unmarshal(e.Kv.Value) ; err != nil {
-							break
-						}
-						pm.pslock.Lock()
-						pm.psNodes[psDetail.PSID] = &psDetail
-						pm.pslock.Unlock()
-						
-						//if there is any PART who is not allocated, allocated to psDetail.PSID
-						var anyChange bool
 
-						pm.partLock.RLock()
-						for _, part := range pm.partMeta {
-							_, ok := pm.currentRegions.Regions[part.PartID]
-							if !ok {
-								pm.currentRegions.Regions[part.PartID] = &pspb.RegionInfo{
-									Rg: part.Rg,
-									PartID: part.PartID,
-									PSID: psDetail.PSID,
-								}
-								anyChange = true
-							}
-						}
-						pm.partLock.RUnlock()
-
-
-						if anyChange {
-							fmt.Printf("NEW PS: set regions/config %+v", pm.currentRegions.Regions)
-							ops := []clientv3.Op{
-								clientv3.OpPut(fmt.Sprintf("regions/config"), string(utils.MustMarshal(pm.currentRegions))),
-							}
-							if err = etcd_utils.EtcdSetKVS(pm.client, []clientv3.Cmp{
-								clientv3.Compare(clientv3.Value(pm.leaderKey), "=", pm.memberValue),
-							}, ops) ; err != nil {
-								xlog.Logger.Warnf("this pm is not leader , can not set 'regions/config'")
-							}
-						} else {
-							fmt.Printf("NEW PS: nothing changed\n")
-						}
-
-					case "DELETE":
-						if err = psDetail.Unmarshal(e.PrevKv.Value) ; err != nil {
-							break
-						}
-						pm.pslock.Lock()
-						delete(pm.psNodes, psDetail.PSID)
-						pm.pslock.Unlock()
-
-						//change regions
-						//move partition [partID] from psDetail.ps to "to"
-						type MovePartition struct {
-							partID uint64
-							to     uint64
-						} 
-
-						var moves []MovePartition
-						for _, region := range pm.currentRegions.Regions {
-							if region.PSID == psDetail.PSID {
-								//move region.PartID to other ps
-								psID, err := pm.policy.AllocPart(pm.psNodes)
-								if err != nil {
-									xlog.Logger.Errorf("can not alloc parts to partition servers")
-									//set error somewhere
-									//will set region's PSID = 0
-									delete(pm.currentRegions.Regions, region.PartID)
-								} else {
-									moves = append(moves, MovePartition{partID: region.PartID, to:psID})
-								}
-							}
-						}
-
-						//先clone pm.currentRegions, 然后setETCD, 再更新pm.currentRegions更好
-						//但是这样写更加简单, 并且只会导致监控看region数据时, 有可能有错误数据
-						for _, move := range moves {
-							pm.currentRegions.Regions[move.partID].PSID = move.to
-						}
-						data := utils.MustMarshal(pm.currentRegions)
-
-						//set etcd
-						fmt.Printf("DELETE PS: set regions/config %+v", pm.currentRegions.Regions)
-						ops := []clientv3.Op{
-							clientv3.OpPut(fmt.Sprintf("regions/config"), string(data)),
-						}
-						if err = etcd_utils.EtcdSetKVS(pm.client, []clientv3.Cmp{
-							clientv3.Compare(clientv3.Value(pm.leaderKey), "=", pm.memberValue),
-						}, ops) ; err != nil {
-							xlog.Logger.Warnf("this pm is not leader , can not set 'regions/config'")
-						}		
-				}
-
-				
-			}
-		}
-	}()
-
-	pm.stopWatch = closeWatchCh
+	pm.stopper.RunWorker(func(){
+		pm.watchEvents(watchServerCh, closeWatchCh)
+	})
 
 	atomic.StoreInt32(&pm.isLeader, 1)
 }
@@ -370,13 +387,13 @@ func (pm *PartitionManager) LeaderLoop() {
 
 		select {
 		case <-s.Done():
-			s.Close()
 			atomic.StoreInt32(&pm.isLeader, 0)
+			s.Close()
+			pm.stopper.Stop()
 			xlog.Logger.Info("%d's leadershipt expire", pm.ID)
 		}
 	}
 }
-
 
 
 func (pm *PartitionManager) RegisterGRPC(grpcServer *grpc.Server) {

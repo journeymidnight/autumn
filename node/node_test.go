@@ -257,7 +257,7 @@ func (suite *ExtentNodeTestSuite) TestCopy() {
 		fmt.Printf("id %d\n", suite.ens[i].nodeID)
 	}
 
-	err = sc.MustAllocNewExtent(extentID, 3, 0)
+	err = sc.MustAllocNewExtent(extentID)
 	suite.Nil(err)
 
 	//原来是(4,2,3), 改成(1,2,3)
