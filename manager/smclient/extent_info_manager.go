@@ -239,11 +239,8 @@ func (PrimaryPolicy) Choose(em *ExtentManager, extentID uint64) *grpc.ClientConn
 		return nil
 	}
 	nodeInfo := em.GetNodeInfo(exInfo.Replicates[0])
-	pool, err := conn.GetPools().Get(nodeInfo.Address)
-	if err != nil {
-		if err == conn.ErrNoConnection {
-			return conn.GetPools().Connect(nodeInfo.Address).Get()
-		}
+	pool := conn.GetPools().Connect(nodeInfo.Address)
+	if pool == nil || !pool.IsHealthy(){
 		return nil
 	}
 	return pool.Get()
@@ -263,11 +260,8 @@ func (AlivePolicy) Choose(em *ExtentManager, extentID uint64) *grpc.ClientConn {
 		}
 		nodeInfo := em.GetNodeInfo(exInfo.Replicates[i])
 
-		pool, err := conn.GetPools().Get(nodeInfo.Address)
-		if err != nil {
-			if err == conn.ErrNoConnection {
-				return conn.GetPools().Connect(nodeInfo.Address).Get()
-			}
+		pool := conn.GetPools().Connect(nodeInfo.Address)
+		if pool == nil || !pool.IsHealthy(){
 			return nil
 		}
 		return pool.Get()

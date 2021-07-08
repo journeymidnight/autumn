@@ -222,7 +222,7 @@ func bootstrap(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("bootstrap succeed, created new range partition %d on %d\n", partID)
+	fmt.Printf("bootstrap succeed, created new range partition %d\n", partID)
 	return nil
 }
 

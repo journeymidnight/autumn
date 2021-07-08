@@ -250,11 +250,11 @@ message AllocExtentResponse {
 message StreamAllocExtentRequest{
 	uint64 streamID = 1;
 	uint64 extentToSeal = 2;
-	uint32 dataShard = 3;
-	uint32 parityShard =4;
-	string ownerKey = 5;
+	string ownerKey = 5; //ownerKey, revision is used for locking
 	int64  revision = 6;
-	uint32 checkCommitLength = 7;
+	uint32 checkCommitLength = 7; //if checkCommitLength > 0, do not use end.
+	                              //if checkCommitLength ==0, end is the sealedlength, and all nodes are avaliable
+	uint32 end = 8;
 }
 
 

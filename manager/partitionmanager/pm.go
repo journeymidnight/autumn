@@ -28,7 +28,7 @@ const (
 	pmElectionKeyPrefix = "AutumnPMLeader"
 )
 
-
+//FIXME: 考虑重新分配range partitin的情况, 可能把程序变成单线程server, 避免过多的lock
 type PartitionManager struct {
 	etcd       *embed.Etcd
 	client     *clientv3.Client
@@ -49,6 +49,7 @@ type PartitionManager struct {
 
 	currentRegions  *pspb.Regions
 	allocIdLock utils.SafeMutex
+
 	policy AllocPartPolicy
 	stopWatch func()
 }
@@ -248,6 +249,8 @@ func (pm *PartitionManager) runAsLeader() {
 						
 						//if there is any PART who is not allocated, allocated to psDetail.PSID
 						var anyChange bool
+
+						pm.partLock.RLock()
 						for _, part := range pm.partMeta {
 							_, ok := pm.currentRegions.Regions[part.PartID]
 							if !ok {
@@ -259,6 +262,8 @@ func (pm *PartitionManager) runAsLeader() {
 								anyChange = true
 							}
 						}
+						pm.partLock.RUnlock()
+
 
 						if anyChange {
 							fmt.Printf("NEW PS: set regions/config %+v", pm.currentRegions.Regions)
