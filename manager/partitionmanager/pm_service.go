@@ -15,34 +15,8 @@ import (
 
 
 func (pm *PartitionManager) allocUniqID(count uint64) (uint64, uint64, error) {
-	pm.allocIdLock.Lock()
-	defer pm.allocIdLock.Unlock()
 	return etcd_utils.EtcdAllocUniqID(pm.client, idKey, count)
 }
-
-func (pm *PartitionManager) AllocPSID(ctx context.Context, req *pspb.AllocPSIDRequest) (*pspb.AllocPSIDResponse, error) {
-	errDone := func(err error) (*pspb.AllocPSIDResponse, error){
-		code, desCode := wire_errors.ConvertToPBCode(err)
-		return &pspb.AllocPSIDResponse{
-			Code: code,
-			CodeDes: desCode,
-		}, nil
-	}
-	if !pm.AmLeader() {
-			return errDone(wire_errors.NotLeader)
-	}
-
-	PSID, _, err := pm.allocUniqID(2)
-	if err != nil {
-		return errDone(err)
-	}
-
-	return &pspb.AllocPSIDResponse{
-		PSID: PSID,
-		Code: pb.Code_OK,
-	}, nil
-}
-
 
 func (pm *PartitionManager) Bootstrap(ctx context.Context, req *pspb.BootstrapRequest) (*pspb.BootstrapResponse, error) {
 
@@ -54,13 +28,13 @@ func (pm *PartitionManager) Bootstrap(ctx context.Context, req *pspb.BootstrapRe
 		}, nil
 	}
 	if !pm.AmLeader() {
-			return errDone(wire_errors.NotLeader)
+		return errDone(wire_errors.NotLeader)
 	}
-	
-	pm.partLock.Lock()
-	defer pm.partLock.Unlock()
 
 	//watch started and no partitions
+
+	pm.Lock()
+	defer pm.Unlock()
 
 	if len(pm.partMeta) > 0 {
 		return errDone(errors.New("already has partMeta, can not bootstrap"))
@@ -72,9 +46,7 @@ func (pm *PartitionManager) Bootstrap(ctx context.Context, req *pspb.BootstrapRe
 		return nil, err
 	}
 
-	
-
-	//FIXME: check req	
+	//FIXME: check request	
 	zeroMeta := pspb.PartitionMeta{
 		LogStream: req.LogID,
 		RowStream: req.RowID,

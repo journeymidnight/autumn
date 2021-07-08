@@ -142,18 +142,8 @@ message BootstrapResponse {
 	pb.Code code = 3;
 }
 
-message AllocPSIDRequest {
-}
-
-message AllocPSIDResponse {
-	uint64 PSID = 1;
-	pb.Code code = 2;
-	string codeDes = 3;
-}
-
 service PartitionManagerService {	
 	rpc Bootstrap(BootstrapRequest) returns (BootstrapResponse) {}
-	rpc AllocPSID(AllocPSIDRequest) returns (AllocPSIDResponse) {}
 }
 
 
