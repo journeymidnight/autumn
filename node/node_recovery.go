@@ -187,8 +187,8 @@ func (en *ExtentNode) chooseAliveNode(extentInfo *pb.ExtentInfo, except uint64) 
 		if extentInfo.Replicates[i] == except || (1 << i) & extentInfo.Avali == 0 {
 			continue
 		}
-		pool , err := conn.GetPools().Get(addrs[i])
-		if err != nil {
+		pool := conn.GetPools().Connect(addrs[i])
+		if pool == nil || !pool.IsHealthy(){
 			continue
 		}
 		return pool.Get()
@@ -222,13 +222,14 @@ func (en *ExtentNode) chooseECAliveNode(extentInfo *pb.ExtentInfo, except uint64
 			continue
 		}
 
-		pool , err := conn.GetPools().Get(addrs[i])
-		if err != nil {
+		pool := conn.GetPools().Connect(addrs[i])
+		if pool == nil || pool.IsHealthy() {
 			conns[i] = nil
 		} else {
 			conns[i] = pool.Get()
 			activeConns++
 		}
+
 	}
 
 	if activeConns == len(extentInfo.Replicates) {

@@ -2,6 +2,7 @@ package table
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 
 	"github.com/dgraph-io/ristretto"
@@ -62,8 +63,10 @@ func OpenTable(blockReader streamclient.BlockReader,
 
 	utils.AssertTrue(xlog.Logger != nil)
 
+	fmt.Printf("read table from %d, %d\n", extentID, offset)
 	blocks, _, err := blockReader.Read(context.Background(), extentID, offset, 1)
 	if err != nil {
+		fmt.Printf("%+v\n", err)
 		return nil, err
 	}
 	if len(blocks) != 1 {

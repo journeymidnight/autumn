@@ -15,6 +15,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"time"
@@ -27,7 +28,6 @@ import (
 	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
-	"google.golang.org/grpc"
 )
 
 var (
@@ -83,17 +83,18 @@ func (en *ExtentNode) ReplicateBlocks(ctx context.Context, req *pb.ReplicateBloc
 	}, nil
 
 }
-
+//pool有可能是nil, 如果有nil存在返回error
 func (en *ExtentNode) connPool(peers []string) ([]*conn.Pool, error) {
 	var ret []*conn.Pool
+	var err error
 	for _, peer := range peers {
 		pool := conn.GetPools().Connect(peer)
-		if !pool.IsHealthy() {
-			return nil, errors.Errorf("remote peer %s not healthy", peer)
+		if pool == nil {
+			err = errors.Errorf("can not connected to %s", peer)
 		}
 		ret = append(ret, pool)
 	}
-	return ret, nil
+	return ret, err
 }
 
 func (en *ExtentNode) validReq(extentID uint64, version uint64) (*extent.Extent, *pb.ExtentInfo, error) {
@@ -145,9 +146,10 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 	//extentInfo.Replicates : list of extent node'ID
 	//extentInfo.Parity:
 
+	//if any connection is lost, return error
 	pools, err := en.connPool(en.em.GetPeers(req.ExtentID))
 	if err != nil {
-		return errDone(errors.Errorf("extent %d is sealed", req.ExtentID))
+		return errDone(errors.Errorf("extent %d's append can not get pool[%s]", req.ExtentID, err.Error()))
 	}
 
 	//prepare data
@@ -296,33 +298,34 @@ func (en *ExtentNode) SmartReadBlocks(ctx context.Context, req *pb.ReadBlocksReq
 
 	stopper := utils.NewStopper()
 	retChan := make(chan Result, n)
+	errChan := make(chan Result, n)
 
-	submitReq := func(conn *grpc.ClientConn, pos int) {
-		if conn == nil {
-			retChan <- Result{
+	submitReq := func(pool * conn.Pool, pos int) {
+		if pool == nil {
+			errChan <- Result{
 				Error: errors.New("can not get conn"),
 			}
 			return
 		}
-		c := pb.NewExtentServiceClient(conn)
+		c := pb.NewExtentServiceClient(pool.Get())
 		res, err := c.ReadBlocks(pctx, req)
 
 		if err != nil { //network error
-			retChan <- Result{
+			errChan <- Result{
 				Error: err,}
 			return
 		}
 
 		err = wire_errors.FromPBCode(res.Code, res.CodeDes)
 		if err != nil && err != context.Canceled && err != wire_errors.EndOfExtent && err != wire_errors.EndOfStream {
-			retChan <- Result{
+			errChan <- Result{
 				Error: err,
 			}
 			return
 		}
 
 		//successful read
-		//insert into res.Blocks
+		//如果读到最后, err有可能是EndOfExtent或者EndOfStream
 		dataBlocks[pos] = res.Blocks
 		retChan <- Result{
 			Error: err,
@@ -332,11 +335,9 @@ func (en *ExtentNode) SmartReadBlocks(ctx context.Context, req *pb.ReadBlocksReq
 		}
 	}
 
-	pools, err := en.connPool(en.em.GetPeers(req.ExtentID))
-	if err != nil {
-		cancel()
-		return errDone(err)
-	}
+	//pools里面有可能有nil
+	pools, _ := en.connPool(en.em.GetPeers(req.ExtentID))
+
 
 	//only read from avali data
 	//read data shards
@@ -346,8 +347,7 @@ func (en *ExtentNode) SmartReadBlocks(ctx context.Context, req *pb.ReadBlocksReq
 			continue
 		}
 		stopper.RunWorker(func() {
-			conn := pools[j].Get()
-			submitReq(conn, j)
+			submitReq(pools[j], j)
 		})
 	}
 
@@ -359,12 +359,11 @@ func (en *ExtentNode) SmartReadBlocks(ctx context.Context, req *pb.ReadBlocksReq
 			continue
 		}
 		stopper.RunWorker(func() {
-			conn := pools[dataShards+j].Get()
 			select {
 			case <-stopper.ShouldStop():
 				return
 			case <-time.After(10 * time.Millisecond):
-				submitReq(conn, j+dataShards)
+				submitReq(pools[dataShards+j], j+dataShards)
 			}
 		})
 
@@ -383,12 +382,14 @@ waitResult:
 				success = true
 				break waitResult
 			}
+	
 		}
 	}
 
 	cancel()
 	stopper.Stop()
 	close(retChan)
+	close(errChan)
 
 	var lenOfBlocks int
 	var end uint32
@@ -407,7 +408,13 @@ waitResult:
 		finalErr = successRet[0].Error
 		offsets = successRet[0].Offsets
 	} else {
-		return errDone(errors.New("read timeout, not enough nodes response"))
+		//collect errChan, find err
+		errBuf := new(bytes.Buffer)
+		for r := range errChan {
+			errBuf.WriteString(r.Error.Error())
+			errBuf.WriteString("\n")
+		}
+		return errDone(errors.New(errBuf.String()))
 	}
 
 	//join each block

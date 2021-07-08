@@ -228,9 +228,9 @@ func (sm *StreamManager) unlockExtent(extentID uint64) {
 func (sm *StreamManager) reAvali(exInfo *pb.ExtentInfo, nodeID uint64) {
 
 	ns := sm.getNodeStatus(nodeID)
-	pool, err := conn.GetPools().Get(ns.Address)
-	if err != nil {
-		return
+	pool := conn.GetPools().Connect(ns.Address)
+	if pool == nil {
+		return 
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30 * time.Second)

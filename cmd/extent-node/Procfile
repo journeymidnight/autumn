@@ -4,3 +4,4 @@
 node1: ./extent-node --config en_1.toml
 node2: ./extent-node --config en_4.toml
 node3: ./extent-node --config en_7.toml
+node4: ./extent-node --config en_10.toml

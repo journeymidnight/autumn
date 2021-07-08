@@ -201,31 +201,29 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		return errDone(wire_errors.NotLeader)
 	}
 
-	if req.DataShard == 0 {
-		return errDone(errors.New("req.DataShard can not be 0"))
-	}
-	if req.ParityShard == 0 && req.DataShard != 3 {
-		return errDone(errors.New("replica only support 3 replics"))
-	}
 	
 	//get current Stream's last extent, and find current extents' nodes
 	nodes, id, lastExtentInfo, err := sm.getAppendExtentsAddr(req.StreamID)
 	if err != nil {
 		return errDone(err)
 	}
+	dataShards := len(lastExtentInfo.Replicates)
+	parityShards := len(lastExtentInfo.Parity)
 	if id != req.ExtentToSeal {
 		return errDone(wire_errors.StreamVersionLow)
 	}
-
+	var sizes []int64
 	if req.CheckCommitLength > 0 {
 		haveToCreateNewExtent := false
-		sizes := sm.receiveCommitlength(ctx, nodes, req.ExtentToSeal)
+		sizes = sm.receiveCommitlength(ctx, nodes, req.ExtentToSeal)
 		for i := range sizes {
 			if sizes[i] == -1 {
 				haveToCreateNewExtent = true
 				break			
 			}
 		}
+
+		//all nodes are good
 		if haveToCreateNewExtent == false {
 			return  &pb.StreamAllocExtentResponse{
 				Code: pb.Code_OK,
@@ -235,9 +233,10 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	}
 
 	var ops []clientv3.Op
-
+	var minimalLength int64 = math.MaxInt64
+	var avali uint32
 	//seal the oldExtent, update lastExtentInfo
-	{
+	if req.End ==0 {
 		//recevied commit length
 
 		var minSize int
@@ -249,12 +248,11 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		} else {
 			minSize = 2
 		}
-
-		avali := uint32(0)
-		var minimalLength int64 = math.MaxInt64
-		var sizes []int64
 		
-		sizes = sm.receiveCommitlength(ctx, nodes, req.ExtentToSeal)
+		if len(sizes) == 0 && req.CheckCommitLength == 0 {
+			sizes = sm.receiveCommitlength(ctx, nodes, req.ExtentToSeal)
+		}
+
 		for i := range sizes {
 			if sizes[i] != -1 {
 				avali |= (1 << i)
@@ -267,19 +265,23 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 			xlog.Logger.Warnf("avali nodes is %d , less than minSize %d", avali, minSize)
 			return errDone(errors.Errorf("avali nodes is %d , less than minSize %d", avali, minSize))
 		}
-		
-		
-		//set extent
-		lastExtentInfo.SealedLength = uint64(minimalLength)
-		lastExtentInfo.Eversion ++
-		lastExtentInfo.Avali = avali
-
-		data := utils.MustMarshal(lastExtentInfo)
-	
-		ops = append(ops, 
-			clientv3.OpPut(formatExtentKey(id), string(data)),
-		)
+	} else {
+		//all nodes are avali:
+		minimalLength = int64(req.End)
+		avali = (1 << (dataShards+ parityShards)) - 1
 	}
+		
+	//set extent
+	lastExtentInfo.SealedLength = uint64(minimalLength)
+	lastExtentInfo.Eversion ++
+	lastExtentInfo.Avali = avali
+
+	data := utils.MustMarshal(lastExtentInfo)
+	
+	ops = append(ops, 
+		clientv3.OpPut(formatExtentKey(id), string(data)),
+	)
+	
 
 
 	//alloc new extend
@@ -291,7 +293,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	nodes = sm.getAllNodeStatus(true)
 
 	//? todo
-	nodes, err = sm.policy.AllocExtent(nodes, int(req.DataShard+ req.ParityShard), nil)
+	nodes, err = sm.policy.AllocExtent(nodes, dataShards+parityShards, nil)
 	if err != nil {
 		return errDone(err)
 	}
@@ -316,11 +318,11 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	extentKey := formatExtentKey(extentID)
 	extentInfo := pb.ExtentInfo{
 		ExtentID:   extentID,
-		Replicates: nodeIDs[:req.DataShard],
-		Parity: nodeIDs[req.DataShard:],
+		Replicates: nodeIDs[:dataShards],
+		Parity: nodeIDs[dataShards:],
 		Eversion: 1,
-		ReplicateDisks: diskIDs[:req.DataShard],
-		ParityDisk: diskIDs[req.DataShard:],
+		ReplicateDisks: diskIDs[:dataShards],
+		ParityDisk: diskIDs[dataShards:],
 		Refs: 1,
 	}
 

@@ -123,7 +123,7 @@ func (ps *PartitionServer) parseRegionAndStart(regions *pspb.Regions) int64{
 	var blobs []uint64
 	var locs []*pspb.Location
 	var err error
-	fmt.Printf("region: %+v\n", regions.Regions)
+	fmt.Printf("current region: %+v\n", regions.Regions)
 
 	for _, region := range regions.Regions {
 		//ok : if we have activated PART
@@ -161,7 +161,8 @@ func (ps *PartitionServer) parseRegionAndStart(regions *pspb.Regions) int64{
 			mutex.Unlock(context.Background())
 			continue
 		}
-		fmt.Printf("partid is %d, meta is %+v\n",region.PartID,  meta)
+
+		xlog.Logger.Infof("range partition %d starting, meta: %v", meta.PartID, meta)
 
 		rp, err := ps.startRangePartition(meta, locs, blobs, mutex)
 		if err != nil {
@@ -174,6 +175,8 @@ func (ps *PartitionServer) parseRegionAndStart(regions *pspb.Regions) int64{
 		ps.rangePartitionLocks[meta.PartID] = mutex
 		ps.rangePartitions[meta.PartID] = rp
 		ps.Unlock()
+		xlog.Logger.Infof("range partition %d started", meta.PartID)
+
 	}
 	return rev
 
@@ -241,7 +244,6 @@ func (ps *PartitionServer) Init() {
 				xlog.Logger.Errorf(err.Error())
 				continue
 			}
-			fmt.Printf("updated regions %+v\n", regions.Regions)
 			ps.parseRegionAndStart(&regions)
 		}
 	}()

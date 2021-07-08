@@ -10,6 +10,7 @@ import (
 	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/wire_errors"
+	"github.com/pkg/errors"
 )
 
 
@@ -61,6 +62,9 @@ func (pm *PartitionManager) Bootstrap(ctx context.Context, req *pspb.BootstrapRe
 
 	//watch started and no partitions
 
+	if len(pm.partMeta) > 0 {
+		return errDone(errors.New("already has partMeta, can not bootstrap"))
+	}
 
 	//alloc new partID
 	partID, _, err := pm.allocUniqID(2)
@@ -88,5 +92,6 @@ func (pm *PartitionManager) Bootstrap(ctx context.Context, req *pspb.BootstrapRe
 	}, ops)
 
 	pm.partMeta[partID] = &zeroMeta
+
 	return &pspb.BootstrapResponse{PartID: partID, Code: pb.Code_OK}, nil
 }
