@@ -22,7 +22,7 @@ func main() {
 		return
 	}
 	fmt.Printf("config: %+v\n", config)
-	xlog.InitLog([]string{fmt.Sprintf("node_%d.log", config.ID)}, zap.InfoLevel)
+	xlog.InitLog([]string{fmt.Sprintf("node_%d.log", config.ID)}, zap.DebugLevel)
 
 	//FIXME: sm address
 	node := node.NewExtentNode(config.ID, config.Dirs, config.WalDir, config.ListenUrl, []string{"127.0.0.1:3401"}, []string{"127.0.0.1:2379"})
@@ -30,6 +30,7 @@ func main() {
 	//open all extent files
 	err = node.LoadExtents()
 	utils.Check(err)
+
 
 	//start grpc service
 	err = node.ServeGRPC()

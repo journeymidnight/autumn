@@ -50,7 +50,15 @@ func receiveData(client *clientv3.Client) []KV {
 		panic(err)
 	}
 	for _, kv := range kvs {
-		if strings.HasSuffix(string(kv.Key), "tables") {
+		if strings.HasPrefix(string(kv.Key), "recoveryTasks/") {
+			var task pb.RecoveryTask
+			task.Unmarshal(kv.Value)
+			d := KV {
+				Key: string(kv.Key),
+				Value: fmt.Sprintf("%+v", task),
+			}
+			data = append(data, d)
+		} else if strings.HasSuffix(string(kv.Key), "tables") {
 			var table pspb.TableLocations
 			table.Unmarshal(kv.Value)
 			d := KV {
@@ -67,7 +75,7 @@ func receiveData(client *clientv3.Client) []KV {
 			}
 			data = append(data, d)
 
-		}else if strings.HasPrefix(string(kv.Key), "PART") {
+		}else if strings.HasPrefix(string(kv.Key), "PART/") {
 			var meta pspb.PartitionMeta
 			if err = meta.Unmarshal(kv.Value) ; err != nil {
 				fmt.Printf("can not parse %s", kv.Key)
@@ -94,7 +102,7 @@ func receiveData(client *clientv3.Client) []KV {
 				Value: fmt.Sprintf("%+v", x),
 			}
 			data = append(data, d)
-		} else if strings.HasPrefix(string(kv.Key), "PSSERVER") {
+		} else if strings.HasPrefix(string(kv.Key), "PSSERVER/") {
 			var x pspb.PSDetail
 			if err := x.Unmarshal(kv.Value); err != nil {
 				panic(err)
@@ -104,7 +112,7 @@ func receiveData(client *clientv3.Client) []KV {
 				Value: fmt.Sprintf("%+v", x),
 			}
 			data = append(data, d)
-		} else if strings.HasPrefix(string(kv.Key), "extents") {
+		} else if strings.HasPrefix(string(kv.Key), "extents/") {
 			var x pb.ExtentInfo
 			if err := x.Unmarshal(kv.Value); err != nil {
 				panic(err)

@@ -2,6 +2,7 @@ package smclient
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -31,6 +32,8 @@ type ExtentManager struct {
 
 	//condition lock to notify WaitVersion
 	cond   *sync.Cond
+	extentUpdatedCallback extentInfoUpdatedFunc
+
 }
 
 
@@ -62,6 +65,7 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 		client: client,
 		smClient : smclient,
 		cond: sync.NewCond(new(sync.Mutex)),
+		extentUpdatedCallback: extentsUpdate,
 	}
 	
 	//load latest data
@@ -129,9 +133,10 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 							}
 						}
 
-						if extentsUpdate != nil {
-							extentsUpdate("PUT", &info, prevInfo)
+						if em.extentUpdatedCallback != nil {
+							em.extentUpdatedCallback("PUT", &info, prevInfo)
 						}
+						
 
 
 					case "DELETE":
@@ -142,7 +147,6 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 						p := em.getExtentInfo(info.ExtentID)
 						if p != nil && info.Eversion >= p.Eversion {
 							delete(em.extentInfo, info.ExtentID)
-
 						}
 
 						var prevInfo pb.ExtentInfo
@@ -151,9 +155,10 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 							continue
 						}
 
-						if extentsUpdate != nil {
-							extentsUpdate("DELETE", nil, &prevInfo)
+						if em.extentUpdatedCallback != nil {
+							em.extentUpdatedCallback("DELETE", nil, &prevInfo)
 						}
+						
 					default:
 						panic("")
 					}
@@ -291,6 +296,7 @@ func (em *ExtentManager) WaitVersion(extentID uint64, version uint64) *pb.Extent
 		if ei != nil && ei.Eversion >= version{
 			break
 		} else {
+			fmt.Printf("exteint %d waiting for %d", extentID, version)
 			em.cond.Wait()
 		}
 	}
@@ -299,7 +305,7 @@ func (em *ExtentManager) WaitVersion(extentID uint64, version uint64) *pb.Extent
 }
 
 
-func (em *ExtentManager) Update(extentID uint64) *pb.ExtentInfo {
+func (em *ExtentManager) Latest(extentID uint64) *pb.ExtentInfo {
 	     
 	var ei *pb.ExtentInfo
 	for {
@@ -308,14 +314,8 @@ func (em *ExtentManager) Update(extentID uint64) *pb.ExtentInfo {
 			ei = res[extentID]
 			break
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 	}
-	em.extentLock.Lock()
-	old := em.getExtentInfo(extentID)
-	if old == nil || (old != nil && ei.Eversion > old.Eversion) {
-		em.extentInfo[ei.ExtentID] = ei
-	}
-	defer em.extentLock.Unlock()
 	return ei
 }
 
