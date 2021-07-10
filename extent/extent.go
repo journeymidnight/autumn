@@ -15,6 +15,7 @@
 package extent
 
 import (
+	"fmt"
 	"io"
 	"io/ioutil"
 	"strconv"
@@ -100,22 +101,19 @@ func readExtentHeader(file *os.File) (*extentHeader, error) {
 
 }
 
-func CreateCopyExtent(fileName string, ID uint64) (*os.File, error) {
+func CreateCopyExtent(fileName string, ID uint64) (string, error) {
 	f, err := os.OpenFile(fileName, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
+	defer f.Close()
 	extentHeader := newExtentHeader(ID)
 	value := extentHeader.Marshal()
 
 	if err := xattr.FSet(f, XATTRMETA, value); err != nil {
-		return nil, err
+		return "", err
 	}
-	if err := xattr.FSet(f, XATTRSEAL, []byte("true")); err != nil {
-		return nil, err
-	}
-
-	return f, nil
+	return fileName, nil
 }
 
 func CreateExtent(fileName string, ID uint64) (*Extent, error) {
@@ -255,8 +253,11 @@ func (ex *Extent) Seal(commit uint32) error {
 
 	ex.AssertLock()
 
-	ex.writer.Close()
-	ex.writer = nil
+	if ex.writer != nil {
+		ex.writer.Close()
+		ex.writer = nil
+	}
+	
 	currentLength := atomic.LoadUint32(&ex.commitLength)
 	if currentLength < commit {
 		return errors.New("commit is less than current commit length")
@@ -304,8 +305,7 @@ func (fw *fixWriter) Seek(offset int64, whence int) (int64, error) {
 
 //fixWriter is used to fill gaps between
 func (ex *Extent) GetFixWriter() *fixWriter{
-	ex.Lock()
-	defer ex.Unlock()
+	ex.AssertLock()
 
 	if ex.writer != nil {
 		utils.Check(ex.writer.Close())
@@ -494,8 +494,9 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 		}
 
 		if err != nil {
-			rr.Recover() //ignore current block
-			continue
+			fmt.Printf("ReadBlocks: err != nil %s\n", err)
+			xlog.Logger.Errorf("extent %d readBlock from %d , err is %s", ex.ID, offset, err)
+			return nil, nil, 0, err
 		}
 
 		if rr.End()-start+size > int64(maxTotalSize) && len(ret) > 0 {
@@ -510,6 +511,8 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 		end = uint32(rr.End())
 		i++
 	}
+	utils.AssertTrue(end <= ex.commitLength)
+	fmt.Printf("read block at extent ID %d, end is %d\n", ex.ID, end)
 	return ret, offsets, end, nil
 }
 

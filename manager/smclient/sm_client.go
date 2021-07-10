@@ -19,7 +19,7 @@ import (
 //err表示网络错误
 
 var (
-	errTruncateNoMatch = errors.New("truncateNoMatch")
+	ErrTimeOut   = errors.New("can not find connection to stream manager, timeout")
 )
 
 type SMClient struct {
@@ -110,7 +110,7 @@ func (client *SMClient) try(f func(conn *grpc.ClientConn) bool, x time.Duration)
 }
 
 func (client *SMClient) RegisterNode(ctx context.Context, uuids []string, addr string) (uint64, map[string]uint64, error) {
-	err := errors.New("can not find connection to stream manager")
+	err := ErrTimeOut
 	var res *pb.RegisterNodeResponse
 	nodeID := uint64(0)
 	var uuidToDiskID map[string]uint64
@@ -147,7 +147,8 @@ func (client *SMClient) RegisterNode(ctx context.Context, uuids []string, addr s
 
 //FIXME: stream layer need Code to tell logic error or network error
 func (client *SMClient) CreateStream(ctx context.Context, dataShard uint32, parityShard uint32) (*pb.StreamInfo, *pb.ExtentInfo, error) {	
-	err := errors.New("can not find connection to stream manager")
+	err := ErrTimeOut
+	
 	var res *pb.CreateStreamResponse
 	var ei *pb.ExtentInfo
 	var si *pb.StreamInfo
@@ -187,10 +188,11 @@ checkCommitLength:1 , end:0,  readEntries for logStream
 checkCommitLength:0,  end:0,  append tables on rowstream, and meet an error
 checkCommitLength:0,  end:N,  append log/row stream, meet an error or do rotate   
 */
+
 func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64, 
 	extentToSeal uint64, ownerKey string, revision int64, checkCommitLength uint32, end uint32) (*pb.ExtentInfo, error) {
 
-	err := errors.New("can not find connection to stream manager")
+	err := ErrTimeOut
 	var res *pb.StreamAllocExtentResponse
 	var ei *pb.ExtentInfo
 	client.try(func(conn *grpc.ClientConn) bool {
@@ -229,7 +231,7 @@ func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64,
 
 func (client *SMClient) NodesInfo(ctx context.Context) (map[uint64]*pb.NodeInfo, error) {
 	
-	err := errors.New("can not find connection to stream manager")
+	err := ErrTimeOut
 	var res *pb.NodesInfoResponse
 	var nodeInfos map[uint64]*pb.NodeInfo
 	client.try(func(conn *grpc.ClientConn) bool {
@@ -260,7 +262,7 @@ func (client *SMClient) NodesInfo(ctx context.Context) (map[uint64]*pb.NodeInfo,
 
 func (client *SMClient) ExtentInfo(ctx context.Context, extentIDs []uint64) (map[uint64]*pb.ExtentInfo, error) {
 	
-	err := errors.New("can not find connection to stream manager")
+	err := ErrTimeOut
 	var res *pb.ExtentInfoResponse
 	var extentInfos map[uint64]*pb.ExtentInfo
 	client.try(func(conn *grpc.ClientConn) bool {
@@ -293,7 +295,7 @@ func (client *SMClient) ExtentInfo(ctx context.Context, extentIDs []uint64) (map
 
 func (client *SMClient) StreamInfo(ctx context.Context, streamIDs []uint64) (map[uint64]*pb.StreamInfo, map[uint64]*pb.ExtentInfo, error) {
 	
-	err := errors.New("can not find connection to stream manager")
+	err := ErrTimeOut
 	var res *pb.StreamInfoResponse
 	var extentInfos map[uint64]*pb.ExtentInfo
 	var streamInfos map[uint64]*pb.StreamInfo
@@ -325,7 +327,7 @@ func (client *SMClient) StreamInfo(ctx context.Context, streamIDs []uint64) (map
 }
 
 func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, extentID uint64) error {
-	err := errors.New("can not find connection to stream manager")
+	err := ErrTimeOut
 	var res *pb.TruncateResponse
 	client.try(func(conn *grpc.ClientConn) bool {
 		c := pb.NewStreamManagerServiceClient(conn)

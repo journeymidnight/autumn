@@ -132,19 +132,19 @@ func (sm *StreamManager) addNode(info pb.NodeInfo) {
 	})
 }
 
-func (sm *StreamManager) addExtent(streamID uint64, extent *pb.ExtentInfo) {
+func (sm *StreamManager) addExtent(streamID uint64, exInfo *pb.ExtentInfo) {
 	s, ok := sm.cloneStreamInfo(streamID)
 	if ok {
-		s.ExtentIDs = append(s.ExtentIDs, extent.ExtentID)
+		s.ExtentIDs = append(s.ExtentIDs, exInfo.ExtentID)
 		sm.streams.Set(streamID, s)
 	} else {
 		sm.streams.Set(streamID, &pb.StreamInfo{
 			StreamID:  streamID,
-			ExtentIDs: []uint64{extent.ExtentID},
+			ExtentIDs: []uint64{exInfo.ExtentID},
 		})
 	}
-	sm.extents.Set(extent.ExtentID, extent)
-	sm.extentsLocks.Store(extent.ExtentID, new(sync.Mutex))
+	sm.extents.Set(exInfo.ExtentID, exInfo)
+	sm.extentsLocks.Store(exInfo.ExtentID, new(sync.Mutex))
 
 }
 
@@ -201,17 +201,41 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		return errDone(wire_errors.NotLeader)
 	}
 
-	
-	//get current Stream's last extent, and find current extents' nodes
-	nodes, id, lastExtentInfo, err := sm.getAppendExtentsAddr(req.StreamID)
-	if err != nil {
-		return errDone(err)
+	s, ok := sm.cloneStreamInfo(req.StreamID)
+	if !ok {
+		return errDone(errors.Errorf("no such stream %d", req.StreamID))
 	}
+
+	//duplicated request?
+	tailExtentID := s.ExtentIDs[len(s.ExtentIDs) - 1]
+	lastExtentInfo, ok  := sm.cloneExtentInfo(tailExtentID)
+	if !ok {
+		return errDone(errors.Errorf("internal errors, no such extent %d", tailExtentID))
+	}
+
+	if tailExtentID != req.ExtentToSeal {
+		size := len(s.ExtentIDs)
+		if size >= 2 && s.ExtentIDs[size-2] == req.ExtentToSeal {
+			//duplicated request. return success
+			return &pb.StreamAllocExtentResponse{
+				Code: pb.Code_OK,
+				StreamID: req.StreamID,
+				Extent:   lastExtentInfo,
+			}, nil
+		}
+		
+		return errDone(errors.Errorf("request errors, extent %d is not the last", req.ExtentToSeal))
+	}
+	
+	nodes := sm.getNodes(lastExtentInfo)
+	if nodes == nil {
+		return errDone(errors.Errorf("request errors, extent %d is not the last", req.ExtentToSeal))
+	}
+
+
 	dataShards := len(lastExtentInfo.Replicates)
 	parityShards := len(lastExtentInfo.Parity)
-	if id != req.ExtentToSeal {
-		return errDone(wire_errors.StreamVersionLow)
-	}
+
 	var sizes []int64
 	if req.CheckCommitLength > 0 {
 		haveToCreateNewExtent := false
@@ -222,7 +246,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 				break			
 			}
 		}
-
+		
 		//all nodes are good
 		if haveToCreateNewExtent == false {
 			return  &pb.StreamAllocExtentResponse{
@@ -279,7 +303,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	data := utils.MustMarshal(lastExtentInfo)
 	
 	ops = append(ops, 
-		clientv3.OpPut(formatExtentKey(id), string(data)),
+		clientv3.OpPut(formatExtentKey(lastExtentInfo.ExtentID), string(data)),
 	)
 	
 
@@ -697,40 +721,30 @@ func (sm *StreamManager) cloneExtentInfo(extentID uint64) (*pb.ExtentInfo, bool)
 	return proto.Clone(v).(*pb.ExtentInfo), true
 }
 
-func (sm *StreamManager) getAppendExtentsAddr(streamID uint64) ([]*NodeStatus,uint64, *pb.ExtentInfo, error) {
 
-	s, ok := sm.cloneStreamInfo(streamID)
-	if !ok {
-		return nil, 0, nil, errors.Errorf("no such stream %d", streamID)
-	}
-
-	lastExtentID := s.ExtentIDs[len(s.ExtentIDs)-1]
-
-
-	extInfo, ok := sm.cloneExtentInfo(lastExtentID)
-	if !ok {
-		return nil, 0, nil, errors.Errorf("no such extentd %d", lastExtentID)
-	}
+func (sm *StreamManager) getNodes(exInfo *pb.ExtentInfo) []*NodeStatus {
 	var ret []*NodeStatus
-	for _, nodeID := range extInfo.Replicates {
+
+	for _, nodeID := range exInfo.Replicates {
 		d, ok := sm.nodes.Get(nodeID)
 		if !ok {
-			return nil, 0, nil, errors.Errorf("no such nodeID %d in %v", nodeID, extInfo.Replicates)
+			return nil
 		}
 		ns := d.(*NodeStatus)
 		ret = append(ret, ns)
 	}
-	for _, nodeID := range extInfo.Parity {
+	for _, nodeID := range exInfo.Parity {
 		d, ok := sm.nodes.Get(nodeID)
 		if !ok {
-			return nil, 0, nil, errors.Errorf("no such nodeID %d in %v", nodeID, extInfo.Replicates)
+			return nil
 		}
 		ns := d.(*NodeStatus)
 		ret = append(ret, ns)
 	}
-	
-	return ret, lastExtentID, extInfo, nil
+	return ret
+
 }
+
 
 func (sm *StreamManager) getDiskStatus(diskID uint64) *DiskStatus {
 	v, ok  := sm.disks.Get(diskID)

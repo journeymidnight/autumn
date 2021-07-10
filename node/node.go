@@ -17,7 +17,6 @@ package node
 import (
 	"fmt"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -191,14 +190,9 @@ func (en *ExtentNode) LoadExtents() error {
 		}
 
 		//if extent's version is updated. remove RecoveryTask
-		extentInfo := en.em.Update(extentID)
+		extentInfo := en.em.Latest(extentID)
 
-		targetFile, err := os.OpenFile(path, os.O_RDWR|os.O_TRUNC, 0755)
-		if err != nil {
-			xlog.Logger.Error(err)
-			return
-		}
-		go en.runRecoveryTask(&task, extentInfo, targetFile, path, diskID)
+		go en.runRecoveryTask(&task, extentInfo, path, diskID)
 	}
 
 	var wg sync.WaitGroup

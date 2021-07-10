@@ -162,6 +162,7 @@ func (pm *PartitionManager) watchEvents(watchServerCh clientv3.WatchChan, closeW
 						}
 	
 					case "DELETE":
+						fmt.Printf("DELETE msg %+v", e)
 						if err = psDetail.Unmarshal(e.PrevKv.Value) ; err != nil {
 							break
 						}

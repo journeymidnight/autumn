@@ -309,7 +309,12 @@ func (en *ExtentNode) SmartReadBlocks(ctx context.Context, req *pb.ReadBlocksReq
 		}
 		c := pb.NewExtentServiceClient(pool.Get())
 		res, err := c.ReadBlocks(pctx, req)
-
+		if err != nil {
+			fmt.Printf("remote: %s %d read block from %d result %v\n", pool.Addr, req.ExtentID, req.Offset, err)
+		} else {
+			fmt.Printf("remote: %s %d read block from %d result %v\n", pool.Addr, req.ExtentID, req.Offset, res.End)
+		}
+		
 		if err != nil { //network error
 			errChan <- Result{
 				Error: err,}
@@ -400,7 +405,7 @@ waitResult:
 		for i := 0; i < dataShards-1; i++ {
 			//if err is EndExtent or EndStream, err must be the save
 			if successRet[i].End != successRet[i+1].End {
-				return errDone(errors.Errorf("wrong successRet, %v != %v ", successRet[i], successRet[i+1]))
+				return errDone(errors.Errorf("extent %d: wrong successRet, %+v != %+v ", exInfo.ExtentID, successRet[i], successRet[i+1]))
 			}
 		}
 		lenOfBlocks = successRet[0].Len

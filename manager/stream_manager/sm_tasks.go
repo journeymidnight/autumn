@@ -28,7 +28,7 @@ func (sm *StreamManager) copyDone(task *pb.RecoveryTask) {
 	}
 	newNodeID := task.NodeID
 
-	slot := FindReplaceSlot(extentInfo, task.ReplaceID)
+	slot := FindNodeIndex(extentInfo, task.ReplaceID)
 	if slot == -1 {
 		xlog.Logger.Errorf("copyDone invalid task %v", task)
 		return 
@@ -68,7 +68,7 @@ func (sm *StreamManager) copyDone(task *pb.RecoveryTask) {
 //go routine
 func (sm *StreamManager) routineUpdateDF() {
 
-	ticker := utils.NewRandomTicker(time.Minute, 2 * time.Minute)
+	ticker := utils.NewRandomTicker(10 * time.Second, 20 * time.Second)
 
 	var ctx context.Context
 	var cancel context.CancelFunc
@@ -80,11 +80,11 @@ func (sm *StreamManager) routineUpdateDF() {
 
 	df := func(node *NodeStatus){
 		defer func(){
-			if time.Now().Sub(node.LastEcho()) > 20 * time.Minute {
-				node.SetDead()
+			if time.Now().Sub(node.LastEcho()) > 4 * time.Minute {
+				fmt.Printf("node %d set dead", node.NodeInfo.NodeID)
+				//node.SetDead()
 			}
 		}()
-
 		
 		conn := node.GetConn()
 		pctx, pCancel := context.WithTimeout(ctx, 5 * time.Second)
@@ -94,7 +94,7 @@ func (sm *StreamManager) routineUpdateDF() {
 		})
 		pCancel()
 		if err != nil {
-			xlog.Logger.Infof("remote server %s not response or to", node.Address)
+			xlog.Logger.Infof("remote server %s has no response", node.Address)
 			return
 		}
 		if res.Code != pb.Code_OK {
@@ -130,7 +130,7 @@ func (sm *StreamManager) routineUpdateDF() {
 				return
 			case <- ticker.C:
 				ctx, cancel = context.WithCancel(context.Background())
-				nodes := sm.getAllNodeStatus(true)
+				nodes := sm.getAllNodeStatus(false)
 				for i := range nodes {
 					node := nodes[i]
 					go df(node)
@@ -220,7 +220,7 @@ func (sm *StreamManager) lockExtent(extentID uint64) error {
 func (sm *StreamManager) unlockExtent(extentID uint64) {
 	v, ok := sm.extentsLocks.Load(extentID)
 	if ok {
-		v.(*sync.Mutex).Lock()
+		v.(*sync.Mutex).Unlock()
 	}
 }
 
@@ -233,11 +233,11 @@ func (sm *StreamManager) reAvali(exInfo *pb.ExtentInfo, nodeID uint64) {
 		return 
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30 * time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3 * time.Second)
 	c := pb.NewExtentServiceClient(pool.Get())
 	res, err := c.ReAvali(ctx, &pb.ReAvaliRequest{
 		ExtentID: exInfo.ExtentID,
-		Eversion: exInfo.ExtentID,
+		Eversion: exInfo.Eversion,
 	})
 	cancel()
 	if err != nil {
@@ -249,16 +249,7 @@ func (sm *StreamManager) reAvali(exInfo *pb.ExtentInfo, nodeID uint64) {
 		return
 	}
 
-	sm.lockExtent(exInfo.ExtentID)
-	defer sm.unlockExtent(exInfo.ExtentID)
-
-	exInfo, ok := sm.cloneExtentInfo(exInfo.ExtentID)
-	if !ok {
-		//BUGON
-		xlog.Logger.Fatal("reAvali returns an extent which does not exist")
-		return
-	}
-	slot := FindReplaceSlot(exInfo, nodeID)
+	slot := FindNodeIndex(exInfo, nodeID)
 	if slot == -1 {
 		xlog.Logger.Error("maybe updated by others..")
 		return
@@ -282,17 +273,15 @@ func (sm *StreamManager) reAvali(exInfo *pb.ExtentInfo, nodeID uint64) {
 	}
 
 	//update extent
-	sm.extents.Set(exInfo, exInfo)
+	sm.extents.Set(exInfo.ExtentID, exInfo)
 }
 
 //dispatchRecoveryTask already have extentLock, ask one node to do recovery
-func (sm *StreamManager) dispatchRecoveryTask(extentID, replaceID uint64) error {
-
-	defer sm.unlockExtent(extentID)
+func (sm *StreamManager) dispatchRecoveryTask(exInfo *pb.ExtentInfo, replaceID uint64) error {
 
 	//duplicate?
-	if sm.taskPool.HasTask(extentID) {
-		t := sm.taskPool.GetFromExtent(extentID)
+	if sm.taskPool.HasTask(exInfo.ExtentID) {
+		t := sm.taskPool.GetFromExtent(exInfo.ExtentID)
 		ns := sm.getNodeStatus(t.NodeID)
 		pool := conn.GetPools().Connect(ns.Address)
 		if pool != nil &&  pool.IsHealthy() {
@@ -305,23 +294,29 @@ func (sm *StreamManager) dispatchRecoveryTask(extentID, replaceID uint64) error 
 	if len(nodes) == 0 {
 		return errors.Errorf("can not find remote node to copy")
 	}
+
 	var chosenNode *NodeStatus
 	for i := range nodes {
 		if nodes[i].NodeID == replaceID {
-				continue
+			continue
+		}
+		if FindNodeIndex(exInfo, nodes[i].NodeID) >= 0 {
+			continue
 		}
 		chosenNode = nodes[i]
 	}
+
 
 	pool := conn.GetPools().Connect(chosenNode.Address)
 	if pool == nil || pool.IsHealthy() == false {
 		xlog.Logger.Warnf("can not connect %v", chosenNode)
 		return errors.Errorf("can not connect %v", chosenNode)
 	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	c := pb.NewExtentServiceClient(pool.Get())
 	task := &pb.RecoveryTask{
-		ExtentID: extentID,
+		ExtentID: exInfo.ExtentID,
 		ReplaceID: replaceID,
 		NodeID: chosenNode.NodeID,
 	}
@@ -345,30 +340,33 @@ func (sm *StreamManager) dispatchRecoveryTask(extentID, replaceID uint64) error 
 		xlog.Logger.Warnf(err.Error())
 		return err
 	}
-	sm.taskPool.Insert(extentID, task)
+	sm.taskPool.Insert(exInfo.ExtentID, task)
 	
 	return nil
 }
 
 func (sm *StreamManager) routineDispatchTask() {
 	//loop over task pool, assign a task to a living node
-	ticker := utils.NewRandomTicker(time.Minute, 2 * time.Minute)
+	ticker := utils.NewRandomTicker(5* time.Second, 10 * time.Second)
 	defer func() {
+		ticker.Stop()
 		xlog.Logger.Infof("routineDispatchTask quit")
 	}()
 
 	xlog.Logger.Infof("routineDispatchTask started")
-
 
 	for {
 		select {
 			case <- sm.stopper.ShouldStop():
 				return
 			case <- ticker.C:
+				fmt.Println("ticker")
 				OUTER:
 				for kv := range sm.extents.Iter() {
 					extent := kv.Value.(*pb.ExtentInfo) //extent is read only
-					
+
+					fmt.Printf("check extent %d\n", extent.ExtentID)
+
 					//only check sealed extent
 					if extent.SealedLength == 0 {
 						continue 
@@ -377,7 +375,9 @@ func (sm *StreamManager) routineDispatchTask() {
 					sm.lockExtent(extent.ExtentID)
 
 					allCopies := append(extent.Replicates, extent.Parity...)
+					
 					for i, nodeID := range allCopies {
+
 						//check disk health
 						var diskID uint64
 						if i >= len(extent.Replicates) {
@@ -388,32 +388,37 @@ func (sm *StreamManager) routineDispatchTask() {
 						
 						diskInfo, ok := sm.cloneDiskInfo(diskID)
 						if !ok || diskInfo.Online == 0 {
-							go func() {
-								sm.dispatchRecoveryTask(extent.ExtentID, nodeID)
-							}()
+							go func(extent *pb.ExtentInfo, nodeID uint64) {
+								sm.dispatchRecoveryTask(extent, nodeID)
+								sm.unlockExtent(extent.ExtentID)
+							}(extent, nodeID)
 							continue OUTER
 						}
 
 
 						//check node health
 						ns := sm.getNodeStatus(nodeID)
+						fmt.Printf("check node status %v\n", ns)
 						if (ns == nil || ns.Dead()) && extent.SealedLength > 0{
-							go func() {
-								sm.dispatchRecoveryTask(extent.ExtentID, nodeID)
-							}()
+							fmt.Printf("node %d is dead, recovery for %d\n", nodeID, extent.ExtentID) 
+							go func(extent *pb.ExtentInfo, nodeID uint64) {
+								sm.dispatchRecoveryTask(extent, nodeID)
+								sm.unlockExtent(extent.ExtentID)
+							}(extent, nodeID)
 							continue OUTER
 						}
 
 						//check node is avali
-						if extent.Avali & uint32(i << 1) == 0 {
-							go func(){
+						if extent.Avali & uint32(1 << i) == 0 {
+							go func(extent *pb.ExtentInfo, nodeID uint64){
+								fmt.Printf("node %d is not avali for extent %d\n", nodeID, extent.ExtentID) 
 								sm.reAvali(extent, nodeID)
-							}()
+								sm.unlockExtent(extent.ExtentID)
+							}(extent, nodeID)
+							continue OUTER
 						}
 
 					}
-
-					//FIXME: FIXAVALI data/check commit length 优化
 					sm.unlockExtent(extent.ExtentID)
 				}
 			}
@@ -421,20 +426,20 @@ func (sm *StreamManager) routineDispatchTask() {
 }
 
 
-func FindReplaceSlot(extentInfo *pb.ExtentInfo, replaceID uint64) int {
+func FindNodeIndex(extentInfo *pb.ExtentInfo, nodeID uint64) int {
 	slot := -1
 	for i := range extentInfo.Replicates {
-		if extentInfo.Replicates[i] == replaceID {
+		if extentInfo.Replicates[i] == nodeID {
 			slot = i
 		}
 	}
 
 	for j := range extentInfo.Parity {
-		if extentInfo.Parity[j] == replaceID {
+		if extentInfo.Parity[j] == nodeID {
 			if slot == -1 {
 				slot = j + len(extentInfo.Replicates)
 			} else {
-				xlog.Logger.Warnf("replaceID is %d, extentInfo is %v, can not find replaceID\n", replaceID, extentInfo)
+				xlog.Logger.Warnf("replaceID is %d, extentInfo is %v, can not find replaceID\n", nodeID, extentInfo)
 				return -1
 			}
 		}

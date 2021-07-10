@@ -2,6 +2,6 @@
 #node2: ./extent-node --listenUrl 127.0.0.1:4002 --dirs store2/sda --dirs store2/sdb --ID 2
 #node3: ./extent-node --listenUrl 127.0.0.1:4003 --dirs store3/sda --dirs store3/sdb --ID 3
 node1: ./extent-node --config en_1.toml
-node2: ./extent-node --config en_4.toml
-node3: ./extent-node --config en_7.toml
-node4: ./extent-node --config en_10.toml
+node4: ./extent-node --config en_4.toml
+node7: ./extent-node --config en_7.toml
+node10: ./extent-node --config en_10.toml

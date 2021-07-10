@@ -2,9 +2,14 @@ package erasure_code
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 
+	"github.com/journeymidnight/autumn/extent"
+	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
+	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/klauspost/reedsolomon"
 )
 
@@ -127,3 +132,76 @@ func (ReedSolomon) Encode(input []byte, dataShards int, parityShards int) ([][]b
 
 }
 
+
+func which(x [][]byte) {
+	for i := 0; i < len(x); i++ {
+		if x[i] == nil {
+			fmt.Printf("%d is zero\n", i)
+		}
+	}
+}
+
+func (ReedSolomon) RebuildECExtent(dataShards, parityShards int, sourceExtent []*extent.Extent, replacingIndex int, targetExtent *extent.Extent) error {
+	
+	targetExtent.Lock()
+	defer targetExtent.Unlock()
+
+	enc, err := reedsolomon.New(dataShards, parityShards)
+	
+	blocks := make([][]*pb.Block, dataShards+parityShards)
+	shards := make([][]byte, dataShards+parityShards)
+
+	if len(sourceExtent) > replacingIndex  && sourceExtent[replacingIndex] != nil {
+		return errors.New("sourceExtent[replacingIndex] must be nil")
+	}
+
+	var done bool
+	start := uint32(0)
+	end := uint32(0)
+	n := 0
+	for !done {
+		for i:= 0 ; i < dataShards + parityShards ; i ++ {
+			if sourceExtent[i] != nil {
+				blocks[i], _, end, err = sourceExtent[i].ReadBlocks(start, 20, 40<<20)
+				n = len(blocks[i])
+				if err != nil {
+					if err != wire_errors.EndOfExtent && err !=wire_errors.EndOfStream {
+						return err
+					}
+					done= true
+				}
+			} else {
+				blocks[i] = nil
+			}
+		}
+
+		start = end
+		writeBlocks := make([]*pb.Block, n)
+
+		for k := 0; k < n; k++ {
+			for i := 0 ; i < dataShards + parityShards ; i ++ {
+				if blocks[i] == nil {
+					shards[i] = nil
+				} else {
+					shards[i] = blocks[i][k].Data
+				}
+			}
+			
+			if err = enc.Reconstruct(shards) ; err != nil {
+				return err
+			}
+			writeBlocks[k] = &pb.Block{
+				Data: shards[replacingIndex],
+			}
+		}
+		var doSync bool
+		if done {//last one
+			doSync = true
+		}
+		if _, _, err = targetExtent.AppendBlocks(writeBlocks, doSync); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
