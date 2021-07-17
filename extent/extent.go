@@ -285,26 +285,26 @@ func (ex *Extent) GetReader() *extentReader {
 	}
 
 }
-type fixWriter struct{
+type rawWriter struct{
 	io.WriteSeeker
 	extent *Extent
 }
 
-func (fw *fixWriter) Write(p []byte) (n int, err error) {
+func (fw *rawWriter) Write(p []byte) (n int, err error) {
 	//extent will be sealed, no need to update lastRevision
 	n, err = fw.extent.file.Write(p)
 	fw.extent.commitLength += uint32(n)
 	return n, err
 }
 
-func (fw *fixWriter) Seek(offset int64, whence int) (int64, error) {
+func (fw *rawWriter) Seek(offset int64, whence int) (int64, error) {
 	//no-op
 	return 0, nil
 }
 
 
 //fixWriter is used to fill gaps between
-func (ex *Extent) GetFixWriter() *fixWriter{
+func (ex *Extent) GetRawWriter() *rawWriter{
 	ex.AssertLock()
 
 	if ex.writer != nil {
@@ -312,7 +312,7 @@ func (ex *Extent) GetFixWriter() *fixWriter{
 		ex.writer = nil
 	}
 	ex.file.Seek(int64(ex.commitLength), io.SeekStart)
-	return &fixWriter{
+	return &rawWriter{
 		extent: ex,
 	}
 }
@@ -327,6 +327,14 @@ func (ex *Extent) Close() {
 	ex.file.Close()
 }
 
+
+func (ex *Extent) Truncate(length uint32) error {
+	ex.AssertLock()
+
+	ex.commitLength = length
+	ex.file.Truncate(int64(length))
+	return ex.resetWriter()
+}
 
 func (ex *Extent) HasLock(revision int64) bool {
 	if ex.lastRevision == revision {
@@ -457,6 +465,33 @@ func (ex *Extent) AppendBlocks(blocks []*pb.Block, doSync bool) ([]uint32, uint3
 	return offsets, uint32(end), nil
 }
 
+func (ex *Extent) ValidAllBlocks() (uint64, error) {
+
+	wrapReader := ex.GetReader() //thread-safe
+	rr := record.NewReader(wrapReader)
+	var start uint64
+	var err error
+	var rec io.Reader
+	for {
+		rec, err = rr.Next()
+		start = uint64(rr.Offset())
+		
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			//err happens...
+			return start, err
+		}
+		_, err = ioutil.ReadAll(rec)
+		if err != nil {
+			//err happens
+			return start, err
+		}
+	}
+	return start, nil
+}
+
 func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize uint32) ([]*pb.Block, []uint32, uint32, error) {
 
 	var ret []*pb.Block
@@ -512,7 +547,7 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 		i++
 	}
 	utils.AssertTrue(end <= ex.commitLength)
-	fmt.Printf("read block at extent ID %d, end is %d\n", ex.ID, end)
+	//fmt.Printf("read block at extent ID %d, end is %d\n", ex.ID, end)
 	return ret, offsets, end, nil
 }
 

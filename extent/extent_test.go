@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/journeymidnight/autumn/extent/record"
 	"github.com/journeymidnight/autumn/extent/wal"
 
 	"github.com/journeymidnight/autumn/proto/pb"
@@ -253,6 +254,31 @@ func TestWalExtent(t *testing.T) {
 		require.Equal(t, cases[i].Data, blocks[i].Data)
 	}
 	fmt.Printf("End:%d\n", end)
+}
+
+
+func TestValidBlock(t *testing.T) {
+	cases := []*pb.Block{
+		generateBlock(4096),
+		generateBlock(4096),
+	}
+
+	extent, err := CreateExtent("localtest.ext", 100)
+	assert.Nil(t, err)
+
+	defer os.Remove("localtest.ext")
+	extent.Lock()
+	extent.AppendBlocks(cases, true)
+	extent.Unlock()
+
+	//
+	extent.file.Truncate(5000)
+	extent.commitLength = 5000
+	
+	start, err := extent.ValidAllBlocks()
+	
+	fmt.Printf("start is %d, err is %v\n", start, err)
+	require.Equal(t, record.ComputeEnd(0, 4096), uint32(start))
 }
 
 func TestWriteECFriendlyBlock(t *testing.T) {

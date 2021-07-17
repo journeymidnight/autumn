@@ -360,12 +360,9 @@ func (sm *StreamManager) routineDispatchTask() {
 			case <- sm.stopper.ShouldStop():
 				return
 			case <- ticker.C:
-				fmt.Println("ticker")
 				OUTER:
 				for kv := range sm.extents.Iter() {
 					extent := kv.Value.(*pb.ExtentInfo) //extent is read only
-
-					fmt.Printf("check extent %d\n", extent.ExtentID)
 
 					//only check sealed extent
 					if extent.SealedLength == 0 {
@@ -398,7 +395,6 @@ func (sm *StreamManager) routineDispatchTask() {
 
 						//check node health
 						ns := sm.getNodeStatus(nodeID)
-						fmt.Printf("check node status %v\n", ns)
 						if (ns == nil || ns.Dead()) && extent.SealedLength > 0{
 							fmt.Printf("node %d is dead, recovery for %d\n", nodeID, extent.ExtentID) 
 							go func(extent *pb.ExtentInfo, nodeID uint64) {
@@ -411,7 +407,6 @@ func (sm *StreamManager) routineDispatchTask() {
 						//check node is avali
 						if extent.Avali & uint32(1 << i) == 0 {
 							go func(extent *pb.ExtentInfo, nodeID uint64){
-								fmt.Printf("node %d is not avali for extent %d\n", nodeID, extent.ExtentID) 
 								sm.reAvali(extent, nodeID)
 								sm.unlockExtent(extent.ExtentID)
 							}(extent, nodeID)

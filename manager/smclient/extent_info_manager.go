@@ -296,7 +296,7 @@ func (em *ExtentManager) WaitVersion(extentID uint64, version uint64) *pb.Extent
 		if ei != nil && ei.Eversion >= version{
 			break
 		} else {
-			fmt.Printf("exteint %d waiting for %d", extentID, version)
+			fmt.Printf("extent %d waiting for %d", extentID, version)
 			em.cond.Wait()
 		}
 	}

@@ -144,7 +144,7 @@ func (en *ExtentNode) recoveryErasureExtent(exInfo *pb.ExtentInfo, exceptID, off
 			ex := sourceExtent[j]
 			ex.Lock()
 			defer ex.Unlock()
-			if err := en.copyRemoteExtent(conns[j], exInfo, ex.GetFixWriter(), offset, size); err != nil  {
+			if err := en.copyRemoteExtent(conns[j], exInfo, ex.GetRawWriter(), offset, size); err != nil  {
 				xlog.Logger.Warnf("ErasureExtent can not copyRemoteExtent %v", err)
 				sourceExtent[j] = nil
 				return
@@ -454,15 +454,19 @@ func (en *ExtentNode) ReAvali(ctx context.Context, req *pb.ReAvaliRequest) (*pb.
 
 
 	isEC := len(exInfo.Parity) > 0
-	offset := uint64(ex.CommitLength())
-	size := exInfo.SealedLength - uint64(ex.CommitLength())
+
 	var err error
-	appendWriter := ex.GetFixWriter()
 	if isEC == false {
+		offset := uint64(ex.CommitLength())
+		size := exInfo.SealedLength - uint64(ex.CommitLength())
+		appendWriter := ex.GetRawWriter()
 		err = en.recoveryReplicateExtent(exInfo, en.nodeID, offset, size, appendWriter)
 	} else {
-		err = nil
-		//err = en.recoveryErasureExtent(exInfo, en.nodeID, offset, size, appendWriter)
+		start, _ := ex.ValidAllBlocks()
+		err = ex.Truncate(uint32(start))
+		if err == nil {
+			err = en.recoveryErasureExtent(exInfo, en.nodeID, uint64(start), exInfo.SealedLength - start, ex.Extent)
+		}
 	}
 	xlog.Logger.Infof("recovery data err is %v", err)
 	if err != nil {
