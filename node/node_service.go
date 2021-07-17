@@ -309,12 +309,13 @@ func (en *ExtentNode) SmartReadBlocks(ctx context.Context, req *pb.ReadBlocksReq
 		}
 		c := pb.NewExtentServiceClient(pool.Get())
 		res, err := c.ReadBlocks(pctx, req)
+		/*
 		if err != nil {
 			fmt.Printf("remote: %s %d read block from %d result %v\n", pool.Addr, req.ExtentID, req.Offset, err)
 		} else {
 			fmt.Printf("remote: %s %d read block from %d result %v\n", pool.Addr, req.ExtentID, req.Offset, res.End)
 		}
-		
+		*/
 		if err != nil { //network error
 			errChan <- Result{
 				Error: err,}
