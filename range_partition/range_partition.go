@@ -124,16 +124,19 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 
 	//SORT all tables, by lastSeq
 	//rp.table MUST be ordered
+	/*
 	sort.Slice(rp.tables, func(i, j int) bool {
 		return rp.tables[i].LastSeq < rp.tables[j].LastSeq
 	})
-
+	*/
+	
 	var lastTable *table.Table
-	if len(rp.tables) > 0 {
-		lastTable = rp.tables[len(rp.tables)-1]
-		rp.seqNumber = lastTable.LastSeq
-	} else {
-		rp.seqNumber = 0
+	rp.seqNumber = 0
+	for i := range rp.tables {
+		if rp.tables[i].LastSeq > rp.seqNumber {
+			rp.seqNumber = rp.tables[i].LastSeq
+			lastTable = rp.tables[i]
+		}
 	}
 
 	//FIXME:poor performace: prefetch read will be better
@@ -295,12 +298,14 @@ func (rp *RangePartition) handleFlushTask(ft flushTask) error {
 	rp.tableLock.Lock()
 	rp.tables = append(rp.tables, tbl)
 	//run insertsort to make sure rp.tables is sorted by lastSeq
+	/*
 	for j := len(rp.tables) - 1; j > 0 && rp.tables[j].LastSeq < rp.tables[j-1].LastSeq; j-- {
 		//swap [j] and [j-1]
 		tmp := rp.tables[j]
 		rp.tables[j] = rp.tables[j-1]
 		rp.tables[j-1] = tmp
 	}
+	*/
 	rp.tableLock.Unlock()
 
 	xlog.Logger.Debugf("flushed table %s to %s seq[%d], head %d\n", y.ParseKey(first), y.ParseKey(last), tbl.LastSeq, tbl.VpOffset)
@@ -753,20 +758,9 @@ func (rp *RangePartition) getTablesForKey(userKey []byte) ([]*table.Table, func(
 	//的key的情况下, 总是找到新的key(为什么会出现version相同的key? 从valuelog gc而来
 
 	if len(out) > 1 {
-		//is ordered?
-		for i := 0 ; i < len(out) - 1 ; i ++ {
-			utils.AssertTrue(out[i].LastSeq < out[i+1].LastSeq)
-		}
-		//reverse
-		i := 0
-		j := len(out) - 1
-		for i < j {
-			tmp := out[i]
-			out[i] = out[j]
-			out[j] = tmp
-			i ++
-			j --
-		}
+		sort.Slice(out, func(i, j int) bool {
+			return out[i].LastSeq > out[j].LastSeq
+		})
 	}
 
 
