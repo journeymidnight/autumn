@@ -162,6 +162,8 @@ func (p *Pool) shutdown() {
 
 
 func (p *Pool) LastEcho() time.Time {
+	p.RLock()
+	defer p.RUnlock()
 	return p.lastEcho
 }
 

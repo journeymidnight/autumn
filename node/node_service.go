@@ -630,7 +630,6 @@ func (en *ExtentNode) ReadEntries(ctx context.Context, req *pb.ReadEntriesReques
 		}, nil
 	}
 	
-
 	ex := en.getExtent(req.ExtentID)
 	if ex == nil {
 		return errDone(errors.Errorf("no such extent %d", req.ExtentID))
@@ -640,7 +639,6 @@ func (en *ExtentNode) ReadEntries(ctx context.Context, req *pb.ReadEntriesReques
 	if req.Replay > 0 {
 		replay = true
 	}
-
 	res, _ := en.SmartReadBlocks(ctx, &pb.ReadBlocksRequest{
 		ExtentID: req.ExtentID,
 		Offset: req.Offset,
@@ -649,7 +647,7 @@ func (en *ExtentNode) ReadEntries(ctx context.Context, req *pb.ReadEntriesReques
 	})
 
 
-	if res.Code != pb.Code_OK && res.Code != pb.Code_EndOfExtent && res.Code != pb.Code_EndOfStream {
+	if res.Code != pb.Code_OK && res.Code != pb.Code_EndOfExtent {
 		return &pb.ReadEntriesResponse{
 			Code:    res.Code,
 			CodeDes: res.CodeDes,
@@ -665,7 +663,7 @@ func (en *ExtentNode) ReadEntries(ctx context.Context, req *pb.ReadEntriesReques
 			xlog.Logger.Errorf("unmarshal entries error %v\n", err)
 			continue
 		}
-		//fmt.Printf("Read entries %v\n", entry)
+		//fmt.Printf("Read entries %s\n", string(entry.Log.Key))
 		entries[i] = entry
 	}
 

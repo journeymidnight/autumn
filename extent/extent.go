@@ -500,11 +500,7 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 	currentLength := atomic.LoadUint32(&ex.commitLength)
 
 	if currentLength <= offset {
-		if ex.IsSeal() {
-			return nil, nil, 0, wire_errors.EndOfExtent
-		} else {
-			return nil, nil, 0, wire_errors.EndOfStream
-		}
+		return nil, nil, 0, wire_errors.EndOfExtent
 	}
 
 	wrapReader := ex.GetReader() //thread-safe
@@ -521,11 +517,8 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 		reader, err := rr.Next()
 		start := rr.Offset()
 		if err == io.EOF {
-			if ex.IsSeal() {
-				return ret, offsets, end, wire_errors.EndOfExtent
-			} else {
-				return ret, offsets, end, wire_errors.EndOfStream
-			}
+			return ret, offsets, end, wire_errors.EndOfExtent
+		
 		}
 
 		if err != nil {
@@ -562,7 +555,7 @@ func (ex *Extent) ReadEntries(offset uint32, maxTotalSize uint32, replay bool) (
 
 	
 	blocks, offsets, end, err := ex.ReadBlocks(offset, 10, maxTotalSize)
-	if err != nil && err != wire_errors.EndOfStream && err != wire_errors.EndOfExtent {
+	if err != nil && err != wire_errors.EndOfExtent {
 		return nil, 0, err
 	}
 	var ret []*pb.EntryInfo
@@ -571,7 +564,6 @@ func (ex *Extent) ReadEntries(offset uint32, maxTotalSize uint32, replay bool) (
 		if err != nil {
 			xlog.Logger.Error(err)
 			continue
-
 		}
 		ret = append(ret, e)
 	}

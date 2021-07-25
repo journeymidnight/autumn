@@ -43,7 +43,7 @@ enum Code {
 	EVersionLow = 4;
 	NotLEADER = 5;
 	LockedByOther = 6;
-	StreamVersionLow = 7;
+	ClientStreamVersionTooHigh = 7;
 }
 
 
@@ -255,6 +255,7 @@ message StreamAllocExtentRequest{
 	uint32 checkCommitLength = 7; //if checkCommitLength > 0, do not use end.
 	                              //if checkCommitLength ==0, end is the sealedlength, and all nodes are avaliable
 	uint32 end = 8;
+	int64 sversion = 9; //当前stream的version,用来去重. client的sversion只会小于等于sm的sversion, 否则返回ClientStreamVersionTooHigh
 }
 
 
@@ -323,11 +324,20 @@ message CreateStreamResponse {
 message TruncateRequest {
 	uint64 streamID = 1;
 	uint64 extentID = 2;
+	string ownerKey = 3; //ownerKey, revision is used for locking
+	int64  revision = 4;
+	int64  sversion = 5;//当前stream的version,用来去重. client的sversion只会小于等于sm的sversion, 否则返回ClientStreamVersionTooHigh
+	string gabageKey = 6; //if gabageKey == "", delete extents, else "create new stream, and add it to gabageKey"
+}
+
+message GabageStreams {
+	map<uint64, uint64> gabages = 1;
 }
 
 message TruncateResponse {
 	Code code = 1;
 	string codeDes = 2;
+	GabageStreams gabages = 3;
 }
 
 service StreamManagerService {
@@ -375,6 +385,7 @@ sm_service什么时候删除extentInfo[ref==0]? 任何时候都可以
 message StreamInfo {
 	uint64 streamID = 1;
 	repeated uint64 extentIDs = 2;
+	uint64 sversion = 3;
 }
 
 message NodeInfo {

@@ -149,7 +149,7 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 	eID := tbls[len(tbls)-1].Loc.ExtentID
 
 	//last table's meta extentd
-	_, _, err := rp.rowStream.Truncate(context.Background(), eID)
+	_, err := rp.rowStream.Truncate(context.Background(), eID, "")
 	if err == nil {
 		_ = err
 		//FIXME: send frontStream/endStream to sm

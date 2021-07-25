@@ -184,12 +184,14 @@ func (client *SMClient) CreateStream(ctx context.Context, dataShard uint32, pari
 
 
 /*
+end表明在stream client层, 明确确认的已经写完成的end(end在写入成功后自动更新), 在Seal时, 如果存在end, 
+, sm只需要seal而不需要读各个extent长度,节省运行时间
 checkCommitLength:1 , end:0,  readEntries for logStream
 checkCommitLength:0,  end:0,  append tables on rowstream, and meet an error
 checkCommitLength:0,  end:N,  append log/row stream, meet an error or do rotate   
 */
 
-func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64, 
+func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64, Sversion int64,
 	extentToSeal uint64, ownerKey string, revision int64, checkCommitLength uint32, end uint32) (*pb.ExtentInfo, error) {
 
 	err := ErrTimeOut
@@ -203,6 +205,7 @@ func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64,
 			OwnerKey: ownerKey,
 			Revision: revision,
 			CheckCommitLength: checkCommitLength,
+			Sversion: Sversion,
 			End: end,
 		})
 		if err == context.Canceled || err == context.DeadlineExceeded {
@@ -326,15 +329,21 @@ func (client *SMClient) StreamInfo(ctx context.Context, streamIDs []uint64) (map
 	return streamInfos, extentInfos, err	
 }
 
-func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, extentID uint64) error {
+func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, extentID uint64, ownerKey string, revision int64, sversion int64, gabageKey string) (*pb.GabageStreams ,error) {
 	err := ErrTimeOut
 	var res *pb.TruncateResponse
+	var gabageStreams *pb.GabageStreams
 	client.try(func(conn *grpc.ClientConn) bool {
 		c := pb.NewStreamManagerServiceClient(conn)
 		res, err = c.Truncate(ctx, &pb.TruncateRequest{
 			StreamID: streamID,
 			ExtentID: extentID,
+			OwnerKey: ownerKey,
+			Revision: revision,
+			Sversion: sversion,
+			GabageKey: gabageKey,
 		})
+		
 		if err == context.Canceled || err == context.DeadlineExceeded {
 			return false
 		}
@@ -350,10 +359,11 @@ func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, ext
 			}
 			return false
 		}
+		gabageStreams = res.Gabages
 		return false
 	}, 500*time.Millisecond)
 
-	return  err	
+	return gabageStreams, err	
 }
 	
 
