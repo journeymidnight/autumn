@@ -2,6 +2,7 @@ package streamclient
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/coreos/etcd/clientv3/concurrency"
@@ -42,7 +43,7 @@ type StreamClient interface {
     Append(ctx context.Context, blocks []*pb.Block) (extentID uint64, offsets []uint32, end uint32, err error)
 	NewLogEntryIter(opt ...ReadOption) LogEntryIter
 	//Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, uint32, error)
-	Truncate(ctx context.Context, extentID uint64) (pb.StreamInfo, pb.StreamInfo, error)
+	Truncate(ctx context.Context, extentID uint64, gabageKey string) (*pb.GabageStreams , error)
 	//FIXME: stat => ([]extentID , offset)
 }
 
@@ -197,7 +198,7 @@ func (iter *AutumnEntryIter) CheckCommitLength() error {
 	xlog.Logger.Infof("Check Commit Length at extent %d", extentID)
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 5 * time.Second)
-		newExInfo, err := iter.sc.smClient.StreamAllocExtent(ctx, iter.sc.streamID, extentID, 
+		newExInfo, err := iter.sc.smClient.StreamAllocExtent(ctx, iter.sc.streamID, int64(iter.sc.streamInfo.Sversion), extentID, 
 			iter.sc.streamLock.ownerKey, iter.sc.streamLock.revision, 1, 0)
 		
 		xlog.Logger.Infof("Check Commit Length %v, new extent: %v", err, newExInfo)
@@ -211,12 +212,11 @@ func (iter *AutumnEntryIter) CheckCommitLength() error {
 			}
 			break
 		}
+		fmt.Printf("err is %s\n\n", err.Error())
 		xlog.Logger.Warnf(err.Error())
-		if err == smclient.ErrTimeOut {
-			time.Sleep(5 * time.Second)
-			continue
-		}
-		return err		
+		time.Sleep(5 * time.Second)
+		continue
+		
 	}
 	return nil
 
@@ -225,13 +225,16 @@ func (iter *AutumnEntryIter) HasNext() (bool, error) {
 	if len(iter.cache) == 0 {
 		if iter.noMore {
 			return false, nil
-		}
-		err := iter.receiveEntries()
-		if err != nil {
-			return false, err
+		} 
+		for iter.noMore == false && len(iter.cache) == 0 {
+			err := iter.receiveEntries()
+			if err != nil {
+				return false, err
+			}
 		}
 	}
-	return len(iter.cache) > 0, nil
+	
+	return true, nil
 }
 
 func (iter *AutumnEntryIter) Next() *pb.EntryInfo {
@@ -242,8 +245,6 @@ func (iter *AutumnEntryIter) Next() *pb.EntryInfo {
 	iter.cache = iter.cache[1:]
 	return ret
 }
-
-
 
 
 func (iter *AutumnEntryIter) receiveEntries() error {
@@ -270,7 +271,7 @@ retry:
 	exInfo := iter.sc.em.GetExtentInfo(extentID)
 	xlog.Logger.Debugf("read extentID %d, offset : %d, eversion is %d\n", extentID, iter.currentOffset, exInfo.Eversion)
 
-
+	//fmt.Printf("read extentID %d, offset : %d,  index : %d\n", extentID, iter.currentOffset, iter.currentExtentIndex)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	c := pb.NewExtentServiceClient(iter.conn)
 	res, err := c.ReadEntries(ctx, &pb.ReadEntriesRequest{
@@ -303,6 +304,7 @@ retry:
 		iter.cache = append(iter.cache, res.Entries...)
 	}
 
+
 	switch res.Code {
 	case pb.Code_OK:
 		iter.currentOffset = res.End
@@ -310,13 +312,12 @@ retry:
 	case pb.Code_EndOfExtent:
 		iter.currentOffset = 0
 		iter.currentExtentIndex++
+		iter.conn = nil
 		//如果stream是BlobStream, 最后一个extent也返回EndOfExtent
+		fmt.Printf("readentries currentIndex is %d in %v nomore?%v\n", iter.currentExtentIndex, iter.sc.streamInfo.ExtentIDs, iter.noMore)
 		if iter.currentExtentIndex == len(iter.sc.streamInfo.ExtentIDs) {
 			iter.noMore = true
 		}
-		return nil
-	case pb.Code_EndOfStream:
-		iter.noMore = true
 		return nil
 	default:
 		return errors.Errorf(res.CodeDes)
@@ -329,6 +330,7 @@ func (sc *AutumnStreamClient) NewLogEntryIter(opts ...ReadOption) LogEntryIter {
 	for _, opt := range opts {
 		opt(readOpt)
 	}
+
 	leIter := &AutumnEntryIter{
 		sc:  sc,
 		opt: readOpt,
@@ -351,7 +353,7 @@ func (sc *AutumnStreamClient) NewLogEntryIter(opts ...ReadOption) LogEntryIter {
 	return leIter
 }
 
-func (sc *AutumnStreamClient) Truncate(ctx context.Context, extentID uint64) (pb.StreamInfo, pb.StreamInfo, error) {
+func (sc *AutumnStreamClient) Truncate(ctx context.Context, extentID uint64, gabageKey string) (*pb.GabageStreams, error) {
 
 	var i int
 	for i = range sc.streamInfo.ExtentIDs {
@@ -360,14 +362,11 @@ func (sc *AutumnStreamClient) Truncate(ctx context.Context, extentID uint64) (pb
 		}
 	}
 	if i == 0 {
-		return pb.StreamInfo{}, pb.StreamInfo{}, errNoTrucate
+		return nil, errNoTruncate
 	}
-	/*
-		sc.streamInfo.ExtentIDs = sc.streamInfo.ExtentIDs[i:]
-		return sc.smClient.TruncateStream(ctx, sc.streamID, sc.streamInfo.ExtentIDs)
-	*/
-	//FIXME:
-	return pb.StreamInfo{}, pb.StreamInfo{}, errNoTrucate
+
+	return sc.smClient.TruncateStream(ctx, sc.streamID, extentID, 
+		sc.streamLock.ownerKey, sc.streamLock.revision, int64(sc.streamInfo.Sversion), gabageKey)
 }
 
 func (sc *AutumnStreamClient) getExtentIndexFromID(extentID uint64) int {
@@ -405,7 +404,7 @@ func (sc *AutumnStreamClient) MustAllocNewExtent(oldExtentID uint64) error{
 	var err error
 	for {
 		ctx , cancel := context.WithTimeout(context.Background(), 5 * time.Second)
-		newExInfo, err = sc.smClient.StreamAllocExtent(ctx, sc.streamID, 
+		newExInfo, err = sc.smClient.StreamAllocExtent(ctx, sc.streamID, int64(sc.streamInfo.Sversion),
 		oldExtentID , sc.streamLock.ownerKey, sc.streamLock.revision, 0, sc.end)
 		cancel()
 		if err == nil {
@@ -434,6 +433,7 @@ func (sc *AutumnStreamClient) Connect() error {
 		return err
 	}
 	sc.streamInfo = s[sc.streamID]
+	fmt.Printf("stream info is %d : %v\n", sc.streamInfo.StreamID, sc.streamInfo.ExtentIDs)
 	return nil
 }
 

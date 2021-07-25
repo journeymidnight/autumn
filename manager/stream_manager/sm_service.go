@@ -72,6 +72,7 @@ func (sm *StreamManager) CreateStream(ctx context.Context, req *pb.CreateStreamR
 	streamInfo := pb.StreamInfo{
 		StreamID:  streamID,
 		ExtentIDs: []uint64{extentID},
+		Sversion: 1,
 	}
 
 	sdata, err := streamInfo.Marshal()
@@ -136,11 +137,13 @@ func (sm *StreamManager) addExtent(streamID uint64, exInfo *pb.ExtentInfo) {
 	s, ok := sm.cloneStreamInfo(streamID)
 	if ok {
 		s.ExtentIDs = append(s.ExtentIDs, exInfo.ExtentID)
+		s.Sversion ++
 		sm.streams.Set(streamID, s)
 	} else {
 		sm.streams.Set(streamID, &pb.StreamInfo{
 			StreamID:  streamID,
 			ExtentIDs: []uint64{exInfo.ExtentID},
+			Sversion: 1,
 		})
 	}
 	sm.extents.Set(exInfo.ExtentID, exInfo)
@@ -206,27 +209,32 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		return errDone(errors.Errorf("no such stream %d", req.StreamID))
 	}
 
+	if req.Sversion > int64(s.Sversion) {
+		return errDone(wire_errors.ClientStreamVersionTooHigh)
+	}
+
 	//duplicated request?
+	var lastExtentInfo *pb.ExtentInfo
+	if req.Sversion < int64(s.Sversion) {
+		tailExtentID := s.ExtentIDs[len(s.ExtentIDs) - 1]
+		lastExtentInfo, ok = sm.cloneExtentInfo(tailExtentID)
+		if !ok {
+			return errDone(errors.Errorf("internal errors, no such extent %d", tailExtentID))
+		}
+		return &pb.StreamAllocExtentResponse{
+			Code: pb.Code_OK,
+			StreamID: req.StreamID,
+			Extent:   lastExtentInfo,
+		}, nil
+
+	}
+	
+	//version match: req.Sversion == s.Sversion
 	tailExtentID := s.ExtentIDs[len(s.ExtentIDs) - 1]
-	lastExtentInfo, ok  := sm.cloneExtentInfo(tailExtentID)
+	lastExtentInfo, ok = sm.cloneExtentInfo(tailExtentID)
 	if !ok {
 		return errDone(errors.Errorf("internal errors, no such extent %d", tailExtentID))
 	}
-
-	if tailExtentID != req.ExtentToSeal {
-		size := len(s.ExtentIDs)
-		if size >= 2 && s.ExtentIDs[size-2] == req.ExtentToSeal {
-			//duplicated request. return success
-			return &pb.StreamAllocExtentResponse{
-				Code: pb.Code_OK,
-				StreamID: req.StreamID,
-				Extent:   lastExtentInfo,
-			}, nil
-		}
-		
-		return errDone(errors.Errorf("request errors, extent %d is not the last", req.ExtentToSeal))
-	}
-	
 	nodes := sm.getNodes(lastExtentInfo)
 	if nodes == nil {
 		return errDone(errors.Errorf("request errors, extent %d is not the last", req.ExtentToSeal))
@@ -275,6 +283,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		
 		if len(sizes) == 0 && req.CheckCommitLength == 0 {
 			sizes = sm.receiveCommitlength(ctx, nodes, req.ExtentToSeal)
+
 		}
 
 		for i := range sizes {
@@ -415,6 +424,7 @@ func (sm *StreamManager) sealExtents(ctx context.Context, nodes []*NodeStatus, e
 //receiveCommitlength returns minimal commitlength and all node who give us response and who did not
 //-1 if no response
 func (sm *StreamManager) receiveCommitlength(ctx context.Context, nodes []*NodeStatus, extentID uint64) ([]int64) {
+
 	pctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
 
@@ -425,15 +435,21 @@ func (sm *StreamManager) receiveCommitlength(ctx context.Context, nodes []*NodeS
 		j := i
 		stopper.RunWorker(func() {
 			pool := conn.GetPools().Connect(addr)
+
 			if pool == nil {
 				result[j] = -1
+				fmt.Println("no result")
 				return
 			}
+
 			conn := pool.Get()
+
 			c := pb.NewExtentServiceClient(conn)
+			
 			res, err := c.CommitLength(pctx, &pb.CommitLengthRequest{
 				ExtentID: extentID,
 			})
+
 			if err != nil { //timeout or other error
 				xlog.Logger.Warnf(err.Error())
 				result[j] = -1
@@ -444,6 +460,8 @@ func (sm *StreamManager) receiveCommitlength(ctx context.Context, nodes []*NodeS
 	}
 	stopper.Wait()
 	xlog.Logger.Debugf("get commitlenght of extent %d, the sizes is %+v", extentID, result)
+	fmt.Printf("receive commmit length: %v\n", result)
+
 	return result
 }
 
@@ -670,8 +688,33 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 
 	streamInfo, ok := sm.cloneStreamInfo(req.StreamID)
 	if !ok {
-		return errDone(errors.Errorf("stream do not have streaminfo"))
+		return errDone(errors.Errorf("stream do not have extent %d", req.ExtentID))
 	}
+
+	if streamInfo.Sversion < uint64(req.Sversion) {
+		return errDone(wire_errors.ClientStreamVersionTooHigh)
+	}
+	
+	var gabages pb.GabageStreams
+	if len(req.GabageKey) > 0  {
+		data, _, err := etcd_utils.EtcdGetKV(sm.client, req.GabageKey)
+		if err != nil {
+			return errDone(err)
+		}
+		if len(data) > 0 {
+			utils.MustUnMarshal(data, &gabages)
+		}
+	}
+
+	//duplicated truncated
+	if streamInfo.Sversion > uint64(req.Sversion) {
+		return &pb.TruncateResponse{
+			Code: pb.Code_OK,
+			Gabages: &gabages,
+		}, nil
+	}
+
+	//streamInfo.Sversion  == req.Sversion
 	var i int
 	for i = range streamInfo.ExtentIDs {
 		if streamInfo.ExtentIDs[i] == req.ExtentID {
@@ -680,35 +723,102 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 	}
 
 	if i == 0 {
-		return &pb.TruncateResponse{
-			Code: pb.Code_OK}, nil
+		return errDone(errors.Errorf("do not have to truncate"))
 	}
 
-	//update ETCD
+
+	//delete extents
 	newExtentIDs := streamInfo.ExtentIDs[i:]
+	oldExtentIDs := streamInfo.ExtentIDs[:i]
+
 	streamKey := formatStreamKey(req.StreamID)
 	newStreamInfo := pb.StreamInfo{
 		StreamID:  req.StreamID,
 		ExtentIDs: newExtentIDs,
+		Sversion: streamInfo.Sversion+1,
 	}
 
+	//update current stream
 	sdata, err := newStreamInfo.Marshal()
 	utils.Check(err)
-
 	ops := []clientv3.Op{
 		clientv3.OpPut(streamKey, string(sdata)),
 	}
+
+
+	if len(req.GabageKey) == 0 {
+		//delete extents whose ref == 1
+		var exToBeDeleted []*pb.ExtentInfo
+		var exToBeUpdated  []*pb.ExtentInfo
+		for i := range oldExtentIDs {
+			if err := sm.lockExtent(oldExtentIDs[i]) ; err != nil {
+				continue
+			}
+			oldExInfo, ok := sm.cloneExtentInfo(oldExtentIDs[i])
+			if !ok {
+				continue
+			}
+			if oldExInfo.Refs == 1 {
+				exToBeDeleted = append(exToBeDeleted, oldExInfo)
+			} else {
+				oldExInfo.Refs --
+				oldExInfo.Eversion ++
+				exToBeUpdated = append(exToBeUpdated, oldExInfo)
+			}
+		}
+
+		defer func(){
+			for i := range oldExtentIDs {
+				sm.unlockExtent(oldExtentIDs[i])
+			}
+		}()
+		for _, exInfo := range exToBeDeleted {
+			ops = append(ops, clientv3.OpDelete(formatExtentKey(exInfo.ExtentID)))
+		}
+		for _, exInfo := range exToBeUpdated {
+			ops = append(ops, clientv3.OpPut(formatExtentKey(exInfo.ExtentID), string(utils.MustMarshal(exInfo))))
+		}
+
+	} else {
+		//create a new stream, and add it to req.GabageKey, it will run gc in the future.
+		var newGabageStreamID uint64
+		if newGabageStreamID, _, err = sm.allocUniqID(1) ; err != nil {
+			return errDone(err)
+		}
+
+		gabages.Gabages[newGabageStreamID] = newGabageStreamID
+
+		sdata := utils.MustMarshal(
+			&pb.StreamInfo{
+				StreamID:  newGabageStreamID,
+				ExtentIDs: oldExtentIDs,
+				Sversion: 1,
+			},
+		)
+		//transfer old extent to new stream
+		//add add stream to gabages
+		ops = append(ops, clientv3.OpPut(formatStreamKey(newGabageStreamID), string(sdata)))
+		ops = append(ops, clientv3.OpPut(req.GabageKey, string(utils.MustMarshal(&gabages))))
+	}
+	
+
 	err = etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
 		clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
+		clientv3.Compare(clientv3.CreateRevision(req.OwnerKey), "=", req.Revision),
 	}, ops)
+
 
 	if err != nil {
 		return errDone(err)
 	}
 
 	sm.streams.Set(req.StreamID, &newStreamInfo)
+
 	return &pb.TruncateResponse{
-		Code: pb.Code_OK}, nil
+		Code: pb.Code_OK,
+		Gabages: &gabages,
+		}, nil
+
 }
 
 

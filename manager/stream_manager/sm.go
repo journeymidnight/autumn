@@ -185,6 +185,14 @@ func (sm *StreamManager) runAsLeader() {
 			xlog.Logger.Warnf(err.Error())
 			return
 		}
+
+		//FIXME:
+		//utils.AssertTrue(kv.Version == int64(streamInfo.Sversion))
+		if kv.Version != int64(streamInfo.Sversion) {
+			streamInfo.Sversion = uint64(kv.Version)
+			etcd_utils.EtcdSetKV(sm.client, formatStreamKey(streamID), utils.MustMarshal(&streamInfo))
+		}
+
 		sm.streams.Set(streamID, &streamInfo)
 		//sm.streams[streamID] = &streamInfo
 	}
@@ -209,6 +217,10 @@ func (sm *StreamManager) runAsLeader() {
 			xlog.Logger.Errorf(err.Error())
 			return
 		}
+
+		utils.AssertTrue(kv.Version == int64(extentInfo.Eversion))
+
+
 		sm.extents.Set(extentID, &extentInfo)
 		sm.extentsLocks.Store(extentID, new(sync.Mutex))
 	}

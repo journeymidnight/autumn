@@ -154,6 +154,7 @@ func TestAppendReadBigBlocks(t *testing.T) {
 	require.Equal(t, []int{2,0}, ans) 
 }
 
+/*
 func TestSplitExtent(t *testing.T) {
 	cases := []*pb.EntryInfo{
 		{
@@ -209,3 +210,4 @@ func TestSplitExtent(t *testing.T) {
 	}
 
 }
+*/

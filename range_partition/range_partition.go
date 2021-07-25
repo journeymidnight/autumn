@@ -140,7 +140,7 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	replayedLog := 0
 	replay := func(ei *pb.EntryInfo) (bool, error) {
 		replayedLog++
-		//fmt.Printf("from log %v\n", ei)
+		//fmt.Printf("from log %v\n", string(ei.Log.Key))
 		//build ValueStruct from EntryInfo
 		entriesReady := []*pb.EntryInfo{ei}
 

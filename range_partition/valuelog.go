@@ -3,6 +3,7 @@ package range_partition
 import (
 	"bytes"
 	"context"
+	"fmt"
 
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/range_partition/y"
@@ -43,10 +44,14 @@ func replayLog(stream streamclient.StreamClient, startExtentID uint64, startOffs
 		opts = append(opts, streamclient.WithReadFrom(startExtentID, startOffset))
 	}
 	iter := stream.NewLogEntryIter(opts...)
+	
+	
 	if err := iter.CheckCommitLength(); err != nil {
 		return err
 	}
-
+	
+	fmt.Println("CheckCommitLength Done")
+	
 	for {
 		ok, err := iter.HasNext()
 		if err != nil {

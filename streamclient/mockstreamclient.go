@@ -17,7 +17,7 @@ import (
 
 var (
 	testThreshold = 1 * MB
-	errNoTrucate  = errors.New("not have to truncate")
+	errNoTruncate  = errors.New("not have to truncate")
 )
 
 
@@ -105,7 +105,7 @@ func OpenMockStreamClient(si pb.StreamInfo, br *MockBlockReader) StreamClient {
 	}
 }
 
-func (client *MockStreamClient) Truncate(ctx context.Context, extentID uint64) (pb.StreamInfo, pb.StreamInfo, error) {
+func (client *MockStreamClient) Truncate(ctx context.Context, extentID uint64, gabageKey string) (*pb.GabageStreams , error) {
 
 	var i int
 	for i = range client.stream {
@@ -114,9 +114,9 @@ func (client *MockStreamClient) Truncate(ctx context.Context, extentID uint64) (
 		}
 	}
 	if i == len(client.stream) {
-		return pb.StreamInfo{}, pb.StreamInfo{}, errNoTrucate
+		return nil, errNoTruncate
 	}
-
+/*
 	f := func(id uint64, start int, end int) pb.StreamInfo {
 		var array []uint64
 		for i := start; i < end; i++ {
@@ -127,15 +127,17 @@ func (client *MockStreamClient) Truncate(ctx context.Context, extentID uint64) (
 			ExtentIDs: array,
 		}
 	}
-
+*/
 	//update smclient...
+	/*
 	blobStreamID := rand.Uint64()
 	blobStreamInfo := f(blobStreamID, 0, i)
 
 	myStreamInfo := f(client.ID, i, len(client.stream))
 	client.stream = client.stream[i:]//升级自己
+	*/
 	//生成新的blobstream,
-	return blobStreamInfo, myStreamInfo, nil
+	return nil, nil
 }
 
 //block API, entries has been batched
