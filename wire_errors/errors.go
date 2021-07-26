@@ -24,8 +24,6 @@ func FromPBCode(code pb.Code, des string) error {
 		return LockedByOther
 	case pb.Code_EndOfExtent:
 		return EndOfExtent
-	case pb.Code_EndOfStream:
-		return EndOfExtent
 	case pb.Code_EVersionLow:
 		return VersionLow
 	case pb.Code_NotLEADER:
@@ -45,8 +43,6 @@ func ConvertToPBCode(err error) (pb.Code, string) {
 		return pb.Code_LockedByOther, err.Error()
 	case EndOfExtent:
 		return pb.Code_EndOfExtent, err.Error()
-	case EndOfStream:
-		return pb.Code_EndOfStream, err.Error()
 	case VersionLow:
 		return pb.Code_EVersionLow, err.Error()
 	case NotLeader:

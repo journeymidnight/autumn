@@ -200,7 +200,7 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	}
 
 	xlog.Logger.Infof("replayed log number: %d\n", replayedLog)
-	fmt.Printf("replayed log number: %d\n", replayedLog)
+	fmt.Printf("replayed log number: %d, mt size is %d\n", rp.mt.MemSize(), replayedLog)
 
 	//start real write
 	rp.startWriteLoop()
