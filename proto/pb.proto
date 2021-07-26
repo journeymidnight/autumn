@@ -39,7 +39,6 @@ enum Code {
 	OK = 0;
 	ERROR = 1;
 	EndOfExtent = 2;
-	EndOfStream = 3;
 	EVersionLow = 4;
 	NotLEADER = 5;
 	LockedByOther = 6;
