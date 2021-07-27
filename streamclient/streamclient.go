@@ -96,7 +96,7 @@ retry:
 
 	err = wire_errors.FromPBCode(res.Code, res.CodeDes)
 	if err == wire_errors.VersionLow {
-		br.em.Latest(extentID)
+		br.em.WaitVersion(extentID, exInfo.Eversion+1)
 		goto retry
 	} else if err != nil {
 		return nil, 0, err
@@ -293,7 +293,7 @@ retry:
 	}
 
 	if res.Code == pb.Code_EVersionLow {
-		iter.sc.em.Latest(extentID)
+		iter.sc.em.WaitVersion(extentID, exInfo.Eversion+1)
 		goto retry
 	}
 
