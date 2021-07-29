@@ -165,7 +165,7 @@ ETCD存储结构in PM(Partition Manager)
 PART/{PartID} => {id, id <startKey, endKEY>} //immutable
 
 PARTSTATS/{PartID}/tables => [(extentID,offset),...,(extentID,offset)]
-PARTSTATS/{PartID}/blobStreams => [id,...,id]
+PARTSTATS/{PartID}/blobStreams => map[id,...,id]
 PARTSTATS/{PartID}/discard => <DATA>
 
 

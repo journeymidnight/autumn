@@ -329,15 +329,30 @@ message TruncateRequest {
 	string gabageKey = 6; //if gabageKey == "", delete extents, else "create new stream, and add it to gabageKey"
 }
 
-message GabageStreams {
-	map<uint64, uint64> gabages = 1;
+message	BlobStreams {
+	map<uint64, uint64> blobs = 1;
 }
 
 message TruncateResponse {
 	Code code = 1;
 	string codeDes = 2;
-	GabageStreams gabages = 3;
+	BlobStreams blobs = 3;
 }
+
+
+message MultiModifySplitRequest { 
+	uint64 partID = 1;
+	bytes midKey = 2;
+	string ownerKey = 3;//ownerKey, revision is used for locking
+	int64 revision = 4;
+}
+
+
+message MultiModifySplitResponse {
+	Code code = 1;
+	string codeDes = 2;
+}
+
 
 service StreamManagerService {
 	rpc StreamInfo(StreamInfoRequest) returns (StreamInfoResponse) {}
@@ -350,6 +365,9 @@ service StreamManagerService {
 	rpc CreateStream(CreateStreamRequest) returns  (CreateStreamResponse) {}
 	rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse) {}
 	rpc Truncate(TruncateRequest) returns (TruncateResponse) {}
+
+
+	rpc MultiModifySplit(MultiModifySplitRequest) returns (MultiModifySplitResponse){}
 }
 
 //used in Etcd Campaign

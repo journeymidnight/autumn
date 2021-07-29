@@ -695,14 +695,14 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 		return errDone(wire_errors.ClientStreamVersionTooHigh)
 	}
 	
-	var gabages pb.GabageStreams
+	var blobs pb.BlobStreams
 	if len(req.GabageKey) > 0  {
 		data, _, err := etcd_utils.EtcdGetKV(sm.client, req.GabageKey)
 		if err != nil {
 			return errDone(err)
 		}
 		if len(data) > 0 {
-			utils.MustUnMarshal(data, &gabages)
+			utils.MustUnMarshal(data, &blobs)
 		}
 	}
 
@@ -710,7 +710,7 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 	if streamInfo.Sversion > uint64(req.Sversion) {
 		return &pb.TruncateResponse{
 			Code: pb.Code_OK,
-			Gabages: &gabages,
+			Blobs: &blobs,
 		}, nil
 	}
 
@@ -786,7 +786,7 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 			return errDone(err)
 		}
 
-		gabages.Gabages[newGabageStreamID] = newGabageStreamID
+		blobs.Blobs[newGabageStreamID] = newGabageStreamID
 
 		sdata := utils.MustMarshal(
 			&pb.StreamInfo{
@@ -798,7 +798,7 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 		//transfer old extent to new stream
 		//add add stream to gabages
 		ops = append(ops, clientv3.OpPut(formatStreamKey(newGabageStreamID), string(sdata)))
-		ops = append(ops, clientv3.OpPut(req.GabageKey, string(utils.MustMarshal(&gabages))))
+		ops = append(ops, clientv3.OpPut(req.GabageKey, string(utils.MustMarshal(&blobs))))
 	}
 	
 
@@ -816,7 +816,7 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 
 	return &pb.TruncateResponse{
 		Code: pb.Code_OK,
-		Gabages: &gabages,
+		Blobs: &blobs,
 		}, nil
 
 }
