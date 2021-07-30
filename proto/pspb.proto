@@ -84,7 +84,6 @@ message PartitionMeta {
 	string address = 2;
 }
 
-//BlockMeta will be marshaled into pb.Block.userdata
 message BlockMeta {
 	TableIndex tableIndex = 1;
     uint32  CompressedSize = 2;

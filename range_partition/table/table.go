@@ -63,7 +63,7 @@ func OpenTable(blockReader streamclient.BlockReader,
 
 	utils.AssertTrue(xlog.Logger != nil)
 
-	fmt.Printf("read table from %d, %d\n", extentID, offset)
+	//fmt.Printf("read table from %d, %d\n", extentID, offset)
 	blocks, _, err := blockReader.Read(context.Background(), extentID, offset, 1)
 	if err != nil {
 		fmt.Printf("%+v\n", err)
@@ -174,8 +174,15 @@ func (t *Table) block(idx int) (*entriesBlock, error) {
 // Smallest is its smallest key, or nil if there are none
 func (t *Table) Smallest() []byte { return t.smallest }
 
+
 // Biggest is its biggest key, or nil if there are none
 func (t *Table) Biggest() []byte { return t.biggest }
+
+//the first key of the block with a zero-based index of (n + 1) / 2, where the total number of table is n
+func (t *Table) MidKey() []byte {
+	n := len(t.blockIndex)
+	return t.blockIndex[(n+1)/2].Key
+}
 
 func (t *Table) initBiggestAndSmallest() error {
 	t.smallest = t.blockIndex[0].Key
