@@ -4,6 +4,7 @@ all:
 	make -C cmd/autumn-client/
 	make -C cmd/autumn-ps/
 test:
+	cd range_partition/table && go test
 	cd extent && go test -race
 	cd extent/record && go test -race
 	cd streamclient && go test -race
