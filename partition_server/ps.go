@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/clientv3/concurrency"
@@ -90,7 +91,7 @@ func (ps *PartitionServer) getPartitionMeta(partID uint64) (int64, *pspb.Partiti
 	var rlocs pspb.TableLocations
 	var locs []*pspb.Location
 
-	var rblob pspb.BlobStreams
+	var rblob pb.BlobStreams
 	var blob []uint64
 
 
@@ -106,7 +107,10 @@ func (ps *PartitionServer) getPartitionMeta(partID uint64) (int64, *pspb.Partiti
 				xlog.Logger.Warnf("parse %s error", kv.Key)
 				continue
 			}
-			blob = rblob.Blob
+			blob = make([]uint64, 0, len(rblob.Blobs))
+			for k := range rblob.Blobs {
+				blob = append(blob, k)
+			}
 		} else if strings.HasSuffix(string(kv.Key), "discard") {
 			//TODO
 		} else {
@@ -310,12 +314,18 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, locs []
 	return rp, err
 }
 
-func (ps *PartitionServer) stopRangePartition() {
-	//FIXME
-}
-
 func (ps *PartitionServer) Close() {
 	ps.closeWatchCh()
+	ps.Lock()
+	defer ps.Unlock()
+	for _, rp := range ps.rangePartitions {
+		rp.Close()
+		if mutex, ok := ps.rangePartitionLocks[rp.PartID]; ok {
+			ctx , cancel := context.WithTimeout(context.Background(), time.Second)
+			mutex.Unlock(ctx)
+			cancel()
+		}
+	}
 }
 
 func (ps *PartitionServer) ServeGRPC() error {

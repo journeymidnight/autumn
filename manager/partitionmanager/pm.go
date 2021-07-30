@@ -397,11 +397,6 @@ func (pm *PartitionManager) LeaderLoop() {
 }
 
 
-func (pm *PartitionManager) RegisterGRPC(grpcServer *grpc.Server) {
-	pspb.RegisterPartitionManagerServiceServer(grpcServer, pm)
-	pm.grcpServer = grpcServer
-}
-
 //FIXME
 func (pm *PartitionManager) Close() {
 

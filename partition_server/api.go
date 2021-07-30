@@ -101,3 +101,18 @@ func (ps *PartitionServer) Range(ctx context.Context, req *pspb.RangeRequest) (*
 		Keys:      out,
 	}, nil
 }
+
+func (ps *PartitionServer) SplitPart(ctx context.Context, req *pspb.SplitPartRequest) (*pspb.SplitPartResponse, error) {
+	ps.RLock()
+	rp := ps.rangePartitions[req.PartID]
+	ps.RUnlock()
+	if rp == nil {
+		fmt.Println("no such rp")
+		return nil, errors.New("no such partid")
+	}
+
+	//close rp
+	rp.Close()
+
+}
+

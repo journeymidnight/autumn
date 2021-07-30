@@ -127,21 +127,6 @@ message SetRowStreamTablesResponse {
 }
 
 
-message BootstrapRequest {
-	uint64 logID = 1;
-	uint64 rowID = 2;
-}
-
-message BootstrapResponse {
-	uint64 partID = 1;
-	string codeDes = 2;
-	pb.Code code = 3;
-}
-
-service PartitionManagerService {	
-	rpc Bootstrap(BootstrapRequest) returns (BootstrapResponse) {}
-}
-
 
 
 
@@ -214,6 +199,15 @@ message RangeResponse {
 	repeated bytes keys = 2;
 }
 
+
+message SplitPartRequest {
+	uint64 PartID = 1;
+}
+
+message SplitPartResponse {
+}
+
+
 service PartitionKV {
 	/*
 	option (google.api.http) = {
@@ -226,4 +220,8 @@ service PartitionKV {
 	rpc Get (GetRequest) returns (GetResponse) {}
 	rpc Delete(DeleteRequest) returns (DeleteResponse) {}
 	rpc Range(RangeRequest) returns (RangeResponse) {}
+
+	//ps management API
+	//system performace
+	rpc SplitPart(SplitPartRequest) returns (SplitPartResponse) {}
 }

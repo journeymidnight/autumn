@@ -105,7 +105,7 @@ func OpenMockStreamClient(si pb.StreamInfo, br *MockBlockReader) StreamClient {
 	}
 }
 
-func (client *MockStreamClient) Truncate(ctx context.Context, extentID uint64, gabageKey string) (*pb.GabageStreams , error) {
+func (client *MockStreamClient) Truncate(ctx context.Context, extentID uint64, gabageKey string) (*pb.BlobStreams , error) {
 
 	var i int
 	for i = range client.stream {

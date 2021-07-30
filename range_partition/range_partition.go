@@ -911,7 +911,7 @@ func (rp *RangePartition) Close() error {
 }
 
 func (rp *RangePartition) close(gracefull bool) error {
-	xlog.Logger.Infof("Closing database")
+	xlog.Logger.Infof("Closing RangePartion %d", rp.PartID)
 	atomic.StoreInt32(&rp.blockWrites, 1)
 
 	rp.writeStopper.Stop()

@@ -329,10 +329,10 @@ func (client *SMClient) StreamInfo(ctx context.Context, streamIDs []uint64) (map
 	return streamInfos, extentInfos, err	
 }
 
-func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, extentID uint64, ownerKey string, revision int64, sversion int64, gabageKey string) (*pb.GabageStreams ,error) {
+func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, extentID uint64, ownerKey string, revision int64, sversion int64, gabageKey string) (*pb.BlobStreams ,error) {
 	err := ErrTimeOut
 	var res *pb.TruncateResponse
-	var gabageStreams *pb.GabageStreams
+	var gabageStreams *pb.BlobStreams
 	client.try(func(conn *grpc.ClientConn) bool {
 		c := pb.NewStreamManagerServiceClient(conn)
 		res, err = c.Truncate(ctx, &pb.TruncateRequest{
@@ -359,7 +359,7 @@ func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, ext
 			}
 			return false
 		}
-		gabageStreams = res.Gabages
+		gabageStreams = res.Blobs
 		return false
 	}, 500*time.Millisecond)
 
