@@ -43,7 +43,7 @@ type StreamClient interface {
     Append(ctx context.Context, blocks []*pb.Block) (extentID uint64, offsets []uint32, end uint32, err error)
 	NewLogEntryIter(opt ...ReadOption) LogEntryIter
 	//Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, uint32, error)
-	Truncate(ctx context.Context, extentID uint64, gabageKey string) (*pb.GabageStreams , error)
+	Truncate(ctx context.Context, extentID uint64, gabageKey string) (*pb.BlobStreams , error)
 	//FIXME: stat => ([]extentID , offset)
 }
 
@@ -269,7 +269,7 @@ retry:
 	}
 
 	exInfo := iter.sc.em.GetExtentInfo(extentID)
-	xlog.Logger.Debugf("read extentID %d, offset : %d, eversion is %d\n", extentID, iter.currentOffset, exInfo.Eversion)
+	//xlog.Logger.Debugf("read extentID %d, offset : %d, eversion is %d\n", extentID, iter.currentOffset, exInfo.Eversion)
 
 	//fmt.Printf("read extentID %d, offset : %d,  index : %d\n", extentID, iter.currentOffset, iter.currentExtentIndex)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -314,10 +314,11 @@ retry:
 		iter.currentExtentIndex++
 		iter.conn = nil
 		//如果stream是BlobStream, 最后一个extent也返回EndOfExtent
-		fmt.Printf("readentries currentIndex is %d in %v nomore?%v\n", iter.currentExtentIndex, iter.sc.streamInfo.ExtentIDs, iter.noMore)
 		if iter.currentExtentIndex == len(iter.sc.streamInfo.ExtentIDs) {
 			iter.noMore = true
 		}
+		fmt.Printf("readentries currentIndex is %d in %v nomore?%v\n", iter.currentExtentIndex, iter.sc.streamInfo.ExtentIDs, iter.noMore)
+
 		return nil
 	default:
 		return errors.Errorf(res.CodeDes)
@@ -353,7 +354,7 @@ func (sc *AutumnStreamClient) NewLogEntryIter(opts ...ReadOption) LogEntryIter {
 	return leIter
 }
 
-func (sc *AutumnStreamClient) Truncate(ctx context.Context, extentID uint64, gabageKey string) (*pb.GabageStreams, error) {
+func (sc *AutumnStreamClient) Truncate(ctx context.Context, extentID uint64, gabageKey string) (*pb.BlobStreams, error) {
 
 	var i int
 	for i = range sc.streamInfo.ExtentIDs {

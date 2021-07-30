@@ -17,9 +17,12 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/coreos/etcd/clientv3"
+	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/manager/pmclient"
 	"github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/node"
+	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
 	_ "github.com/journeymidnight/autumn/xlog"
@@ -194,6 +197,13 @@ func benchmark(etcdAddrs []string, op BenchType, threadNum int, duration int, si
 }
 
 func bootstrap(c *cli.Context) error {
+
+	etcdAddr := utils.SplitAndTrim(c.String("etcdAddr"), ",")
+	etcdClient, err := clientv3.New(clientv3.Config{
+		Endpoints:   etcdAddr,
+		DialTimeout: time.Second,
+	})
+
 	smAddrs := utils.SplitAndTrim(c.String("smAddr"), ",")
 
 	smc := smclient.NewSMClient(smAddrs)
@@ -218,11 +228,32 @@ func bootstrap(c *cli.Context) error {
 		return err
 	}
 
-	partID, err := pmc.Bootstrap(log.StreamID, row.StreamID)
+	partID, _, err := etcd_utils.EtcdAllocUniqID(etcdClient, "AutumnSMIDKey", 1)
+	if err != nil {
+		fmt.Printf("can not create partID %v\n", err)
+		return err
+	}
+
+	zeroMeta := pspb.PartitionMeta{
+		LogStream: log.StreamID,
+		RowStream: row.StreamID,
+		Rg:&pspb.Range{StartKey: []byte(""), EndKey: []byte("")},
+		PartID: partID,
+	}
+
+	//valid no PART exists...
+
+	kv, _, _ := etcd_utils.EtcdRange(etcdClient, "PART/")
+	if len(kv) > 0 {
+		return errors.New("partition already exists")
+	}
+
+	err = etcd_utils.EtcdSetKV(etcdClient, fmt.Sprintf("PART/%d", partID), utils.MustMarshal(&zeroMeta))
 	if err != nil {
 		return err
 	}
-	fmt.Printf("bootstrap succeed, created new range partition %d\n", partID)
+
+	fmt.Printf("bootstrap succeed, created new range partition %d\n", partID)	
 	return nil
 }
 
@@ -364,6 +395,7 @@ func main() {
 			Usage: "bootstrap -smAddr <addrs>",
 			Flags: []cli.Flag{
 				&cli.StringFlag{Name: "smAddr", Value: "127.0.0.1:3401"},
+				&cli.StringFlag{Name: "etcdAddr", Value: "127.0.0.1:2379"},
 			},
 			Action: bootstrap,
 		},

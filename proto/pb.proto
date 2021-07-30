@@ -372,9 +372,9 @@ service StreamManagerService {
 
 //used in Etcd Campaign
 message MemberValue {
-        uint64 ID = 1;
-        string Name = 2;
-        string GrpcURL =3;
+    uint64 ID = 1;
+    string Name = 2;
+    string GrpcURL =3;
 }
 
 

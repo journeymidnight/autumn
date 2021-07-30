@@ -45,8 +45,6 @@ func main() {
 	pm := partitionmanager.NewPartitionManager(etcd, client, config)
 	go pm.LeaderLoop()
 
-	pm.RegisterGRPC(grpcServer)
-
 	/*
 		if err = pm.ServeGRPC(grpc); err != nil {
 			xlog.Logger.Fatalf(err.Error())
