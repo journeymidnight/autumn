@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"os"
 	"os/signal"
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -19,7 +21,6 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/coreos/etcd/clientv3"
 	"github.com/journeymidnight/autumn/etcd_utils"
-	"github.com/journeymidnight/autumn/manager/pmclient"
 	"github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/node"
 	"github.com/journeymidnight/autumn/proto/pspb"
@@ -89,6 +90,7 @@ func benchmark(etcdAddrs []string, op BenchType, threadNum int, duration int, si
 		}
 	}
 
+	n := rand.Int31()
 	go func() {
 		for i := 0; i < threadNum; i++ {
 			loop := 0 //sample to record lantency
@@ -107,7 +109,7 @@ func benchmark(etcdAddrs []string, op BenchType, threadNum int, duration int, si
 						return
 					default:
 						write := func(t int) {
-							key := fmt.Sprintf("test%d_%d", t, j)
+							key := fmt.Sprintf("test%d_%d_%d",n, t, j)
 							ctx, cancel = context.WithCancel(context.Background())
 							start := time.Now()
 							err := client.Put(ctx, []byte(key), data)
@@ -208,11 +210,6 @@ func bootstrap(c *cli.Context) error {
 
 	smc := smclient.NewSMClient(smAddrs)
 	if err := smc.Connect(); err != nil {
-		return err
-	}
-
-	pmc := pmclient.NewAutumnPMClient(smAddrs)
-	if err := pmc.Connect(); err != nil {
 		return err
 	}
 	//choose the first one
@@ -354,6 +351,34 @@ func put(c *cli.Context) error {
 	return nil
 }
 
+
+func splitPartition(c *cli.Context) error {
+	etcdAddr := utils.SplitAndTrim(c.String("etcdAddr"), ",")
+	if len(etcdAddr) == 0 {
+		return errors.Errorf("etcdAddr is nil")
+	}
+	client := NewAutumnLib(etcdAddr)
+
+	if err := client.Connect(); err != nil {
+		return err
+	}
+
+	defer client.Close()
+
+	partIDString := c.Args().First()
+
+	if len(partIDString) == 0 {
+		return errors.New("partID is nil")
+
+	}
+	partID , err := strconv.ParseUint(partIDString, 10, 64)
+	if err != nil {
+		return errors.Errorf("partID is not int: %s", partIDString)
+	}
+	return client.SplitPart(context.Background(), partID)
+}
+
+
 func info(c *cli.Context) error {
 	smAddrs := utils.SplitAndTrim(c.String("smAddr"), ",")
 	client := smclient.NewSMClient(smAddrs)
@@ -392,7 +417,7 @@ func main() {
 
 		{
 			Name:  "bootstrap",
-			Usage: "bootstrap -smAddr <addrs>",
+			Usage: "bootstrap -smAddr <addrs> --etcdAddr <addrs>",
 			Flags: []cli.Flag{
 				&cli.StringFlag{Name: "smAddr", Value: "127.0.0.1:3401"},
 				&cli.StringFlag{Name: "etcdAddr", Value: "127.0.0.1:2379"},
@@ -423,6 +448,14 @@ func main() {
 				&cli.StringFlag{Name: "etcdAddr", Value: "127.0.0.1:2379"},
 			},
 			Action: del,
+		},
+		{
+			Name:  "split",
+			Usage: "split --etcdAddr <addrs> <PARTID>",
+			Flags: []cli.Flag{
+				&cli.StringFlag{Name: "etcdAddr", Value: "127.0.0.1:2379"},
+			},
+			Action: splitPartition,
 		},
 		{
 			Name:  "wbench",

@@ -33,7 +33,7 @@ type Table struct {
 	smallest, biggest []byte // Smallest and largest keys (with timestamps).
 
 	// Stores the total size of key-values stored in this table (including the size on vlog).
-	estimatedSize uint64
+	EstimatedSize uint64
 	bf            *z.Bloom
 	Cache         *ristretto.Cache
 	BfCache       *ristretto.Cache
@@ -97,7 +97,7 @@ func OpenTable(blockReader streamclient.BlockReader,
 	t := &Table{
 		blockIndex:    make([]*pspb.BlockOffset, len(meta.TableIndex.Offsets)),
 		blockReader:        blockReader,
-		estimatedSize: meta.TableIndex.EstimatedSize,
+		EstimatedSize: meta.TableIndex.EstimatedSize,
 		Loc: pspb.Location{
 			ExtentID: extentID,
 			Offset:   offset,

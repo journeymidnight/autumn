@@ -105,6 +105,14 @@ func OpenMockStreamClient(si pb.StreamInfo, br *MockBlockReader) StreamClient {
 	}
 }
 
+func (client *MockStreamClient) End() uint32 {
+	panic("mockStream should not call End")
+}
+
+func (client *MockStreamClient) CheckCommitLength() error {
+	return nil
+}
+
 func (client *MockStreamClient) Truncate(ctx context.Context, extentID uint64, gabageKey string) (*pb.BlobStreams , error) {
 
 	var i int
@@ -248,9 +256,7 @@ type MockLockEntryIter struct {
 	replay        bool
 }
 
-func (iter *MockLockEntryIter) CheckCommitLength() error {
-	return nil
-}
+
 
 func (iter *MockLockEntryIter) HasNext() (bool, error) {
 	if len(iter.cache) == 0 {

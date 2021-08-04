@@ -1,7 +1,9 @@
 package range_partition
 
 import (
+	"bytes"
 	"context"
+	"sync/atomic"
 	"time"
 
 	"github.com/journeymidnight/autumn/proto/pspb"
@@ -105,6 +107,15 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 		var numKeys, numSkips uint64
 		memStore := skiplist.NewSkiplist(capacity)
 		for ; it.Valid(); it.Next() {
+
+			userKey := y.ParseKey(it.Key())
+			if bytes.Compare(userKey, rp.StartKey) < 0 {
+				continue
+			}
+			if len(rp.EndKey) > 0 && bytes.Compare(rp.EndKey, userKey) <= 0 {
+				continue
+			}
+
 			if len(skipKey) > 0 {
 				if y.SameKey(it.Key(), skipKey) {
 					updateStats(it.Value())
@@ -153,6 +164,12 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 	if err == nil {
 		_ = err
 		//FIXME: send frontStream/endStream to sm
+	}
+
+	//在这个时间, 虽然有可能memstore还没有完全刷下去, 但是rp.Close调用会等待flushTask全部执行完成.
+	//另外, 在分裂时选择midKey后, 会有一个assert确保midKey在startKey和endKey之间
+	if major {
+		atomic.StoreUint32(&rp.hasOverlap, 0)
 	}
 }
 

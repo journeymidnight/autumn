@@ -192,11 +192,12 @@ checkCommitLength:0,  end:N,  append log/row stream, meet an error or do rotate
 */
 
 func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64, Sversion int64,
-	extentToSeal uint64, ownerKey string, revision int64, checkCommitLength uint32, end uint32) (*pb.ExtentInfo, error) {
+	extentToSeal uint64, ownerKey string, revision int64, checkCommitLength uint32, end uint32) (*pb.ExtentInfo, uint32, error) {
 
 	err := ErrTimeOut
 	var res *pb.StreamAllocExtentResponse
 	var ei *pb.ExtentInfo
+	var lastExtentEnd uint32
 	client.try(func(conn *grpc.ClientConn) bool {
 		c := pb.NewStreamManagerServiceClient(conn)
 		res, err = c.StreamAllocExtent(ctx, &pb.StreamAllocExtentRequest{
@@ -223,12 +224,13 @@ func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64, 
 			}
 			return false
 		}
-
+		
 		ei = res.Extent
+		lastExtentEnd = res.End
 		return false
-	}, 100*time.Millisecond)
+	}, 500*time.Millisecond)
 
-	return ei, err	
+	return ei, lastExtentEnd, err	
 }
 
 
@@ -366,6 +368,43 @@ func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, ext
 	return gabageStreams, err	
 }
 	
+
+func (client *SMClient) MultiModifySplit(ctx context.Context, partID uint64, midKey []byte, 
+	ownerKey string, revision int64, logEnd, rowEnd uint32) error {
+	err := ErrTimeOut
+	var res *pb.MultiModifySplitResponse
+	client.try(func(conn *grpc.ClientConn) bool {
+		c := pb.NewStreamManagerServiceClient(conn)
+		res, err = c.MultiModifySplit(ctx, &pb.MultiModifySplitRequest{
+			PartID: partID,
+			MidKey: midKey,
+			OwnerKey: ownerKey,
+			Revision: revision,
+			LogStreamSealedLength: logEnd,
+			RowStreamSealedLength: rowEnd,
+		})
+		
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			return false
+		}
+		if err != nil {
+			xlog.Logger.Warnf(err.Error())
+			return true
+		}
+		if res.Code != pb.Code_OK {
+			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
+			//if remote is not a leader, retry
+			if err == wire_errors.NotLeader {
+				return true
+			}
+			return false
+		}
+		return false
+	}, 500*time.Millisecond)
+
+	return err	
+}
+
 
 /*
 func (client *SMClient) SubmitRecoveryTask(ctx context.Context, extentID uint64, replaceID uint64) error {

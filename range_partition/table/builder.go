@@ -19,6 +19,7 @@ package table
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"unsafe"
 
@@ -357,6 +358,7 @@ func (b *Builder) FinishAll(headExtentID uint64, headOffset uint32, seqNum uint6
 		TableIndex:       b.tableIndex,
 	}
 
+
 	metaBlock := &pb.Block{
 		Data: make([]byte, meta.Size()+4),
 	}
@@ -372,5 +374,7 @@ func (b *Builder) FinishAll(headExtentID uint64, headOffset uint32, seqNum uint6
 	if err != nil {
 		return 0, 0, err
 	}
+	fmt.Printf("build table on %d:%d , vp [%d,%d]\n", extentID, offsets[0], headExtentID, headOffset)
+
 	return extentID, offsets[0], nil
 }

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"strings"
-	"time"
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/clientv3/concurrency"
@@ -155,6 +154,7 @@ func (ps *PartitionServer) parseRegionAndStart(regions *pspb.Regions) int64{
 		if ok {
 			continue
 		}
+		
 		
 		//if PART did not activate, lock and activate
 		mutex := concurrency.NewMutex(ps.session, formatPartLock(region.PartID))
@@ -308,24 +308,10 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, locs []
 
 
 	rp, err := range_partition.OpenRangePartition(meta.PartID, row, log, ps.blockReader, meta.Rg.StartKey, meta.Rg.EndKey, locs,
-		blobs, setRowStreamTables, openStream, range_partition.DefaultOption())
+		blobs, setRowStreamTables, openStream, range_partition.DefaultOption(), range_partition.WithMaxSkipList(1<<20))
 	
 	xlog.Logger.Infof("open range partition %d, StartKey:[%s], EndKey:[%s]: err is %v", meta.PartID, meta.Rg.StartKey, meta.Rg.EndKey, err)
 	return rp, err
-}
-
-func (ps *PartitionServer) Close() {
-	ps.closeWatchCh()
-	ps.Lock()
-	defer ps.Unlock()
-	for _, rp := range ps.rangePartitions {
-		rp.Close()
-		if mutex, ok := ps.rangePartitionLocks[rp.PartID]; ok {
-			ctx , cancel := context.WithTimeout(context.Background(), time.Second)
-			mutex.Unlock(ctx)
-			cancel()
-		}
-	}
 }
 
 func (ps *PartitionServer) ServeGRPC() error {
@@ -348,6 +334,19 @@ func (ps *PartitionServer) ServeGRPC() error {
 }
 
 func (ps *PartitionServer) Shutdown() {
+
+	//1. close grpc server
+	if ps.grcpServer != nil {
+		ps.grcpServer.GracefulStop()
+	}
+
+	//2. close all range partition
+	ps.Lock()
+	for _, rp := range ps.rangePartitions {
+		rp.Close()
+	}
+	ps.Unlock()
+
 	//FIXME
 	ps.session.Close()
 }

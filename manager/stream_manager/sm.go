@@ -187,14 +187,18 @@ func (sm *StreamManager) runAsLeader() {
 		}
 
 		//FIXME:
-		//utils.AssertTrue(kv.Version == int64(streamInfo.Sversion))
+		utils.AssertTrue(kv.Version == int64(streamInfo.Sversion))
+
+		/*
+		Fix if kv.Version != streamInfo.Sversion
 		if kv.Version != int64(streamInfo.Sversion) {
 			streamInfo.Sversion = uint64(kv.Version)
 			etcd_utils.EtcdSetKV(sm.client, formatStreamKey(streamID), utils.MustMarshal(&streamInfo))
 		}
-
+		*/
+		
+		
 		sm.streams.Set(streamID, &streamInfo)
-		//sm.streams[streamID] = &streamInfo
 	}
 
 	//load extents

@@ -259,7 +259,7 @@ func (pm *PartitionManager) runAsLeader() {
 	maxRev = utils.Max64(rev, maxRev)
 
 	pm.partMeta = parseParts(kvs)
-
+	
 
 	//is current config valid?
 	var data []byte

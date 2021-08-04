@@ -132,7 +132,7 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 		return errDone(err)
 	}
 
-	if extentInfo.SealedLength > 0 {
+	if extentInfo.Avali > 0 {
 		return errDone(errors.Errorf("extent %d is sealed", req.ExtentID))
 	}
 
@@ -349,7 +349,7 @@ func (en *ExtentNode) SmartReadBlocks(ctx context.Context, req *pb.ReadBlocksReq
 	//read data shards
 	for i := 0; i < dataShards; i++ {
 		j := i
-		if exInfo.SealedLength > 0 &&  (1 << j) & exInfo.Avali == 0 {
+		if exInfo.Avali > 0 &&  (1 << j) & exInfo.Avali == 0 {
 			continue
 		}
 		stopper.RunWorker(func() {
@@ -361,7 +361,7 @@ func (en *ExtentNode) SmartReadBlocks(ctx context.Context, req *pb.ReadBlocksReq
 	//read parity data
 	for i := 0; i < parityShards; i++ {
 		j := i
-		if exInfo.SealedLength > 0 && (1 << (j + dataShards)) & exInfo.Avali == 0 {
+		if exInfo.Avali > 0 && (1 << (j + dataShards)) & exInfo.Avali == 0 {
 			continue
 		}
 		stopper.RunWorker(func() {
@@ -664,12 +664,17 @@ func (en *ExtentNode) ReadEntries(ctx context.Context, req *pb.ReadEntriesReques
 			continue
 		}
 		//fmt.Printf("Read entries %s\n", string(entry.Log.Key))
+		if i == len(res.Blocks)-1 {
+			entry.End = res.End
+		} else {
+			entry.End = res.Offsets[i+1]
+		}
 		entries[i] = entry
 	}
 
 	return &pb.ReadEntriesResponse{
 		Code: res.Code,
 		Entries: entries,
-		End:res.End,
+		End : res.End,
 	}, nil
 }

@@ -33,6 +33,7 @@ message EntryInfo {
 	uint64 extentID = 2;
 	uint32 offset = 3;
 	uint64 estimatedSize = 4;
+	uint32 end = 5;
 }
 
 enum Code {
@@ -262,7 +263,9 @@ message StreamAllocExtentResponse{
 	Code code = 1;
 	string codeDes = 2;
 	uint64 streamID = 3;
+	//one of extent or return end of last extent
 	ExtentInfo extent = 4;
+	uint32 end = 5;
 }
 
 
@@ -345,6 +348,8 @@ message MultiModifySplitRequest {
 	bytes midKey = 2;
 	string ownerKey = 3;//ownerKey, revision is used for locking
 	int64 revision = 4;
+	uint32 logStreamSealedLength = 5;
+	uint32 rowStreamSealedLength = 6;
 }
 
 

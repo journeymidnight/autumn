@@ -72,6 +72,8 @@ type RangePartition struct {
 	//functions
 	openStream OpenStreamFunc //doGC的时候, 
 	setLocs    SetRowStreamTableFunc
+
+	hasOverlap uint32 //atomic
 }
 
 //TODO
@@ -107,7 +109,16 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		opt:opt,
 	}
 	rp.startMemoryFlush()
-
+	var err error
+	if err = logStream.CheckCommitLength(); err != nil {
+		return nil, err
+	}
+	fmt.Printf("log end is %d\n", logStream.End())
+	if err = rowStream.CheckCommitLength(); err != nil {
+		return nil, err
+	}
+	fmt.Printf("row end is %d\n", rowStream.End())
+	
 	//replay log
 	//open tables
 	//tableLocs的顺序就是在logStream里面的顺序
@@ -120,6 +131,20 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 			goto retry
 		}
 		rp.tables = append(rp.tables, tbl)
+
+
+		key := y.ParseKey(tbl.Smallest())
+		if bytes.Compare(key, startKey) < 0 || (len(endKey) > 0 && bytes.Compare(key, endKey) >= 0) {
+			//smallest key in table is not in range
+			fmt.Printf("smallest key :%s is out of [%s, %s]\n", key, startKey, endKey)
+			rp.hasOverlap = 1
+		}
+		key = y.ParseKey(tbl.Biggest())
+		if bytes.Compare(key, startKey) < 0 || (len(endKey) > 0 && bytes.Compare(key, endKey) >= 0) {
+			//biggest key in table is not in range
+			fmt.Printf("bigest key :%s is out of [%s, %s]\n", key, startKey, endKey)
+			rp.hasOverlap = 1
+		}
 	}
 
 	//SORT all tables, by lastSeq
@@ -133,6 +158,7 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	var lastTable *table.Table
 	rp.seqNumber = 0
 	for i := range rp.tables {
+		fmt.Printf("table %d, table lastSeq %d, vp [%d, %d]\n", i, rp.tables[i].LastSeq, rp.tables[i].VpExtentID, rp.tables[i].VpOffset)
 		if rp.tables[i].LastSeq > rp.seqNumber {
 			rp.seqNumber = rp.tables[i].LastSeq
 			lastTable = rp.tables[i]
@@ -147,7 +173,7 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		//build ValueStruct from EntryInfo
 		entriesReady := []*pb.EntryInfo{ei}
 
-		head := valuePointer{extentID: ei.ExtentID, offset: ei.Offset}
+		head := valuePointer{extentID: ei.ExtentID, offset: ei.End}
 
 		if y.ParseTs(ei.Log.Key) > rp.seqNumber {
 			rp.seqNumber++
@@ -177,6 +203,8 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		*/
 		//fmt.Printf("replay %s, %d\n", ei.Log.Key, len(ei.Log.Value))
 		rp.writeToLSM([]*pb.EntryInfo{ei})
+		
+		rp.vhead = head
 		return true, nil
 	}
 
@@ -186,7 +214,7 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 			return nil, err
 		}
 	} else {
-		fmt.Printf("replay log from vp offset [%d]\n", lastTable.VpOffset)
+		fmt.Printf("replay log from vp extent %d, offset [%d]\n", lastTable.VpExtentID, lastTable.VpOffset)
 		/*
 			rp.vhead = valuePointer{
 				extentID: lastTable.VpExtentID,
@@ -200,13 +228,15 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	}
 
 	xlog.Logger.Infof("replayed log number: %d\n", replayedLog)
-	fmt.Printf("replayed log number: %d, mt size is %d\n", rp.mt.MemSize(), replayedLog)
+	fmt.Printf("replayed log number: %d, mt size is %d, empty?%v \n", replayedLog, rp.mt.MemSize(), rp.mt.Empty())
 
 	//start real write
 	rp.startWriteLoop()
 
 	//do compactions:FIXME, doCompactions放到另一个goroutine里面执行
 
+	
+	/*
 	var tbls []*table.Table
 	rp.tableLock.RLock()
 	for _, t := range rp.tables {
@@ -214,14 +244,17 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	}
 	rp.tableLock.RUnlock()
 
+	
 	if len(tbls) <= 1 {
 		return rp, nil
 	}
+	
 	rp.doCompact(tbls, true)
 	rp.deprecateTables(tbls)
 	for _, t := range tbls {
 		t.DecrRef()
 	}
+	*/
 	return rp,nil
 }
 
@@ -232,6 +265,38 @@ type flushTask struct {
 	isCompact bool          //如果是compact任务, 不需要修改rp.mt
 	resultCh  chan struct{} //也可以用wg, 但是防止未来还需要发数据
 }
+
+
+//split相关, 提供相关参数给上层
+//ADD more policy here, to support different Split policy
+func (rp *RangePartition) GetSplitPoint() []byte{
+	utils.AssertTrue(rp.hasOverlap == 0 && len(rp.tables) > 2)
+
+	//find the biggest table
+	var biggestTable *table.Table
+	rp.tableLock.Lock()
+	defer rp.tableLock.Unlock()
+	biggestTable = rp.tables[0]
+	for _, tbl := range rp.tables {
+		if tbl.EstimatedSize > biggestTable.EstimatedSize {
+			biggestTable = tbl
+		}
+	}
+	return y.ParseKey(biggestTable.MidKey())
+}
+
+//split相关, 提供相关参数给上层
+//ADD more policy here, to support different Split policy
+func (rp *RangePartition) CanSplit() bool {
+	rp.tableLock.Lock()
+	defer rp.tableLock.Unlock()
+	return  atomic.LoadUint32(&rp.hasOverlap) == 0 && len(rp.tables) > 2
+}
+
+func (rp *RangePartition) LogRowStreamEnd() (uint32, uint32) {
+	return rp.logStream.End(), rp.rowStream.End()
+}
+
 
 func (rp *RangePartition) startWriteLoop() {
 	rp.writeStopper = utils.NewStopper()
@@ -917,10 +982,11 @@ func (rp *RangePartition) close(gracefull bool) error {
 	rp.writeStopper.Stop()
 	close(rp.writeCh)
 
+	
 	//FIXME lost data in mt/imm, will have to replay log
 	//doWrite在返回前,会调用最后一次writeRequest并且等待返回, 所以这里
 	//mt和rp.vhead都是只读的
-	if gracefull && !rp.mt.Empty() {
+	if gracefull && rp.mt.MemSize() > (rp.opt.MaxSkipList/4) {
 		for {
 			pushedFlushTask := func() bool {
 				rp.Lock()
