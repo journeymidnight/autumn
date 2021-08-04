@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/range_partition"
 	"github.com/journeymidnight/autumn/wire_errors"
@@ -110,9 +111,69 @@ func (ps *PartitionServer) SplitPart(ctx context.Context, req *pspb.SplitPartReq
 		fmt.Println("no such rp")
 		return nil, errors.New("no such partid")
 	}
+	
+	if !rp.CanSplit() {
+		return nil, errors.New("range partition overlaps")
+	}
+	
 
-	//close rp
+	mutex, ok := ps.rangePartitionLocks[rp.PartID]
+	if !ok {
+		return nil, errors.New("ps has no lock on partID")
+	}
+	defer func() {
+		ps.Lock()
+		delete(ps.rangePartitionLocks, rp.PartID)
+		ps.Unlock()
+		mutex.Unlock(context.Background())
+	}()
+
+
+	//stop incoming requests and make sure only one is calling "rp.Close, rp.Split"
+	ps.Lock()
+	if _, ok := ps.rangePartitions[req.PartID] ; !ok {
+		ps.Unlock()
+		return nil, errors.New("no such partid")
+	}
+	delete(ps.rangePartitions, req.PartID)
+	ps.Unlock()
+
+
+	
+	midKey := rp.GetSplitPoint()
+
+	if len(midKey) == 0 {
+		return nil, errors.New("mid key is zero")
+	}
+	
+
 	rp.Close()
 
+	fmt.Printf("rp %d is closed", rp.PartID)
+	xlog.Logger.Infof("rp %d is closed", rp.PartID)
+	
+	
+	//LogRowStreamEnd MUST called before rp.Close()
+	//sm service use logEnd and rowEnd to seal log stream and row stream
+	logEnd, rowEnd := rp.LogRowStreamEnd()
+
+	backOffTime := time.Second
+	for {
+		err := ps.smClient.MultiModifySplit(ctx, rp.PartID, midKey, mutex.Key(), mutex.Header().Revision, logEnd, rowEnd)
+		xlog.Logger.Infof("range partionion %d split: resut is %v", err)
+		if err == nil {
+			break
+		} else if err == smclient.ErrTimeOut || err == wire_errors.NotLeader{
+			time.Sleep(backOffTime)
+			backOffTime *= 2
+			continue
+		} else {
+			//I have to reopen rp
+			//send warning to sm service
+			defer panic("I have to reopen rp, panic myself to reopen all range partitions")
+			return nil, err
+		}
+	}
+	return nil, nil
 }
 

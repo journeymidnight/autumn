@@ -43,13 +43,13 @@ func replayLog(stream streamclient.StreamClient, startExtentID uint64, startOffs
 	} else {
 		opts = append(opts, streamclient.WithReadFrom(startExtentID, startOffset))
 	}
+
+
+
 	iter := stream.NewLogEntryIter(opts...)
 	
 	
-	if err := iter.CheckCommitLength(); err != nil {
-		return err
-	}
-	
+
 	fmt.Println("CheckCommitLength Done")
 	
 	for {
@@ -124,11 +124,11 @@ func (rp *RangePartition) runGC(discardRatio float64) {
 		if bytes.Compare(userKey, rp.StartKey) < 0 {
 			return true, nil
 		}
-		if len(rp.EndKey) > 0 && bytes.Compare(rp.EndKey, userKey) < 0 {
+		if len(rp.EndKey) > 0 && bytes.Compare(rp.EndKey, userKey) <= 0 {
 			return true, nil
 		}
 
-		//startKey <=userKey <= endKey
+		//startKey <= userKey < endKey
 
 		vs := rp.getValueStruct(userKey, 0) //get the lasted version, do not support multiversion
 

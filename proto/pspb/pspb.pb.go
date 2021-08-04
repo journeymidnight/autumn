@@ -443,7 +443,6 @@ func (m *PSDetail) GetAddress() string {
 	return ""
 }
 
-//BlockMeta will be marshaled into pb.Block.userdata
 type BlockMeta struct {
 	TableIndex       *TableIndex `protobuf:"bytes,1,opt,name=tableIndex,proto3" json:"tableIndex,omitempty"`
 	CompressedSize   uint32      `protobuf:"varint,2,opt,name=CompressedSize,proto3" json:"CompressedSize,omitempty"`

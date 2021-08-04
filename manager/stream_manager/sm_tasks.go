@@ -395,7 +395,7 @@ func (sm *StreamManager) routineDispatchTask() {
 
 						//check node health
 						ns := sm.getNodeStatus(nodeID)
-						if (ns == nil || ns.Dead()) && extent.SealedLength > 0{
+						if (ns == nil || ns.Dead()) && extent.Avali > 0{
 							fmt.Printf("node %d is dead, recovery for %d\n", nodeID, extent.ExtentID) 
 							go func(extent *pb.ExtentInfo, nodeID uint64) {
 								sm.dispatchRecoveryTask(extent, nodeID)

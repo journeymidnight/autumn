@@ -45,6 +45,8 @@ type StreamClient interface {
 	//Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, uint32, error)
 	Truncate(ctx context.Context, extentID uint64, gabageKey string) (*pb.BlobStreams , error)
 	//FIXME: stat => ([]extentID , offset)
+	End() uint32
+	CheckCommitLength() error
 }
 
 //random read block
@@ -55,7 +57,7 @@ type BlockReader interface {
 type LogEntryIter interface {
 	HasNext() (bool, error)
 	Next() *pb.EntryInfo
-	CheckCommitLength() error
+	//CheckCommitLength() error
 }
 
 type AutumnBlockReader struct {
@@ -181,34 +183,35 @@ type AutumnEntryIter struct {
 }
 
 
-//CheckCommitLength is called only when read entries on logStream
-func (iter *AutumnEntryIter) CheckCommitLength() error {
+func (sc *AutumnStreamClient) 	CheckCommitLength() error {
 	//if last extent is not sealed, we must 'Check Commit length' for all replicates,
 	//if any error happend, we seal and create a new extent
-	if len(iter.sc.streamInfo.ExtentIDs) == 0 {
+	if len(sc.streamInfo.ExtentIDs) == 0 {
 		return nil
 	}
-	extentID := iter.sc.streamInfo.ExtentIDs[len(iter.sc.streamInfo.ExtentIDs)-1] //last extent
-	exInfo := iter.sc.em.Latest(extentID) 
+	extentID := sc.streamInfo.ExtentIDs[len(sc.streamInfo.ExtentIDs)-1] //last extent
+	exInfo := sc.em.Latest(extentID) 
 
-	if exInfo.SealedLength > 0 {
+	if exInfo.Avali > 0 {
 		return nil
 	}
 
 	xlog.Logger.Infof("Check Commit Length at extent %d", extentID)
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 5 * time.Second)
-		newExInfo, err := iter.sc.smClient.StreamAllocExtent(ctx, iter.sc.streamID, int64(iter.sc.streamInfo.Sversion), extentID, 
-			iter.sc.streamLock.ownerKey, iter.sc.streamLock.revision, 1, 0)
+		newExInfo, lastExtentEnd,  err := sc.smClient.StreamAllocExtent(ctx, sc.streamID, int64(sc.streamInfo.Sversion), extentID, 
+			sc.streamLock.ownerKey, sc.streamLock.revision, 1, 0)
 		
 		xlog.Logger.Infof("Check Commit Length %v, new extent: %v", err, newExInfo)
 		cancel()
 		if err == nil {
 			if newExInfo != nil {
 				//update local streaminfo
-				iter.sc.streamInfo.ExtentIDs = append(iter.sc.streamInfo.ExtentIDs, newExInfo.ExtentID)
-				iter.sc.em.WaitVersion(newExInfo.ExtentID, 1)
-				utils.AssertTrue(iter.sc.end == 0)
+				sc.streamInfo.ExtentIDs = append(sc.streamInfo.ExtentIDs, newExInfo.ExtentID)
+				sc.em.WaitVersion(newExInfo.ExtentID, 1)
+				sc.end = 0
+			} else {
+				sc.end = lastExtentEnd
 			}
 			break
 		}
@@ -234,7 +237,7 @@ func (iter *AutumnEntryIter) HasNext() (bool, error) {
 		}
 	}
 	
-	return true, nil
+	return len(iter.cache) > 0, nil
 }
 
 func (iter *AutumnEntryIter) Next() *pb.EntryInfo {
@@ -281,6 +284,7 @@ retry:
 		Eversion: exInfo.Eversion,
 	})
 	cancel()
+
 
 	if err != nil { //network error
 		if loop > 5 {
@@ -354,6 +358,8 @@ func (sc *AutumnStreamClient) NewLogEntryIter(opts ...ReadOption) LogEntryIter {
 	return leIter
 }
 
+//Truncate keeps extentID, if gabageKey is not nil, move all extents before extentID to gabageKey, else
+//unref all extents.
 func (sc *AutumnStreamClient) Truncate(ctx context.Context, extentID uint64, gabageKey string) (*pb.BlobStreams, error) {
 
 	var i int
@@ -399,13 +405,17 @@ func (sc *AutumnStreamClient) getLastExtent() (uint64, error) {
 	return extentID, nil
 }
 
+func (sc *AutumnStreamClient) End() uint32 {
+	return sc.end
+}
 
+//alloc new extent, and reset sc.end = 0
 func (sc *AutumnStreamClient) MustAllocNewExtent(oldExtentID uint64) error{
 	var newExInfo *pb.ExtentInfo
 	var err error
 	for {
 		ctx , cancel := context.WithTimeout(context.Background(), 5 * time.Second)
-		newExInfo, err = sc.smClient.StreamAllocExtent(ctx, sc.streamID, int64(sc.streamInfo.Sversion),
+		newExInfo, _, err = sc.smClient.StreamAllocExtent(ctx, sc.streamID, int64(sc.streamInfo.Sversion),
 		oldExtentID , sc.streamLock.ownerKey, sc.streamLock.revision, 0, sc.end)
 		cancel()
 		if err == nil {
@@ -422,6 +432,7 @@ func (sc *AutumnStreamClient) MustAllocNewExtent(oldExtentID uint64) error{
 	sc.streamInfo.ExtentIDs = append(sc.streamInfo.ExtentIDs, newExInfo.ExtentID)
 
 	sc.em.WaitVersion(newExInfo.ExtentID, 1)
+	sc.end = 0
 	xlog.Logger.Debugf("created new extent %d on stream %d", newExInfo.ExtentID, sc.streamID)
 	return nil
 }
@@ -434,6 +445,12 @@ func (sc *AutumnStreamClient) Connect() error {
 		return err
 	}
 	sc.streamInfo = s[sc.streamID]
+
+	//wait to get the latest extentInfo for future write.
+	exID, _ := sc.getLastExtent()
+	exInfo := sc.em.Latest(exID)
+	sc.em.WaitVersion(exID, exInfo.Eversion)
+
 	fmt.Printf("stream info is %d : %v\n", sc.streamInfo.StreamID, sc.streamInfo.ExtentIDs)
 	return nil
 }
@@ -483,11 +500,19 @@ retry:
 		return extentID, nil, 0, errors.New("not such extent")
 	}
 
+	if exInfo.Avali > 0 {
+		if err = sc.MustAllocNewExtent(extentID) ; err != nil {
+			return 0, nil, 0, err
+		}
+		goto retry
+	}
+
 	conn := sc.em.GetExtentConn(extentID, smclient.PrimaryPolicy{})
 	if conn == nil {
 		if err = sc.MustAllocNewExtent(extentID) ; err != nil {
 			return 0, nil, 0, err
 		}
+		goto retry
 
 	}
 
@@ -532,7 +557,6 @@ retry:
 		if err = sc.MustAllocNewExtent(extentID); err != nil {
 			return 0, nil, 0, err
 		}
-		sc.end = 0
 	} else {
 		sc.end = res.End
 	}

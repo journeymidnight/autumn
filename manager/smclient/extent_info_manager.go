@@ -260,7 +260,7 @@ func (AlivePolicy) Choose(em *ExtentManager, extentID uint64) *grpc.ClientConn {
 	}
 	//in EC, if all replicates do not work, so it is meaningless to connect parity nodes
 	for i := range exInfo.Replicates {
-		if exInfo.SealedLength > 0 && ((1 << i) & exInfo.Avali) == 0 {
+		if exInfo.Avali > 0 && ((1 << i) & exInfo.Avali) == 0 {
 			continue
 		}
 		nodeInfo := em.GetNodeInfo(exInfo.Replicates[i])

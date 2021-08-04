@@ -258,9 +258,17 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		
 		//all nodes are good
 		if haveToCreateNewExtent == false {
+			//get minimun from sizes
+			minSize := sizes[0]
+			for i := 1; i < len(sizes); i++ {
+				if minSize > sizes[i] {
+					minSize = sizes[i]
+				}
+			}
 			return  &pb.StreamAllocExtentResponse{
 				Code: pb.Code_OK,
 				StreamID: req.StreamID,
+				End:uint32(sizes[0]),
 			}, nil
 		}
 	}
@@ -269,7 +277,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	var minimalLength int64 = math.MaxInt64
 	var avali uint32
 	//seal the oldExtent, update lastExtentInfo
-	if req.End ==0 {
+	if req.End == 0 {
 		//recevied commit length
 
 		var minSize int
@@ -284,7 +292,6 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		
 		if len(sizes) == 0 && req.CheckCommitLength == 0 {
 			sizes = sm.receiveCommitlength(ctx, nodes, req.ExtentToSeal)
-
 		}
 
 		for i := range sizes {
@@ -342,6 +349,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	utils.AssertTrue(ok)
 
 	stream.ExtentIDs = append(stream.ExtentIDs, extentID)
+	stream.Sversion ++
 	//add extentID to stream
 	streamKey := formatStreamKey(req.StreamID)
 	sdata, err := stream.Marshal()

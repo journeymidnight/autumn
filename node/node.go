@@ -102,7 +102,7 @@ func (en *ExtentNode) extentInfoUpdatedfunc(eventType string, cur *pb.ExtentInfo
 	switch eventType {
 	case "PUT":
 		//sealed
-		if cur.SealedLength > 0 {
+		if cur.Avali > 0 {
 			ex := en.getExtent(cur.ExtentID)
 			if ex != nil && ex.IsSeal() == false {
 				xlog.Logger.Infof("SEAL extent %d", cur.ExtentID)
