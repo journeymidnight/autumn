@@ -1,4 +1,4 @@
-package partitionmanager
+package partition_manager
 
 import (
 	"errors"

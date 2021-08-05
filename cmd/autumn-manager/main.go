@@ -8,7 +8,7 @@ import (
 
 	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/manager"
-	"github.com/journeymidnight/autumn/manager/partitionmanager"
+	"github.com/journeymidnight/autumn/manager/partition_manager"
 	"github.com/journeymidnight/autumn/manager/stream_manager"
 	"google.golang.org/grpc"
 
@@ -42,7 +42,7 @@ func main() {
 
 	sm.RegisterGRPC(grpcServer)
 
-	pm := partitionmanager.NewPartitionManager(etcd, client, config)
+	pm := partition_manager.NewPartitionManager(etcd, client, config)
 	go pm.LeaderLoop()
 
 	/*
