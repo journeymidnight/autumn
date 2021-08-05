@@ -105,7 +105,7 @@ func parseParts(kvs []*mvccpb.KeyValue) map[uint64]*pspb.PartitionMeta {
 	return ret
 }
 
-func (pm *PartitionManager) watchEvents(watchServerCh clientv3.WatchChan, closeWatch func()) {
+func (pm *PartitionManager) watchPSEvents(watchServerCh clientv3.WatchChan, closeWatch func()) {
 	var err error
 	for {
 		select {
@@ -114,8 +114,8 @@ func (pm *PartitionManager) watchEvents(watchServerCh clientv3.WatchChan, closeW
 			closeWatch()
 			pm.currentRegions = nil
 			pm.psNodes = nil
-			pm.partMeta = nil
 			pm.Unlock()
+			return
 		case res := <- watchServerCh:
 			pm.Lock()
 			for _, e := range res.Events {
@@ -275,6 +275,7 @@ func (pm *PartitionManager) runAsLeader() {
 		part := pm.partMeta[region.PartID]
 		if part == nil {
 			//在删除part时, 同时也会修config, 不应当出现这个情况, BUGON
+			//如果用其他方式如从etcd删除part, 可以直接删除"regions/config"
 			xlog.Logger.Fatal("part %d is in config, but not int meta", region.PartID)
 		}
 	}
@@ -347,19 +348,81 @@ func (pm *PartitionManager) runAsLeader() {
 	
 
 	//start watch PSSERVER
-	watchServerCh, closeWatchCh := etcd_utils.EtcdWatchEvents(pm.client, "PSSERVER/", "PSSERVER0", maxRev)
+	watchPSServerCh, closeWatchPSCh := etcd_utils.EtcdWatchEvents(pm.client, "PSSERVER/", "PSSERVER0", maxRev)
+	watchPartServerCh, closeWatchPartCh := etcd_utils.EtcdWatchEvents(pm.client, "PART/", "PART0", maxRev)
 
 
 	pm.stopper.RunWorker(func(){
-		pm.watchEvents(watchServerCh, closeWatchCh)
+		pm.watchPSEvents(watchPSServerCh, closeWatchPSCh)
 	})
 
+	pm.stopper.RunWorker(func(){
+		pm.watchPartEvents(watchPartServerCh, closeWatchPartCh)
+	})
 	atomic.StoreInt32(&pm.isLeader, 1)
 }
 
 
 func (pm *PartitionManager) etcdLeader() uint64 {
 	return uint64(pm.etcd.Server.Leader())
+}
+
+//watchPartEvents watch part events
+func (pm *PartitionManager) watchPartEvents(watchCh clientv3.WatchChan, closeCh func()) {
+	for {
+		select {
+		case <-pm.stopper.ShouldStop():
+			closeCh()
+			pm.Lock()
+			pm.partMeta = nil
+			pm.Unlock()
+			return
+		case event := <-watchCh:
+			pm.Lock()
+			for _, e := range event.Events {
+				var partMeta pspb.PartitionMeta
+				switch e.Type.String() {
+				case "PUT":
+					utils.MustUnMarshal(e.Kv.Value, &partMeta)
+					if _, ok := pm.partMeta[partMeta.PartID]; ok {
+						pm.partMeta[partMeta.PartID] = &partMeta
+						continue
+					}
+					//else this a new Part created.
+					fmt.Printf("new part %d is created [%v]\n", partMeta.PartID, partMeta.Rg)
+					pm.partMeta[partMeta.PartID] = &partMeta
+					//alloc partMeta
+					psID, err := pm.policy.AllocPart(pm.psNodes)
+					if err != nil {
+						//分配错误?
+						xlog.Logger.Errorf("can not alloc parts to partition servers")
+						continue
+					}
+					pm.currentRegions.Regions[partMeta.PartID] = &pspb.RegionInfo{
+						Rg: partMeta.Rg,
+						PartID: partMeta.PartID,
+						PSID: psID,
+					}
+					fmt.Printf("NEW PART: set regions/config %+v", pm.currentRegions.Regions)
+
+					ops := []clientv3.Op{
+						clientv3.OpPut(fmt.Sprintf("regions/config"), string(utils.MustMarshal(pm.currentRegions))),
+					}
+					if err = etcd_utils.EtcdSetKVS(pm.client, []clientv3.Cmp{
+						clientv3.Compare(clientv3.Value(pm.leaderKey), "=", pm.memberValue),
+					}, ops) ; err != nil {
+						xlog.Logger.Warnf("this pm is not leader , can not set 'regions/config'")
+					}
+				case "DELETE":
+					xlog.Logger.Warnf("partition %d is deleted", e.Kv.Key)	
+				default:
+					//in case of "DELETE" or others
+					xlog.Logger.Fatalf("no solution for event %s", e.Type.String())
+				}
+			}
+			pm.Unlock()
+		}
+	}
 }
 
 //FIXME:put into etcd_op
