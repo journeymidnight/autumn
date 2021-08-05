@@ -183,6 +183,7 @@ func main() {
 	detailText := widget.NewMultiLineEntry()
 	detailText.SetText("Select An Item From The List")
 
+	var chosenItemID widget.ListItemID
 	list := widget.NewList(
 		func() int {
 			return len(data)
@@ -196,9 +197,11 @@ func main() {
 	)
 	list.OnSelected = func(id widget.ListItemID) {
 		detailText.SetText(data[id].Value)
+		chosenItemID = id
 	}
 	list.OnUnselected = func(id widget.ListItemID) {
 		detailText.SetText("Select An Item From The List")
+		chosenItemID = widget.ListItemID(-1)
 	}
 
 	refresh := func() {
@@ -206,6 +209,7 @@ func main() {
 		myWindow.SetTitle("getting data...")
 		list.Refresh()
 		myWindow.SetTitle("etcd data")
+		chosenItemID = widget.ListItemID(-1)
 	}
 
 	refresh()
@@ -215,6 +219,11 @@ func main() {
 
 	deleteButton := widget.NewButton("delete", func() {
 		keyName := widget.NewEntry()
+		if chosenItemID == widget.ListItemID(-1) {
+			keyName.SetText("")
+		} else {
+			keyName.SetText(data[chosenItemID].Key)
+		}
 		items := []*widget.FormItem{
 			widget.NewFormItem("KeyName", keyName),
 		}
