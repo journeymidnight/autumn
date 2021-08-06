@@ -106,7 +106,8 @@ func OpenMockStreamClient(si pb.StreamInfo, br *MockBlockReader) StreamClient {
 }
 
 func (client *MockStreamClient) End() uint32 {
-	panic("mockStream should not call End")
+	//fake function
+	return 0
 }
 
 func (client *MockStreamClient) CheckCommitLength() error {

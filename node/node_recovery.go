@@ -464,9 +464,11 @@ func (en *ExtentNode) ReAvali(ctx context.Context, req *pb.ReAvaliRequest) (*pb.
 	} else {
 		start, _ := ex.ValidAllBlocks()
 		err = ex.Truncate(uint32(start))
-		if err == nil {
-			err = en.recoveryErasureExtent(exInfo, en.nodeID, uint64(start), exInfo.SealedLength - start, ex.Extent)
+		if err != nil {
+			xlog.Logger.Errorf("EC recovery after validBlocks truncate extent %d error %v", exInfo.ExtentID, err)
+			return errDone(err)
 		}
+		err = en.recoveryErasureExtent(exInfo, en.nodeID, uint64(start), exInfo.SealedLength - start, ex.Extent)
 	}
 	xlog.Logger.Infof("recovery data err is %v", err)
 	if err != nil {

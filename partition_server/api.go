@@ -100,16 +100,6 @@ func (ps *PartitionServer) Range(ctx context.Context, req *pspb.RangeRequest) (*
 		return nil, errors.New("no such partid")
 	}
 	
-	//提前对prefix做判断, 保证preifx在区间内, 避免调用NewIterator时进行遍历
-	if len(req.Prefix) > 0 {
-		if bytes.Compare(rp.StartKey, req.Prefix) <= 0 && (len(rp.EndKey) == 0 || bytes.Compare(req.Prefix, rp.EndKey) < 0) {
-			//prefix is in range
-		} else {
-			return nil, errors.Errorf("prefix is not in range [%s, %s]", rp.StartKey, rp.EndKey)
-		}
-	}
-	
-
 	out := rp.Range(req.Prefix, req.Start, req.Limit)
 
 	var truncated uint32

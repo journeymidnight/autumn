@@ -356,5 +356,4 @@ If an EN was not reachable by the SM during the sealing process but later become
 the SM will force the EN to synchronize the given extent to the chosen commit length
 
 2. node增加过期extent检查
-4. 增加split stream
 5. 增加删除stream
