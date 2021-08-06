@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"math"
 	"sort"
 	"time"
 
@@ -241,10 +240,10 @@ func (lib *AutumnLib) Get(ctx context.Context, key []byte) ([]byte, error) {
 
 }
 
-func (lib *AutumnLib) Range(ctx context.Context, prefix []byte, start []byte) ([][]byte, error) {
+func (lib *AutumnLib) Range(ctx context.Context, prefix []byte, start []byte, limit uint32) ([][]byte, bool, error) {
 	sortedRegions := lib.getRegions()
 	if len(sortedRegions) == 0 {
-		return nil, errors.New("no regions to write")
+		return nil, false, errors.New("no regions to write")
 	}
 	//FIXME: 多range partition的情况
 	//idx
@@ -256,7 +255,8 @@ func (lib *AutumnLib) Range(ctx context.Context, prefix []byte, start []byte) ([
 	})
 	//start from idx
 	results := make([][]byte, 0)
-	for i := idx ; i < len(sortedRegions) ; i++ {
+	var more bool
+	for i := idx ; i < len(sortedRegions) && limit > 0 ; i++ {
 		if i != idx {
 			if !bytes.HasPrefix(sortedRegions[i].Rg.StartKey, prefix){
 				break
@@ -268,18 +268,22 @@ func (lib *AutumnLib) Range(ctx context.Context, prefix []byte, start []byte) ([
 		res, err := client.Range(ctx, &pspb.RangeRequest{
 			Prefix: prefix,
 			Start:  start,
-			Limit:  math.MaxUint32,
+			Limit:  limit,
 			Partid: sortedRegions[i].PartID,
 		})
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
+
+		limit -= uint32(len(res.Keys))
+		more = (res.Truncated == 1)
 		//print len of res.Keys
-		//fmt.Printf("len of res.Keys %d\n", len(res.Keys))
+		fmt.Printf("i :%d, len of res.Keys %d\n", i,len(res.Keys))
 		results = append(results, res.Keys...)
+
 	}
 
-	return results, nil
+	return results, more, nil
 }
 
 

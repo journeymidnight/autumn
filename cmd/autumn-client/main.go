@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"math/rand"
 	"os"
 	"os/signal"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -304,9 +306,22 @@ func autumnRange(c *cli.Context) error {
 	if err := client.Connect(); err != nil {
 		return err
 	}
-	prefix := c.Args().First()
+	start := c.String("start")
+	prefix := c.String("prefix")
+	limit := c.Int("limit")
+	var err error
 
-	out, err := client.Range(context.Background(), []byte(prefix), []byte(prefix))
+	if len(start) == 0 && len(prefix) > 0 {
+		start = prefix
+	}
+	
+	if !strings.HasPrefix(start, prefix){
+		return errors.Errorf("start :[%s] does not have prefix [%s]", start, prefix)
+	}
+
+
+
+	out, _, err := client.Range(context.Background(), []byte(prefix), []byte(start), uint32(limit))
 	if err != nil {
 		return err
 	}
@@ -474,6 +489,9 @@ func main() {
 			Usage: "ls --etcdAddr <addrs> <prefix>",
 			Flags: []cli.Flag{
 				&cli.StringFlag{Name: "etcdAddr", Value: "127.0.0.1:2379"},
+				&cli.StringFlag{Name: "start", Value: ""},
+				&cli.StringFlag{Name: "prefix", Value: ""},
+				&cli.Int64Flag{Name: "limit", Value: math.MaxUint32},
 			},
 			Action: autumnRange,
 		},
