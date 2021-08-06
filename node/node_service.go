@@ -49,6 +49,7 @@ func (en *ExtentNode) Heartbeat(in *pb.Payload, stream pb.ExtentService_Heartbea
 			return ctx.Err()
 		case <-ticker.C:
 			if err := stream.Send(out); err != nil {
+				fmt.Printf("remote connect lost\n")
 				return err
 			}
 		}

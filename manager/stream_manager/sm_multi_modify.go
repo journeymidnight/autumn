@@ -70,7 +70,6 @@ func (sm *StreamManager) duplicateStream(ops *[]clientv3.Op, srcStreamID uint64,
 		updateExInfos = append(updateExInfos, exInfo)
 	}
 	
-	fmt.Printf("update stream %d: %v\n", destStreamID, newStreamInfo)
 	*ops = append(*ops, clientv3.OpPut(formatStreamKey(destStreamID), string(utils.MustMarshal(&newStreamInfo))))
 
 
@@ -83,7 +82,8 @@ func (sm *StreamManager) duplicateStream(ops *[]clientv3.Op, srcStreamID uint64,
 			sm.extents.Set(exInfo.ExtentID, exInfo)
 		}
 		unlockExtents()
-		sm.streams.Set(destStreamID, newStreamInfo)
+		sm.streams.Set(destStreamID, &newStreamInfo)
+		fmt.Printf("update stream %d: %v\n", destStreamID, newStreamInfo)
 	}, nil
 }
 
@@ -151,7 +151,7 @@ func (sm *StreamManager) MultiModifySplit(ctx context.Context, req *pb.MultiModi
 	var successOps []func()
 	var failedOps []func()
 
-	s, f, err := sm.duplicateStream(&ops,  meta.LogStream, start, req.LogStreamSealedLength)
+	f, s, err := sm.duplicateStream(&ops,  meta.LogStream, start, req.LogStreamSealedLength)
 	if err != nil {
 		return errDone(err)
 	}
@@ -160,7 +160,7 @@ func (sm *StreamManager) MultiModifySplit(ctx context.Context, req *pb.MultiModi
 	
 
 	//seal meta.RowStream first
-	s, f, err = sm.duplicateStream(&ops, meta.RowStream, start +1, req.RowStreamSealedLength)
+	f, s, err = sm.duplicateStream(&ops, meta.RowStream, start +1, req.RowStreamSealedLength)
 	if err != nil {
 		return errDone(err)
 	}
@@ -171,14 +171,14 @@ func (sm *StreamManager) MultiModifySplit(ctx context.Context, req *pb.MultiModi
 
 	i := start + 2
 	for gabageStreamID := range garbageStreams.Blobs {
-		s, f, err = sm.duplicateStream(&ops, gabageStreamID, i, 0) 
+		f, s, err = sm.duplicateStream(&ops, gabageStreamID, i, 0) 
 		if err != nil {
 			return errDone(err)
 		}
 		successOps = append(successOps, s)
 		failedOps = append(failedOps, f)
 		i ++
-	}
+	} 
 	utils.AssertTrue(i == end -1)
 
 	
@@ -196,6 +196,7 @@ func (sm *StreamManager) MultiModifySplit(ctx context.Context, req *pb.MultiModi
 	}
 	ops = append(ops, clientv3.OpPut(fmt.Sprintf("PART/%d", newPartID), string(utils.MustMarshal(&newMeta))))
 	//update original meta's EndKey to midKEY
+
 	meta.Rg.EndKey = req.MidKey
 	ops = append(ops, clientv3.OpPut(fmt.Sprintf("PART/%d", req.PartID), string(utils.MustMarshal(&meta))))
 

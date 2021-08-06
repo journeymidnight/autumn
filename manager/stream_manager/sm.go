@@ -2,6 +2,7 @@ package stream_manager
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -165,6 +166,8 @@ func (sm *StreamManager) AmLeader() bool {
 func (sm *StreamManager) runAsLeader() {
 	//load system
 
+	startLoading := time.Now()
+
 	//load streams
 	kvs, _, err := etcd_utils.EtcdRange(sm.client, "streams")
 	if err != nil {
@@ -187,7 +190,9 @@ func (sm *StreamManager) runAsLeader() {
 		}
 
 		//FIXME:
-		utils.AssertTrue(kv.Version == int64(streamInfo.Sversion))
+		if kv.Version != int64(streamInfo.Sversion) {
+			panic(fmt.Sprintf("%s 's Version is not equal to %d", kv.Key, kv.Version, streamInfo.Sversion))
+		}
 
 		/*
 		Fix if kv.Version != streamInfo.Sversion
@@ -221,9 +226,11 @@ func (sm *StreamManager) runAsLeader() {
 			xlog.Logger.Errorf(err.Error())
 			return
 		}
-
-		utils.AssertTrue(kv.Version == int64(extentInfo.Eversion))
-
+		
+		if kv.Version != int64(extentInfo.Eversion) {
+			panic(fmt.Sprintf("%s 's Version %d is not equal to %d", kv.Key, kv.Version, extentInfo.Eversion))
+		}
+		
 
 		sm.extents.Set(extentID, &extentInfo)
 		sm.extentsLocks.Store(extentID, new(sync.Mutex))
@@ -303,6 +310,7 @@ func (sm *StreamManager) runAsLeader() {
 	sm.stopper.RunWorker(sm.routineUpdateDF)
 	sm.stopper.RunWorker(sm.routineDispatchTask)
 
+	fmt.Printf("Start loading data from etcd, cost %v\n", time.Now().Sub(startLoading))
 	atomic.StoreInt32(&sm.isLeader, 1)
 }
 
