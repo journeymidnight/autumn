@@ -299,17 +299,13 @@ func autumnRange(c *cli.Context) error {
 		return errors.Errorf("etcdAddr is nil")
 	}
 	client := NewAutumnLib(etcdAddr)
-	//defer client.Close()
+	defer client.Close()
 
 	if err := client.Connect(); err != nil {
 		return err
 	}
 	prefix := c.Args().First()
-	/*
-		if len(prefix) == 0 {
-			return errors.New("no key")
-		}
-	*/
+
 	out, err := client.Range(context.Background(), []byte(prefix), []byte(prefix))
 	if err != nil {
 		return err

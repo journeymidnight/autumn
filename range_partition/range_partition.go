@@ -838,6 +838,9 @@ func (rp *RangePartition) getTablesForKey(userKey []byte) ([]*table.Table, func(
 }
 
 func (rp *RangePartition) Range(prefix []byte, start []byte, limit uint32) [][]byte {
+
+
+	hasOverLap := atomic.LoadUint32(&rp.hasOverlap) == 1
 	iter := rp.newIterator()
 	defer iter.Close()
 	var out [][]byte
@@ -845,16 +848,31 @@ func (rp *RangePartition) Range(prefix []byte, start []byte, limit uint32) [][]b
 	startTs := y.KeyWithTs(start, atomic.LoadUint64(&rp.seqNumber))
 	//readTs: 是否以后支持readTs:如果version比readTS大, 则忽略这个版本
 	for iter.Seek(startTs); iter.Valid() && uint32(len(out)) < limit; iter.Next() {
+		
 		if !bytes.HasPrefix(iter.Key(), prefix) {
 			break
 		}
+		
+		userKey := y.ParseKey(iter.Key())
+
+		if hasOverLap{
+			//if hasOverLap && userKey less than rp.startKey, then continue
+			if bytes.Compare(userKey, rp.StartKey) < 0 {
+				continue
+			}
+			//if hasOverLap && userKey greater than rp.endKey, then break
+			if len(rp.EndKey) > 0 && bytes.Compare(userKey, rp.EndKey) >= 0 {
+				break
+			}
+		}
+
 		if len(skipKey) > 0 {
 			if y.SameKey(iter.Key(), skipKey) {
 				continue
 			} else {
 				skipKey = skipKey[:0] //reset
 			}
-		}
+		}	
 		skipKey = y.SafeCopy(skipKey, iter.Key())
 
 		vs := iter.Value()
@@ -863,7 +881,7 @@ func (rp *RangePartition) Range(prefix []byte, start []byte, limit uint32) [][]b
 			continue
 		}
 		//FIXME:slab allocation key
-		out = append(out, y.Copy(y.ParseKey(iter.Key())))
+		out = append(out, y.Copy(userKey))
 	}
 	return out
 }
