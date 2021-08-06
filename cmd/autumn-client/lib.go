@@ -190,6 +190,9 @@ func (lib *AutumnLib) getRegions() []*pspb.RegionInfo {
 
 
 func (lib *AutumnLib) Put(ctx context.Context, key, value []byte) error {
+	if len(key)== 0 || len(value) == 0 { 
+		return errors.New("key or value is empty")
+	}
 	sortedRegions := lib.getRegions()
 	if len(sortedRegions) == 0 {
 		return errors.New("no regions to write")
@@ -249,22 +252,34 @@ func (lib *AutumnLib) Range(ctx context.Context, prefix []byte, start []byte) ([
 		if len(sortedRegions[i].Rg.EndKey) == 0 {
 			return true
 		}
-		return bytes.Compare(sortedRegions[i].Rg.EndKey, prefix) > 0
+		return bytes.Compare(sortedRegions[i].Rg.EndKey, start) > 0
 	})
-
-	conn := lib.getConn(lib.getPSAddr((sortedRegions[idx].PSID)))
-
-	client := pspb.NewPartitionKVClient(conn)
-	res, err := client.Range(ctx, &pspb.RangeRequest{
-		Prefix: prefix,
-		Start:  start,
-		Limit:  math.MaxUint32,
-		Partid: sortedRegions[idx].PartID,
-	})
-	if err != nil {
-		return nil, err
+	//start from idx
+	results := make([][]byte, 0)
+	for i := idx ; i < len(sortedRegions) ; i++ {
+		if i != idx {
+			if !bytes.HasPrefix(sortedRegions[i].Rg.StartKey, prefix){
+				break
+			}
+		}
+		//fmt.Printf("range from partID %d, startKey %s \n", sortedRegions[i].PartID, string(sortedRegions[i].Rg.StartKey))
+		conn := lib.getConn(lib.getPSAddr((sortedRegions[i].PSID)))
+		client := pspb.NewPartitionKVClient(conn)
+		res, err := client.Range(ctx, &pspb.RangeRequest{
+			Prefix: prefix,
+			Start:  start,
+			Limit:  math.MaxUint32,
+			Partid: sortedRegions[i].PartID,
+		})
+		if err != nil {
+			return nil, err
+		}
+		//print len of res.Keys
+		//fmt.Printf("len of res.Keys %d\n", len(res.Keys))
+		results = append(results, res.Keys...)
 	}
-	return res.Keys, nil
+
+	return results, nil
 }
 
 

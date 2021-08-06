@@ -3,9 +3,10 @@ package partition_server
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"time"
+
+	"github.com/pkg/errors"
 
 	"github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/proto/pspb"
@@ -25,7 +26,7 @@ func (ps *PartitionServer) checkVersion(partID uint64, key []byte) *range_partit
 	if bytes.Compare(rp.StartKey, key) <= 0 && (len(rp.EndKey) == 0 || bytes.Compare(key, rp.EndKey) < 0) {
 		return rp
 	}
-	fmt.Println("compare?")
+	fmt.Println("key is not in range")
 	return nil
 }
 
@@ -92,13 +93,33 @@ func (ps *PartitionServer) Delete(ctx context.Context, req *pspb.DeleteRequest) 
 }
 
 func (ps *PartitionServer) Range(ctx context.Context, req *pspb.RangeRequest) (*pspb.RangeResponse, error) {
-	rp := ps.checkVersion(req.Partid, req.Start)
+	ps.RLock()
+	rp := ps.rangePartitions[req.Partid]
+	ps.RUnlock()
 	if rp == nil {
 		return nil, errors.New("no such partid")
 	}
+	
+	//提前对prefix做判断, 保证preifx在区间内, 避免调用NewIterator时进行遍历
+	if len(req.Prefix) > 0 {
+		if bytes.Compare(rp.StartKey, req.Prefix) <= 0 && (len(rp.EndKey) == 0 || bytes.Compare(req.Prefix, rp.EndKey) < 0) {
+			//prefix is in range
+		} else {
+			return nil, errors.Errorf("prefix is not in range [%s, %s]", rp.StartKey, rp.EndKey)
+		}
+	}
+	
+
 	out := rp.Range(req.Prefix, req.Start, req.Limit)
+
+	var truncated uint32
+	if len(out) == int(req.Limit) {
+		truncated = 1
+	} else {
+		truncated = 0
+	}
 	return &pspb.RangeResponse{
-		Truncated: 0,
+		Truncated: truncated,
 		Keys:      out,
 	}, nil
 }
