@@ -274,7 +274,7 @@ retry:
 	exInfo := iter.sc.em.GetExtentInfo(extentID)
 	//xlog.Logger.Debugf("read extentID %d, offset : %d, eversion is %d\n", extentID, iter.currentOffset, exInfo.Eversion)
 
-	//fmt.Printf("read extentID %d, offset : %d,  index : %d\n", extentID, iter.currentOffset, iter.currentExtentIndex)
+	//mt.Printf("read extentID %d, offset : %d,  index : %d\n", extentID, iter.currentOffset, iter.currentExtentIndex)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	c := pb.NewExtentServiceClient(iter.conn)
 	res, err := c.ReadEntries(ctx, &pb.ReadEntriesRequest{
@@ -447,8 +447,12 @@ func (sc *AutumnStreamClient) Connect() error {
 	sc.streamInfo = s[sc.streamID]
 
 	//wait to get the latest extentInfo for future write.
-	exID, _ := sc.getLastExtent()
+	exID, err := sc.getLastExtent()
+	if err != nil {
+		return err
+	}
 	exInfo := sc.em.Latest(exID)
+	utils.AssertTrue(exInfo != nil)
 	sc.em.WaitVersion(exID, exInfo.Eversion)
 
 	fmt.Printf("stream info is %d : %v\n", sc.streamInfo.StreamID, sc.streamInfo.ExtentIDs)

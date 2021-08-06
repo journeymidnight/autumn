@@ -160,6 +160,7 @@ func (ps *PartitionServer) parseRegionAndStart(regions *pspb.Regions) int64{
 		mutex := concurrency.NewMutex(ps.session, formatPartLock(region.PartID))
 		utils.Check(mutex.Lock(context.Background()))
 
+		fmt.Printf("getPartionMeta %d\n", region.PartID)
 		if rev, meta, locs ,blobs, err = ps.getPartitionMeta(region.PartID) ; err != nil {
 			xlog.Logger.Errorf(err.Error())
 			mutex.Unlock(context.Background())
@@ -199,7 +200,7 @@ func (ps *PartitionServer) Init() {
 	//share the connection with extentManager
 	ps.etcdClient = ps.extentManager.EtcdClient()
 	
-	session , err := concurrency.NewSession(ps.etcdClient, concurrency.WithTTL(30))
+	session , err := concurrency.NewSession(ps.etcdClient, concurrency.WithTTL(60))
 	utils.Check(err)
 
 	ps.session = session

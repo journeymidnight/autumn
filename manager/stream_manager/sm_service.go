@@ -629,8 +629,12 @@ func (sm *StreamManager) ExtentInfo(ctx context.Context, req *pb.ExtentInfoReque
 	}
 
 	out := make(map[uint64]*pb.ExtentInfo)
+	var ok bool
 	for _, extentId := range req.Extents {
-		out[extentId], _ = sm.cloneExtentInfo(extentId)
+		out[extentId], ok = sm.cloneExtentInfo(extentId)
+		if !ok {
+			return errDone(errors.New("not found"))
+		}
 	}
 	return &pb.ExtentInfoResponse{
 		Code:    pb.Code_OK,

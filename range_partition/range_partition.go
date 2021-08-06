@@ -136,13 +136,13 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		key := y.ParseKey(tbl.Smallest())
 		if bytes.Compare(key, startKey) < 0 || (len(endKey) > 0 && bytes.Compare(key, endKey) >= 0) {
 			//smallest key in table is not in range
-			fmt.Printf("smallest key :%s is out of [%s, %s]\n", key, startKey, endKey)
+			//fmt.Printf("smallest key :%s is out of [%s, %s]\n", key, startKey, endKey)
 			rp.hasOverlap = 1
 		}
 		key = y.ParseKey(tbl.Biggest())
 		if bytes.Compare(key, startKey) < 0 || (len(endKey) > 0 && bytes.Compare(key, endKey) >= 0) {
 			//biggest key in table is not in range
-			fmt.Printf("bigest key :%s is out of [%s, %s]\n", key, startKey, endKey)
+			//fmt.Printf("bigest key :%s is out of [%s, %s]\n", key, startKey, endKey)
 			rp.hasOverlap = 1
 		}
 	}
@@ -255,6 +255,7 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		t.DecrRef()
 	}
 	*/
+	
 	return rp,nil
 }
 
