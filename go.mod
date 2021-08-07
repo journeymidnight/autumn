@@ -6,7 +6,7 @@ require (
 	fyne.io/fyne v1.4.3
 	fyne.io/fyne/v2 v2.0.1
 	github.com/BurntSushi/toml v0.3.1
-	github.com/HdrHistogram/hdrhistogram-go v0.9.0
+	github.com/HdrHistogram/hdrhistogram-go v1.1.0
 	github.com/cespare/xxhash v1.1.0
 	github.com/coreos/bbolt v0.0.0-00010101000000-000000000000 // indirect
 	github.com/coreos/etcd v3.3.22+incompatible
@@ -40,7 +40,7 @@ require (
 	github.com/prometheus/procfs v0.1.3 // indirect
 	github.com/satori/go.uuid v1.2.0 // indirect
 	github.com/soheilhy/cmux v0.1.4 // indirect
-	github.com/stretchr/testify v1.6.1
+	github.com/stretchr/testify v1.7.0
 	github.com/tmc/grpc-websocket-proxy v0.0.0-20200427203606-3cfed13b9966 // indirect
 	github.com/urfave/cli v1.22.5 // indirect
 	github.com/urfave/cli/v2 v2.3.0

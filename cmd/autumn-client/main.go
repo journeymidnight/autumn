@@ -22,6 +22,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/coreos/etcd/clientv3"
+	"github.com/journeymidnight/autumn/autumn_clientv1"
 	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/node"
@@ -50,7 +51,7 @@ const (
 
 func benchmark(etcdAddrs []string, op BenchType, threadNum int, duration int, size int) error {
 
-	client := NewAutumnLib(etcdAddrs)
+	client := autumn_clientv1.NewAutumnLib(etcdAddrs)
 	//defer client.Close()
 
 	if err := client.Connect(); err != nil {
@@ -111,7 +112,7 @@ func benchmark(etcdAddrs []string, op BenchType, threadNum int, duration int, si
 						return
 					default:
 						write := func(t int) {
-							key := fmt.Sprintf("test%d_%d_%d",n, t, j)
+							key := fmt.Sprintf("test%d_%d_%d", n, t, j)
 							ctx, cancel = context.WithCancel(context.Background())
 							start := time.Now()
 							err := client.Put(ctx, []byte(key), data)
@@ -236,8 +237,8 @@ func bootstrap(c *cli.Context) error {
 	zeroMeta := pspb.PartitionMeta{
 		LogStream: log.StreamID,
 		RowStream: row.StreamID,
-		Rg:&pspb.Range{StartKey: []byte(""), EndKey: []byte("")},
-		PartID: partID,
+		Rg:        &pspb.Range{StartKey: []byte(""), EndKey: []byte("")},
+		PartID:    partID,
 	}
 
 	//valid no PART exists...
@@ -252,13 +253,13 @@ func bootstrap(c *cli.Context) error {
 		return err
 	}
 
-	fmt.Printf("bootstrap succeed, created new range partition %d\n", partID)	
+	fmt.Printf("bootstrap succeed, created new range partition %d\n", partID)
 	return nil
 }
 
 func del(c *cli.Context) error {
 	etcdAddr := utils.SplitAndTrim(c.String("etcdAddr"), ",")
-	client := NewAutumnLib(etcdAddr)
+	client := autumn_clientv1.NewAutumnLib(etcdAddr)
 	//defer client.Close()
 	if err := client.Connect(); err != nil {
 		return err
@@ -274,7 +275,7 @@ func del(c *cli.Context) error {
 
 func get(c *cli.Context) error {
 	etcdAddr := utils.SplitAndTrim(c.String("etcdAddr"), ",")
-	client := NewAutumnLib(etcdAddr)
+	client := autumn_clientv1.NewAutumnLib(etcdAddr)
 	//defer client.Close()
 
 	if err := client.Connect(); err != nil {
@@ -300,7 +301,7 @@ func autumnRange(c *cli.Context) error {
 	if len(etcdAddr) == 0 {
 		return errors.Errorf("etcdAddr is nil")
 	}
-	client := NewAutumnLib(etcdAddr)
+	client := autumn_clientv1.NewAutumnLib(etcdAddr)
 	defer client.Close()
 
 	if err := client.Connect(); err != nil {
@@ -314,12 +315,10 @@ func autumnRange(c *cli.Context) error {
 	if len(start) == 0 && len(prefix) > 0 {
 		start = prefix
 	}
-	
-	if !strings.HasPrefix(start, prefix){
+
+	if !strings.HasPrefix(start, prefix) {
 		return errors.Errorf("start :[%s] does not have prefix [%s]", start, prefix)
 	}
-
-
 
 	out, _, err := client.Range(context.Background(), []byte(prefix), []byte(start), uint32(limit))
 	if err != nil {
@@ -337,7 +336,7 @@ func put(c *cli.Context) error {
 	if len(etcdAddr) == 0 {
 		return errors.Errorf("etcdAddr is nil")
 	}
-	client := NewAutumnLib(etcdAddr)
+	client := autumn_clientv1.NewAutumnLib(etcdAddr)
 	//defer client.Close()
 
 	if err := client.Connect(); err != nil {
@@ -362,13 +361,12 @@ func put(c *cli.Context) error {
 	return nil
 }
 
-
 func splitPartition(c *cli.Context) error {
 	etcdAddr := utils.SplitAndTrim(c.String("etcdAddr"), ",")
 	if len(etcdAddr) == 0 {
 		return errors.Errorf("etcdAddr is nil")
 	}
-	client := NewAutumnLib(etcdAddr)
+	client := autumn_clientv1.NewAutumnLib(etcdAddr)
 
 	if err := client.Connect(); err != nil {
 		return err
@@ -382,13 +380,12 @@ func splitPartition(c *cli.Context) error {
 		return errors.New("partID is nil")
 
 	}
-	partID , err := strconv.ParseUint(partIDString, 10, 64)
+	partID, err := strconv.ParseUint(partIDString, 10, 64)
 	if err != nil {
 		return errors.Errorf("partID is not int: %s", partIDString)
 	}
 	return client.SplitPart(context.Background(), partID)
 }
-
 
 func info(c *cli.Context) error {
 	smAddrs := utils.SplitAndTrim(c.String("smAddr"), ",")
@@ -513,7 +510,6 @@ func main() {
 
 }
 
-
 //FIXME: detect disk and verify , then register first, then write down uuid, node_id, directory level
 func format(c *cli.Context) error {
 	//if any error happend, revert.
@@ -571,7 +567,7 @@ func format(c *cli.Context) error {
 	//register a new NodeID
 
 	fmt.Printf("format on disks : %+v", dirList)
-	
+
 	fmt.Printf("register node on stream manager ..\n")
 	nodeID, uuidToDiskID, err := sm.RegisterNode(context.Background(), uuids, listenUrl)
 	if err != nil {
@@ -580,7 +576,7 @@ func format(c *cli.Context) error {
 	}
 
 	fmt.Printf("node %d is registered\n", nodeID)
-	
+
 	for _, dir := range dirList {
 		nodeIDPath := path.Join(dir, "node_id")
 		if err := ioutil.WriteFile(nodeIDPath, []byte(fmt.Sprintf("%d", nodeID)), 0644); err != nil {
