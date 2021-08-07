@@ -1,4 +1,4 @@
-package main
+package autumn_clientv1
 
 import (
 	"bytes"
@@ -18,26 +18,24 @@ import (
 )
 
 type AutumnLib struct {
-	etcdClient       *clientv3.Client
-	etcdAddr          []string
+	etcdClient      *clientv3.Client
+	etcdAddr        []string
 	regions         []*pspb.RegionInfo
 	psDetails       map[uint64]*pspb.PSDetail
 	utils.SafeMutex //protect regions and psDetails
-	closeWatch     func()
+	closeWatch      func()
 
 	conns    map[string]*grpc.ClientConn
 	connLock utils.SafeMutex //protect conns
 }
 
-
 func NewAutumnLib(etcdAddr []string) *AutumnLib {
 	return &AutumnLib{
-		etcdAddr: etcdAddr,
+		etcdAddr:  etcdAddr,
 		psDetails: make(map[uint64]*pspb.PSDetail),
-		conns : make(map[string]*grpc.ClientConn),
+		conns:     make(map[string]*grpc.ClientConn),
 	}
 }
-
 
 func (lib *AutumnLib) Close() {
 	lib.etcdClient.Close()
@@ -49,7 +47,7 @@ func (lib *AutumnLib) saveRegion(regions *pspb.Regions) {
 	i := 0
 	for _, region := range regions.Regions {
 		newRegions[i] = region
-		i ++
+		i++
 	}
 	sort.Slice(newRegions, func(i, j int) bool {
 		return bytes.Compare(newRegions[i].Rg.StartKey, newRegions[j].Rg.StartKey) < 0
@@ -66,9 +64,8 @@ func (lib *AutumnLib) Connect() error {
 	})
 	lib.etcdClient = client
 
-
 	var maxRev int64
-	data, rev , err := etcd_utils.EtcdGetKV(client, "regions/config")
+	data, rev, err := etcd_utils.EtcdGetKV(client, "regions/config")
 	if err == nil {
 		var regions pspb.Regions
 		utils.MustUnMarshal(data, &regions)
@@ -77,7 +74,7 @@ func (lib *AutumnLib) Connect() error {
 	}
 	maxRev = utils.Max64(maxRev, rev)
 
-	var kvs []*mvccpb.KeyValue	
+	var kvs []*mvccpb.KeyValue
 	kvs, rev, err = etcd_utils.EtcdRange(client, "PSSERVER/")
 	if err == nil {
 		for _, kv := range kvs {
@@ -88,8 +85,6 @@ func (lib *AutumnLib) Connect() error {
 	}
 	maxRev = utils.Max64(maxRev, rev)
 
-	
-
 	watch1, close1 := etcd_utils.EtcdWatchEvents(client, "regions/config", "", maxRev)
 	go func() {
 		for res := range watch1 {
@@ -97,7 +92,7 @@ func (lib *AutumnLib) Connect() error {
 			fmt.Printf("%+v\n", res)
 			e := res.Events[len(res.Events)-1]
 			var regions pspb.Regions
-			if err = regions.Unmarshal(e.Kv.Value) ; err != nil {
+			if err = regions.Unmarshal(e.Kv.Value); err != nil {
 				xlog.Logger.Errorf(err.Error())
 				continue
 			}
@@ -112,33 +107,33 @@ func (lib *AutumnLib) Connect() error {
 			for _, e := range res.Events {
 				var psDetail pspb.PSDetail
 				switch e.Type.String() {
-					case "PUT":
-						if err = psDetail.Unmarshal(e.Kv.Value) ; err != nil {
-							break
-						}
-						lib.Lock()
-						lib.psDetails[psDetail.PSID] = &psDetail
-						lib.Unlock()
-					case "DELETE":
-						if err = psDetail.Unmarshal(e.PrevKv.Value) ; err != nil {
-							break
-						}
-						lib.Lock()
-						delete(lib.psDetails, psDetail.PSID)
-						lib.Unlock()
+				case "PUT":
+					if err = psDetail.Unmarshal(e.Kv.Value); err != nil {
+						break
 					}
+					lib.Lock()
+					lib.psDetails[psDetail.PSID] = &psDetail
+					lib.Unlock()
+				case "DELETE":
+					if err = psDetail.Unmarshal(e.PrevKv.Value); err != nil {
+						break
+					}
+					lib.Lock()
+					delete(lib.psDetails, psDetail.PSID)
+					lib.Unlock()
+				}
 			}
 		}
 	}()
 
-	lib.closeWatch = func(){
+	lib.closeWatch = func() {
 		close1()
 		close2()
 	}
 	return nil
 }
 
-//会不会有可能PS更新的慢, 没有得到最新的PS,导致psDetails里面是空, 
+//会不会有可能PS更新的慢, 没有得到最新的PS,导致psDetails里面是空,
 //这里就loop ever
 func (lib *AutumnLib) getPSAddr(psID uint64) string {
 	for {
@@ -162,7 +157,7 @@ func (lib *AutumnLib) getConn(addr string) *grpc.ClientConn {
 
 	var err error
 	for {
-		conn, err = grpc.Dial(addr, 
+		conn, err = grpc.Dial(addr,
 			grpc.WithDefaultCallOptions(
 				grpc.MaxCallRecvMsgSize(33<<20),
 				grpc.MaxCallSendMsgSize(33<<20)),
@@ -187,9 +182,8 @@ func (lib *AutumnLib) getRegions() []*pspb.RegionInfo {
 	return lib.regions
 }
 
-
 func (lib *AutumnLib) Put(ctx context.Context, key, value []byte) error {
-	if len(key)== 0 || len(value) == 0 { 
+	if len(key) == 0 || len(value) == 0 {
 		return errors.New("key or value is empty")
 	}
 	sortedRegions := lib.getRegions()
@@ -256,9 +250,9 @@ func (lib *AutumnLib) Range(ctx context.Context, prefix []byte, start []byte, li
 	//start from idx
 	results := make([][]byte, 0)
 	var more bool
-	for i := idx ; i < len(sortedRegions) && limit > 0 ; i++ {
+	for i := idx; i < len(sortedRegions) && limit > 0; i++ {
 		if i != idx {
-			if !bytes.HasPrefix(sortedRegions[i].Rg.StartKey, prefix){
+			if !bytes.HasPrefix(sortedRegions[i].Rg.StartKey, prefix) {
 				break
 			}
 		}
@@ -278,7 +272,7 @@ func (lib *AutumnLib) Range(ctx context.Context, prefix []byte, start []byte, li
 		limit -= uint32(len(res.Keys))
 		more = (res.Truncated == 1)
 		//print len of res.Keys
-		fmt.Printf("i :%d, len of res.Keys %d\n", i,len(res.Keys))
+		fmt.Printf("i :%d, len of res.Keys %d\n", i, len(res.Keys))
 		results = append(results, res.Keys...)
 
 	}
@@ -286,13 +280,12 @@ func (lib *AutumnLib) Range(ctx context.Context, prefix []byte, start []byte, li
 	return results, more, nil
 }
 
-
 func (lib *AutumnLib) SplitPart(ctx context.Context, partID uint64) error {
 	sortedRegions := lib.getRegions()
 	foundRegion := -1
-	for i := 0 ; i < len(sortedRegions) ; i++ {
+	for i := 0; i < len(sortedRegions); i++ {
 		if sortedRegions[i].PartID == partID {
-			foundRegion= i
+			foundRegion = i
 		}
 	}
 	if foundRegion == -1 {
