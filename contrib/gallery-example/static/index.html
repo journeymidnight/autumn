@@ -1,0 +1,147 @@
+<p>
+Upload Zone:<br>
+<form action="/put/" enctype="multipart/form-data" id="upload">
+<input id="the-file" name="file" type="file">
+<input type="submit"/>
+</form>
+</p>
+
+<p id="progress"></p>
+
+<p id="fileid"></p>
+
+<p>
+Show Zone
+<form id="show">
+<input id="num" type="text">
+<input type="submit"/>
+</form>
+</p>
+
+<p>
+    <p id="link"></p>
+    <p id="loadingprogess"></p>
+    <img id="loadingimg" src='/loading.gif' style='display: none'>
+    <div id="preview"></div>
+</p>
+
+
+<script> 
+
+
+
+
+function setProgress(s, isDownload) {
+    const loadingProgress = document.getElementById("progress");
+    loadingProgress.innerHTML =  (isDownload ?`Download Progress ${s}%`: `Upload Progress ${s}%`);
+}
+
+function displayLoading() {
+    const e = document.getElementById('loadingimg');
+    e.style.display = "block";
+}
+function hideLoading() {
+    const e = document.getElementById('loadingimg');
+    e.style.display = "none";
+}
+
+Image.prototype.load = function(url){
+        var thisImg = this;
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', url,true);
+        xhr.responseType = 'arraybuffer';
+        xhr.onload = function(e) {
+            hideLoading();
+            var blob = new Blob([this.response]);
+            thisImg.src = window.URL.createObjectURL(blob);
+        };
+        xhr.onprogress = function(e) {
+            thisImg.completedPercentage = parseInt((e.loaded / e.total) * 100);
+            setProgress(thisImg.completedPercentage, true)
+        };
+        xhr.onloadstart = function() {
+            displayLoading();
+            thisImg.completedPercentage = 0;
+            setProgress(thisImg.completedPercentage, true)
+        };
+        xhr.onreadystatechange = function() {
+            if (this.readyState == 4) {
+                if (this.status != 200){
+                    alert(xhr.statusText);
+                }
+            }
+        }
+        xhr.send();
+};
+
+function previewImage(url){
+    var ext = url.substr(url.lastIndexOf('.'));
+    if (ext == '.jpg' || ext == '.jpeg' || ext == '.png' || ext == '.gif') {
+        var img = new Image();
+        img.load(url)
+        img.width = 400;
+        document.getElementById("link").innerHTML = `http://${window.location.hostname}:5000${url}`;
+        var previewDiv = document.getElementById('preview');
+        previewDiv.innerHTML = '';
+        document.getElementById('preview').appendChild(img);
+    } else {
+        //get content  from url
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', url, false);
+        xhr.send();    
+        document.getElementById("preview").innerHTML = xhr.responseText;
+    }
+
+}
+
+
+var uploadform = document.getElementById('upload');
+uploadform.addEventListener("submit", function(e){
+    e.preventDefault();
+    
+    var formData = new FormData(uploadform);
+    var fileInput = document.getElementById('the-file');
+    var file = fileInput.files[0];
+    
+    formData.append('file', file);
+
+    var xhr = new XMLHttpRequest();
+    
+    
+    xhr.upload.onloadstart = function(e) {
+        setProgress(0, false);
+    };
+    
+    
+    xhr.upload.onprogress = function(e) {
+        var percent = parseInt(e.loaded/e.total*100);
+        setProgress(percent, false);
+    }
+    
+    
+    //no upload here. different from others;
+    xhr.onreadystatechange = function() {
+        if (this.readyState == 4 && this.status == 200) {
+            document.getElementById("the-file").value = "";
+            console.log(this.responseText);
+            var re = /The ID is (\d+)/
+            var fileNum = this.responseText.replace(re, '$1')
+            if (fileNum != "") {
+                previewImage(`/get/${fileNum}`)
+            }
+        } else if (this.readyState == 4) {
+            alert("upload failed" + this.responseText);
+        }
+    };
+    xhr.open('POST', uploadform.getAttribute('action'), true);
+    xhr.send(formData);
+});
+
+var showform = document.getElementById('show');
+show.addEventListener('submit', function(e){
+        e.preventDefault();
+        var inputText = document.getElementById('num').value;
+        previewImage(`/get/${inputText}`);
+});
+
+</script>

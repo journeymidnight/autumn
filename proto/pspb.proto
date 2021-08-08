@@ -16,15 +16,6 @@ syntax = "proto3";
 
 package pspb;
 
-import "pb.proto";
-
-
-message MixedLog {
-	repeated uint32 offsets = 1;
-}
-
-
-
 
 /*
 
@@ -105,27 +96,6 @@ message TableIndex {
   uint64 estimatedSize = 3;
   uint32 numOfBlocks = 4;
 }
-
-
-message GetPartitionMetaRequest {
-	uint64 PSID = 1;
-}
-message GetPartitionMetaResponse {
-	pb.Code code = 1;
-	repeated PartitionMeta meta = 2;
-}
-
-
-message SetRowStreamTablesRequest {
-	uint64 partitionID = 1;
-	TableLocations locs = 2;
-}
-
-message SetRowStreamTablesResponse {
-	pb.Code code = 1;
-}
-
-
 
 
 
