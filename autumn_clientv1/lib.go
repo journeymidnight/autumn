@@ -103,7 +103,6 @@ func (lib *AutumnLib) Connect() error {
 	watch2, close2 := etcd_utils.EtcdWatchEvents(client, "PSSERVER/", "PSSERVER0", maxRev)
 	go func() {
 		for res := range watch2 {
-			//skip to the last, only cares about latest config
 			for _, e := range res.Events {
 				var psDetail pspb.PSDetail
 				switch e.Type.String() {

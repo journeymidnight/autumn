@@ -235,8 +235,8 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 
 	//do compactions:FIXME, doCompactions放到另一个goroutine里面执行
 
-	
 	/*
+	
 	var tbls []*table.Table
 	rp.tableLock.RLock()
 	for _, t := range rp.tables {
