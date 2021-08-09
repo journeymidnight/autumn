@@ -1,3 +1,4 @@
+#/usr/bin/python3
 import pspb_pb2_grpc as pspb_grpc
 import pspb_pb2 as pspb
 import etcd3
@@ -86,6 +87,28 @@ class AutumnLib:
         return stub.Put(pspb.PutRequest(key=key,value=value,partid=sortedRegion[idx].PartID))
 
 
+    def ListAll(self):
+        sortedRegion = self._getRegions()
+        if len(sortedRegion) == 0:
+            return None
+        #loop over all regions
+        try:
+            for region in sortedRegion:
+                conn = self._getConn(self._getPSAddr(region.PSID))
+                stub = pspb_grpc.PartitionKVStub(conn)
+                res = stub.Range(pspb.RangeRequest(
+                    partid=region.PartID,
+                    limit = ((1<<32) - 1)),
+                )
+                #append res to list
+                for key in res.keys:
+                    yield str(key, "utf-8")
+                #yield str(res.keys, "utf-8")
+        except grpc.RpcError as e:
+            print(e)
+        
+        
+
     def Get(self, key):
         sortedRegion = self._getRegions()
         if len(sortedRegion) == 0:
@@ -132,8 +155,6 @@ class AutumnLib:
 if __name__ == "__main__":
     lib = AutumnLib()
     lib.Connect()
-    lib.Put(b"hello", b"world")
-    print(lib.Get(b"hello"))
 
 
 

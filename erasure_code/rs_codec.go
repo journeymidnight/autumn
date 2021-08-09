@@ -143,8 +143,7 @@ func which(x [][]byte) {
 
 func (ReedSolomon) RebuildECExtent(dataShards, parityShards int, sourceExtent []*extent.Extent, replacingIndex int, targetExtent *extent.Extent) error {
 	
-	targetExtent.Lock()
-	defer targetExtent.Unlock()
+	targetExtent.AssertLock()
 
 	enc, err := reedsolomon.New(dataShards, parityShards)
 	
@@ -165,7 +164,7 @@ func (ReedSolomon) RebuildECExtent(dataShards, parityShards int, sourceExtent []
 				blocks[i], _, end, err = sourceExtent[i].ReadBlocks(start, 20, 40<<20)
 				n = len(blocks[i])
 				if err != nil {
-					if err != wire_errors.EndOfExtent && err !=wire_errors.EndOfStream {
+					if err != wire_errors.EndOfExtent{
 						return err
 					}
 					done= true
