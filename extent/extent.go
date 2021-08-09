@@ -171,7 +171,6 @@ func OpenExtent(fileName string) (*Extent, error) {
 			file:         file,
 			ID:           eh.ID,
 		}
-		ex.resetWriter()
 		return ex, nil
 	}
 
@@ -260,11 +259,11 @@ func (ex *Extent) Seal(commit uint32) error {
 	
 	currentLength := atomic.LoadUint32(&ex.commitLength)
 	if currentLength < commit {
+		ex.resetWriter()
 		return errors.New("commit is less than current commit length")
-	} else if currentLength > commit {
-		ex.file.Truncate(int64(commit))
 	}
-
+	
+	ex.file.Truncate(int64(commit))
 	if err := xattr.FSet(ex.file, XATTRSEAL, []byte("true")); err != nil {
 		return err
 	}
@@ -441,12 +440,13 @@ func (ex *Extent) AppendBlocks(blocks []*pb.Block, doSync bool) ([]uint32, uint3
 		ex.resetWriter()
 	}
 
+	utils.AssertTrue(ex.writer != nil)
+
 	var offsets []uint32
 	var start int64
 	end := int64(currentLength)
 	var err error
 	for _, block := range blocks {
-
 		start, end, err = ex.writer.WriteRecord(block.Data)
 		utils.AssertTrue(end <= math.MaxUint32)
 		if err != nil {
@@ -474,11 +474,12 @@ func (ex *Extent) ValidAllBlocks() (uint64, error) {
 	var rec io.Reader
 	for {
 		rec, err = rr.Next()
-		start = uint64(rr.Offset())
-		
 		if err == io.EOF {
 			break
 		}
+		start = uint64(rr.Offset())
+		
+
 		if err != nil {
 			//err happens...
 			return start, err

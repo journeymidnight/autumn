@@ -1,6 +1,8 @@
+#/usr/bin/python3
 from flask import Flask
 from flask import request
 import lib
+import mimetypes
 
 app = Flask(__name__, static_url_path='')
 
@@ -8,10 +10,22 @@ app = Flask(__name__, static_url_path='')
 def get(name):
     try:
         ret = lib.Get(bytes(name, "utf8"))
-        return ret.value
+        type, encoding = mimetypes.guess_type(name)
+        return ret.value, 200, {"Content-Type": type}
     except Exception as e:
         return str(e)
 
+@app.route("/list/", methods=['GET'])
+def list():
+    try:
+        t = ""
+        for e in lib.ListAll():
+            t += e + "\n"
+        return t, 200, {"Content-Type": "text/plain"}
+    except Exception as e:
+        return str(e)
+
+@app.route("/put/<name>", methods=['POST'])
 @app.route("/put/", methods=['POST'])
 def put():
     file = request.files['file']

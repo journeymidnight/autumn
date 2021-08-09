@@ -266,6 +266,12 @@ func TestValidBlock(t *testing.T) {
 	extent, err := CreateExtent("localtest.ext", 100)
 	assert.Nil(t, err)
 
+
+	start, err := extent.ValidAllBlocks()
+	assert.Nil(t, err)
+	assert.Equal(t, uint64(0), start)
+
+
 	defer os.Remove("localtest.ext")
 	extent.Lock()
 	extent.AppendBlocks(cases, true)
@@ -275,7 +281,7 @@ func TestValidBlock(t *testing.T) {
 	extent.file.Truncate(5000)
 	extent.commitLength = 5000
 	
-	start, err := extent.ValidAllBlocks()
+	start, err = extent.ValidAllBlocks()
 	
 	fmt.Printf("start is %d, err is %v\n", start, err)
 	require.Equal(t, record.ComputeEnd(0, 4096), uint32(start))

@@ -26,10 +26,12 @@ func main(){
 	if err != nil {
 		panic(err)
 	}
+	ex3.Lock()
 	err = erasure_code.ReedSolomon{}.RebuildECExtent(2, 1, sourceExtents, 1, ex3)
 	if err != nil {
 		panic(err.Error())
 	}
+	ex3.Unlock()
 
 	/*
 	enc, err := reedsolomon.New(2, 1)
