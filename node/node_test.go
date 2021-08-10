@@ -62,6 +62,7 @@ func setupStreamManager(suite *ExtentNodeTestSuite, dir string) {
 
 	cfg, err := config.GetEmbedConfig()
 	if err != nil {
+		fmt.Println(err)
 		xlog.Logger.Fatal(err)
 	}
 

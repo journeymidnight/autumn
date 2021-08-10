@@ -267,7 +267,7 @@ func (AlivePolicy) Choose(em *ExtentManager, extentID uint64) *grpc.ClientConn {
 
 		pool := conn.GetPools().Connect(nodeInfo.Address)
 		if pool == nil || !pool.IsHealthy(){
-			return nil
+			continue
 		}
 		return pool.Get()
 	}

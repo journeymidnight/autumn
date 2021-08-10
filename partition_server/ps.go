@@ -309,7 +309,7 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, locs []
 
 
 	rp, err := range_partition.OpenRangePartition(meta.PartID, row, log, ps.blockReader, meta.Rg.StartKey, meta.Rg.EndKey, locs,
-		blobs, setRowStreamTables, openStream, range_partition.DefaultOption(), range_partition.WithMaxSkipList(1<<20))
+		blobs, setRowStreamTables, openStream, range_partition.DefaultOption(), range_partition.WithMaxSkipList(16<<20))
 	
 	xlog.Logger.Infof("open range partition %d, StartKey:[%s], EndKey:[%s]: err is %v", meta.PartID, meta.Rg.StartKey, meta.Rg.EndKey, err)
 	return rp, err

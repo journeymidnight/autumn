@@ -469,7 +469,7 @@ func (sm *StreamManager) receiveCommitlength(ctx context.Context, nodes []*NodeS
 	}
 	stopper.Wait()
 	xlog.Logger.Debugf("get commitlenght of extent %d, the sizes is %+v", extentID, result)
-	fmt.Printf("receive commmit length: %v\n", result)
+	fmt.Printf("extent/%d receive commmit length: %v\n", extentID, result)
 
 	return result
 }
@@ -765,11 +765,17 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 		var exToBeUpdated  []*pb.ExtentInfo
 		for i := range oldExtentIDs {
 			if err := sm.lockExtent(oldExtentIDs[i]) ; err != nil {
-				continue
+				for j := 0 ; j < i ; j++ {
+					sm.unlockExtent(oldExtentIDs[j])
+				}
+				return errDone(err)
 			}
 			oldExInfo, ok := sm.cloneExtentInfo(oldExtentIDs[i])
 			if !ok {
-				continue
+				for j := 0 ; j < i ; j++ {
+					sm.unlockExtent(oldExtentIDs[j])
+				}
+				return errDone(errors.Errorf("not found"))
 			}
 			if oldExInfo.Refs == 1 {
 				exToBeDeleted = append(exToBeDeleted, oldExInfo)
@@ -785,6 +791,7 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 				sm.unlockExtent(oldExtentIDs[i])
 			}
 		}()
+		
 		for _, exInfo := range exToBeDeleted {
 			ops = append(ops, clientv3.OpDelete(formatExtentKey(exInfo.ExtentID)))
 		}

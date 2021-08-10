@@ -308,23 +308,22 @@ func (en *ExtentNode) SmartReadBlocks(ctx context.Context, req *pb.ReadBlocksReq
 			}
 			return
 		}
-		c := pb.NewExtentServiceClient(pool.Get())
-		res, err := c.ReadBlocks(pctx, req)
-		/*
-		if err != nil {
-			fmt.Printf("remote: %s %d read block from %d result %v\n", pool.Addr, req.ExtentID, req.Offset, err)
+		var res * pb.ReadBlocksResponse
+		var err error
+		
+		if pos < len(exInfo.Replicates) && exInfo.Replicates[pos] == en.nodeID {
+			res, err = en.ReadBlocks(pctx, req)
 		} else {
-			fmt.Printf("remote: %s %d read block from %d result %v\n", pool.Addr, req.ExtentID, req.Offset, res.End)
+			c := pb.NewExtentServiceClient(pool.Get())
+			res, err = c.ReadBlocks(pctx, req)
 		}
-		*/
-		if err != nil { //network error
+		if err != nil { //network error or disk error
 			errChan <- Result{
 				Error: err,}
 			return
 		}
-
 		err = wire_errors.FromPBCode(res.Code, res.CodeDes)
-		if err != nil && err != context.Canceled && err != wire_errors.EndOfExtent && err != wire_errors.EndOfStream {
+		if err != nil && err != context.Canceled && err != wire_errors.EndOfExtent{
 			errChan <- Result{
 				Error: err,
 			}
@@ -332,7 +331,7 @@ func (en *ExtentNode) SmartReadBlocks(ctx context.Context, req *pb.ReadBlocksReq
 		}
 
 		//successful read
-		//如果读到最后, err有可能是EndOfExtent或者EndOfStream
+		//如果读到最后, err有可能是EndOfExtent
 		dataBlocks[pos] = res.Blocks
 		retChan <- Result{
 			Error: err,
@@ -451,7 +450,7 @@ waitResult:
 	}, nil
 }
 
-func (en *ExtentNode) ReadBlocks(ctx context.Context, req *pb.ReadBlocksRequest) (*pb.ReadBlocksResponse, error) {
+func (en *ExtentNode) 	ReadBlocks(ctx context.Context, req *pb.ReadBlocksRequest) (*pb.ReadBlocksResponse, error) {
 
 	errDone := func(err error) (*pb.ReadBlocksResponse, error) {
 		code, desCode := wire_errors.ConvertToPBCode(err)
@@ -465,7 +464,7 @@ func (en *ExtentNode) ReadBlocks(ctx context.Context, req *pb.ReadBlocksRequest)
 	if ex == nil {
 		return nil, errors.Errorf("node %d have no such extent :%d", en.nodeID, req.ExtentID)
 	}
-	blocks, offsets, end, err := ex.ReadBlocks(req.Offset, req.NumOfBlocks, (32 << 20))
+	blocks, offsets, end, err := ex.ReadBlocks(req.Offset, req.NumOfBlocks, (128 << 20))
 	if err != nil && err != wire_errors.EndOfStream && err != wire_errors.EndOfExtent {
 		return errDone(err)
 	}
@@ -643,7 +642,7 @@ func (en *ExtentNode) ReadEntries(ctx context.Context, req *pb.ReadEntriesReques
 	res, _ := en.SmartReadBlocks(ctx, &pb.ReadBlocksRequest{
 		ExtentID: req.ExtentID,
 		Offset: req.Offset,
-		NumOfBlocks: 10,
+		NumOfBlocks: 20000,
 		Eversion: req.Eversion,
 	})
 

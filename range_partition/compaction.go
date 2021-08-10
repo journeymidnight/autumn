@@ -161,9 +161,8 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 
 	//last table's meta extentd
 	_, err := rp.rowStream.Truncate(context.Background(), eID, "")
-	if err == nil {
-		_ = err
-		//FIXME: send frontStream/endStream to sm
+	if err != nil {
+		xlog.Logger.Warnf("LOG Truncate extent %d error %v", eID, err)
 	}
 
 	//在这个时间, 虽然有可能memstore还没有完全刷下去, 但是rp.Close调用会等待flushTask全部执行完成.
