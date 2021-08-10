@@ -301,8 +301,9 @@ retry:
 		goto retry
 	}
 
-	//fmt.Printf("ans: %v, %v\n", err, err == context.DeadlineExceeded)
 	//xlog.Logger.Debugf("res code is %v, len of entries %d\n", res.Code, len(res.Entries))
+	//fmt.Printf("extent %d read from res code is %v, len of entries %d\n",  exInfo.ExtentID ,res.Code, len(res.Entries))
+
 	if len(res.Entries) > 0 {
 		iter.cache = nil
 		iter.cache = append(iter.cache, res.Entries...)
@@ -531,7 +532,7 @@ retry:
 	cancel()
 
 	
-	if status.Code(err) == codes.DeadlineExceeded{ //timeout
+	if status.Code(err) == codes.DeadlineExceeded || status.Code(err) == codes.Unavailable{ //timeout
 		if loop < 3 {
 			loop ++
 			goto retry

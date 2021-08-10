@@ -227,11 +227,11 @@ func (sm *StreamManager) runAsLeader() {
 			return
 		}
 		
+		
 		if kv.Version != int64(extentInfo.Eversion) {
 			panic(fmt.Sprintf("%s 's Version %d is not equal to %d", kv.Key, kv.Version, extentInfo.Eversion))
 		}
 		
-
 		sm.extents.Set(extentID, &extentInfo)
 		sm.extentsLocks.Store(extentID, new(sync.Mutex))
 	}

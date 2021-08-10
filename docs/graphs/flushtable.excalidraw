@@ -81,6 +81,9 @@
       "boundElementIds": [],
       "startBinding": null,
       "endBinding": null,
+      "lastCommittedPoint": null,
+      "startArrowhead": null,
+      "endArrowhead": null,
       "points": [
         [
           0,
@@ -90,10 +93,7 @@
           -0.9550777785262881,
           38.047275993583185
         ]
-      ],
-      "lastCommittedPoint": null,
-      "startArrowhead": null,
-      "endArrowhead": null
+      ]
     },
     {
       "type": "line",
@@ -119,6 +119,9 @@
       "boundElementIds": [],
       "startBinding": null,
       "endBinding": null,
+      "lastCommittedPoint": null,
+      "startArrowhead": null,
+      "endArrowhead": null,
       "points": [
         [
           0,
@@ -128,10 +131,7 @@
           -0.10323897401929116,
           37.855536715632866
         ]
-      ],
-      "lastCommittedPoint": null,
-      "startArrowhead": null,
-      "endArrowhead": null
+      ]
     },
     {
       "type": "text",
@@ -217,6 +217,9 @@
       "boundElementIds": [],
       "startBinding": null,
       "endBinding": null,
+      "lastCommittedPoint": null,
+      "startArrowhead": null,
+      "endArrowhead": null,
       "points": [
         [
           0,
@@ -226,10 +229,7 @@
           97.8125,
           -2.76171875
         ]
-      ],
-      "lastCommittedPoint": null,
-      "startArrowhead": null,
-      "endArrowhead": null
+      ]
     },
     {
       "type": "arrow",
@@ -261,6 +261,9 @@
         "gap": 3.737931103852816
       },
       "endBinding": null,
+      "lastCommittedPoint": null,
+      "startArrowhead": null,
+      "endArrowhead": "arrow",
       "points": [
         [
           0,
@@ -270,10 +273,7 @@
           1.0572898553000414,
           55.26182479241302
         ]
-      ],
-      "lastCommittedPoint": null,
-      "startArrowhead": null,
-      "endArrowhead": "arrow"
+      ]
     },
     {
       "type": "rectangle",
@@ -354,6 +354,9 @@
       "boundElementIds": [],
       "startBinding": null,
       "endBinding": null,
+      "lastCommittedPoint": null,
+      "startArrowhead": null,
+      "endArrowhead": null,
       "points": [
         [
           0,
@@ -363,10 +366,7 @@
           -0.012160351128159164,
           155.02594635570642
         ]
-      ],
-      "lastCommittedPoint": null,
-      "startArrowhead": null,
-      "endArrowhead": null
+      ]
     },
     {
       "type": "line",
@@ -392,6 +392,9 @@
       "boundElementIds": [],
       "startBinding": null,
       "endBinding": null,
+      "lastCommittedPoint": null,
+      "startArrowhead": null,
+      "endArrowhead": null,
       "points": [
         [
           0,
@@ -401,10 +404,7 @@
           -0.012160351128159164,
           155.02594635570642
         ]
-      ],
-      "lastCommittedPoint": null,
-      "startArrowhead": null,
-      "endArrowhead": null
+      ]
     },
     {
       "type": "line",
@@ -430,6 +430,9 @@
       "boundElementIds": [],
       "startBinding": null,
       "endBinding": null,
+      "lastCommittedPoint": null,
+      "startArrowhead": null,
+      "endArrowhead": null,
       "points": [
         [
           0,
@@ -439,10 +442,7 @@
           2.9026776557831226,
           152.291224916545
         ]
-      ],
-      "lastCommittedPoint": null,
-      "startArrowhead": null,
-      "endArrowhead": null
+      ]
     },
     {
       "type": "line",
@@ -468,6 +468,9 @@
       "boundElementIds": [],
       "startBinding": null,
       "endBinding": null,
+      "lastCommittedPoint": null,
+      "startArrowhead": null,
+      "endArrowhead": null,
       "points": [
         [
           0,
@@ -477,10 +480,7 @@
           -0.012160351128159164,
           155.02594635570642
         ]
-      ],
-      "lastCommittedPoint": null,
-      "startArrowhead": null,
-      "endArrowhead": null
+      ]
     },
     {
       "type": "line",
@@ -506,6 +506,9 @@
       "boundElementIds": [],
       "startBinding": null,
       "endBinding": null,
+      "lastCommittedPoint": null,
+      "startArrowhead": null,
+      "endArrowhead": null,
       "points": [
         [
           0,
@@ -515,10 +518,7 @@
           -0.012160351128159164,
           155.02594635570642
         ]
-      ],
-      "lastCommittedPoint": null,
-      "startArrowhead": null,
-      "endArrowhead": null
+      ]
     },
     {
       "type": "text",
@@ -573,6 +573,9 @@
       "boundElementIds": [],
       "startBinding": null,
       "endBinding": null,
+      "lastCommittedPoint": null,
+      "startArrowhead": null,
+      "endArrowhead": null,
       "points": [
         [
           0,
@@ -582,10 +585,7 @@
           0.57861328125,
           37.4658203125
         ]
-      ],
-      "lastCommittedPoint": null,
-      "startArrowhead": null,
-      "endArrowhead": null
+      ]
     },
     {
       "type": "line",
@@ -611,6 +611,9 @@
       "boundElementIds": [],
       "startBinding": null,
       "endBinding": null,
+      "lastCommittedPoint": null,
+      "startArrowhead": null,
+      "endArrowhead": null,
       "points": [
         [
           0,
@@ -620,10 +623,7 @@
           0.57861328125,
           37.4658203125
         ]
-      ],
-      "lastCommittedPoint": null,
-      "startArrowhead": null,
-      "endArrowhead": null
+      ]
     },
     {
       "type": "text",
@@ -795,8 +795,8 @@
     },
     {
       "type": "text",
-      "version": 25,
-      "versionNonce": 1266950073,
+      "version": 63,
+      "versionNonce": 1871356910,
       "isDeleted": false,
       "id": "okefWTDbbEcilxVtuXDHe",
       "fillStyle": "hachure",
@@ -853,8 +853,8 @@
     },
     {
       "type": "text",
-      "version": 436,
-      "versionNonce": 1060574615,
+      "version": 440,
+      "versionNonce": 123009966,
       "isDeleted": false,
       "id": "YlLHgTSWRgLrjYU4QBAqt",
       "fillStyle": "hachure",
@@ -864,7 +864,7 @@
       "opacity": 100,
       "angle": 0,
       "x": 386.64591887636476,
-      "y": 117.25586681297679,
+      "y": 117.02399425438304,
       "strokeColor": "#a61e4d",
       "backgroundColor": "#7950f2",
       "width": 281,
@@ -875,7 +875,7 @@
       "boundElementIds": [],
       "fontSize": 16,
       "fontFamily": 3,
-      "text": "1. write logStram\n2. if memtable > 120MB\n3. write memtable to rowStream",
+      "text": "1. write logStream\n2. if memtable > 120MB\n3. write memtable to rowStream",
       "baseline": 53,
       "textAlign": "left",
       "verticalAlign": "top"
@@ -956,6 +956,9 @@
         "gap": 15.776585820895491
       },
       "endBinding": null,
+      "lastCommittedPoint": null,
+      "startArrowhead": null,
+      "endArrowhead": "arrow",
       "points": [
         [
           0,
@@ -965,10 +968,7 @@
           0.9561567164179223,
           115.71536847014926
         ]
-      ],
-      "lastCommittedPoint": null,
-      "startArrowhead": null,
-      "endArrowhead": "arrow"
+      ]
     },
     {
       "type": "text",
@@ -1054,6 +1054,9 @@
         "focus": 0.29722503070996387,
         "gap": 15.110207727713203
       },
+      "lastCommittedPoint": null,
+      "startArrowhead": null,
+      "endArrowhead": "arrow",
       "points": [
         [
           0,
@@ -1063,39 +1066,36 @@
           -0.060546875,
           57.83789062500003
         ]
-      ],
-      "lastCommittedPoint": null,
-      "startArrowhead": null,
-      "endArrowhead": "arrow"
+      ]
     },
     {
-      "id": "3vaZTxDKJDsfAC4UnmYBh",
       "type": "text",
-      "x": 749.3593234116763,
-      "y": 408.32724532245254,
-      "width": 19,
-      "height": 19,
-      "angle": 0,
-      "strokeColor": "#000000",
-      "backgroundColor": "transparent",
+      "version": 6,
+      "versionNonce": 54040492,
+      "isDeleted": false,
+      "id": "3vaZTxDKJDsfAC4UnmYBh",
       "fillStyle": "hachure",
       "strokeWidth": 2,
       "strokeStyle": "solid",
       "roughness": 2,
       "opacity": 100,
+      "angle": 0,
+      "x": 749.3593234116763,
+      "y": 408.32724532245254,
+      "strokeColor": "#000000",
+      "backgroundColor": "transparent",
+      "width": 19,
+      "height": 19,
+      "seed": 586920084,
       "groupIds": [],
       "strokeSharpness": "sharp",
-      "seed": 586920084,
-      "version": 6,
-      "versionNonce": 54040492,
-      "isDeleted": false,
-      "boundElementIds": null,
-      "text": "t5",
+      "boundElementIds": [],
       "fontSize": 16,
       "fontFamily": 3,
+      "text": "t5",
+      "baseline": 15,
       "textAlign": "center",
-      "verticalAlign": "middle",
-      "baseline": 15
+      "verticalAlign": "middle"
     }
   ],
   "appState": {

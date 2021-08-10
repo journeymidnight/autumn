@@ -130,8 +130,8 @@ func (p *Pools) Connect(addr string) *Pool {
 func newPool(addr string) (*Pool, error) {
 	conn, err := grpc.Dial(addr,
 		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(33<<20),
-			grpc.MaxCallSendMsgSize(33<<20),
+			grpc.MaxCallRecvMsgSize(130<<20),
+			grpc.MaxCallSendMsgSize(130<<20),
 			grpc.UseCompressor((snappyCompressor{}).Name())),
 		grpc.WithBackoffMaxDelay(time.Second),
 		grpc.WithInsecure())

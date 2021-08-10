@@ -174,7 +174,8 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		entriesReady := []*pb.EntryInfo{ei}
 
 		head := valuePointer{extentID: ei.ExtentID, offset: ei.End}
-
+		
+		//print value len of ei
 		if y.ParseTs(ei.Log.Key) > rp.seqNumber {
 			rp.seqNumber++
 		}
@@ -235,7 +236,7 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 
 	//do compactions:FIXME, doCompactions放到另一个goroutine里面执行
 
-	/*
+	
 	
 	var tbls []*table.Table
 	rp.tableLock.RLock()
@@ -254,7 +255,7 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	for _, t := range tbls {
 		t.DecrRef()
 	}
-	*/
+	
 	
 	return rp,nil
 }
@@ -271,13 +272,15 @@ type flushTask struct {
 //split相关, 提供相关参数给上层
 //ADD more policy here, to support different Split policy
 func (rp *RangePartition) GetSplitPoint() []byte{
-	utils.AssertTrue(rp.hasOverlap == 0 && len(rp.tables) > 2)
+	utils.AssertTrue(rp.hasOverlap == 0)
 
 	//find the biggest table
-	var biggestTable *table.Table
 	rp.tableLock.Lock()
 	defer rp.tableLock.Unlock()
+
+	var biggestTable *table.Table
 	biggestTable = rp.tables[0]
+
 	for _, tbl := range rp.tables {
 		if tbl.EstimatedSize > biggestTable.EstimatedSize {
 			biggestTable = tbl
@@ -291,7 +294,7 @@ func (rp *RangePartition) GetSplitPoint() []byte{
 func (rp *RangePartition) CanSplit() bool {
 	rp.tableLock.Lock()
 	defer rp.tableLock.Unlock()
-	return  atomic.LoadUint32(&rp.hasOverlap) == 0 && len(rp.tables) > 2
+	return  atomic.LoadUint32(&rp.hasOverlap) == 0  && len(rp.tables) > 0
 }
 
 func (rp *RangePartition) LogRowStreamEnd() (uint32, uint32) {
@@ -900,7 +903,7 @@ func (rp *RangePartition) Get(userKey []byte, version uint64) ([]byte, error) {
 
 		var vp valuePointer
 		vp.Decode(vs.Value)
-
+		//fmt.Printf("%s's location is [%d, %d]\n", userKey, vp.extentID, vp.offset)
 		blocks, _, err := rp.blockReader.Read(context.Background(), vp.extentID, vp.offset, 1)
 		if err != nil {
 			return nil, err

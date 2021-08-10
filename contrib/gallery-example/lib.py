@@ -66,8 +66,11 @@ class AutumnLib:
                 with self.mutex:
                     self.psDetails[psDetail.PSID] = psDetail
             elif type(event) is etcd3.events.DeleteEvent:
+                #parse PSID from event.key, example b"PSSERVER/10"
+                #convert psid to int
+                psid = int(str(event.key, "utf8").split("/")[1])
                 with self.mutex:
-                    del self.psDetails[event.key]
+                    del self.psDetails[psid]
             else:
                 print(event)
 
@@ -155,7 +158,3 @@ class AutumnLib:
 if __name__ == "__main__":
     lib = AutumnLib()
     lib.Connect()
-
-
-
-
