@@ -141,7 +141,7 @@ func which(x [][]byte) {
 	}
 }
 
-func (ReedSolomon) RebuildECExtent(dataShards, parityShards int, sourceExtent []*extent.Extent, replacingIndex int, targetExtent *extent.Extent) error {
+func (ReedSolomon) RebuildECExtent(dataShards, parityShards int, sourceExtent []*extent.Extent, start uint32, replacingIndex int, targetExtent *extent.Extent) error {
 	
 	targetExtent.AssertLock()
 
@@ -155,16 +155,16 @@ func (ReedSolomon) RebuildECExtent(dataShards, parityShards int, sourceExtent []
 	}
 
 	var done bool
-	start := uint32(0)
 	end := uint32(0)
 	n := 0
 	for !done {
 		for i:= 0 ; i < dataShards + parityShards ; i ++ {
 			if sourceExtent[i] != nil {
-				blocks[i], _, end, err = sourceExtent[i].ReadBlocks(start, 20, 40<<20)
+				blocks[i], _, end, err = sourceExtent[i].ReadBlocks(start, 20000, 40<<20)
 				n = len(blocks[i])
 				if err != nil {
 					if err != wire_errors.EndOfExtent{
+						fmt.Printf("source Extent error!!! to i %d\n", i)
 						return err
 					}
 					done= true

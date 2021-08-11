@@ -33,7 +33,7 @@ const (
 	MB             = 1024 * KB
 	GB             = 1024 * MB
 
-	MaxExtentSize     = 32 * MB
+	MaxExtentSize     = 64 * MB
 )
 
 type StreamClient interface {
@@ -274,7 +274,9 @@ retry:
 	exInfo := iter.sc.em.GetExtentInfo(extentID)
 	//xlog.Logger.Debugf("read extentID %d, offset : %d, eversion is %d\n", extentID, iter.currentOffset, exInfo.Eversion)
 
-	//mt.Printf("read extentID %d, offset : %d,  index : %d\n", extentID, iter.currentOffset, iter.currentExtentIndex)
+	//fmt.Printf("read extentID %d, offset : %d,  index : %d\n from %s ", extentID, 
+	//iter.currentOffset, iter.currentExtentIndex, iter.conn.Target())
+
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	c := pb.NewExtentServiceClient(iter.conn)
 	res, err := c.ReadEntries(ctx, &pb.ReadEntriesRequest{
@@ -290,6 +292,7 @@ retry:
 		if loop > 5 {
 			return errors.New("finally timeout")
 		}
+		fmt.Printf("receiveEntries get error %s\n", err.Error())
 		loop++
 		time.Sleep(3 * time.Second)
 		iter.conn = nil
@@ -302,7 +305,6 @@ retry:
 	}
 
 	//xlog.Logger.Debugf("res code is %v, len of entries %d\n", res.Code, len(res.Entries))
-	//fmt.Printf("extent %d read from res code is %v, len of entries %d\n",  exInfo.ExtentID ,res.Code, len(res.Entries))
 
 	if len(res.Entries) > 0 {
 		iter.cache = nil
@@ -538,16 +540,18 @@ retry:
 			goto retry
 		}
 		err = sc.MustAllocNewExtent(extentID)
-	}
-
-
-	if err != nil {//may have other network errors
+		if err != nil {
+			return 0, nil, 0, err
+		}
+		goto retry
+	} else if err != nil {//may have other network errors
 		return 0, nil, 0, err
+
 	}
 
 	if res.Code == pb.Code_EVersionLow {
 		sc.em.WaitVersion(extentID, exInfo.Eversion+1)
-		goto retry
+		goto retry	
 	}
 	
 	//logic errors
@@ -556,14 +560,13 @@ retry:
 		return 0, nil, 0, err
 	}
 
+	sc.end = res.End
 	//检查offset结果, 如果已经超过MaxExtentSize, 调用StreamAllocExtent
 	utils.AssertTrue(res.End > 0)
 	if res.End > MaxExtentSize {
 		if err = sc.MustAllocNewExtent(extentID); err != nil {
 			return 0, nil, 0, err
 		}
-	} else {
-		sc.end = res.End
 	}
 	//update end
 	return extentID, res.Offsets,res.End, nil

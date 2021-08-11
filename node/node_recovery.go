@@ -99,7 +99,7 @@ func (en *ExtentNode) recoveryReplicateExtent(exInfo *pb.ExtentInfo, exceptID, o
     return nil
 }
 
-func (en *ExtentNode) recoveryErasureExtent(exInfo *pb.ExtentInfo, exceptID, offset, size uint64, targetExtent *extent.Extent) error {
+func (en *ExtentNode) recoveryErasureExtent(exInfo *pb.ExtentInfo, exceptID, offset, size uint64, start uint32, targetExtent *extent.Extent) error {
 
 	fmt.Printf("run recovery EC: %v", exInfo)
 	defer fmt.Printf("recovery done, %v", exInfo.ExtentID)
@@ -160,7 +160,7 @@ func (en *ExtentNode) recoveryErasureExtent(exInfo *pb.ExtentInfo, exceptID, off
 		return errors.Errorf("can not call enought shards")
 	}
 
-	return erasure_code.ReedSolomon{}.RebuildECExtent(len(exInfo.Replicates), len(exInfo.Parity), sourceExtent, replacingIndex, targetExtent)
+	return erasure_code.ReedSolomon{}.RebuildECExtent(len(exInfo.Replicates), len(exInfo.Parity), sourceExtent, start, replacingIndex, targetExtent)
 
 }
 
@@ -266,7 +266,8 @@ func (en *ExtentNode) runRecoveryTask(task *pb.RecoveryTask, extentInfo *pb.Exte
 					xlog.Logger.Warnf(err.Error())
 					return 
 				}
-				err = en.recoveryErasureExtent(extentInfo, task.ReplaceID, 0, extentInfo.SealedLength, ex)
+				//recovery all data
+				err = en.recoveryErasureExtent(extentInfo, task.ReplaceID, 0, extentInfo.SealedLength, 0, ex)
 				ex.Close()
 			}
 
@@ -444,11 +445,18 @@ func (en *ExtentNode) ReAvali(ctx context.Context, req *pb.ReAvaliRequest) (*pb.
 		}, nil
 	}
 
+	if uint64(ex.CommitLength()) >= exInfo.SealedLength {
+		return &pb.ReAvaliResponse{
+			Code: pb.Code_OK,
+		}, nil
+	}
+	/*
 	if err := ex.Seal(uint32(exInfo.SealedLength)) ; err == nil {
 		return &pb.ReAvaliResponse{
 			Code: pb.Code_OK,
 		}, nil
 	}
+	*/
 
 	//extent's length is less than CommitLength...
 	xlog.Logger.Info("Reavali: extent's length is %d, commitLength is %d", ex.CommitLength(), exInfo.SealedLength)
@@ -464,22 +472,26 @@ func (en *ExtentNode) ReAvali(ctx context.Context, req *pb.ReAvaliRequest) (*pb.
 		appendWriter := ex.GetRawWriter()
 		err = en.recoveryReplicateExtent(exInfo, en.nodeID, offset, size, appendWriter)
 	} else {
-		var start uint64
-		start, _ = ex.ValidAllBlocks()
-		err = ex.Truncate(uint32(start))
+		var start uint32
+		start, _ = ex.ValidAllBlocks(0)
+		err = ex.Truncate(start)
+		x := utils.Floor(start, 64<<10)//x + padding = start
+		padding := start - x
 		if err != nil {
 			xlog.Logger.Errorf("EC recovery after validBlocks truncate extent %d error %v", exInfo.ExtentID, err)
 			return errDone(err)
 		}
-		
-		err = en.recoveryErasureExtent(exInfo, en.nodeID, uint64(start), exInfo.SealedLength - start, ex.Extent)
+		fmt.Printf("extent %d Revali from %d\n", exInfo.ExtentID, start)
+		//reavali part data,
+		err = en.recoveryErasureExtent(exInfo, en.nodeID, uint64(x), exInfo.SealedLength - uint64(x), padding, ex.Extent)
 	}
+	fmt.Printf("%d recovery data err is %v\n", exInfo.ExtentID, err)
 	xlog.Logger.Infof("recovery data err is %v", err)
 	if err != nil {
 		return errDone(err)
 	}
 	
-	utils.Check(ex.Seal(uint32(exInfo.SealedLength)))
+	//utils.Check(ex.Seal(uint32(exInfo.SealedLength)))
 
 
 	return &pb.ReAvaliResponse{
