@@ -16,6 +16,9 @@ Show Zone
 <input id="num" type="text">
 <input type="submit"/>
 </form>
+
+<!--list button send xhr /list to backend -->
+<button id="list">List</button>
 </p>
 
 <p>
@@ -76,7 +79,19 @@ Image.prototype.load = function(url){
 
 function previewImage(url){
     var ext = url.substr(url.lastIndexOf('.'));
-    if (ext == '.jpg' || ext == '.jpeg' || ext == '.png' || ext == '.gif') {
+    ext = ext.toLowerCase();
+    if (ext == '.pdf') {
+        //embed pdf in iframe
+        var iframe = document.createElement('iframe');
+        iframe.setAttribute('src', url);
+        iframe.setAttribute('width', '70%');
+        iframe.setAttribute('height', '70%');
+        iframe.setAttribute('frameborder', '0');
+        iframe.setAttribute('scrolling', 'no');
+        var previewDiv = document.getElementById('preview');
+        previewDiv.innerHTML = '';
+        previewDiv.appendChild(iframe);
+    }else if (ext == '.jpg' || ext == '.jpeg' || ext == '.png' || ext == '.gif') {
         var img = new Image();
         img.load(url)
         img.width = 400;
@@ -84,16 +99,50 @@ function previewImage(url){
         var previewDiv = document.getElementById('preview');
         previewDiv.innerHTML = '';
         document.getElementById('preview').appendChild(img);
+    }
+    else if (ext == '.mp4' || ext == '.webm') {
+        document.getElementById("link").innerHTML = `http://${window.location.hostname}:5000${url}`;
+        var previewDiv = document.getElementById('preview');
+        var video = document.createElement('video');
+        video.width = 400;
+        video.height = 300;
+        video.src = url;
+        video.controls = true;
+        video.autoplay = true;
+        previewDiv.innerHTML = '';
+        previewDiv.appendChild(video);
     } else {
-        //get content  from url
+        document.getElementById("link").innerHTML = `http://${window.location.hostname}:5000${url}`;
+        //ajax request to get a text from url
         var xhr = new XMLHttpRequest();
-        xhr.open('GET', url, false);
-        xhr.send();    
-        document.getElementById("preview").innerHTML = xhr.responseText;
+        xhr.open('GET', url,true);
+        xhr.responseType = 'text';
+        xhr.onload = function(e) {
+            hideLoading();
+            var previewDiv = document.getElementById('preview');
+            previewDiv.innerHTML = '';
+            document.getElementById('preview').innerHTML = xhr.responseText;
+        };
+        xhr.send();
     }
 
 }
 
+var list = document.getElementById('list');
+list.addEventListener('click', function(e) {
+    e.preventDefault();
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/list',true);
+    xhr.responseType = 'text';
+    xhr.onload = function(e) {
+        hideLoading();
+        var previewDiv = document.getElementById('preview');
+        previewDiv.innerHTML = '';
+        previewDiv.innerText = xhr.responseText;
+
+    };
+    xhr.send();
+});
 
 var uploadform = document.getElementById('upload');
 uploadform.addEventListener("submit", function(e){

@@ -233,9 +233,17 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	//version match: req.Sversion == s.Sversion
 	tailExtentID := s.ExtentIDs[len(s.ExtentIDs) - 1]
 	lastExtentInfo, ok = sm.cloneExtentInfo(tailExtentID)
+
+
 	if !ok {
 		return errDone(errors.Errorf("internal errors, no such extent %d", tailExtentID))
 	}
+
+	
+	sm.lockExtent(lastExtentInfo.ExtentID)
+	defer sm.unlockExtent(lastExtentInfo.ExtentID)
+	
+
 	nodes := sm.getNodes(lastExtentInfo)
 	if nodes == nil {
 		return errDone(errors.Errorf("request errors, extent %d is not the last", req.ExtentToSeal))
@@ -260,9 +268,24 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		if haveToCreateNewExtent == false {
 			//get minimun from sizes
 			minSize := sizes[0]
+			sizesAreDiff := false
 			for i := 1; i < len(sizes); i++ {
 				if minSize > sizes[i] {
 					minSize = sizes[i]
+					sizesAreDiff = true
+				}
+			}
+			if sizesAreDiff {
+				lastExtentInfo.SealedLength = uint64(minSize)
+				lastExtentInfo.Eversion ++
+				lastExtentInfo.Avali = (1 << (dataShards+ parityShards)) - 1
+				ops := []clientv3.Op{clientv3.OpPut(formatExtentKey(lastExtentInfo.ExtentID), string(utils.MustMarshal(lastExtentInfo)))}
+				err := etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
+					clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
+					clientv3.Compare(clientv3.CreateRevision(req.OwnerKey), "=", req.Revision),
+				}, ops)
+				if err != nil {
+					return errDone(err)
 				}
 			}
 			return  &pb.StreamAllocExtentResponse{

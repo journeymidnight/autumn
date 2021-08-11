@@ -156,6 +156,7 @@ func NewReader(r io.Reader) *Reader {
 }
 
 //called AFTER Next()
+//返回的Offset包括Header, 因为r.i并不包括Header
 func (r *Reader) Offset() int64 {
 	if int64(r.i) < HeaderSize {
 		panic("r.i can not be less than HeaderSize")

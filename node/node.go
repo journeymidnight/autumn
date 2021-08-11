@@ -246,8 +246,8 @@ func (en *ExtentNode) Shutdown() {
 
 func (en *ExtentNode) ServeGRPC() error {
 	grpcServer := grpc.NewServer(
-		grpc.MaxRecvMsgSize(65<<20),
-		grpc.MaxSendMsgSize(65<<20),
+		grpc.MaxRecvMsgSize(64<<20),
+		grpc.MaxSendMsgSize(64<<20),
 		grpc.MaxConcurrentStreams(1000),
 	)
 

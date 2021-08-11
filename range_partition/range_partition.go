@@ -167,6 +167,8 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 
 	//FIXME:poor performace: prefetch read will be better
 	replayedLog := 0
+	logSizeRead := uint32(0)
+
 	replay := func(ei *pb.EntryInfo) (bool, error) {
 		replayedLog++
 		//fmt.Printf("from log %v\n", string(ei.Log.Key))
@@ -174,10 +176,10 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		entriesReady := []*pb.EntryInfo{ei}
 
 		head := valuePointer{extentID: ei.ExtentID, offset: ei.End}
-		
+		logSizeRead += ei.End - ei.Offset
 		//print value len of ei
 		if y.ParseTs(ei.Log.Key) > rp.seqNumber {
-			rp.seqNumber++
+			rp.seqNumber = y.ParseTs(ei.Log.Key)
 		}
 
 		i := 0
@@ -202,20 +204,21 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 				return true, nil
 			}
 		*/
-		//fmt.Printf("replay %s, %d\n", ei.Log.Key, len(ei.Log.Value))
+
 		rp.writeToLSM([]*pb.EntryInfo{ei})
 		
 		rp.vhead = head
 		return true, nil
 	}
 
+	start := time.Now()
 	if lastTable == nil {
 		err := replayLog(rp.logStream, 0, 0, true, replay)
 		if err != nil {
 			return nil, err
 		}
 	} else {
-		fmt.Printf("replay log from vp extent %d, offset [%d]\n", lastTable.VpExtentID, lastTable.VpOffset)
+		//fmt.Printf("replay log from vp extent %d, offset [%d]\n", lastTable.VpExtentID, lastTable.VpOffset)
 		/*
 			rp.vhead = valuePointer{
 				extentID: lastTable.VpExtentID,
@@ -228,8 +231,8 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		}
 	}
 
-	xlog.Logger.Infof("replayed log number: %d\n", replayedLog)
-	fmt.Printf("replayed log number: %d, mt size is %d, empty?%v \n", replayedLog, rp.mt.MemSize(), rp.mt.Empty())
+	//xlog.Logger.Infof("replayed log number: %d, time taken %v\n", replayedLog, time.Since(start))
+	fmt.Printf("replayed log number: %d, mt size is %d, time taken %v, read size %v \n", replayedLog, rp.mt.MemSize(), time.Since(start), logSizeRead)
 
 	//start real write
 	rp.startWriteLoop()
@@ -1004,11 +1007,13 @@ func (rp *RangePartition) close(gracefull bool) error {
 	rp.writeStopper.Stop()
 	close(rp.writeCh)
 
+
+
 	
 	//FIXME lost data in mt/imm, will have to replay log
 	//doWrite在返回前,会调用最后一次writeRequest并且等待返回, 所以这里
 	//mt和rp.vhead都是只读的
-	if gracefull && rp.mt.MemSize() > (rp.opt.MaxSkipList/4) {
+	if gracefull && rp.mt.MemSize() > (1 << 10) {
 		for {
 			pushedFlushTask := func() bool {
 				rp.Lock()

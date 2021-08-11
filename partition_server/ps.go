@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/clientv3/concurrency"
@@ -135,6 +136,7 @@ func (ps *PartitionServer) parseRegionAndStart(regions *pspb.Regions) int64{
 		_, ok = ps.rangePartitions[region.PartID]
 		ps.RUnlock()
 
+		
 		utils.AssertTrue(region.PartID != 0)
 		
 		if region.PSID != ps.PSID{
@@ -157,8 +159,19 @@ func (ps *PartitionServer) parseRegionAndStart(regions *pspb.Regions) int64{
 		
 		
 		//if PART did not activate, lock and activate
-		mutex := concurrency.NewMutex(ps.session, formatPartLock(region.PartID))
-		utils.Check(mutex.Lock(context.Background()))
+		fmt.Printf("locking part %d\n", region.PartID)
+		var mutex *concurrency.Mutex
+		for {
+			mutex = concurrency.NewMutex(ps.session, formatPartLock(region.PartID))
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			if mutex.Lock(ctx) == nil {
+				cancel()
+				break
+			}
+			cancel()
+			time.Sleep(time.Second)
+			fmt.Printf("locking part %d timout..\n", region.PartID)
+		}
 
 		fmt.Printf("getPartionMeta %d\n", region.PartID)
 		if rev, meta, locs ,blobs, err = ps.getPartitionMeta(region.PartID) ; err != nil {
@@ -229,8 +242,6 @@ func (ps *PartitionServer) Init() {
 	
 	var config pspb.Regions
 	utils.MustUnMarshal(data, &config)
-
-	fmt.Printf("regions config is %+v", config.Regions)
 
 	//start partitions
 	newRev := ps.parseRegionAndStart(&config)
@@ -317,8 +328,8 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, locs []
 
 func (ps *PartitionServer) ServeGRPC() error {
 	grpcServer := grpc.NewServer(
-		grpc.MaxRecvMsgSize(65<<20),
-		grpc.MaxSendMsgSize(65<<20),
+		grpc.MaxRecvMsgSize(64<<20),
+		grpc.MaxSendMsgSize(64<<20),
 		grpc.MaxConcurrentStreams(1000),
 	)
 
@@ -343,6 +354,10 @@ func (ps *PartitionServer) Shutdown() {
 
 	//2. close all range partition
 	ps.Lock()
+	for _, mutex := range ps.rangePartitionLocks {
+		ctx , _:= context.WithTimeout(context.Background(), time.Second)
+		mutex.Unlock(ctx)
+	}
 	for _, rp := range ps.rangePartitions {
 		rp.Close()
 	}

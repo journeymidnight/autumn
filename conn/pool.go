@@ -129,9 +129,9 @@ func (p *Pools) Connect(addr string) *Pool {
 // newPool creates a new "pool" with one gRPC connection, refcount 0.
 func newPool(addr string) (*Pool, error) {
 	conn, err := grpc.Dial(addr,
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(130<<20),
-			grpc.MaxCallSendMsgSize(130<<20),
+		grpc.WithDefaultCallOptions(//不是这个
+			grpc.MaxCallRecvMsgSize(64<<20),
+			grpc.MaxCallSendMsgSize(64<<20),
 			grpc.UseCompressor((snappyCompressor{}).Name())),
 		grpc.WithBackoffMaxDelay(time.Second),
 		grpc.WithInsecure())

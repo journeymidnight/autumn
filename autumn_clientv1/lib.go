@@ -158,8 +158,8 @@ func (lib *AutumnLib) getConn(addr string) *grpc.ClientConn {
 	for {
 		conn, err = grpc.Dial(addr,
 			grpc.WithDefaultCallOptions(
-				grpc.MaxCallRecvMsgSize(130<<20),
-				grpc.MaxCallSendMsgSize(130<<20)),
+				grpc.MaxCallRecvMsgSize(33<<20),
+				grpc.MaxCallSendMsgSize(33<<20)),
 			grpc.WithBackoffMaxDelay(time.Second),
 			grpc.WithInsecure())
 		if err == nil {
@@ -184,6 +184,9 @@ func (lib *AutumnLib) getRegions() []*pspb.RegionInfo {
 func (lib *AutumnLib) Put(ctx context.Context, key, value []byte) error {
 	if len(key) == 0 || len(value) == 0 {
 		return errors.New("key or value is empty")
+	}
+	if len(value) > 32<<20 {
+		return errors.New("value is too large")
 	}
 	sortedRegions := lib.getRegions()
 	if len(sortedRegions) == 0 {

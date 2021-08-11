@@ -3,6 +3,8 @@ from flask import Flask
 from flask import request
 import lib
 import mimetypes
+import struct
+import pdb
 
 app = Flask(__name__, static_url_path='')
 
@@ -10,27 +12,67 @@ app = Flask(__name__, static_url_path='')
 @app.route("/get/<name>", methods=['GET'])
 def get(name):
     try:
-        ret = lib.Get(bytes(name, "utf8"))
+        data = bytearray()
+        meta_file_name = "0:" + name
+        ret = lib.Get(bytes(meta_file_name, "utf8"))
+        if len(ret.value) == 4:
+            #if ret is chunked file. get all chunks one by one
+            #read chunk size
+            size = struct.unpack("!I", ret.value[0:4])[0]
+            #read chunk data
+            i = 0
+            #fixme: threading get chunks
+            while len(data) != size:
+                chunk_name = "1:" + name + ":" + str(i)
+                ret = lib.Get(bytes(chunk_name, "utf8"))
+                data.extend(ret.value)
+                i += 1
+        else:
+            #ignore the first 4 bytes
+            data.extend(ret.value[4:])
         type, encoding = mimetypes.guess_type(name)
-        return ret.value, 200, {"Content-Type": type}
+        return bytes(data), 200, {"Content-Type": type, "Content-Encoding": encoding}
     except Exception as e:
+        print(e)
         return str(e)
 
 @app.route("/list/", methods=['GET'])
 def list():
     try:
         t = ""
-        for e in lib.ListAll():
-            t += e + "\n"
+        for e in lib.List(b"", b"0:", (1<<32)-1):
+            t += e[2:] + "\n"
         return t, 200, {"Content-Type": "text/plain"}
     except Exception as e:
         return str(e)
+
+chunk_size = 10 * 1024 * 1024
+
+def split(filename, data):
+    ## split file into chunks
+    ## each filename is "1:"+filename
+    i = 0 
+    for offset in range(0, len(data), chunk_size):
+        chunk_name = "1:" + filename + ":" + str(i)
+        yield chunk_name, data[offset:offset + chunk_size]
+        i += 1
 
 @app.route("/put/", methods=['POST'])
 def put():
     file = request.files['file']
     data = file.read()
-    lib.Put(bytes(file.filename, "utf8"), data)
+    #if len of data is bigger than chunk_size, split data into chunks, and put data one by one
+    if len(data) > chunk_size:
+        for chunk_name, chunk in split(file.filename, data):
+            lib.Put(bytes(chunk_name, "utf8"), chunk)
+        #meta file name is "0:" + filename
+        meta_file_name = "0:" + file.filename
+        meta_value = struct.pack("!I", len(data)) ##big endian u32
+        lib.Put(bytes(meta_file_name, "utf8"), meta_value)
+    else:
+        #concat struct.pack("!I", len(data)) and data
+        value = struct.pack("!I", len(data)) + data
+        lib.Put(bytes("0:"+ file.filename, "utf8"), value)
     return file.filename
 
 @app.route("/", methods=['GET'])

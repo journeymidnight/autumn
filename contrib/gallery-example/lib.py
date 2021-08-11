@@ -51,8 +51,8 @@ class AutumnLib:
                 return self.cons[addr]
         conn = grpc.insecure_channel(target=addr,
         options=[
-        ('grpc.max_send_message_length', 64<<20),
-        ('grpc.max_receive_message_length', 64<<20),
+        ('grpc.max_send_message_length', 33<<20),
+        ('grpc.max_receive_message_length', 33<<20),
         ])
         with self.consLock:
             self.cons[addr] = conn
@@ -77,6 +77,9 @@ class AutumnLib:
     def Put(self, key , value):
         if len(key) == 0 or len(value) == 0:
             return
+        if len(value) > (32<<20):
+            print("value too long")
+            return
         sortedRegion = self._getRegions()
         if len(sortedRegion) == 0:
             return
@@ -90,7 +93,7 @@ class AutumnLib:
         return stub.Put(pspb.PutRequest(key=key,value=value,partid=sortedRegion[idx].PartID))
 
 
-    def ListAll(self):
+    def List(self, start, prefix, limit):
         sortedRegion = self._getRegions()
         if len(sortedRegion) == 0:
             return None
@@ -101,13 +104,15 @@ class AutumnLib:
                 stub = pspb_grpc.PartitionKVStub(conn)
                 res = stub.Range(pspb.RangeRequest(
                     partid=region.PartID,
-                    limit = ((1<<32) - 1)),
-                )
+                    limit = limit,
+                    start=start,
+                    prefix=prefix
+                ))
                 #append res to list
                 for key in res.keys:
                     yield str(key, "utf-8")
                 #yield str(res.keys, "utf-8")
-        except grpc.RpcError as e:
+        except Exception as e:
             print(e)
         
         
@@ -121,7 +126,13 @@ class AutumnLib:
         )
         conn = self._getConn(self._getPSAddr(sortedRegion[idx].PSID))
         stub = pspb_grpc.PartitionKVStub(conn)
-        return stub.Get(pspb.GetRequest(key=key,partid=sortedRegion[idx].PartID))
+        try:
+            ret = stub.Get(pspb.GetRequest(key=key,partid=sortedRegion[idx].PartID))
+            return ret
+        except Exception as e:
+            #print "key is partID"
+            print("key is %s" % key)
+            return None
 
     def Connect(self):
         try:
@@ -152,7 +163,6 @@ class AutumnLib:
             self.etcdClient.add_watch_callback("PSSERVER/", self._update_ps_config, "PSSERVER0", start_revision=max_revision)    
         except Exception as e:
             print(e.with_traceback())
-
 
 
 if __name__ == "__main__":

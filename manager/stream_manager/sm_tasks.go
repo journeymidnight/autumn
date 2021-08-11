@@ -249,6 +249,8 @@ func (sm *StreamManager) reAvali(exInfo *pb.ExtentInfo, nodeID uint64) {
 		return
 	}
 
+	fmt.Printf("Reavali extent %d is good\n", exInfo.ExtentID)
+
 	slot := FindNodeIndex(exInfo, nodeID)
 	if slot == -1 {
 		xlog.Logger.Error("maybe updated by others..")
@@ -274,6 +276,7 @@ func (sm *StreamManager) reAvali(exInfo *pb.ExtentInfo, nodeID uint64) {
 
 	//update extent
 	sm.extents.Set(exInfo.ExtentID, exInfo)
+	fmt.Printf("setting avali for extent:%d on node %d is avali\n", exInfo.ExtentID, nodeID)
 }
 
 //dispatchRecoveryTask already have extentLock, ask one node to do recovery
@@ -362,25 +365,25 @@ func (sm *StreamManager) routineDispatchTask() {
 			case <- ticker.C:
 				OUTER:
 				for kv := range sm.extents.Iter() {
-					extent := kv.Value.(*pb.ExtentInfo) //extent is read only
+					exInfo := kv.Value.(*pb.ExtentInfo) //extent is read only
 
 					//only check sealed extent
-					if extent.SealedLength == 0 {
+					if exInfo.SealedLength == 0 {
 						continue 
 					}
 					
-					sm.lockExtent(extent.ExtentID)
+					sm.lockExtent(exInfo.ExtentID)
 
-					allCopies := append(extent.Replicates, extent.Parity...)
+					allCopies := append(exInfo.Replicates, exInfo.Parity...)
 					
 					for i, nodeID := range allCopies {
 
 						//check disk health
 						var diskID uint64
-						if i >= len(extent.Replicates) {
-							diskID = extent.ParityDisk[i - len(extent.Replicates)]
+						if i >= len(exInfo.Replicates) {
+							diskID = exInfo.ParityDisk[i - len(exInfo.Replicates)]
 						} else {
-							diskID = extent.ReplicateDisks[i]
+							diskID = exInfo.ReplicateDisks[i]
 						}
 						
 						diskInfo, ok := sm.cloneDiskInfo(diskID)
@@ -388,33 +391,36 @@ func (sm *StreamManager) routineDispatchTask() {
 							go func(extent *pb.ExtentInfo, nodeID uint64) {
 								sm.dispatchRecoveryTask(extent, nodeID)
 								sm.unlockExtent(extent.ExtentID)
-							}(extent, nodeID)
+							}(exInfo, nodeID)
 							continue OUTER
 						}
 
 
 						//check node health
 						ns := sm.getNodeStatus(nodeID)
-						if (ns == nil || ns.Dead()) && extent.Avali > 0{
-							fmt.Printf("node %d is dead, recovery for %d\n", nodeID, extent.ExtentID) 
+						if (ns == nil || ns.Dead()) && exInfo.Avali > 0{
+							fmt.Printf("node %d is dead, recovery for %d\n", nodeID, exInfo.ExtentID) 
 							go func(extent *pb.ExtentInfo, nodeID uint64) {
 								sm.dispatchRecoveryTask(extent, nodeID)
 								sm.unlockExtent(extent.ExtentID)
-							}(extent, nodeID)
+							}(exInfo, nodeID)
 							continue OUTER
 						}
 
 						//check node is avali
-						if extent.Avali & uint32(1 << i) == 0 {
+					
+						if (exInfo.Avali & uint32(1 << i)) == 0 {
+							fmt.Printf("check Avali for extent %d on node , avali is %d %d", 
+							exInfo.ExtentID, nodeID, exInfo.Avali)
 							go func(extent *pb.ExtentInfo, nodeID uint64){
 								sm.reAvali(extent, nodeID)
 								sm.unlockExtent(extent.ExtentID)
-							}(extent, nodeID)
+							}(exInfo, nodeID)
 							continue OUTER
 						}
 
 					}
-					sm.unlockExtent(extent.ExtentID)
+					sm.unlockExtent(exInfo.ExtentID)
 				}
 			}
 	}

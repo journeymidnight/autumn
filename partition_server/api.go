@@ -20,7 +20,7 @@ func (ps *PartitionServer) checkVersion(partID uint64, key []byte) *range_partit
 	rp := ps.rangePartitions[partID]
 	ps.RUnlock()
 	if rp == nil {
-		fmt.Println("no such rp")
+		fmt.Printf("no such rp %d\n", partID)
 		return nil
 	}
 	if bytes.Compare(rp.StartKey, key) <= 0 && (len(rp.EndKey) == 0 || bytes.Compare(key, rp.EndKey) < 0) {
@@ -119,7 +119,7 @@ func (ps *PartitionServer) SplitPart(ctx context.Context, req *pspb.SplitPartReq
 	rp := ps.rangePartitions[req.PartID]
 	ps.RUnlock()
 	if rp == nil {
-		fmt.Println("no such rp")
+		fmt.Printf("no such rp %d\n", req.PartID)
 		return nil, errors.New("no such partid")
 	}
 	

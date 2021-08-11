@@ -94,7 +94,7 @@ func readExtentHeader(file *os.File) (*extentHeader, error) {
 		return nil, err
 	}
 
-	if eh.ID == 0 || bytes.Compare(eh.MagicNumber, []byte(extentMagicNumber)) != 0 {
+	if bytes.Compare(eh.MagicNumber, []byte(extentMagicNumber)) != 0 {
 		return nil, errors.New("meta data is not corret")
 	}
 	return eh, nil
@@ -158,7 +158,7 @@ func OpenExtent(fileName string) (*Extent, error) {
 			return nil, errors.Errorf("check extent file, the extent file is too big")
 		}
 		//check extent header
-
+		
 		eh, err := readExtentHeader(file)
 		if err != nil {
 			return nil, err
@@ -465,32 +465,33 @@ func (ex *Extent) AppendBlocks(blocks []*pb.Block, doSync bool) ([]uint32, uint3
 	return offsets, uint32(end), nil
 }
 
-func (ex *Extent) ValidAllBlocks() (uint64, error) {
+
+//ValidAllBlocks表示从start,就存在一个合法的数据block(不是64KB BLOCK)
+func (ex *Extent) ValidAllBlocks(start int64) (uint32, error) {
+	var err error
 
 	wrapReader := ex.GetReader() //thread-safe
+
 	rr := record.NewReader(wrapReader)
-	var start uint64
-	var err error
+	rr.SeekRecord(start)
+	var end uint32
 	var rec io.Reader
 	for {
 		rec, err = rr.Next()
 		if err == io.EOF {
-			break
+			return end, nil
 		}
-		start = uint64(rr.Offset())
-		
-
 		if err != nil {
 			//err happens...
-			return start, err
+			return end, err
 		}
+
 		_, err = ioutil.ReadAll(rec)
 		if err != nil {
-			//err happens
-			return start, err
+			return end, err
 		}
+		end = uint32(rr.End())
 	}
-	return start, nil
 }
 
 func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize uint32) ([]*pb.Block, []uint32, uint32, error) {
@@ -510,35 +511,34 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 	if err != nil {
 		return nil, nil, 0, err
 	}
-	size := int64(0)
 
 	var offsets []uint32
 	var end uint32
-	for i := uint32(0); i < maxNumOfBlocks; {
+	for i := 0; uint32(i) < maxNumOfBlocks; i++ {
 		reader, err := rr.Next()
 		start := rr.Offset()
 		if err == io.EOF {
 			return ret, offsets, end, wire_errors.EndOfExtent
-		
 		}
 
 		if err != nil {
-			fmt.Printf("ReadBlocks: err != nil %s\n", err)
+			fmt.Printf("DISK ReadBlocks: err != nil %s\n", err)
 			xlog.Logger.Errorf("extent %d readBlock from %d , err is %s", ex.ID, offset, err)
 			return nil, nil, 0, err
 		}
 
-		if rr.End()-start+size > int64(maxTotalSize) && len(ret) > 0 {
+
+
+		data, err := ioutil.ReadAll(reader)
+
+		if rr.End() - int64(offset) > int64(maxTotalSize) && len(ret) > 0 {
 			end = uint32(start)
 			break
 		}
 
-		data, err := ioutil.ReadAll(reader)
-
 		ret = append(ret, &pb.Block{Data: data})
 		offsets = append(offsets, uint32(start))
 		end = uint32(rr.End())
-		i++
 	}
 	utils.AssertTrue(end <= ex.commitLength)
 	//fmt.Printf("read block at extent ID %d, end is %d\n", ex.ID, end)
