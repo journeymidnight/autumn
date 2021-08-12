@@ -230,7 +230,14 @@ func (ps *PartitionServer) Init() {
 	ops := []clientv3.Op{
 		clientv3.OpPut(keyName, string(utils.MustMarshal(&detail)), clientv3.WithLease(session.Lease())),
 	}
-	utils.Check(etcd_utils.EtcdSetKVS(ps.etcdClient, cmp, ops))
+	for {
+		err = etcd_utils.EtcdSetKVS(ps.etcdClient, cmp, ops)
+		if err == nil {
+			break
+		}
+		fmt.Printf("create session %s timeout..retying..\n", keyName)
+		time.Sleep(time.Second)
+	}
 
 
 
@@ -357,14 +364,8 @@ func (ps *PartitionServer) Shutdown() {
 	for _, rp := range ps.rangePartitions {
 		rp.Close()
 	}
-
-	for _, mutex := range ps.rangePartitionLocks {
-		ctx , cancel := context.WithTimeout(context.Background(), time.Second)
-		mutex.Unlock(ctx)
-		cancel()
-	}
 	ps.Unlock()
-
-	//FIXME
+	time.Sleep(1 * time.Second)
+	//FIXME, will release all mutex as well
 	ps.session.Close()
 }
