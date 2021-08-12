@@ -119,6 +119,8 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	}
 	fmt.Printf("row end is %d\n", rowStream.End())
 	
+	fmt.Printf("table locs is %v\n", tableLocs)
+	
 	//replay log
 	//open tables
 	//tableLocs的顺序就是在logStream里面的顺序
@@ -154,7 +156,7 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		return rp.tables[i].LastSeq < rp.tables[j].LastSeq
 	})
 	*/
-	
+		
 	var lastTable *table.Table
 	rp.seqNumber = 0
 	for i := range rp.tables {
@@ -463,10 +465,9 @@ func (rp *RangePartition) updateTableLocs(tableLocs []*pspb.Location) {
 		err := rp.setLocs(rp.PartID, tableLocs)
 		if err != nil {
 			xlog.Logger.Errorf("failed to set tableLocs for %d, retry...", rp.PartID)
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(500 * time.Millisecond)
 			continue
 		}
-		break
 	}
 }
 

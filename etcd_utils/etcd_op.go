@@ -3,12 +3,12 @@ package etcd_utils
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"time"
 
 	"github.com/coreos/etcd/clientv3"
 
 	"github.com/coreos/etcd/mvcc/mvccpb"
-	"github.com/pkg/errors"
 )
 
 
@@ -49,8 +49,11 @@ func EtcdSetKVS(c *clientv3.Client, cmps []clientv3.Cmp, ops []clientv3.Op) erro
 	txn := clientv3.NewKV(c).Txn(ctx)
 	txn.If(cmps...)
 	res, err := txn.Then(ops...).Commit()
-	if res.Succeeded == false || err != nil {
-		return errors.Wrap(err, "SetKVs failed")
+	if err != nil {
+		return err
+	}
+	if !res.Succeeded {
+		return errors.New("set etcd kv failed, maybe mutex not match")
 	}
 	return nil
 }

@@ -354,12 +354,14 @@ func (ps *PartitionServer) Shutdown() {
 
 	//2. close all range partition
 	ps.Lock()
-	for _, mutex := range ps.rangePartitionLocks {
-		ctx , _:= context.WithTimeout(context.Background(), time.Second)
-		mutex.Unlock(ctx)
-	}
 	for _, rp := range ps.rangePartitions {
 		rp.Close()
+	}
+
+	for _, mutex := range ps.rangePartitionLocks {
+		ctx , cancel := context.WithTimeout(context.Background(), time.Second)
+		mutex.Unlock(ctx)
+		cancel()
 	}
 	ps.Unlock()
 
