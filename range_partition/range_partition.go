@@ -243,6 +243,7 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 
 	
 	
+	/*
 	var tbls []*table.Table
 	rp.tableLock.RLock()
 	for _, t := range rp.tables {
@@ -260,6 +261,7 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	for _, t := range tbls {
 		t.DecrRef()
 	}
+	*/
 	
 	
 	return rp,nil
@@ -461,11 +463,12 @@ func (rp *RangePartition) updateTableLocs(tableLocs []*pspb.Location) {
 		return
 	}
 	fmt.Printf("updating tables %+v\n", tableLocs)
+	backoff := 100 * time.Millisecond
 	for {
 		err := rp.setLocs(rp.PartID, tableLocs)
 		if err != nil {
 			xlog.Logger.Errorf("failed to set tableLocs for %d, retry...", rp.PartID)
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(2 * backoff)
 			continue
 		}
 	}
