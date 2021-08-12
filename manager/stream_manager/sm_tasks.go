@@ -410,7 +410,7 @@ func (sm *StreamManager) routineDispatchTask() {
 						//check node is avali
 					
 						if (exInfo.Avali & uint32(1 << i)) == 0 {
-							fmt.Printf("check Avali for extent %d on node , avali is %d %d", 
+							fmt.Printf("check Avali for extent %d on node %d, avali is %d", 
 							exInfo.ExtentID, nodeID, exInfo.Avali)
 							go func(extent *pb.ExtentInfo, nodeID uint64){
 								sm.reAvali(extent, nodeID)
