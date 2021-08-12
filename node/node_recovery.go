@@ -472,16 +472,16 @@ func (en *ExtentNode) ReAvali(ctx context.Context, req *pb.ReAvaliRequest) (*pb.
 		appendWriter := ex.GetRawWriter()
 		err = en.recoveryReplicateExtent(exInfo, en.nodeID, offset, size, appendWriter)
 	} else {
-		var start uint32
-		start, _ = ex.ValidAllBlocks(0)
-		err = ex.Truncate(start)
-		x := utils.Floor(start, 64<<10)//x + padding = start
-		padding := start - x
+		var validEnd uint32
+		validEnd, _ = ex.ValidAllBlocks(0)
+		err = ex.Truncate(validEnd)
+		x := utils.Floor(validEnd, 64<<10)//x + padding = validEnd, x is aligned to validEnd
+		padding := validEnd - x
 		if err != nil {
 			xlog.Logger.Errorf("EC recovery after validBlocks truncate extent %d error %v", exInfo.ExtentID, err)
 			return errDone(err)
 		}
-		fmt.Printf("extent %d Revali from %d\n", exInfo.ExtentID, start)
+		fmt.Printf("extent %d Revali from valid end:%d, aligned start %d, padding %d\n", exInfo.ExtentID, validEnd, x, padding)
 		//reavali part data,
 		err = en.recoveryErasureExtent(exInfo, en.nodeID, uint64(x), exInfo.SealedLength - uint64(x), padding, ex.Extent)
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math/rand"
 	"os"
 	"strconv"
 
@@ -30,16 +31,27 @@ func main() {
 	fmt.Println(err)
 	fmt.Printf("end of valid blocks %d\n", validEnd)
 
+	if validEnd != ex.CommitLength() {
+		fmt.Printf("this file from %d ~ %d is valid", offset, validEnd)
+		return 
+	}
+	
 	//call ex.ReadBlocks until meet error
 	var blocks []*pb.Block
 	var end uint32
 	err = nil
 	n := 0
+	var ends []uint32
 	for err == nil {
-		blocks, _, end, err = ex.ReadBlocks(uint32(offset), 100, 120<<20)
+		blocks, _, end, err = ex.ReadBlocks(uint32(offset), 10, 120<<20)
+		//fmt.Printf("possible end %d\n", end)
+		ends = append(ends, end)
 		offset = int(end)
 		n += len(blocks)
 	}
+	//chose random one from ends
+	end = ends[rand.Intn(len(ends))]
+	fmt.Printf("possible in middle end is %d\n", end)
 	fmt.Printf("end of blocks %d, total number of blocks is %d\n", offset, n)
 
 }

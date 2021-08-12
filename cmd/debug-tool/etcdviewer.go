@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -14,6 +16,9 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"github.com/coreos/etcd/clientv3"
+	"github.com/gogo/protobuf/jsonpb"
+	"github.com/gogo/protobuf/proto"
+
 	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/proto/pspb"
@@ -42,6 +47,19 @@ streams/4
 streams/6
 */
 
+
+
+func jsonEncode(x proto.Message) string {
+	var jm = &jsonpb.Marshaler{}
+	jm.Indent="  "
+	ret, err := jm.MarshalToString(x)
+	if err != nil {
+		panic(err)
+	}
+
+	return ret
+}
+
 //receiveData from ETCD
 func receiveData(client *clientv3.Client) []KV {
 	var data []KV
@@ -55,7 +73,7 @@ func receiveData(client *clientv3.Client) []KV {
 			task.Unmarshal(kv.Value)
 			d := KV {
 				Key: string(kv.Key),
-				Value: fmt.Sprintf("%+v", task),
+				Value: jsonEncode(&task),
 			}
 			data = append(data, d)
 		} else if strings.HasSuffix(string(kv.Key), "tables") {
@@ -71,7 +89,7 @@ func receiveData(client *clientv3.Client) []KV {
 			config.Unmarshal(kv.Value)
 			d := KV {
 				Key: string(kv.Key),
-				Value: fmt.Sprintf("%+v", config),
+				Value: jsonEncode(&config),
 			}
 			data = append(data, d)
 
@@ -99,7 +117,7 @@ func receiveData(client *clientv3.Client) []KV {
 			}
 			d := KV{
 				Key:   string(kv.Key),
-				Value: fmt.Sprintf("%+v", x),
+				Value: jsonEncode(&x),
 			}
 			data = append(data, d)
 		} else if strings.HasPrefix(string(kv.Key), "PSSERVER/") {
@@ -109,7 +127,7 @@ func receiveData(client *clientv3.Client) []KV {
 			}
 			d := KV{
 				Key:   string(kv.Key),
-				Value: fmt.Sprintf("%+v", x),
+				Value: jsonEncode(&x),
 			}
 			data = append(data, d)
 		} else if strings.HasPrefix(string(kv.Key), "extents/") {
@@ -119,7 +137,7 @@ func receiveData(client *clientv3.Client) []KV {
 			}
 			d := KV{
 				Key:   string(kv.Key),
-				Value: fmt.Sprintf("%+v", x),
+				Value: jsonEncode(&x),
 			}
 			data = append(data, d)
 		} else if strings.HasPrefix(string(kv.Key), "nodes") {
@@ -129,7 +147,7 @@ func receiveData(client *clientv3.Client) []KV {
 			}
 			d := KV{
 				Key:   string(kv.Key),
-				Value: fmt.Sprintf("%+v", x),
+				Value: jsonEncode(&x),
 			}
 			data = append(data, d)
 
@@ -140,7 +158,7 @@ func receiveData(client *clientv3.Client) []KV {
 			}
 			d := KV{
 				Key:   string(kv.Key),
-				Value: fmt.Sprintf("%+v", x),
+				Value: jsonEncode(&x),
 			}
 			data = append(data, d)
 		} else if strings.HasPrefix(string(kv.Key), "disks") {
@@ -148,7 +166,7 @@ func receiveData(client *clientv3.Client) []KV {
 			utils.MustUnMarshal(kv.Value, &x)
 			d := KV{
 				Key: string(kv.Key),
-				Value: fmt.Sprintf("%+v", x),
+				Value: jsonEncode(&x),
 			}
 			data = append(data, d)
 
@@ -184,6 +202,20 @@ func main() {
 	detailText.SetText("Select An Item From The List")
 
 	var chosenItemID widget.ListItemID
+
+	detailText.Validator = func(text string) error {
+		//TODO
+		if chosenItemID == widget.ListItemID(-1) {
+			return nil
+		}
+		value := detailText.Text
+		if !json.Valid([]byte(value)) {
+			return errors.New("invalid json")
+		}
+		return nil
+
+	}
+
 	list := widget.NewList(
 		func() int {
 			return len(data)
@@ -213,8 +245,61 @@ func main() {
 	}
 
 	refresh()
+
 	refreshButton := widget.NewButton("refresh", func() {
 		refresh()
+	})
+
+	showDialog := func(err error) {
+		dialog.NewInformation("information", err.Error(), myWindow).Show()
+	}
+
+	updateButton := widget.NewButton("update", func() {
+		if chosenItemID == widget.ListItemID(-1) {
+			return
+		}
+		key := data[chosenItemID].Key
+		value := detailText.Text
+		var data []byte
+		if strings.HasPrefix(key, "nodes") {
+			var x pb.NodeInfo
+			if err := jsonpb.UnmarshalString(value, &x); err != nil {
+				showDialog(err)
+				return
+			}
+			data = utils.MustMarshal(&x)
+		} else if strings.HasPrefix(key, "streams") {
+			var x pb.StreamInfo
+			if err := jsonpb.UnmarshalString(value, &x); err != nil {
+				showDialog(err)
+				return
+			}
+			data = utils.MustMarshal(&x)
+
+		} else if strings.HasPrefix(key, "disks") {
+			var x pb.DiskInfo
+			if err := jsonpb.UnmarshalString(value, &x); err != nil {
+				showDialog(err)
+			}
+			data = utils.MustMarshal(&x)
+		} else if strings.HasPrefix(key, "extents/") {
+			var x pb.ExtentInfo
+			if err := jsonpb.UnmarshalString(value, &x); err != nil {
+				showDialog(err)
+			}
+			data = utils.MustMarshal(&x)
+		} else {
+			showDialog(fmt.Errorf("unkown key..."))
+			return
+		}
+
+		err = etcd_utils.EtcdSetKV(client, key, data)
+		if err != nil {
+			showDialog(err)
+		} else {
+			showDialog(errors.New("OK"))
+			refresh()
+		}
 	})
 
 	deleteButton := widget.NewButton("delete", func() {
@@ -240,7 +325,7 @@ func main() {
 		}, myWindow)
 	})
 
-	top := container.NewHBox(refreshButton, deleteButton)
+	top := container.NewHBox(refreshButton, deleteButton, updateButton)
 	bottom := container.NewHSplit(list, detailText)
 	main := container.NewVSplit(top, bottom)
 	main.SetOffset(0)
