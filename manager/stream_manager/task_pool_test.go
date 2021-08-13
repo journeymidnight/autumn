@@ -45,4 +45,9 @@ func TestTaskPool(t *testing.T) {
 
 	rt = tp.GetFromExtent(10)
 	require.Nil(t, rt)
+
+	tp.Remove(20)
+	tasks = tp.GetFromNode(17)
+	require.Equal(t, 1, len(tasks))
+	require.Equal(t, uint64(30), tasks[0].ExtentID)
 }

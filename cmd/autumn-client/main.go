@@ -215,6 +215,13 @@ func bootstrap(c *cli.Context) error {
 	if err := smc.Connect(); err != nil {
 		return err
 	}
+
+	//valid no PART exists...
+	kv, _, _ := etcd_utils.EtcdRange(etcdClient, "PART/")
+	if len(kv) > 0 {
+		return errors.New("partition already exists")
+	}
+
 	//choose the first one
 
 	log, _, err := smc.CreateStream(context.Background(), 2, 1)
@@ -241,12 +248,7 @@ func bootstrap(c *cli.Context) error {
 		PartID:    partID,
 	}
 
-	//valid no PART exists...
 
-	kv, _, _ := etcd_utils.EtcdRange(etcdClient, "PART/")
-	if len(kv) > 0 {
-		return errors.New("partition already exists")
-	}
 
 	err = etcd_utils.EtcdSetKV(etcdClient, fmt.Sprintf("PART/%d", partID), utils.MustMarshal(&zeroMeta))
 	if err != nil {
