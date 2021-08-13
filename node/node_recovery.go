@@ -101,8 +101,7 @@ func (en *ExtentNode) recoveryReplicateExtent(exInfo *pb.ExtentInfo, exceptID, o
 
 func (en *ExtentNode) recoveryErasureExtent(exInfo *pb.ExtentInfo, exceptID, offset, size uint64, start uint32, targetExtent *extent.Extent) error {
 
-	fmt.Printf("run recovery EC: %v", exInfo)
-	defer fmt.Printf("recovery done, %v", exInfo.ExtentID)
+	var err error
 	conns, replacingIndex, err := en.chooseECAliveNode(exInfo, exceptID)
 	if err != nil {
 		return err
@@ -155,8 +154,11 @@ func (en *ExtentNode) recoveryErasureExtent(exInfo *pb.ExtentInfo, exceptID, off
 		})
 	}
 
+
+
 	stopper.Wait()
-	if completes != int32(len(exInfo.Replicates)) {
+	fmt.Printf("completes is %d\n", completes) 
+	if completes < int32(len(exInfo.Replicates)) {
 		return errors.Errorf("can not call enought shards")
 	}
 
@@ -189,29 +191,29 @@ func (en *ExtentNode) chooseAliveNode(extentInfo *pb.ExtentInfo, except uint64) 
 	return nil
 }
 
-func (en *ExtentNode) chooseECAliveNode(extentInfo *pb.ExtentInfo, except uint64) ([]*grpc.ClientConn, int, error){
+func (en *ExtentNode) chooseECAliveNode(exInfo *pb.ExtentInfo, except uint64) ([]*grpc.ClientConn, int, error){
 	var missingIndex = -1
 
-	addrs := en.em.GetPeers(extentInfo.ExtentID)
+	addrs := en.em.GetPeers(exInfo.ExtentID)
 	if addrs == nil {
 		return nil, 0, errors.New("can not get enough addrs")
 	}
-	utils.AssertTrue(len(addrs) == len(extentInfo.Replicates) + len(extentInfo.Parity))
+	utils.AssertTrue(len(addrs) == len(exInfo.Replicates) + len(exInfo.Parity))
 	activeConns := 0
 	conns := make([]*grpc.ClientConn, len(addrs))
 
 	nodes := make([]uint64, len(addrs))
-	copy(nodes, extentInfo.Replicates)
-	copy(nodes[len(extentInfo.Replicates):], extentInfo.Parity)
+	copy(nodes, exInfo.Replicates)
+	copy(nodes[len(exInfo.Replicates):], exInfo.Parity)
 	
 	for i := 0;i  < len(nodes);i ++ {
 		//skip
-		if nodes[i] == except || (1 << i) & extentInfo.Avali == 0{
+		if nodes[i] == except || (exInfo.Avali & (1 << i)) == 0{
 			missingIndex = i
 			continue
 		}
 
-		if (1 << i) & extentInfo.Avali == 0 {
+		if (exInfo.Avali & (1 << i)) == 0 {
 			continue
 		}
 
@@ -225,8 +227,8 @@ func (en *ExtentNode) chooseECAliveNode(extentInfo *pb.ExtentInfo, except uint64
 
 	}
 
-	fmt.Printf("activeConns is %d\n", activeConns)
-	if activeConns == len(extentInfo.Replicates) {
+	fmt.Printf("activeConns is %v\n", activeConns)
+	if activeConns == len(exInfo.Replicates) {
 		return conns, missingIndex, nil
 	}
 
@@ -234,41 +236,71 @@ func (en *ExtentNode) chooseECAliveNode(extentInfo *pb.ExtentInfo, except uint64
 }
 
 
-func (en *ExtentNode) runRecoveryTask(task *pb.RecoveryTask, extentInfo *pb.ExtentInfo, copyFilePath string, diskID uint64) {
+
+func truncateFileToZero(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if info.Size() == 0 {
+		return nil
+	}
+	return os.Truncate(path, 0)
+}
+
+func (en *ExtentNode) runRecoveryTask(task *pb.RecoveryTask, exInfo *pb.ExtentInfo, copyFilePath string, diskID uint64) {
 	
 		atomic.AddInt32(&en.recoveryTaskNum, 1)
 		defer func(){
 			atomic.AddInt32(&en.recoveryTaskNum, ^int32(0))
 		}()
 
-		isEC := len(extentInfo.Parity) > 0
+		isEC := len(exInfo.Parity) > 0
 		var err error
 		//loop 
+		//FIXME:这里也有问题, 这个循环
 		for {
 			//有可能manager等的太久了,或者网络parttion, 找另外一个
 			//node做完了recovery任务, 这个任务自动取消
-			if stream_manager.FindNodeIndex(extentInfo, task.ReplaceID) == -1  {
+			if stream_manager.FindNodeIndex(exInfo, task.ReplaceID) == -1  {
 				os.Remove(copyFilePath)
 				return
 			}
+
+			//if we retry Recovery and copyFilePath is not empty, we should truncate it
+			//主要是多副本情况, 因为是从stream直接写入copyFile, 如果stream中间断开, 可能导致
+			//copyFile数据不完整
+			if err = truncateFileToZero(copyFilePath) ; err != nil {
+				xlog.Logger.Error(err)
+				return
+			}
+			
+
 			//write to ".copy" file, and 
 			if isEC == false {
-				copyFile, err  := os.OpenFile(copyFilePath, os.O_RDWR, 0666)
+				var copyFile *os.File
+				copyFile, err  = os.OpenFile(copyFilePath, os.O_RDWR, 0666)
 				if err!= nil {
 					xlog.Logger.Errorf(err.Error())
 					return
 				}
-				err = en.recoveryReplicateExtent(extentInfo, task.ReplaceID, 0, extentInfo.SealedLength, copyFile)
+				err = en.recoveryReplicateExtent(exInfo, task.ReplaceID, 0, exInfo.SealedLength, copyFile)
 				copyFile.Close()
 			} else {
-				ex , err := extent.OpenExtent(copyFilePath)
+				var ex *extent.Extent
+				ex , err = extent.OpenExtent(copyFilePath)
 				if err != nil {
 					xlog.Logger.Warnf(err.Error())
 					return 
 				}
 				//recovery all data
-				err = en.recoveryErasureExtent(extentInfo, task.ReplaceID, 0, extentInfo.SealedLength, 0, ex)
+				fmt.Printf("recovery EC extent %d \n", exInfo.ExtentID)
+				ex.Lock()
+				err = en.recoveryErasureExtent(exInfo, task.ReplaceID, 0, exInfo.SealedLength, 0, ex)
+				ex.Unlock()
 				ex.Close()
+				fmt.Printf("recovery EC extent result is %v \n", err)
+
 			}
 
 			if err == nil {
@@ -276,13 +308,14 @@ func (en *ExtentNode) runRecoveryTask(task *pb.RecoveryTask, extentInfo *pb.Exte
 			}
 			xlog.Logger.Warnf(err.Error())
 
-			time.Sleep(60*time.Second)
+			time.Sleep(10 *  time.Second)
 			//get the latest extentInfo
-			extentInfo = en.em.Latest(task.ExtentID)
+			exInfo = en.em.Latest(task.ExtentID)
 		}
 
+		
 		//rename file from XX.XX.copy to XX.ext
-		extentFileName := fmt.Sprintf("%s.ext", path.Dir(copyFilePath))
+		extentFileName := fmt.Sprintf("%s/%d.ext", path.Dir(copyFilePath), task.ExtentID)
 		utils.Check(os.Rename(copyFilePath, extentFileName))
 		ex, err := extent.OpenExtent(extentFileName)
 		utils.Check(err)
@@ -309,22 +342,36 @@ func (en *ExtentNode) CopyExtent(req *pb.CopyExtentRequest, stream pb.ExtentServ
 		return io.EOF
 	}
 
-
-	extentInfo := en.em.WaitVersion(req.ExtentID, req.Eversion)
-	if extentInfo == nil {
+	exInfo := en.em.WaitVersion(req.ExtentID, req.Eversion)
+	if exInfo == nil {
 		return errDone(errors.New("no such extentInfo"), stream)
 	}
 
-	//BUGONs
-	extent := en.getExtent(req.ExtentID)
-	if extent == nil {
+	slot := stream_manager.FindNodeIndex(exInfo, en.nodeID)	
+	if slot == -1 {
 		return errDone(errors.Errorf("node %d do not have extent %d", en.nodeID, req.ExtentID), stream)
 	}
-	if !extent.IsSeal() {
-		return errDone(errors.Errorf("BUGON: extent %d on node %d is not sealed", req.ExtentID, en.nodeID), stream)
+
+	if (exInfo.Avali & (1 << slot)) == 0 {
+		return errDone(errors.Errorf("node %d do not have avaliable extent %d", en.nodeID, req.ExtentID), stream)
 	}
-	if req.Offset + req.Size_ > uint64(extent.CommitLength()) {
-		return errDone(errors.Errorf("BUGON: extent %d on node %d's length is %d , less than requested", req.ExtentID, en.nodeID, extent.CommitLength()), stream)
+	
+	//BUGONs
+	ex := en.getExtent(req.ExtentID)
+	if ex == nil {
+		return errDone(errors.Errorf("node %d do not have extent %d", en.nodeID, req.ExtentID), stream)
+	}
+
+	//if Seal message delayed, Seal it now.
+	if !ex.IsSeal(){
+		ex.Lock()
+		ex.Seal(uint32(exInfo.SealedLength))
+		ex.Unlock()
+	}
+
+	if req.Offset + req.Size_ > uint64(ex.CommitLength()) {
+		fmt.Printf("node %d, length wrong req.Offset:%d + req.Size_ %d > commitCommth: %d \n", en.nodeID, req.Offset, req.Size_, ex.CommitLength())
+		return errDone(errors.Errorf("BUGON: extent %d on node %d's length is %d , less than requested", req.ExtentID, en.nodeID, ex.CommitLength()), stream)
 	}
 	
 
@@ -337,9 +384,9 @@ func (en *ExtentNode) CopyExtent(req *pb.CopyExtentRequest, stream pb.ExtentServ
 		},
 	})
 
-	fmt.Printf("extent size is %d, transfer size %d\n", extent.CommitLength(), req.Size_)
+	fmt.Printf("extent size is %d, transfer size %d\n", ex.CommitLength(), req.Size_)
 
-	reader := extent.GetReader()
+	reader := ex.GetReader()
 	reader.Seek(int64(req.Offset), io.SeekStart)
 	buf := make([]byte, 512 << 10)
 	for {
@@ -380,32 +427,37 @@ func (en *ExtentNode) RequireRecovery(ctx context.Context, req *pb.RequireRecove
 		//reply accept
 
 		if en.getExtent(req.Task.ExtentID) != nil {
-			return errDone(errors.New("overlapping current file"))
+			return errDone(errors.Errorf("node %d overlapping current file %d", en.nodeID, req.Task.ExtentID))
 		}
 		//create
 		//xlog.Logger.Infof("run recovery task %+v on node %d\n", req.Task, en.nodeID)
 
-		//wait for the latest extentInfo
-		extentInfo := en.em.Latest(req.Task.ExtentID)
+		//wait for the latest exInfo
+		exInfo := en.em.Latest(req.Task.ExtentID)
 
-		if extentInfo.SealedLength == 0 {
+		if exInfo.Avali == 0 {
 			return errDone(errors.New("extent should be sealed"))
 		}
 
-		if stream_manager.FindNodeIndex(extentInfo, req.Task.ReplaceID) == -1  {
-			xlog.Logger.Infof("task %v is not valid to info %v", req.Task, extentInfo)
-			return errDone(errors.Errorf("task %v is not valid to info %v", req.Task, extentInfo))
+		if stream_manager.FindNodeIndex(exInfo, req.Task.ReplaceID) == -1  {
+			xlog.Logger.Infof("task %v is not valid to info %v", req.Task, exInfo)
+			return errDone(errors.Errorf("task %v is not valid to info %v", req.Task, exInfo))
 		}
 
 		//create targetFile
 		//choose one disk
-		i := en.chooseDisktoAlloc()
-		targetFilePath, err := en.diskFSs[i].AllocCopyExtent(extentInfo.ExtentID, req.Task.ReplaceID)
+		diskID := en.chooseDisktoAlloc()
+		if diskID == 0 {
+			return errDone(errors.New("no available disk"))
+		}
+		targetFilePath, err := en.diskFSs[diskID].AllocCopyExtent(exInfo.ExtentID, req.Task.ReplaceID)
+
+		fmt.Printf("target path is %s\n", targetFilePath)
 		if err != nil {
 			xlog.Logger.Warnf("can not create CopyExtent copy target [%s]", err.Error())
 			return errDone(err)
 		}
-		go en.runRecoveryTask(req.Task, extentInfo, targetFilePath, i)
+		go en.runRecoveryTask(req.Task, exInfo, targetFilePath, diskID)
 
 		return &pb.RequireRecoveryResponse{
 			Code: pb.Code_OK,

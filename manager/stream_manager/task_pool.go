@@ -44,10 +44,11 @@ func (tp *TaskPool) Remove(extentID uint64) {
 	
 }
 
-func (tp *TaskPool) Insert(extentID uint64, t *pb.RecoveryTask) {
+func (tp *TaskPool) Insert(t *pb.RecoveryTask) {
 
 	tp.Lock()
 	defer tp.Unlock()
+	extentID := t.ExtentID
 	tp.extentMap.Set(extentID, t)
 
 	d, ok := tp.nodeMap.Get(t.NodeID)
@@ -56,8 +57,8 @@ func (tp *TaskPool) Insert(extentID uint64, t *pb.RecoveryTask) {
 		tl.Set(extentID, t)
 	} else {
 		tl := &hashmap.HashMap{}
-		tl.Set(extentID, t)
-		tp.nodeMap.Set(extentID, tl)
+		tl.Set(t.NodeID, t)
+		tp.nodeMap.Set(t.NodeID, tl)
 	}
 }
 

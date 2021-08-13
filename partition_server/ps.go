@@ -181,7 +181,7 @@ func (ps *PartitionServer) parseRegionAndStart(regions *pspb.Regions) int64{
 		}
 
 		xlog.Logger.Infof("range partition %d starting, meta: %v", meta.PartID, meta)
-
+		fmt.Printf("range partition %d starting, meta: %v", meta.PartID, meta)
 		rp, err := ps.startRangePartition(meta, locs, blobs, mutex)
 		if err != nil {
 			xlog.Logger.Errorf(err.Error())

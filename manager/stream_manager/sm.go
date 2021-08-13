@@ -191,7 +191,7 @@ func (sm *StreamManager) runAsLeader() {
 
 		//FIXME:
 		if kv.Version != int64(streamInfo.Sversion) {
-			panic(fmt.Sprintf("%s 's Version is not equal to %d", kv.Key, kv.Version, streamInfo.Sversion))
+			panic(fmt.Sprintf("%s 's Version %d is not equal to %d", kv.Key, kv.Version, streamInfo.Sversion))
 		}
 
 		/*
@@ -228,9 +228,11 @@ func (sm *StreamManager) runAsLeader() {
 		}
 		
 		
+		/*
 		if kv.Version != int64(extentInfo.Eversion) {
 			panic(fmt.Sprintf("%s 's Version %d is not equal to %d", kv.Key, kv.Version, extentInfo.Eversion))
 		}
+		*/
 		
 		sm.extents.Set(extentID, &extentInfo)
 		sm.extentsLocks.Store(extentID, new(sync.Mutex))
@@ -268,19 +270,15 @@ func (sm *StreamManager) runAsLeader() {
 		return
 	}
 	for _, kv := range kvs {
-		extentID, err := parseKey(string(kv.Key), "recoveryTasks")
-		if err != nil {
-			xlog.Logger.Errorf(err.Error())
-			return
-		}
-
 		var task pb.RecoveryTask
 		if err = task.Unmarshal(kv.Value); err != nil {
 			xlog.Logger.Errorf(err.Error())
-			return
+			continue
 		}
+		fmt.Printf("%+v\n", task)
 
-		sm.taskPool.Insert(extentID, &task)
+		sm.taskPool.Insert(&task)
+		fmt.Printf("????%v\n" ,sm.taskPool.GetFromNode(task.NodeID))
 	}
 
 	sm.disks = &hashmap.HashMap{}
@@ -310,8 +308,8 @@ func (sm *StreamManager) runAsLeader() {
 	sm.stopper.RunWorker(sm.routineUpdateDF)
 	sm.stopper.RunWorker(sm.routineDispatchTask)
 
-	fmt.Printf("Start loading data from etcd, cost %v\n", time.Now().Sub(startLoading))
 	atomic.StoreInt32(&sm.isLeader, 1)
+	fmt.Printf("Start loading data from etcd, cost %v\n", time.Now().Sub(startLoading))
 }
 
 

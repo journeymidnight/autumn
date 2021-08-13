@@ -15,7 +15,6 @@ import (
 
 
 func main() {
-
 	config, err := node.NewConfig()
 	if err != nil {
 		fmt.Println(err.Error())
@@ -25,9 +24,11 @@ func main() {
 	xlog.InitLog([]string{fmt.Sprintf("node_%d.log", config.ID)}, zap.DebugLevel)
 
 	//FIXME: sm address
+
 	node := node.NewExtentNode(config.ID, config.Dirs, config.WalDir, config.ListenUrl, []string{"127.0.0.1:3401"}, []string{"127.0.0.1:2379"})
 
 	//open all extent files
+
 	err = node.LoadExtents()
 	utils.Check(err)
 
@@ -36,6 +37,7 @@ func main() {
 	err = node.ServeGRPC()
 	utils.Check(err)
 
+	fmt.Println("node is ready")
 	xlog.Logger.Infof("node is ready!")
 
 	sc := make(chan os.Signal, 1)

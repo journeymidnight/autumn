@@ -265,14 +265,14 @@ func (client *SMClient) NodesInfo(ctx context.Context) (map[uint64]*pb.NodeInfo,
 }
 
 
-func (client *SMClient) ExtentInfo(ctx context.Context, extentIDs []uint64) (map[uint64]*pb.ExtentInfo, error) {
+func (client *SMClient) ExtentInfo(ctx context.Context, extentID uint64) (*pb.ExtentInfo, error) {
 	
 	err := ErrTimeOut
 	var res *pb.ExtentInfoResponse
-	var extentInfos map[uint64]*pb.ExtentInfo
+	var exInfo *pb.ExtentInfo
 	client.try(func(conn *grpc.ClientConn) bool {
 		c := pb.NewStreamManagerServiceClient(conn)
-		res, err = c.ExtentInfo(ctx, &pb.ExtentInfoRequest{Extents: extentIDs})
+		res, err = c.ExtentInfo(ctx, &pb.ExtentInfoRequest{ExtentID: extentID})
 		if err == context.Canceled || err == context.DeadlineExceeded {
 			return false
 		}
@@ -288,11 +288,11 @@ func (client *SMClient) ExtentInfo(ctx context.Context, extentIDs []uint64) (map
 			}
 			return false
 		}
-		extentInfos = res.Extents
+		exInfo = res.ExInfo
 		return false
 	}, 500*time.Millisecond)
 
-	return extentInfos, err
+	return exInfo, err
 }
 
 

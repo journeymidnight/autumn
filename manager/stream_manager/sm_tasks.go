@@ -22,31 +22,34 @@ func (sm *StreamManager) copyDone(task *pb.RecoveryTask) {
 	sm.lockExtent(task.ExtentID)
 	defer sm.unlockExtent(task.ExtentID)
 
-	extentInfo, ok := sm.cloneExtentInfo(task.ExtentID)
+	exInfo, ok := sm.cloneExtentInfo(task.ExtentID)
 	if !ok {
 		return
 	}
 	newNodeID := task.NodeID
 
-	slot := FindNodeIndex(extentInfo, task.ReplaceID)
+	slot := FindNodeIndex(exInfo, task.ReplaceID)
 	if slot == -1 {
 		xlog.Logger.Errorf("copyDone invalid task %v", task)
 		return 
 	}
 
 	//replace ID
-	if slot < len(extentInfo.Replicates) {
-		extentInfo.Replicates[slot] = newNodeID
+	if slot < len(exInfo.Replicates) {
+		exInfo.Replicates[slot] = newNodeID
+		exInfo.ReplicateDisks[slot] = task.ReadyDiskID
 	} else {
-		extentInfo.Parity[slot - len(extentInfo.Replicates)] = newNodeID
+		exInfo.Parity[slot - len(exInfo.Replicates)] = newNodeID
+		exInfo.ParityDisk[slot - len(exInfo.Replicates)] = task.ReadyDiskID
 	}
-	extentInfo.Eversion ++
+	exInfo.Eversion ++
 
 
-	extentKey := formatExtentKey(extentInfo.ExtentID)
-	data := utils.MustMarshal(extentInfo)
 
-	taskKey := FormatRecoveryTaskName(extentInfo.ExtentID)
+	extentKey := formatExtentKey(exInfo.ExtentID)
+	data := utils.MustMarshal(exInfo)
+
+	taskKey := FormatRecoveryTaskName(exInfo.ExtentID)
 	cmps := []clientv3.Cmp{clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue)}
 	ops := []clientv3.Op{
 		clientv3.OpDelete(taskKey),
@@ -58,8 +61,9 @@ func (sm *StreamManager) copyDone(task *pb.RecoveryTask) {
 		return
 	}
 
+	sm.extents.Set(exInfo.ExtentID, exInfo)
 	//remove from taskPool in local memory
-	sm.taskPool.Remove(extentInfo.ExtentID)
+	sm.taskPool.Remove(exInfo.ExtentID)
 	//return successfull
 	xlog.Logger.Infof("extent %d, replaceID %d is restored on node %d", task.ExtentID, task.ReplaceID, newNodeID)
 }
@@ -101,6 +105,8 @@ func (sm *StreamManager) routineUpdateDF() {
 			xlog.Logger.Infof("remote server has error %s", res.CodeDes)
 			return
 		}
+
+		//fmt.Printf("df result is %+v\n", res)
 
 		sumFree := uint64(0)
 		sumTotal := uint64(0)
@@ -165,7 +171,7 @@ func (rt *RecoveryTask) SetRunningNode(x uint64) {
 
 
 func FormatRecoveryTaskName(extentID uint64) string {
-	return fmt.Sprintf("recoveryTasks/%d.tsk", extentID)
+	return fmt.Sprintf("recoveryTasks/%d", extentID)
 }
 
 func isReplaceIDinInfo(extentInfo *pb.ExtentInfo, replaceID uint64) bool {
@@ -191,7 +197,7 @@ func (sm *StreamManager) saveRecoveryTask(task *pb.RecoveryTask) error{
 		data := utils.MustMarshal(task)
 
 		cmps := []clientv3.Cmp{clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
-							  clientv3.Compare(clientv3.Version(key), "=", 0)}
+							  clientv3.Compare(clientv3.CreateRevision(key), "=", 0)}
 		ops := []clientv3.Op{
 			clientv3.OpPut(key, string(data)),
 		}
@@ -298,6 +304,18 @@ func (sm *StreamManager) dispatchRecoveryTask(exInfo *pb.ExtentInfo, replaceID u
 		return errors.Errorf("can not find remote node to copy")
 	}
 
+	/*
+	if exInfo.ExtentID == 17 {
+		chosenNode = &NodeStatus{NodeInfo:pb.NodeInfo{
+			NodeID: 4,
+			Address:"127.0.0.1:4002",
+		}}
+	} else {
+		fmt.Printf("ignore")
+		return nil
+	}*/
+
+	//policy
 	var chosenNode *NodeStatus
 	for i := range nodes {
 		if nodes[i].NodeID == replaceID {
@@ -307,6 +325,11 @@ func (sm *StreamManager) dispatchRecoveryTask(exInfo *pb.ExtentInfo, replaceID u
 			continue
 		}
 		chosenNode = nodes[i]
+		break
+	}
+	
+	if chosenNode == nil {
+		return errors.New("can not find remote node to copy")
 	}
 
 
@@ -316,13 +339,15 @@ func (sm *StreamManager) dispatchRecoveryTask(exInfo *pb.ExtentInfo, replaceID u
 		return errors.Errorf("can not connect %v", chosenNode)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	c := pb.NewExtentServiceClient(pool.Get())
 	task := &pb.RecoveryTask{
 		ExtentID: exInfo.ExtentID,
 		ReplaceID: replaceID,
 		NodeID: chosenNode.NodeID,
 	}
+	fmt.Printf("dispatch task %+v to node %+v\n", task, chosenNode)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	c := pb.NewExtentServiceClient(pool.Get())
+
 	res, err := c.RequireRecovery(ctx, &pb.RequireRecoveryRequest{
 			Task: task})
 	cancel()
@@ -343,7 +368,7 @@ func (sm *StreamManager) dispatchRecoveryTask(exInfo *pb.ExtentInfo, replaceID u
 		xlog.Logger.Warnf(err.Error())
 		return err
 	}
-	sm.taskPool.Insert(exInfo.ExtentID, task)
+	sm.taskPool.Insert(task)
 	
 	return nil
 }
@@ -357,7 +382,6 @@ func (sm *StreamManager) routineDispatchTask() {
 	}()
 
 	xlog.Logger.Infof("routineDispatchTask started")
-
 	for {
 		select {
 			case <- sm.stopper.ShouldStop():
@@ -368,7 +392,7 @@ func (sm *StreamManager) routineDispatchTask() {
 					exInfo := kv.Value.(*pb.ExtentInfo) //extent is read only
 
 					//only check sealed extent
-					if exInfo.SealedLength == 0 {
+					if exInfo.Avali == 0 {
 						continue 
 					}
 					
@@ -378,6 +402,17 @@ func (sm *StreamManager) routineDispatchTask() {
 					
 					for i, nodeID := range allCopies {
 
+						//check node is avali					
+						if (exInfo.Avali & uint32(1 << i)) == 0 {
+							fmt.Printf("check Avali for extent %d on node %d, avali is %d", 
+							exInfo.ExtentID, nodeID, exInfo.Avali)
+							go func(extent *pb.ExtentInfo, nodeID uint64){
+								sm.reAvali(extent, nodeID)
+								sm.unlockExtent(extent.ExtentID)
+							}(exInfo, nodeID)
+							continue OUTER
+						}
+						
 						//check disk health
 						var diskID uint64
 						if i >= len(exInfo.Replicates) {
@@ -388,13 +423,14 @@ func (sm *StreamManager) routineDispatchTask() {
 						
 						diskInfo, ok := sm.cloneDiskInfo(diskID)
 						if !ok || diskInfo.Online == 0 {
-							go func(extent *pb.ExtentInfo, nodeID uint64) {
-								sm.dispatchRecoveryTask(extent, nodeID)
-								sm.unlockExtent(extent.ExtentID)
+							go func(exInfo *pb.ExtentInfo, nodeID uint64) {
+								err := sm.dispatchRecoveryTask(exInfo, nodeID)
+								fmt.Printf("extent %d on disk %d is offline, dispatch result is %v\n", exInfo.ExtentID, diskInfo.DiskID, err)
+								sm.unlockExtent(exInfo.ExtentID)
 							}(exInfo, nodeID)
 							continue OUTER
 						}
-
+						
 
 						//check node health
 						ns := sm.getNodeStatus(nodeID)
@@ -407,17 +443,7 @@ func (sm *StreamManager) routineDispatchTask() {
 							continue OUTER
 						}
 
-						//check node is avali
-					
-						if (exInfo.Avali & uint32(1 << i)) == 0 {
-							fmt.Printf("check Avali for extent %d on node %d, avali is %d", 
-							exInfo.ExtentID, nodeID, exInfo.Avali)
-							go func(extent *pb.ExtentInfo, nodeID uint64){
-								sm.reAvali(extent, nodeID)
-								sm.unlockExtent(extent.ExtentID)
-							}(exInfo, nodeID)
-							continue OUTER
-						}
+
 
 					}
 					sm.unlockExtent(exInfo.ExtentID)
