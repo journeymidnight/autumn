@@ -4,10 +4,15 @@ from flask import request
 import lib
 import mimetypes
 import struct
-import pdb
+
+from multiprocessing.dummy import Pool as ThreadPool
 
 app = Flask(__name__, static_url_path='')
 
+
+def downloadPart(chunk_name):
+    ret = lib.Get(bytes(chunk_name, "utf8"))
+    return ret.value
 
 @app.route("/get/<name>", methods=['GET'])
 def get(name):
@@ -22,11 +27,15 @@ def get(name):
             #read chunk data
             i = 0
             #fixme: threading get chunks
-            while len(data) != size:
-                chunk_name = "1:" + name + ":" + str(i)
-                ret = lib.Get(bytes(chunk_name, "utf8"))
-                data.extend(ret.value)
-                i += 1
+            #multi thread get data from
+            names = ["1:" + name + ":" + str(int(i/chunk_size)) for i in range(0, size, chunk_size)]
+            pool = ThreadPool(4)
+            results = pool.map(downloadPart, names)
+            pool.close()
+            pool.join()
+            #concatenate all chunks
+            for chunk in results:
+                data.extend(chunk)
         else:
             #ignore the first 4 bytes
             data.extend(ret.value[4:])
