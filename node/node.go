@@ -74,7 +74,7 @@ func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl st
 	
 	en.em = smclient.NewExtentManager(en.smClient, etcdAddr, en.extentInfoUpdatedfunc)
 
-	fmt.Printf("connected to SM server\n")
+	fmt.Printf("connected to ETCD server\n")
 	//load disk
 	for _, diskDir := range diskDirs {
 		disk, err := OpenDiskFS(diskDir, en.nodeID)

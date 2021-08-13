@@ -12,6 +12,7 @@ import (
 	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
+	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
 )
@@ -315,15 +316,32 @@ func (sm *StreamManager) dispatchRecoveryTask(exInfo *pb.ExtentInfo, replaceID u
 		return nil
 	}*/
 
-	//policy
+	//simple policy
 	var chosenNode *NodeStatus
 	for i := range nodes {
+		//to be replaced
 		if nodes[i].NodeID == replaceID {
 			continue
 		}
+
+		//already in node
 		if FindNodeIndex(exInfo, nodes[i].NodeID) >= 0 {
 			continue
 		}
+
+		//no disk avali
+		noDiskAvali := true
+		for _, diskID := range nodes[i].Disks {
+			ds := sm.getDiskStatus(diskID)
+			if ds.Online == 1 {
+				noDiskAvali = false
+				break
+			}
+		}
+		if noDiskAvali {
+			continue
+		}
+
 		chosenNode = nodes[i]
 		break
 	}
@@ -358,7 +376,8 @@ func (sm *StreamManager) dispatchRecoveryTask(exInfo *pb.ExtentInfo, replaceID u
 	}
 	//logic error
 	if res.Code != pb.Code_OK {
-		xlog.Logger.Warnf(res.CodeDes)
+		err = wire_errors.FromPBCode(res.Code, res.CodeDes)
+		xlog.Logger.Warnf(err.Error())
 		return err
 	}
 

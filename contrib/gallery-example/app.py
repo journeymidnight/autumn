@@ -46,7 +46,7 @@ def list():
     except Exception as e:
         return str(e)
 
-chunk_size = 10 * 1024 * 1024
+chunk_size = 1 * 1024 * 1024
 
 def split(filename, data):
     ## split file into chunks

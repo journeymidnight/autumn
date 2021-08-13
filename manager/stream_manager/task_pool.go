@@ -31,7 +31,7 @@ func (tp *TaskPool) Remove(extentID uint64) {
 	if !ok {
 		return
 	}
-	defer tp.extentMap.Del(extentID)
+	tp.extentMap.Del(extentID)
 
 	t := d.(*pb.RecoveryTask)
 
@@ -40,7 +40,7 @@ func (tp *TaskPool) Remove(extentID uint64) {
 		return
 	}
 	tl := d.(*hashmap.HashMap)
-	tl.Del(extentID)
+	tl.Del(t.NodeID)
 	
 }
 
