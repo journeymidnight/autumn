@@ -183,30 +183,56 @@ func (client *SMClient) CreateStream(ctx context.Context, dataShard uint32, pari
 }
 
 
-/*
-end表明在stream client层, 明确确认的已经写完成的end(end在写入成功后自动更新), 在Seal时, 如果存在end, 
-, sm只需要seal而不需要读各个extent长度,节省运行时间
-checkCommitLength:1 , end:0,  readEntries for logStream
-checkCommitLength:0,  end:0,  append tables on rowstream, and meet an error
-checkCommitLength:0,  end:N,  append log/row stream, meet an error or do rotate   
-*/
+func (client *SMClient) CheckCommitLength(ctx context.Context, streamID uint64, ownerKey string, revision int64) (*pb.StreamInfo , *pb.ExtentInfo, uint32, error){
+	err := ErrTimeOut
+	var res *pb.CheckCommitLengthResponse
+	var stream *pb.StreamInfo
+	var lastEx *pb.ExtentInfo
+	var end uint32
+	client.try(func(conn *grpc.ClientConn) bool {
+		c := pb.NewStreamManagerServiceClient(conn)
+		res, err = c.CheckCommitLength(ctx, &pb.CheckCommitLengthRequest{
+			StreamID: streamID,
+			OwnerKey: ownerKey,
+			Revision: revision,
+		})
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			return false
+		}
+		if err != nil {
+			xlog.Logger.Warnf(err.Error())
+			return true
+		}
+		if res.Code != pb.Code_OK {
+			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
+			//if remote is not a leader, retry
+			if err == wire_errors.NotLeader {
+				return true
+			}
+			return false
+		}
+		stream = res.StreamInfo
+		lastEx = res.LastExInfo
+		end = res.End
+		return false
+	}, 500*time.Millisecond)
+
+	return stream, lastEx, end, err
+}
 
 func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64, Sversion int64,
-	extentToSeal uint64, ownerKey string, revision int64, checkCommitLength uint32, end uint32) (*pb.ExtentInfo, uint32, uint64, error) {
+	ownerKey string, revision int64, end uint32) (*pb.StreamInfo , *pb.ExtentInfo, error) {
 
 	err := ErrTimeOut
 	var res *pb.StreamAllocExtentResponse
-	var ei *pb.ExtentInfo
-	var lastExtentEnd uint32
-	var newSversion uint64
+	var lastEx *pb.ExtentInfo
+	var stream *pb.StreamInfo
 	client.try(func(conn *grpc.ClientConn) bool {
 		c := pb.NewStreamManagerServiceClient(conn)
 		res, err = c.StreamAllocExtent(ctx, &pb.StreamAllocExtentRequest{
 			StreamID: streamID,
-			ExtentToSeal: extentToSeal,
 			OwnerKey: ownerKey,
 			Revision: revision,
-			CheckCommitLength: checkCommitLength,
 			Sversion: Sversion,
 			End: end,
 		})
@@ -225,13 +251,12 @@ func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64, 
 			}
 			return false
 		}
-		newSversion = res.Sversion
-		ei = res.Extent
-		lastExtentEnd = res.End
+		stream = res.StreamInfo
+		lastEx = res.LastExInfo
 		return false
 	}, 500*time.Millisecond)
 
-	return ei, lastExtentEnd, newSversion, err	
+	return stream, lastEx, err
 }
 
 

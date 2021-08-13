@@ -109,16 +109,9 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		opt:opt,
 	}
 	rp.startMemoryFlush()
-	var err error
-	if err = logStream.CheckCommitLength(); err != nil {
-		return nil, err
-	}
+
 	fmt.Printf("log end is %d\n", logStream.End())
-	if err = rowStream.CheckCommitLength(); err != nil {
-		return nil, err
-	}
 	fmt.Printf("row end is %d\n", rowStream.End())
-	
 	fmt.Printf("table locs is %v\n", tableLocs)
 	
 	//replay log

@@ -191,6 +191,118 @@ func (sm *StreamManager) cloneStreamInfo(streamID uint64) (*pb.StreamInfo, bool)
 	return proto.Clone(v).(*pb.StreamInfo), true
 }
 
+func (sm *StreamManager) CheckCommitLength(ctx context.Context, req *pb.CheckCommitLengthRequest) (*pb.CheckCommitLengthResponse, error) {
+	errDone := func(err error) (*pb.CheckCommitLengthResponse, error){
+		code, desCode := wire_errors.ConvertToPBCode(err)
+		return &pb.CheckCommitLengthResponse{
+			Code: code,
+			CodeDes: desCode,
+		}, nil
+	}
+
+	if !sm.AmLeader() {
+		return errDone(wire_errors.NotLeader)
+	}
+
+	s, ok := sm.cloneStreamInfo(req.StreamID)
+	if !ok {
+		return errDone(errors.Errorf("no such stream %d", req.StreamID))
+	}
+
+	tailExtentID := s.ExtentIDs[len(s.ExtentIDs) - 1]
+	lastExtentInfo, ok := sm.cloneExtentInfo(tailExtentID)
+	if !ok {
+		return errDone(errors.Errorf("internal errors, no such extent %d", tailExtentID))
+	}
+
+	if lastExtentInfo.Avali > 0 {
+		return &pb.CheckCommitLengthResponse{
+			Code: pb.Code_OK,
+			StreamInfo: s,
+			End: uint32(lastExtentInfo.SealedLength),
+			LastExInfo: lastExtentInfo,
+		},nil
+	}
+
+		
+	sm.lockExtent(lastExtentInfo.ExtentID)
+	defer sm.unlockExtent(lastExtentInfo.ExtentID)
+
+
+	nodes := sm.getNodes(lastExtentInfo)
+	if nodes == nil {
+		return errDone(errors.Errorf("request errors, sm.getNodes(lastExtentInfo) == nil"))
+	}
+
+	haveToSealLastExtent := false
+	sizes := sm.receiveCommitlength(ctx, nodes, tailExtentID)
+
+
+	//如果sizes里存在-1或者sizes的值不相等:
+	//[-1, 10, 10]
+	//[-1, -1, -1]
+	//[10, 9,  9]
+	for i := 0; i < len(sizes); i++ {
+		if sizes[i] == -1 || (i > 0 && sizes[i] != sizes[i-1]) {
+			haveToSealLastExtent = true
+			break
+		}
+	}
+
+	//all nodes are alive and have the same commit length
+	if !haveToSealLastExtent {
+		return &pb.CheckCommitLengthResponse{
+			Code: pb.Code_OK,
+			StreamInfo: s,
+			End: uint32(sizes[0]),
+			LastExInfo: lastExtentInfo,
+		},nil
+	}
+
+
+	var minSize int
+	if len(lastExtentInfo.Parity) > 0  {
+		minSize = len(lastExtentInfo.Replicates)
+	} else {
+		minSize = 2
+	}
+	var minimalLength int64 = math.MaxInt64
+
+	var avali uint32
+	for i := range sizes {
+		if sizes[i] != -1 {
+			avali |= (1 << i)
+			if minimalLength > sizes[i] {
+				minimalLength = sizes[i]
+			}					
+		}
+	}
+	if bits.OnesCount32(avali) < minSize {
+		xlog.Logger.Warnf("avali nodes is %d , less than minSize %d", avali, minSize)
+		return errDone(errors.Errorf("avali nodes is %d , less than minSize %d", avali, minSize))
+	}
+
+
+	lastExtentInfo.SealedLength = uint64(minimalLength)
+	lastExtentInfo.Eversion ++
+	lastExtentInfo.Avali = avali
+	ops := []clientv3.Op{clientv3.OpPut(formatExtentKey(lastExtentInfo.ExtentID), string(utils.MustMarshal(lastExtentInfo)))}
+	err := etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
+		clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
+		clientv3.Compare(clientv3.CreateRevision(req.OwnerKey), "=", req.Revision),
+	}, ops)
+	if err != nil {
+		return errDone(err)
+	}
+	
+	return &pb.CheckCommitLengthResponse{
+		Code: pb.Code_OK,
+		StreamInfo: s,
+		End: uint32(minimalLength),
+		LastExInfo: lastExtentInfo,
+	},nil
+}
+
 func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAllocExtentRequest) (*pb.StreamAllocExtentResponse, error) {
 
 	errDone := func(err error) (*pb.StreamAllocExtentResponse, error){
@@ -214,89 +326,38 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		return errDone(wire_errors.ClientStreamVersionTooHigh)
 	}
 
-	//duplicated request?
-	var lastExtentInfo *pb.ExtentInfo
-	if req.Sversion < int64(s.Sversion) {
-		fmt.Printf("req.Sversion:%d < s.Sversion:%d\n", req.Sversion, s.Sversion)
-		
-		tailExtentID := s.ExtentIDs[len(s.ExtentIDs) - 1]
-		lastExtentInfo, ok = sm.cloneExtentInfo(tailExtentID)
-		if !ok {
-			return errDone(errors.Errorf("internal errors, no such extent %d", tailExtentID))
-		}
-		return &pb.StreamAllocExtentResponse{
-			Code: pb.Code_OK,
-			StreamID: req.StreamID,
-			Extent:   lastExtentInfo,
-		}, nil
-
-	}
-	
-	//version match: req.Sversion == s.Sversion
 	tailExtentID := s.ExtentIDs[len(s.ExtentIDs) - 1]
-	lastExtentInfo, ok = sm.cloneExtentInfo(tailExtentID)
-
-
+	lastExInfo, ok := sm.cloneExtentInfo(tailExtentID)
 	if !ok {
 		return errDone(errors.Errorf("internal errors, no such extent %d", tailExtentID))
 	}
 
+	//duplicated request?
+	if req.Sversion < int64(s.Sversion) {
+		fmt.Printf("req.Sversion:%d < s.Sversion:%d\n", req.Sversion, s.Sversion)
+		
+		return &pb.StreamAllocExtentResponse{
+			Code: pb.Code_OK,
+			StreamInfo: s,
+			LastExInfo: lastExInfo,
+		}, nil
+	}
 	
-	sm.lockExtent(lastExtentInfo.ExtentID)
-	defer sm.unlockExtent(lastExtentInfo.ExtentID)
+	//version match: req.Sversion == s.Sversion
+	sm.lockExtent(lastExInfo.ExtentID)
+	defer sm.unlockExtent(lastExInfo.ExtentID)
 	
 
-	nodes := sm.getNodes(lastExtentInfo)
+	nodes := sm.getNodes(lastExInfo)
 	if nodes == nil {
-		return errDone(errors.Errorf("request errors, extent %d is not the last", req.ExtentToSeal))
+		return errDone(errors.Errorf("request errors, internal error can not get nodesStatus from extentInfo %d", lastExInfo.ExtentID))
 	}
 
 
-	dataShards := len(lastExtentInfo.Replicates)
-	parityShards := len(lastExtentInfo.Parity)
+	dataShards := len(lastExInfo.Replicates)
+	parityShards := len(lastExInfo.Parity)
 
 	var sizes []int64
-	if req.CheckCommitLength > 0 {
-		haveToCreateNewExtent := false
-		sizes = sm.receiveCommitlength(ctx, nodes, req.ExtentToSeal)
-		for i := range sizes {
-			if sizes[i] == -1 {
-				haveToCreateNewExtent = true
-				break			
-			}
-		}
-		
-		//all nodes are good
-		if haveToCreateNewExtent == false {
-			//get minimun from sizes
-			minSize := sizes[0]
-			sizesAreDiff := false
-			for i := 1; i < len(sizes); i++ {
-				if minSize > sizes[i] {
-					minSize = sizes[i]
-					sizesAreDiff = true
-				}
-			}
-			if sizesAreDiff {
-				lastExtentInfo.SealedLength = uint64(minSize)
-				lastExtentInfo.Eversion ++
-				lastExtentInfo.Avali = (1 << (dataShards+ parityShards)) - 1
-				ops := []clientv3.Op{clientv3.OpPut(formatExtentKey(lastExtentInfo.ExtentID), string(utils.MustMarshal(lastExtentInfo)))}
-				err := etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
-					clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
-					clientv3.Compare(clientv3.CreateRevision(req.OwnerKey), "=", req.Revision),
-				}, ops)
-				if err != nil {
-					return errDone(err)
-				}
-			}
-			return  &pb.StreamAllocExtentResponse{
-				Code: pb.Code_OK,
-				StreamID: req.StreamID,
-				End:uint32(sizes[0]),
-			}, nil
-		}
-	}
 
 	var ops []clientv3.Op
 	var minimalLength int64 = math.MaxInt64
@@ -304,21 +365,18 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	//seal the oldExtent, update lastExtentInfo
 	if req.End == 0 {
 		//recevied commit length
-
 		var minSize int
 		//if EC, we have to get datashards results to decide the minimal length
 		//if replicated, only one returns can work, but if we want the system more stable
 		//use 2 insdead of 1
-		if len(lastExtentInfo.Parity) > 0  {
-			minSize = len(lastExtentInfo.Replicates)
+		if len(lastExInfo.Parity) > 0  {
+			minSize = len(lastExInfo.Replicates)
 		} else {
 			minSize = 2
 		}
 		
-		if len(sizes) == 0 && req.CheckCommitLength == 0 {
-			sizes = sm.receiveCommitlength(ctx, nodes, req.ExtentToSeal)
-		}
-
+		sizes = sm.receiveCommitlength(ctx, nodes, lastExInfo.ExtentID)
+		
 		for i := range sizes {
 			if sizes[i] != -1 {
 				avali |= (1 << i)
@@ -332,25 +390,24 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 			return errDone(errors.Errorf("avali nodes is %d , less than minSize %d", avali, minSize))
 		}
 	} else {
-		//all nodes are avali:
+		//all nodes were avali
 		minimalLength = int64(req.End)
 		avali = (1 << (dataShards+ parityShards)) - 1
 	}
 		
 	//set extent
-	lastExtentInfo.SealedLength = uint64(minimalLength)
-	lastExtentInfo.Eversion ++
-	lastExtentInfo.Avali = avali
+	lastExInfo.SealedLength = uint64(minimalLength)
+	lastExInfo.Eversion ++
+	lastExInfo.Avali = avali
 
-	data := utils.MustMarshal(lastExtentInfo)
+	data := utils.MustMarshal(lastExInfo)
 	
 	ops = append(ops, 
-		clientv3.OpPut(formatExtentKey(lastExtentInfo.ExtentID), string(data)),
+		clientv3.OpPut(formatExtentKey(lastExInfo.ExtentID), string(data)),
 	)
 	
 
-
-	//alloc new extend
+	//alloc new extent
 	extentID, _, err := sm.allocUniqID(1)
 	if err != nil {
 		return errDone(errors.Errorf("can not alloc a new id"))
@@ -383,7 +440,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	nodeIDs := extractNodeId(nodes)
 	//new extents
 	extentKey := formatExtentKey(extentID)
-	extentInfo := pb.ExtentInfo{
+	newExInfo := pb.ExtentInfo{
 		ExtentID:   extentID,
 		Replicates: nodeIDs[:dataShards],
 		Parity: nodeIDs[dataShards:],
@@ -395,7 +452,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 
 	//set old
 
-	edata, err := extentInfo.Marshal()
+	edata, err := newExInfo.Marshal()
 	utils.Check(err)
 
 	ops = append(ops, 
@@ -414,15 +471,14 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 
 	//update memory
 	//update last extent, lastExtent is not sealed, so we do not need to lock
-	sm.extents.Set(lastExtentInfo.ExtentID, lastExtentInfo)
+	sm.extents.Set(lastExInfo.ExtentID, lastExInfo)
 	//update streams and new extents
-	sm.addExtent(req.StreamID, &extentInfo)
+	sm.addExtent(req.StreamID, &newExInfo)
 
 	return &pb.StreamAllocExtentResponse{
 		Code: pb.Code_OK,
-		StreamID: req.StreamID,
-		Extent:   &extentInfo,
-		Sversion: stream.Sversion,
+		StreamInfo: stream,
+		LastExInfo: &newExInfo,
 	}, nil
 }
 

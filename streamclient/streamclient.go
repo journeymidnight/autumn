@@ -46,7 +46,6 @@ type StreamClient interface {
 	Truncate(ctx context.Context, extentID uint64, gabageKey string) (*pb.BlobStreams , error)
 	//FIXME: stat => ([]extentID , offset)
 	End() uint32
-	CheckCommitLength() error
 }
 
 //random read block
@@ -183,48 +182,35 @@ type AutumnEntryIter struct {
 }
 
 
-func (sc *AutumnStreamClient) CheckCommitLength() error {
+
+func (sc *AutumnStreamClient) checkCommitLength() {
 	//if last extent is not sealed, we must 'Check Commit length' for all replicates,
 	//if any error happend, we seal and create a new extent
 	if len(sc.streamInfo.ExtentIDs) == 0 {
-		return nil
-	}
-	extentID := sc.streamInfo.ExtentIDs[len(sc.streamInfo.ExtentIDs)-1] //last extent
-	exInfo := sc.em.Latest(extentID) 
-
-	if exInfo.Avali > 0 {
-		return nil
+		panic("sc.streamInfo can not be zero")
 	}
 
-	xlog.Logger.Infof("Check Commit Length at extent %d", extentID)
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 5 * time.Second)
-		newExInfo, lastExtentEnd,  _, err := sc.smClient.StreamAllocExtent(ctx, sc.streamID, int64(sc.streamInfo.Sversion), extentID, 
-			sc.streamLock.ownerKey, sc.streamLock.revision, 1, 0)
-		
-		xlog.Logger.Infof("Check Commit Length %v, new extent: %v", err, newExInfo)
+		stream, lastEx,  end,  err := sc.smClient.CheckCommitLength(ctx, sc.streamID, sc.streamLock.ownerKey, sc.streamLock.revision)
+		xlog.Logger.Infof("CheckCommitLength %v, new extent: %v", err, lastEx)
 		cancel()
 		if err == nil {
-			if newExInfo != nil {
-				//update local streaminfo
-				sc.streamInfo.ExtentIDs = append(sc.streamInfo.ExtentIDs, newExInfo.ExtentID)
-				sc.streamInfo.Sversion = sc.streamInfo.Sversion + 1
-				sc.em.WaitVersion(newExInfo.ExtentID, 1)
-				sc.end = 0
-			} else {
-				sc.end = lastExtentEnd
+			if stream.Sversion > sc.streamInfo.Sversion {
+				sc.streamInfo = stream
 			}
+			sc.em.WaitVersion(lastEx.ExtentID, lastEx.Eversion)
+			sc.end = end
 			break
 		}
 		fmt.Printf("err is %s\n\n", err.Error())
 		xlog.Logger.Warnf(err.Error())
 		time.Sleep(5 * time.Second)
 		continue
-		
 	}
-	return nil
 
 } 
+
 func (iter *AutumnEntryIter) HasNext() (bool, error) {
 	if len(iter.cache) == 0 {
 		if iter.noMore {
@@ -416,14 +402,14 @@ func (sc *AutumnStreamClient) End() uint32 {
 //alloc new extent, and reset sc.end = 0
 func (sc *AutumnStreamClient) 	MustAllocNewExtent(oldExtentID uint64) error{
 	var newExInfo *pb.ExtentInfo
-	var newSversion uint64
 	var err error
-	fmt.Printf("Seal extent %d on stream %d\n", oldExtentID, sc.streamID)
+	var updatedStream *pb.StreamInfo
+	fmt.Printf("Seal extent %d on stream %d: sealedLength is %d\n", oldExtentID,sc.streamID, sc.end)
 
 	for {
 		ctx , cancel := context.WithTimeout(context.Background(), 5 * time.Second)
-		newExInfo, _, newSversion, err = sc.smClient.StreamAllocExtent(ctx, sc.streamID, int64(sc.streamInfo.Sversion),
-		oldExtentID , sc.streamLock.ownerKey, sc.streamLock.revision, 0, sc.end)
+		updatedStream, newExInfo, err = sc.smClient.StreamAllocExtent(ctx, sc.streamID, int64(sc.streamInfo.Sversion),
+		 sc.streamLock.ownerKey, sc.streamLock.revision, sc.end)
 		cancel()
 		if err == nil {
 			break
@@ -436,10 +422,7 @@ func (sc *AutumnStreamClient) 	MustAllocNewExtent(oldExtentID uint64) error{
 		return err
 		
 	}
-	sc.streamInfo.ExtentIDs = append(sc.streamInfo.ExtentIDs, newExInfo.ExtentID)
-
-	//更新stream.version
-	sc.streamInfo.Sversion = newSversion
+	sc.streamInfo = updatedStream
 	sc.em.WaitVersion(newExInfo.ExtentID, 1)
 	sc.end = 0
 	fmt.Printf("created new extent %d on stream %d\n", newExInfo.ExtentID, sc.streamID)
@@ -456,16 +439,12 @@ func (sc *AutumnStreamClient) Connect() error {
 	}
 	sc.streamInfo = s[sc.streamID]
 
-	//wait to get the latest extentInfo for future write.
-	exID, err := sc.getLastExtent()
-	if err != nil {
-		return err
-	}
-	exInfo := sc.em.Latest(exID)
-	utils.AssertTrue(exInfo != nil)
-	sc.em.WaitVersion(exID, exInfo.Eversion)
+	
+	sc.checkCommitLength()
 
-	fmt.Printf("stream info is %d : %v\n", sc.streamInfo.StreamID, sc.streamInfo.ExtentIDs)
+	extentID := sc.streamInfo.ExtentIDs[len(sc.streamInfo.ExtentIDs)-1] //last extent
+	fmt.Printf("connected :stream %d, extent %d's end is %d\n", sc.streamID, extentID, sc.end)
+
 	return nil
 }
 
@@ -541,7 +520,7 @@ retry:
 	cancel()
 
 	
-	if status.Code(err) == codes.DeadlineExceeded || status.Code(err) == codes.Unavailable{ //timeout
+	if status.Code(err) == codes.DeadlineExceeded || status.Code(err) == codes.Unavailable { //timeout
 		fmt.Printf("append on extent %d; error is %v\n", extentID, err)
 		if loop < 3 {
 			loop ++
@@ -569,6 +548,7 @@ retry:
 	}
 
 	sc.end = res.End
+	fmt.Printf("extent %d updated end is %d\n", extentID, sc.end)
 	//检查offset结果, 如果已经超过MaxExtentSize, 调用StreamAllocExtent
 	utils.AssertTrue(res.End > 0)
 	if res.End > MaxExtentSize {
