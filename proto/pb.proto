@@ -267,6 +267,8 @@ message StreamAllocExtentResponse{
 	//one of extent or return end of last extent
 	ExtentInfo extent = 4;
 	uint32 end = 5;
+
+	uint64 Sversion = 6;//with ExtentInfo:FIXME: 以后和CheckCommitLength分开
 }
 
 

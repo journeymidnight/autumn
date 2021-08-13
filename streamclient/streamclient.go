@@ -183,7 +183,7 @@ type AutumnEntryIter struct {
 }
 
 
-func (sc *AutumnStreamClient) 	CheckCommitLength() error {
+func (sc *AutumnStreamClient) CheckCommitLength() error {
 	//if last extent is not sealed, we must 'Check Commit length' for all replicates,
 	//if any error happend, we seal and create a new extent
 	if len(sc.streamInfo.ExtentIDs) == 0 {
@@ -199,7 +199,7 @@ func (sc *AutumnStreamClient) 	CheckCommitLength() error {
 	xlog.Logger.Infof("Check Commit Length at extent %d", extentID)
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 5 * time.Second)
-		newExInfo, lastExtentEnd,  err := sc.smClient.StreamAllocExtent(ctx, sc.streamID, int64(sc.streamInfo.Sversion), extentID, 
+		newExInfo, lastExtentEnd,  _, err := sc.smClient.StreamAllocExtent(ctx, sc.streamID, int64(sc.streamInfo.Sversion), extentID, 
 			sc.streamLock.ownerKey, sc.streamLock.revision, 1, 0)
 		
 		xlog.Logger.Infof("Check Commit Length %v, new extent: %v", err, newExInfo)
@@ -208,6 +208,7 @@ func (sc *AutumnStreamClient) 	CheckCommitLength() error {
 			if newExInfo != nil {
 				//update local streaminfo
 				sc.streamInfo.ExtentIDs = append(sc.streamInfo.ExtentIDs, newExInfo.ExtentID)
+				sc.streamInfo.Sversion = sc.streamInfo.Sversion + 1
 				sc.em.WaitVersion(newExInfo.ExtentID, 1)
 				sc.end = 0
 			} else {
@@ -413,12 +414,15 @@ func (sc *AutumnStreamClient) End() uint32 {
 }
 
 //alloc new extent, and reset sc.end = 0
-func (sc *AutumnStreamClient) MustAllocNewExtent(oldExtentID uint64) error{
+func (sc *AutumnStreamClient) 	MustAllocNewExtent(oldExtentID uint64) error{
 	var newExInfo *pb.ExtentInfo
+	var newSversion uint64
 	var err error
+	fmt.Printf("Seal extent %d on stream %d\n", oldExtentID, sc.streamID)
+
 	for {
 		ctx , cancel := context.WithTimeout(context.Background(), 5 * time.Second)
-		newExInfo, _, err = sc.smClient.StreamAllocExtent(ctx, sc.streamID, int64(sc.streamInfo.Sversion),
+		newExInfo, _, newSversion, err = sc.smClient.StreamAllocExtent(ctx, sc.streamID, int64(sc.streamInfo.Sversion),
 		oldExtentID , sc.streamLock.ownerKey, sc.streamLock.revision, 0, sc.end)
 		cancel()
 		if err == nil {
@@ -434,8 +438,11 @@ func (sc *AutumnStreamClient) MustAllocNewExtent(oldExtentID uint64) error{
 	}
 	sc.streamInfo.ExtentIDs = append(sc.streamInfo.ExtentIDs, newExInfo.ExtentID)
 
+	//更新stream.version
+	sc.streamInfo.Sversion = newSversion
 	sc.em.WaitVersion(newExInfo.ExtentID, 1)
 	sc.end = 0
+	fmt.Printf("created new extent %d on stream %d\n", newExInfo.ExtentID, sc.streamID)
 	xlog.Logger.Debugf("created new extent %d on stream %d", newExInfo.ExtentID, sc.streamID)
 	return nil
 }
@@ -535,18 +542,19 @@ retry:
 
 	
 	if status.Code(err) == codes.DeadlineExceeded || status.Code(err) == codes.Unavailable{ //timeout
+		fmt.Printf("append on extent %d; error is %v\n", extentID, err)
 		if loop < 3 {
 			loop ++
+			time.Sleep(500 * time.Millisecond)
 			goto retry
 		}
-		err = sc.MustAllocNewExtent(extentID)
-		if err != nil {
+		
+		if err = sc.MustAllocNewExtent(extentID); err != nil {
 			return 0, nil, 0, err
 		}
 		goto retry
-	} else if err != nil {//may have other network errors
+	} else if err != nil {//may have other network errors:FIXME
 		return 0, nil, 0, err
-
 	}
 
 	if res.Code == pb.Code_EVersionLow {
