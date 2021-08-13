@@ -215,7 +215,7 @@ service ExtentService {
 	rpc CopyExtent(CopyExtentRequest) returns (stream CopyExtentResponse){}
 	rpc Df(DfRequest) returns (DfResponse){}
 	rpc RequireRecovery(RequireRecoveryRequest) returns (RequireRecoveryResponse) {}
-	//rpc Seal(SealRequest) returns (SealResponse) {}
+
 	rpc CommitLength(CommitLengthRequest) returns (CommitLengthResponse) {}
 	rpc Heartbeat (Payload)  returns (stream Payload) {}
 	rpc ReplicateBlocks(ReplicateBlocksRequest) returns (ReplicateBlocksResponse) {}
@@ -248,6 +248,36 @@ message AllocExtentResponse {
 }
 
 
+message CheckCommitLengthRequest {
+	uint64 streamID = 1;
+	string ownerKey = 2;
+	int64 revision = 3;//ownerKey, revision is used for locking
+}
+
+message CheckCommitLengthResponse {
+	Code code = 1;
+	string codeDes = 2;
+	StreamInfo streamInfo = 3;
+	uint32 end = 4;
+	ExtentInfo lastExInfo = 5; //主要是发送lastExInfo.eversion, 客户端waitforversion
+}
+
+message StreamAllocExtentRequest {
+	uint64 streamID = 1;
+	string ownerKey = 2; //ownerKey, revision is used for locking
+	int64 revision = 3;
+	uint32 end = 4;
+	int64 sversion = 5;
+}
+
+message StreamAllocExtentResponse {
+	Code code = 1;
+	string codeDes = 2;
+	StreamInfo streamInfo = 3;
+	ExtentInfo lastExInfo = 4;//主要是发送lastExInfo.eversion, 客户端waitforversion
+}
+
+/*
 message StreamAllocExtentRequest{
 	uint64 streamID = 1;
 	uint64 extentToSeal = 2;
@@ -270,6 +300,7 @@ message StreamAllocExtentResponse{
 
 	uint64 Sversion = 6;//with ExtentInfo:FIXME: 以后和CheckCommitLength分开
 }
+*/
 
 
 message StreamInfoRequest {
@@ -369,7 +400,9 @@ service StreamManagerService {
 	//verify extent should exist on this node...
 	//rpc verifyExtent
 
+	rpc CheckCommitLength(CheckCommitLengthRequest) returns (CheckCommitLengthResponse) {}
 	rpc StreamAllocExtent(StreamAllocExtentRequest) returns  (StreamAllocExtentResponse) {}
+	
 	rpc CreateStream(CreateStreamRequest) returns  (CreateStreamResponse) {}
 	rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse) {}
 	rpc Truncate(TruncateRequest) returns (TruncateResponse) {}
