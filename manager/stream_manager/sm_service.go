@@ -217,6 +217,8 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	//duplicated request?
 	var lastExtentInfo *pb.ExtentInfo
 	if req.Sversion < int64(s.Sversion) {
+		fmt.Printf("req.Sversion:%d < s.Sversion:%d\n", req.Sversion, s.Sversion)
+		
 		tailExtentID := s.ExtentIDs[len(s.ExtentIDs) - 1]
 		lastExtentInfo, ok = sm.cloneExtentInfo(tailExtentID)
 		if !ok {
@@ -420,6 +422,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		Code: pb.Code_OK,
 		StreamID: req.StreamID,
 		Extent:   &extentInfo,
+		Sversion: stream.Sversion,
 	}, nil
 }
 

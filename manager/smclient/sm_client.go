@@ -192,12 +192,13 @@ checkCommitLength:0,  end:N,  append log/row stream, meet an error or do rotate
 */
 
 func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64, Sversion int64,
-	extentToSeal uint64, ownerKey string, revision int64, checkCommitLength uint32, end uint32) (*pb.ExtentInfo, uint32, error) {
+	extentToSeal uint64, ownerKey string, revision int64, checkCommitLength uint32, end uint32) (*pb.ExtentInfo, uint32, uint64, error) {
 
 	err := ErrTimeOut
 	var res *pb.StreamAllocExtentResponse
 	var ei *pb.ExtentInfo
 	var lastExtentEnd uint32
+	var newSversion uint64
 	client.try(func(conn *grpc.ClientConn) bool {
 		c := pb.NewStreamManagerServiceClient(conn)
 		res, err = c.StreamAllocExtent(ctx, &pb.StreamAllocExtentRequest{
@@ -224,13 +225,13 @@ func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64, 
 			}
 			return false
 		}
-		
+		newSversion = res.Sversion
 		ei = res.Extent
 		lastExtentEnd = res.End
 		return false
 	}, 500*time.Millisecond)
 
-	return ei, lastExtentEnd, err	
+	return ei, lastExtentEnd, newSversion, err	
 }
 
 
