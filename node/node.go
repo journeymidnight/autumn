@@ -17,6 +17,7 @@ package node
 import (
 	"fmt"
 	"net"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -71,17 +72,16 @@ func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl st
 		return nil
 	}
 	
-
 	en.em = smclient.NewExtentManager(en.smClient, etcdAddr, en.extentInfoUpdatedfunc)
 
+	fmt.Printf("connected to SM server\n")
 	//load disk
 	for _, diskDir := range diskDirs {
 		disk, err := OpenDiskFS(diskDir, en.nodeID)
 		if err != nil {
-			xlog.Logger.Fatalf("can not load disk %s, [%v]", diskDir, err)
-			//FIXME: if one disk failed, can we continue?
+			xlog.Logger.Errorf("can not load disk %s, [%v]", diskDir, err)
+			continue
 		}
-		//FIXME: validate dirs
 		en.diskFSs[disk.diskID] = disk
 	}
 
@@ -149,6 +149,7 @@ func (en *ExtentNode) setExtent(ID uint64, eod *ExtentOnDisk) {
 
 
 func (en *ExtentNode) LoadExtents() error {
+
 	//register each extent to node
 	registerExt := func(path string, diskID uint64) {
 		ex, err := extent.OpenExtent(path)
@@ -160,12 +161,15 @@ func (en *ExtentNode) LoadExtents() error {
 			Extent: ex,
 			diskID: diskID,
 		})
+		//fmt.Printf("found extent %d on %s\n", ex.ID, path)
 		xlog.Logger.Debugf("found extent %d", ex.ID)
 	}
 
 	registerCopy := func(path string, diskID uint64) {
 		//extentID.replaceID.copy
-		parts := strings.Split(path, ".")
+		//get basename of path
+		fmt.Println("register copy")
+		parts := strings.Split(filepath.Base(path), ".")
 		if len(parts) != 3 {
 			xlog.Logger.Errorf("found extent %s: can not parse replaceID", path)
 			return
@@ -191,7 +195,7 @@ func (en *ExtentNode) LoadExtents() error {
 
 		//if extent's version is updated. remove RecoveryTask
 		extentInfo := en.em.Latest(extentID)
-
+		fmt.Printf("resume copy task %+v\n", task)
 		go en.runRecoveryTask(&task, extentInfo, path, diskID)
 	}
 

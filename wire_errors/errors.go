@@ -13,11 +13,14 @@ var (
 	NotLeader = errors.New("not a leader")
 	LockedByOther = errors.New("LockedByOther")
 	ClientStreamVersionTooHigh = errors.New("client's version is too high, bugon")
+	NotFound = errors.New("NotFound")
 )
 
 
 func FromPBCode(code pb.Code, des string) error {
 	switch code {
+	case pb.Code_NotFound:
+		return NotFound
 	case pb.Code_ClientStreamVersionTooHigh:
 		return ClientStreamVersionTooHigh
 	case pb.Code_LockedByOther:
@@ -37,6 +40,8 @@ func FromPBCode(code pb.Code, des string) error {
 }
 func ConvertToPBCode(err error) (pb.Code, string) {
 	switch err {
+	case NotFound:
+		return pb.Code_NotFound, "NotFound"
 	case ClientStreamVersionTooHigh:
 		return pb.Code_ClientStreamVersionTooHigh, err.Error()
 	case LockedByOther:

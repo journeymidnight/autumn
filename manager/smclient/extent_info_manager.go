@@ -12,6 +12,7 @@ import (
 	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
+	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/journeymidnight/autumn/xlog"
 	"google.golang.org/grpc"
 )
@@ -307,16 +308,17 @@ func (em *ExtentManager) WaitVersion(extentID uint64, version uint64) *pb.Extent
 
 func (em *ExtentManager) Latest(extentID uint64) *pb.ExtentInfo {
 	     
-	var ei *pb.ExtentInfo
 	for {
-		res, err := em.smClient.ExtentInfo(context.Background(), []uint64{extentID})
+		res, err := em.smClient.ExtentInfo(context.Background(), extentID)
 		if err == nil {
-			ei = res[extentID]
-			break
+			return res
 		}
+		if err == wire_errors.NotFound {
+			return nil
+		}
+		fmt.Println(err)
 		time.Sleep(500 * time.Millisecond)
 	}
-	return ei
 }
 
 func (em *ExtentManager) GetNodeInfo(nodeID uint64) *pb.NodeInfo {

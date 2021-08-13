@@ -44,6 +44,7 @@ enum Code {
 	NotLEADER = 5;
 	LockedByOther = 6;
 	ClientStreamVersionTooHigh = 7;
+	NotFound = 8;
 }
 
 
@@ -282,13 +283,13 @@ message StreamInfoResponse {
 }
 
 message ExtentInfoRequest {
-	repeated uint64 extents = 1;
+	uint64 extentID = 1;
 }
 
 message ExtentInfoResponse {
 	Code code = 1;
 	string codeDes = 2;
-	map<uint64, ExtentInfo> extents = 3;
+	ExtentInfo exInfo = 3;
 }
 
 message NodesInfoRequest{}

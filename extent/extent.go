@@ -106,6 +106,7 @@ func CreateCopyExtent(fileName string, ID uint64) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	f.Sync()
 	defer f.Close()
 	extentHeader := newExtentHeader(ID)
 	value := extentHeader.Marshal()
@@ -262,7 +263,7 @@ func (ex *Extent) Seal(commit uint32) error {
 		ex.resetWriter()
 		return errors.New("commit is less than current commit length")
 	}
-	
+	ex.commitLength = commit
 	ex.file.Truncate(int64(commit))
 	if err := xattr.FSet(ex.file, XATTRSEAL, []byte("true")); err != nil {
 		return err

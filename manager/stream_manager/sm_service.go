@@ -651,18 +651,18 @@ func (sm *StreamManager) ExtentInfo(ctx context.Context, req *pb.ExtentInfoReque
 		return errDone(wire_errors.NotLeader)
 	}
 
-	out := make(map[uint64]*pb.ExtentInfo)
-	var ok bool
-	for _, extentId := range req.Extents {
-		out[extentId], ok = sm.cloneExtentInfo(extentId)
-		if !ok {
-			return errDone(errors.New("not found"))
-		}
+
+	exInfo, ok := sm.cloneExtentInfo(req.ExtentID)
+
+	if !ok {
+		return errDone(wire_errors.NotFound)
 	}
 	return &pb.ExtentInfoResponse{
-		Code:    pb.Code_OK,
-		Extents: out,
+		Code: pb.Code_OK,
+		ExInfo: exInfo,
 	}, nil
+
+
 }
 
 func (sm *StreamManager) StreamInfo(ctx context.Context, req *pb.StreamInfoRequest) (*pb.StreamInfoResponse, error) {

@@ -326,7 +326,7 @@ func (pm *PartitionManager) runAsLeader() {
 
 	//if regions changed, set "config"
 	if len(partsAlloc) > 0 {
-		fmt.Printf("run as leader: set regions/config:\n")
+		fmt.Printf("PM: set regions/config:\n")
 		for _, v := range regions.Regions {
 			fmt.Printf("partID: %d , rg is %v is on ps %d\n",v.PartID, v.Rg, v.PSID )
 		}
@@ -341,7 +341,7 @@ func (pm *PartitionManager) runAsLeader() {
 			return
 		}
 	} else {
-		fmt.Printf("run as leader: regions/config remain the same %+v\n", regions.Regions)
+		fmt.Printf("PM: regions/config remain the same %+v\n", regions.Regions)
 
 	}
 	pm.currentRegions = &regions

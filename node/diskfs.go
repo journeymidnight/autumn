@@ -13,6 +13,7 @@ import (
 
 	"github.com/dgryski/go-farm"
 	"github.com/journeymidnight/autumn/extent"
+	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
 	uuid "github.com/satori/go.uuid"
@@ -104,9 +105,10 @@ func (s *diskFS) pathName(extentID uint64, suffix string) string {
 	return filepath.Join(fpath...)
 }
 
-func (s *diskFS) AllocCopyExtent(ID uint64, ReplaceID uint64) (string, error) {
-	fpath := s.pathName(ID, fmt.Sprintf("%d.copy", ReplaceID))
-	return extent.CreateCopyExtent(fpath, ID)
+func (s *diskFS) AllocCopyExtent(extentID uint64, ReplaceNodeID uint64) (string, error) {
+	utils.AssertTrue(s!=nil)
+	fpath := s.pathName(extentID, fmt.Sprintf("%d.copy", ReplaceNodeID))
+	return extent.CreateCopyExtent(fpath, extentID)
 }
 
 func (s *diskFS) AllocExtent(ID uint64) (*extent.Extent, error) {

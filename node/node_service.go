@@ -488,17 +488,13 @@ func (en *ExtentNode) ReadBlocks(ctx context.Context, req *pb.ReadBlocksRequest)
 
 
 func (en *ExtentNode) chooseDisktoAlloc() uint64 {
-	//Other policies choose disk
-	var i uint64 //diskID
 	//only choose the first disk
 	for _, disk := range en.diskFSs {
-		if disk.Online() == 0 {
-			continue
+		if disk.Online() == 1{
+			return disk.diskID
 		}
-		i = disk.diskID
-		break
 	}
-	return i
+	return 0
 }
 
 func (en *ExtentNode) AllocExtent(ctx context.Context, req *pb.AllocExtentRequest) (*pb.AllocExtentResponse, error) {
