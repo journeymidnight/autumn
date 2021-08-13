@@ -524,7 +524,7 @@ retry:
 		fmt.Printf("append on extent %d; error is %v\n", extentID, err)
 		if loop < 3 {
 			loop ++
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond)
 			goto retry
 		}
 		
@@ -532,7 +532,9 @@ retry:
 			return 0, nil, 0, err
 		}
 		goto retry
-	} else if err != nil {//may have other network errors:FIXME
+	}
+	
+	if err != nil {//may have other network errors:FIXME
 		return 0, nil, 0, err
 	}
 
@@ -548,7 +550,7 @@ retry:
 	}
 
 	sc.end = res.End
-	fmt.Printf("extent %d updated end is %d\n", extentID, sc.end)
+	//fmt.Printf("extent %d updated end is %d\n", extentID, sc.end)
 	//检查offset结果, 如果已经超过MaxExtentSize, 调用StreamAllocExtent
 	utils.AssertTrue(res.End > 0)
 	if res.End > MaxExtentSize {
