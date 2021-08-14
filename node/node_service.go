@@ -119,6 +119,12 @@ func (en *ExtentNode) validReq(extentID uint64, version uint64) (*extent.Extent,
 
 func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.AppendResponse, error) {
 
+
+	startTime := time.Now()
+	defer func() {
+		fmt.Printf("node %d Append extent %d, duration is %+v\n", en.nodeID, req.ExtentID, time.Since(startTime))
+	}()
+
 	errDone := func(err error) (*pb.AppendResponse, error) {
 		code, desCode := wire_errors.ConvertToPBCode(err)
 		return &pb.AppendResponse{
@@ -128,7 +134,6 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 	}
 
 	ex, extentInfo, err := en.validReq(req.ExtentID, req.Eversion)
-
 	if err != nil {
 		return errDone(err)
 	}
@@ -139,6 +144,7 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 
 	ex.Lock()
 	defer ex.Unlock()
+
 
 	if ex.HasLock(req.Revision) == false {
 		return errDone(wire_errors.LockedByOther)
@@ -242,6 +248,7 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 			preEnd = int64(result.End)
 		}
 		if result.Error != nil {
+			fmt.Printf("append on extent %d error: %v\n", req.ExtentID, result.Error)
 			return nil, result.Error
 		}
 		if !utils.EqualUint32(result.Offsets, preOffsets) || preEnd != int64(result.End) {
@@ -514,7 +521,7 @@ func (en *ExtentNode) AllocExtent(ctx context.Context, req *pb.AllocExtentReques
 
 	en.setExtent(req.ExtentID, &ExtentOnDisk{
 		Extent: ex,
-		diskID: 10,
+		diskID: en.diskFSs[i].diskID,
 	})
 
 	return &pb.AllocExtentResponse{
