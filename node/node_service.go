@@ -120,10 +120,12 @@ func (en *ExtentNode) validReq(extentID uint64, version uint64) (*extent.Extent,
 func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.AppendResponse, error) {
 
 
+	/*
 	startTime := time.Now()
 	defer func() {
 		fmt.Printf("node %d Append extent %d, duration is %+v\n", en.nodeID, req.ExtentID, time.Since(startTime))
 	}()
+	*/
 
 	errDone := func(err error) (*pb.AppendResponse, error) {
 		code, desCode := wire_errors.ConvertToPBCode(err)
