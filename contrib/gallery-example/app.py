@@ -29,7 +29,7 @@ def get(name):
             #fixme: threading get chunks
             #multi thread get data from
             names = ["1:" + name + ":" + str(int(i/chunk_size)) for i in range(0, size, chunk_size)]
-            pool = ThreadPool(4)
+            pool = ThreadPool(2)
             results = pool.map(downloadPart, names)
             pool.close()
             pool.join()
