@@ -111,8 +111,8 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 			case <- stopper.ShouldStop():
 				return
 			case res := <- extentsChan:
+				em.extentLock.Lock()
 				for _, e := range res.Events {
-					em.extentLock.Lock()
 					var info pb.ExtentInfo
 					
 					switch e.Type.String() {
@@ -139,7 +139,6 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 						}
 						
 
-
 					case "DELETE":
 						if err := info.Unmarshal(e.PrevKv.Value); err != nil {
 							xlog.Logger.Errorf("reflect: can not get pb.NodeInfo")
@@ -163,15 +162,15 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 					default:
 						panic("")
 					}
-					em.extentLock.Unlock()
-					em.cond.Broadcast()
+					
 				}
+				em.extentLock.Unlock()
+				em.cond.Broadcast()
 
 			case res := <- nodesChan:
+				em.nodesLock.Lock()
 				for _, e := range res.Events {
 					//update nodes
-					em.nodesLock.Lock()
-
 					var info pb.NodeInfo
 					switch e.Type.String() {
 					case "PUT":
@@ -189,8 +188,9 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 					default:
 						panic("")
 					}
-					em.nodesLock.Unlock()
 				}
+				em.nodesLock.Unlock()
+
 			}
 		}
 	})
@@ -290,6 +290,14 @@ func (em *ExtentManager) GetExtentConn(extentID uint64, policy SelectNodePolicy)
 */
 func (em *ExtentManager) WaitVersion(extentID uint64, version uint64) *pb.ExtentInfo {
 	
+	start := time.Now()
+	defer func(){
+		d := time.Since(start)
+		if d > time.Second*5 {
+			panic(fmt.Sprintf("waiting for %d to long", extentID))
+		}
+		//fmt.Printf("extent %d wait version %d cost %v\n", extentID, version, time.Now().Sub(start))
+	}()
 	var ei *pb.ExtentInfo
 	em.cond.L.Lock()
 	for {
@@ -297,7 +305,7 @@ func (em *ExtentManager) WaitVersion(extentID uint64, version uint64) *pb.Extent
 		if ei != nil && ei.Eversion >= version{
 			break
 		} else {
-			fmt.Printf("extent %d waiting for %d\n", extentID, version)
+			//fmt.Printf("extent %d wait version START for %d, current is %+v\n", extentID, version, ei)
 			em.cond.Wait()
 		}
 	}

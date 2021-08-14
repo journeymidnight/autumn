@@ -29,21 +29,21 @@ against a replica sealed by the SM
 */
 
 const (
-	KB             = 1024
-	MB             = 1024 * KB
-	GB             = 1024 * MB
+	KB = 1024
+	MB = 1024 * KB
+	GB = 1024 * MB
 
-	MaxExtentSize     = 64 * MB
+	MaxExtentSize = 64 * MB
 )
 
 type StreamClient interface {
 	Connect() error
 	Close()
 	AppendEntries(ctx context.Context, entries []*pb.EntryInfo) (uint64, uint32, error)
-    Append(ctx context.Context, blocks []*pb.Block) (extentID uint64, offsets []uint32, end uint32, err error)
+	Append(ctx context.Context, blocks []*pb.Block) (extentID uint64, offsets []uint32, end uint32, err error)
 	NewLogEntryIter(opt ...ReadOption) LogEntryIter
 	//Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, uint32, error)
-	Truncate(ctx context.Context, extentID uint64, gabageKey string) (*pb.BlobStreams , error)
+	Truncate(ctx context.Context, extentID uint64, gabageKey string) (*pb.BlobStreams, error)
 	//FIXME: stat => ([]extentID , offset)
 	End() uint32
 }
@@ -75,7 +75,7 @@ func (br *AutumnBlockReader) Read(ctx context.Context, extentID uint64, offset u
 retry:
 	exInfo := br.em.GetExtentInfo(extentID)
 	if exInfo == nil {
-		return nil,  0, errors.Errorf("no such extent")
+		return nil, 0, errors.Errorf("no such extent")
 	}
 	//BlockReader.Read should be a random read
 	conn := br.em.GetExtentConn(extentID, smclient.AlivePolicy{})
@@ -87,7 +87,7 @@ retry:
 		ExtentID:    extentID,
 		Offset:      offset,
 		NumOfBlocks: numOfBlocks,
-		Eversion: exInfo.Eversion ,
+		Eversion:    exInfo.Eversion,
 	})
 
 	//network error
@@ -105,8 +105,6 @@ retry:
 
 	return res.Blocks, res.End, nil
 }
-
-
 
 type readOption struct {
 	ReadFromStart bool
@@ -138,7 +136,7 @@ func WithReadFrom(extentID uint64, offset uint32) ReadOption {
 
 type StreamLock struct {
 	revision int64
-	ownerKey  string
+	ownerKey string
 }
 
 func MutexToLock(mutex *concurrency.Mutex) StreamLock {
@@ -151,21 +149,21 @@ func MutexToLock(mutex *concurrency.Mutex) StreamLock {
 //for single stream
 type AutumnStreamClient struct {
 	StreamClient
-	smClient     *smclient.SMClient
-	streamInfo   *pb.StreamInfo
+	smClient   *smclient.SMClient
+	streamInfo *pb.StreamInfo
 
-	em       *smclient.ExtentManager
-	streamID uint64
+	em         *smclient.ExtentManager
+	streamID   uint64
 	streamLock StreamLock
-	end uint32
+	end        uint32
 }
 
 func NewStreamClient(sm *smclient.SMClient, em *smclient.ExtentManager, streamID uint64, streamLock StreamLock) *AutumnStreamClient {
 	utils.AssertTrue(xlog.Logger != nil)
 	return &AutumnStreamClient{
-		smClient: sm,
-		em:       em,
-		streamID: streamID,
+		smClient:   sm,
+		em:         em,
+		streamID:   streamID,
 		streamLock: streamLock,
 	}
 }
@@ -181,8 +179,6 @@ type AutumnEntryIter struct {
 	conn               *grpc.ClientConn
 }
 
-
-
 func (sc *AutumnStreamClient) checkCommitLength() {
 	//if last extent is not sealed, we must 'Check Commit length' for all replicates,
 	//if any error happend, we seal and create a new extent
@@ -191,8 +187,8 @@ func (sc *AutumnStreamClient) checkCommitLength() {
 	}
 
 	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 5 * time.Second)
-		stream, lastEx,  end,  err := sc.smClient.CheckCommitLength(ctx, sc.streamID, sc.streamLock.ownerKey, sc.streamLock.revision)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		stream, lastEx, end, err := sc.smClient.CheckCommitLength(ctx, sc.streamID, sc.streamLock.ownerKey, sc.streamLock.revision)
 		xlog.Logger.Infof("CheckCommitLength %v, new extent: %v", err, lastEx)
 		cancel()
 		if err == nil {
@@ -209,13 +205,13 @@ func (sc *AutumnStreamClient) checkCommitLength() {
 		continue
 	}
 
-} 
+}
 
 func (iter *AutumnEntryIter) HasNext() (bool, error) {
 	if len(iter.cache) == 0 {
 		if iter.noMore {
 			return false, nil
-		} 
+		}
 		for iter.noMore == false && len(iter.cache) == 0 {
 			err := iter.receiveEntries()
 			if err != nil {
@@ -223,7 +219,7 @@ func (iter *AutumnEntryIter) HasNext() (bool, error) {
 			}
 		}
 	}
-	
+
 	return len(iter.cache) > 0, nil
 }
 
@@ -236,10 +232,8 @@ func (iter *AutumnEntryIter) Next() *pb.EntryInfo {
 	return ret
 }
 
-
 func (iter *AutumnEntryIter) receiveEntries() error {
 	loop := 0
-
 
 	extentID, err := iter.sc.getExtentFromIndex(iter.currentExtentIndex)
 	if err != nil {
@@ -247,12 +241,12 @@ func (iter *AutumnEntryIter) receiveEntries() error {
 		return err
 	}
 retry:
-	for loop := 0 ; iter.conn == nil ; loop ++ {
+	for i := 0; iter.conn == nil; i++ {
 		iter.conn = iter.sc.em.GetExtentConn(extentID, smclient.AlivePolicy{})
 		if iter.conn == nil {
-			time.Sleep(3*time.Second)
+			time.Sleep(3 * time.Second)
 			xlog.Logger.Warnf("retry to get connect to %d", extentID)
-			if loop > 100 {
+			if i > 10 {
 				return errors.New("retries too many time to get extent connection")
 			}
 		}
@@ -261,7 +255,7 @@ retry:
 	exInfo := iter.sc.em.GetExtentInfo(extentID)
 	//xlog.Logger.Debugf("read extentID %d, offset : %d, eversion is %d\n", extentID, iter.currentOffset, exInfo.Eversion)
 
-	//fmt.Printf("read extentID %d, offset : %d,  index : %d\n from %s ", extentID, 
+	//fmt.Printf("read extentID %d, offset : %d,  index : %d\n from %s ", extentID,
 	//iter.currentOffset, iter.currentExtentIndex, iter.conn.Target())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -273,7 +267,6 @@ retry:
 		Eversion: exInfo.Eversion,
 	})
 	cancel()
-
 
 	if err != nil { //network error
 		if loop > 5 {
@@ -297,7 +290,6 @@ retry:
 		iter.cache = nil
 		iter.cache = append(iter.cache, res.Entries...)
 	}
-
 
 	switch res.Code {
 	case pb.Code_OK:
@@ -362,7 +354,7 @@ func (sc *AutumnStreamClient) Truncate(ctx context.Context, extentID uint64, gab
 		return nil, errNoTruncate
 	}
 
-	return sc.smClient.TruncateStream(ctx, sc.streamID, extentID, 
+	return sc.smClient.TruncateStream(ctx, sc.streamID, extentID,
 		sc.streamLock.ownerKey, sc.streamLock.revision, int64(sc.streamInfo.Sversion), gabageKey)
 }
 
@@ -400,16 +392,16 @@ func (sc *AutumnStreamClient) End() uint32 {
 }
 
 //alloc new extent, and reset sc.end = 0
-func (sc *AutumnStreamClient) 	MustAllocNewExtent(oldExtentID uint64) error{
+func (sc *AutumnStreamClient) MustAllocNewExtent(oldExtentID uint64) error {
 	var newExInfo *pb.ExtentInfo
 	var err error
 	var updatedStream *pb.StreamInfo
-	fmt.Printf("Seal extent %d on stream %d: sealedLength is %d\n", oldExtentID,sc.streamID, sc.end)
+	fmt.Printf("Seal extent %d on stream %d: sealedLength is %d\n", oldExtentID, sc.streamID, sc.end)
 
 	for {
-		ctx , cancel := context.WithTimeout(context.Background(), 5 * time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		updatedStream, newExInfo, err = sc.smClient.StreamAllocExtent(ctx, sc.streamID, int64(sc.streamInfo.Sversion),
-		 sc.streamLock.ownerKey, sc.streamLock.revision, sc.end)
+			sc.streamLock.ownerKey, sc.streamLock.revision, sc.end)
 		cancel()
 		if err == nil {
 			break
@@ -420,7 +412,7 @@ func (sc *AutumnStreamClient) 	MustAllocNewExtent(oldExtentID uint64) error{
 			continue
 		}
 		return err
-		
+
 	}
 	sc.streamInfo = updatedStream
 	sc.em.WaitVersion(newExInfo.ExtentID, 1)
@@ -439,7 +431,6 @@ func (sc *AutumnStreamClient) Connect() error {
 	}
 	sc.streamInfo = s[sc.streamID]
 
-	
 	sc.checkCommitLength()
 
 	extentID := sc.streamInfo.ExtentIDs[len(sc.streamInfo.ExtentIDs)-1] //last extent
@@ -459,15 +450,15 @@ func (sc *AutumnStreamClient) AppendEntries(ctx context.Context, entries []*pb.E
 		return 0, 0, errors.Errorf("blocks can not be nil")
 	}
 
-	blocks := make([]*pb.Block,0, len(entries))
+	blocks := make([]*pb.Block, 0, len(entries))
 
-    for _, entry := range entries {
-               data := utils.MustMarshal(entry.Log)
-               blocks = append(blocks,  &pb.Block{
-                       data,
-               })
-    }
-	extentID, offsets , tail, err := sc.Append(ctx, blocks)
+	for _, entry := range entries {
+		data := utils.MustMarshal(entry.Log)
+		blocks = append(blocks, &pb.Block{
+			data,
+		})
+	}
+	extentID, offsets, tail, err := sc.Append(ctx, blocks)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -475,14 +466,14 @@ func (sc *AutumnStreamClient) AppendEntries(ctx context.Context, entries []*pb.E
 		entries[i].ExtentID = extentID
 		entries[i].Offset = offsets[i]
 	}
-    return extentID, tail, err
+	return extentID, tail, err
 }
 
+func (sc *AutumnStreamClient) Append(ctx context.Context, blocks []*pb.Block) (uint64, []uint32, uint32, error) {
 
-func (sc *AutumnStreamClient) Append(ctx context.Context, blocks []*pb.Block) (uint64, []uint32, uint32,  error) {
 	loop := 0
-retry:
 
+retry:
 	extentID, err := sc.getLastExtent()
 	if err != nil {
 		xlog.Logger.Error(err)
@@ -494,7 +485,7 @@ retry:
 	}
 
 	if exInfo.Avali > 0 {
-		if err = sc.MustAllocNewExtent(extentID) ; err != nil {
+		if err = sc.MustAllocNewExtent(extentID); err != nil {
 			return 0, nil, 0, err
 		}
 		goto retry
@@ -502,14 +493,13 @@ retry:
 
 	conn := sc.em.GetExtentConn(extentID, smclient.PrimaryPolicy{})
 	if conn == nil {
-		if err = sc.MustAllocNewExtent(extentID) ; err != nil {
+		if err = sc.MustAllocNewExtent(extentID); err != nil {
 			return 0, nil, 0, err
 		}
 		goto retry
-
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15 * time.Second)
 	c := pb.NewExtentServiceClient(conn)
 	res, err := c.Append(ctx, &pb.AppendRequest{
 		ExtentID: extentID,
@@ -519,30 +509,29 @@ retry:
 	})
 	cancel()
 
-	
 	if status.Code(err) == codes.DeadlineExceeded || status.Code(err) == codes.Unavailable { //timeout
 		fmt.Printf("append on extent %d; error is %v\n", extentID, err)
-		if loop < 3 {
+		if loop < 2 {
 			loop ++
 			time.Sleep(100 * time.Millisecond)
 			goto retry
 		}
-		
 		if err = sc.MustAllocNewExtent(extentID); err != nil {
 			return 0, nil, 0, err
 		}
+		loop = 0 //reset loop, new extent could retry
 		goto retry
 	}
-	
-	if err != nil {//may have other network errors:FIXME
+
+	if err != nil { //may have other network errors:FIXME
 		return 0, nil, 0, err
 	}
 
 	if res.Code == pb.Code_EVersionLow {
 		sc.em.WaitVersion(extentID, exInfo.Eversion+1)
-		goto retry	
+		goto retry
 	}
-	
+
 	//logic errors
 	err = wire_errors.FromPBCode(res.Code, res.CodeDes)
 	if err != nil {
@@ -559,5 +548,5 @@ retry:
 		}
 	}
 	//update end
-	return extentID, res.Offsets,res.End, nil
+	return extentID, res.Offsets, res.End, nil
 }
