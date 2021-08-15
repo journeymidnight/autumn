@@ -10,12 +10,9 @@ from multiprocessing.dummy import Pool as ThreadPool
 app = Flask(__name__, static_url_path='')
 
 
-def downloadPart(chunk_name):
-    ret = lib.Get(bytes(chunk_name, "utf8"))
-    return ret.value
-
 @app.route("/get/<name>", methods=['GET'])
 def get(name):
+    type, encoding = mimetypes.guess_type(name)
     try:
         data = bytearray()
         meta_file_name = "0:" + name
@@ -24,22 +21,15 @@ def get(name):
             #if ret is chunked file. get all chunks one by one
             #read chunk size
             size = struct.unpack("!I", ret.value[0:4])[0]
-            #read chunk data
-            i = 0
-            #fixme: threading get chunks
-            #multi thread get data from
             names = ["1:" + name + ":" + str(int(i/chunk_size)) for i in range(0, size, chunk_size)]
-            pool = ThreadPool(2)
-            results = pool.map(downloadPart, names)
-            pool.close()
-            pool.join()
-            #concatenate all chunks
-            for chunk in results:
-                data.extend(chunk)
+            def download_chunk():
+                for name in names:
+                    x = lib.Get(bytes(name, "utf8"))
+                    yield x.value
+            return app.response_class(download_chunk(), mimetype=type,headers={'Content-Length':size})
         else:
             #ignore the first 4 bytes
             data.extend(ret.value[4:])
-        type, encoding = mimetypes.guess_type(name)
         return bytes(data), 200, {"Content-Type": type, "Content-Encoding": encoding}
     except Exception as e:
         print(e)

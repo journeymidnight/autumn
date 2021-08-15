@@ -178,10 +178,10 @@ func (t *Table) Smallest() []byte { return t.smallest }
 // Biggest is its biggest key, or nil if there are none
 func (t *Table) Biggest() []byte { return t.biggest }
 
-//the first key of the block with a zero-based index of (n + 1) / 2, where the total number of table is n
+//the first key of the block with a zero-based index of (n) / 2, where the total number of table is n
 func (t *Table) MidKey() []byte {
 	n := len(t.blockIndex)
-	return t.blockIndex[(n+1)/2].Key
+	return t.blockIndex[(n)/2].Key
 }
 
 func (t *Table) initBiggestAndSmallest() error {

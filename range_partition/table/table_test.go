@@ -76,7 +76,7 @@ func  TestMidKey(t *testing.T) {
 	require.NoError(t, err)
 	defer table.DecrRef()
 
-	require.Equal(t, []byte("key3003"), y.ParseKey(table.MidKey()))
+	require.Equal(t, []byte("key2002"), y.ParseKey(table.MidKey()))
 }
 func TestSeekToFirst(t *testing.T) {
 	for _, n := range []int{101, 199, 200, 250, 9999, 10000} {
