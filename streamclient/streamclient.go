@@ -535,6 +535,7 @@ retry:
 	//logic errors
 	err = wire_errors.FromPBCode(res.Code, res.CodeDes)
 	if err != nil {
+		fmt.Printf("append on extent %d; error is %v\n", extentID, err)
 		return 0, nil, 0, err
 	}
 

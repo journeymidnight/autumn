@@ -1,15 +1,18 @@
 #/usr/bin/python3
 from flask import Flask
 from flask import request
+from werkzeug.datastructures import Headers
 import lib
 import mimetypes
 import struct
+import re
 
 from multiprocessing.dummy import Pool as ThreadPool
 
 app = Flask(__name__, static_url_path='')
 
 
+#support [mimetypes, range bytes, streamread]
 @app.route("/get/<name>", methods=['GET'])
 def get(name):
     type, encoding = mimetypes.guess_type(name)
@@ -17,20 +20,53 @@ def get(name):
         data = bytearray()
         meta_file_name = "0:" + name
         ret = lib.Get(bytes(meta_file_name, "utf8"))
+        headers = Headers()
+        headers.add('Content-Type', type)
+        headers.add('Content-Encoding', encoding)
+
         if len(ret.value) == 4:
-            #if ret is chunked file. get all chunks one by one
-            #read chunk size
             size = struct.unpack("!I", ret.value[0:4])[0]
-            names = ["1:" + name + ":" + str(int(i/chunk_size)) for i in range(0, size, chunk_size)]
-            def download_chunk():
-                for name in names:
-                    x = lib.Get(bytes(name, "utf8"))
-                    yield x.value
-            return app.response_class(download_chunk(), mimetype=type,headers={'Content-Length':size})
+            if request.headers.has_key("Range"):#suport Range get
+                headers.add('Accept-Ranges','bytes')
+                ranges = re.findall(r"\d+", request.headers["Range"])
+                begin = int(ranges[0])
+                end = size -1   
+                if len(ranges) > 1:
+                    end = int(ranges[1])
+                headers.add('Content-Range', 'bytes %d-%d/%d' % (begin, end, size))
+                beginIdx = int(begin / chunk_size)
+                endIdx = int(end / chunk_size)
+                names = ["1:" + name + ":" + str(int(i)) for i in range(beginIdx, endIdx+1)]
+                #define a function to get chunk
+                def get_partial_chunk():
+                    for i, name in enumerate(names):
+                        ret = lib.Get(bytes(name, "utf8"))
+                        if i == 0:
+                            yield ret.value[begin % chunk_size:]
+                        elif i == endIdx:
+                            if (end + 1) % chunk_size == 0:
+                                yield ret.value
+                            else:
+                                yield ret.value[:(end + 1)% chunk_size]
+                        else:
+                            yield ret.value
+                return app.response_class(get_partial_chunk(),206, headers=headers)
+            else:#normal get
+                #if ret is chunked file. get all chunks one by one
+                #read chunk size
+                names = ["1:" + name + ":" + str(int(i/chunk_size)) for i in range(0, size, chunk_size)]
+                headers.add("Content-Length", size)
+
+                def download_chunk():
+                    for name in names:
+                        x = lib.Get(bytes(name, "utf8"))
+                        yield x.value
+            return app.response_class(download_chunk(), headers=headers)
         else:
             #ignore the first 4 bytes
             data.extend(ret.value[4:])
-        return bytes(data), 200, {"Content-Type": type, "Content-Encoding": encoding}
+            headers.add("Content-Length", len(data))
+        return bytes(data), 200, headers
     except Exception as e:
         print(e)
         return str(e)
