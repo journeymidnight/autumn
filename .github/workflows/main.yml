@@ -1,5 +1,5 @@
 on: [push, pull_request]
-name: run autumn rangepartition test
+name: build
 jobs:
   test:
     strategy:
