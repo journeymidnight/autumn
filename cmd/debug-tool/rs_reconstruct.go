@@ -27,7 +27,7 @@ func main(){
 		panic(err)
 	}
 	ex3.Lock()
-	err = erasure_code.ReedSolomon{}.RebuildECExtent(2, 1, sourceExtents, 1, ex3)
+	err = erasure_code.ReedSolomon{}.RebuildECExtent(2, 1, sourceExtents, 0, 1, ex3)
 	if err != nil {
 		panic(err.Error())
 	}

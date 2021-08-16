@@ -295,6 +295,7 @@ func (wal *Wal) Replay(callback func(uint64, uint32, int64, []*pb.Block)) error 
 		if err != nil {
 			return err
 		}
+		n := 0
 		records := record.NewReader(f)
 		for {
 			var req request
@@ -303,12 +304,17 @@ func (wal *Wal) Replay(callback func(uint64, uint32, int64, []*pb.Block)) error 
 				break
 			}
 			if err != nil {
-				xlog.Logger.Warnf("recovering: %v", err)
+				xlog.Logger.Warnf("%s read %d record, meet err : recovering: %v", fname, n, err)
 				break
 			}
 			s, err := ioutil.ReadAll(rec)
+			if err != nil {
+				xlog.Logger.Warnf("%s read %d record, meet err : recovering: %v", fname, n, err)
+				break
+			}
 			req.decode(s)
 			callback(req.extentID, req.start, req.rev, req.data)
+			n ++
 		}
 	}
 	wal.cleanPendingWal()

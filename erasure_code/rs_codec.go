@@ -165,7 +165,8 @@ func (ReedSolomon) RebuildECExtent(dataShards, parityShards int, sourceExtent []
 				if err != nil {
 					if err != wire_errors.EndOfExtent{
 						fmt.Printf("source Extent error!!! to i %d\n", i)
-						return err
+						//来源block也可能损坏, 所以应该持续恢复, 并且返回给上层err内容
+						//return err
 					}
 					done= true
 				}
@@ -202,5 +203,5 @@ func (ReedSolomon) RebuildECExtent(dataShards, parityShards int, sourceExtent []
 		}
 	}
 
-	return nil
+	return err
 }

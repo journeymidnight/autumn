@@ -74,10 +74,6 @@ func setupStreamManager(suite *ExtentNodeTestSuite, dir string) {
 	sm := stream_manager.NewStreamManager(etcd, client, config)
 	go sm.LeaderLoop()
 
-
-
-
-
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(64<<20),
 		grpc.MaxSendMsgSize(64<<20),
@@ -112,23 +108,19 @@ func (suite *ExtentNodeTestSuite) SetupSuite() {
 	}
 	setupStreamManager(suite, tmpdir)
 
-
 	smc := smclient.NewSMClient([]string{"127.0.0.1:3401"})
 	err = smc.Connect()
 	if err != nil {
 		panic(err)
 	}
 
-
-
-	session , err := concurrency.NewSession(suite.client, concurrency.WithTTL(30))
+	session, err := concurrency.NewSession(suite.client, concurrency.WithTTL(30))
 	if err != nil {
 		panic(err.Error())
 	}
 	suite.session = session
 
 	suite.mutex = concurrency.NewMutex(session, "lockCouldHaveAnyName")
-
 
 	var nodeIDs []uint64
 	//format disk, generate dirs
@@ -144,7 +136,6 @@ func (suite *ExtentNodeTestSuite) SetupSuite() {
 
 		nodeID, uuidToDiskID, err := smc.RegisterNode(context.Background(), []string{fmt.Sprintf("uuid%d", i)}, url)
 
-
 		err = ioutil.WriteFile(dir+"/node_id", []byte(fmt.Sprintf("%d", nodeID)), 0644)
 		if err != nil {
 			panic(err)
@@ -156,7 +147,6 @@ func (suite *ExtentNodeTestSuite) SetupSuite() {
 		}
 	}
 
-	
 	for i := range suite.ens {
 		dir := fmt.Sprintf("%s/store%d", tmpdir, i)
 		url := fmt.Sprintf("127.0.0.1:400%d", i)
@@ -172,6 +162,8 @@ func (suite *ExtentNodeTestSuite) SetupSuite() {
 			panic(err)
 		}
 	}
+
+	fmt.Printf("NodeIDs is %v\n", nodeIDs)
 
 	suite.tmpdir = tmpdir
 
@@ -189,12 +181,12 @@ func (suite *ExtentNodeTestSuite) TestAppendReadValue() {
 	err := sm.Connect()
 	suite.Require().Nil(err)
 
-	si, ei, err := sm.CreateStream(context.Background(), 2, 1)
+	si, _, err := sm.CreateStream(context.Background(), 2, 1)
 	suite.Require().Nil(err)
-	fmt.Printf("%v", ei)
+	//fmt.Printf("%v", ei)
 
-	em := smclient.NewExtentManager(sm, []string{"127.0.0.1:2379"}, func(eventType string, cur *pb.ExtentInfo, prev *pb.ExtentInfo){
-		fmt.Printf("updates: %s: %+v from %+v\n", eventType, cur, prev)
+	em := smclient.NewExtentManager(sm, []string{"127.0.0.1:2379"}, func(eventType string, cur *pb.ExtentInfo, prev *pb.ExtentInfo) {
+		//fmt.Printf("updates: %s: %+v from %+v\n", eventType, cur, prev)
 	})
 
 	suite.mutex.Lock(context.Background())
@@ -204,8 +196,8 @@ func (suite *ExtentNodeTestSuite) TestAppendReadValue() {
 	suite.Require().Nil(err)
 	extentID, offsets, end, err := sc.Append(context.Background(),
 		[]*pb.Block{
-			{[]byte("hello")},
-			{[]byte("world")},
+			{Data:[]byte("hello")},
+			{Data:[]byte("world")},
 		})
 	suite.Require().Nil(err)
 	suite.Require().True(len(offsets) > 0)
@@ -214,65 +206,61 @@ func (suite *ExtentNodeTestSuite) TestAppendReadValue() {
 	blockReader := streamclient.NewAutumnBlockReader(em, sm)
 	ret, end, err := blockReader.Read(context.Background(), extentID, offsets[0], 2)
 	suite.Require().Nil(err)
-	
+
 	fmt.Printf("ret:%v, end %d\n", ret, end)
 	suite.Require().Equal([]byte("hello"), ret[0].Data)
 	suite.Require().Equal([]byte("world"), ret[1].Data)
 
 }
 
-
-
-func (suite *ExtentNodeTestSuite) TestCopy() {
+func (suite *ExtentNodeTestSuite) TestNodeRecoveryDataFromOtherNode() {
 	sm := smclient.NewSMClient([]string{"127.0.0.1:3401"})
 	err := sm.Connect()
 	suite.Require().Nil(err)
 
-	si, ei, err := sm.CreateStream(context.Background(), 2, 1)
+	si, _, err := sm.CreateStream(context.Background(), 2, 1)
 	suite.Require().Nil(err)
-	fmt.Printf("%v", ei)
 
-
-	em := smclient.NewExtentManager(sm, []string{"127.0.0.1:2379"}, func(eventType string, cur *pb.ExtentInfo, prev *pb.ExtentInfo){
-		fmt.Printf("%s: %+v from %+v", eventType, cur, prev)
+	em := smclient.NewExtentManager(sm, []string{"127.0.0.1:2379"}, func(eventType string, cur *pb.ExtentInfo, prev *pb.ExtentInfo) {
+		//fmt.Printf("%s: %+v from %+v", eventType, cur, prev)
 	})
-
 
 	suite.mutex.Lock(context.Background())
 	defer suite.mutex.Unlock(context.Background())
-	
+
 	sc := streamclient.NewStreamClient(sm, em, si.StreamID, streamclient.MutexToLock(suite.mutex))
 	err = sc.Connect()
 	suite.Require().Nil(err)
 	extentID, offsets, _, err := sc.Append(context.Background(),
 		[]*pb.Block{
-			{[]byte("hello")},
-			{[]byte("world")},
+			{Data:[]byte("hello")},
+			{Data:[]byte("world")},
 		})
 	suite.Require().Nil(err)
 	suite.Require().True(len(offsets) > 0)
 
-	extentInfo := em.GetExtentInfo(extentID)
-	fmt.Printf("%+v\n", extentInfo)
-	for i := range suite.ens {
-		fmt.Printf("id %d\n", suite.ens[i].nodeID)
-	}
-
-	err = sc.MustAllocNewExtent(extentID)
+	err = sc.MustAllocNewExtent()
 	suite.Nil(err)
 
-	//原来是(4,2,3), 改成(1,2,3)
+	em.WaitVersion(extentID, 2)//wait for version 2
+	
+
+	//原来是(7,5,3), 改成(1,5,3)
+	suite.Require().Equal(uint64(1), suite.ens[0].nodeID)
+	//发请求到node 1
 	res, err := suite.ens[0].RequireRecovery(context.Background(), &pb.RequireRecoveryRequest{
-		&pb.RecoveryTask{
+		Task: &pb.RecoveryTask{
 			ExtentID:  extentID,
-			ReplaceID: 4,
+			ReplaceID: 7,
+			NodeID: 1,
 		},
 	})
-
 	fmt.Printf("%+v\n", res)
-	fmt.Println(err)
+	time.Sleep(3 * time.Second)
 
-	time.Sleep(20 * time.Second)
+	eod := suite.ens[0].getExtent(extentID)//恢复后的extent
+	suite.NotNil(eod)
+	
 }
 
 func TestNode(t *testing.T) {
