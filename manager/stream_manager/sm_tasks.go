@@ -358,9 +358,9 @@ func (sm *StreamManager) dispatchRecoveryTask(exInfo *pb.ExtentInfo, replaceID u
 	}
 
 	task := &pb.RecoveryTask{
-		ExtentID: exInfo.ExtentID,
-		ReplaceID: replaceID,
-		NodeID: chosenNode.NodeID,
+		ExtentID: exInfo.ExtentID, //extentID to be recovered
+		ReplaceID: replaceID,      //nodeID in replicas or parity fields, origin location
+		NodeID: chosenNode.NodeID, //nodeID of newlocation
 	}
 	fmt.Printf("dispatch task %+v to node %+v\n", task, chosenNode)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

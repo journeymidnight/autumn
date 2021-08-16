@@ -392,11 +392,11 @@ func (sc *AutumnStreamClient) End() uint32 {
 }
 
 //alloc new extent, and reset sc.end = 0
-func (sc *AutumnStreamClient) MustAllocNewExtent(oldExtentID uint64) error {
+func (sc *AutumnStreamClient) MustAllocNewExtent() error {
 	var newExInfo *pb.ExtentInfo
 	var err error
 	var updatedStream *pb.StreamInfo
-	fmt.Printf("Seal extent %d on stream %d: sealedLength is %d\n", oldExtentID, sc.streamID, sc.end)
+	fmt.Printf("Seal on stream %d: sealedLength is %d\n",sc.streamID, sc.end)
 
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -485,7 +485,7 @@ retry:
 	}
 
 	if exInfo.Avali > 0 {
-		if err = sc.MustAllocNewExtent(extentID); err != nil {
+		if err = sc.MustAllocNewExtent(); err != nil {
 			return 0, nil, 0, err
 		}
 		goto retry
@@ -493,7 +493,7 @@ retry:
 
 	conn := sc.em.GetExtentConn(extentID, smclient.PrimaryPolicy{})
 	if conn == nil {
-		if err = sc.MustAllocNewExtent(extentID); err != nil {
+		if err = sc.MustAllocNewExtent(); err != nil {
 			return 0, nil, 0, err
 		}
 		goto retry
@@ -516,7 +516,7 @@ retry:
 			time.Sleep(100 * time.Millisecond)
 			goto retry
 		}
-		if err = sc.MustAllocNewExtent(extentID); err != nil {
+		if err = sc.MustAllocNewExtent(); err != nil {
 			return 0, nil, 0, err
 		}
 		loop = 0 //reset loop, new extent could retry
@@ -544,7 +544,7 @@ retry:
 	//检查offset结果, 如果已经超过MaxExtentSize, 调用StreamAllocExtent
 	utils.AssertTrue(res.End > 0)
 	if res.End > MaxExtentSize {
-		if err = sc.MustAllocNewExtent(extentID); err != nil {
+		if err = sc.MustAllocNewExtent(); err != nil {
 			return 0, nil, 0, err
 		}
 	}
