@@ -20,41 +20,44 @@ func init() {
 
 
 func TestLinear(t *testing.T) {
-	enc, err := reedsolomon.New(2, 2)
+	enc, err := reedsolomon.New(3, 2)
 
-	data1 := make([][]byte, 2 + 2)
+	data1 := make([][]byte, 3 + 2)
 	data1[0] = []byte("y")
 	data1[1] = []byte("x")
-	data1[2] = make([]byte,1)
+	data1[2] = []byte("z")
+
 	data1[3] = make([]byte,1)
+	data1[4] = make([]byte,1)
 
 	err = enc.Encode(data1)
 
 	require.Nil(t, err)
 	fmt.Printf("%+v\n", data1)
 
-	data2 := make([][]byte, 2 + 2)
+	data2 := make([][]byte, 3 + 2)
 	data2[0] = []byte("12345")
 	data2[1] = []byte("54321")
-	data2[2] = make([]byte, 5)
+	data2[2] = []byte("98765")
 	data2[3] = make([]byte, 5)
+	data2[4] = make([]byte, 5)
 
 	err = enc.Encode(data2)
 	fmt.Printf("%+v\n", data2)
 
 
-	data3 := make([][]byte, 2+2)
-	data3[0] = append(data1[0], data2[0]...)//[]byte("r12345")
-	data3[1] = append(data1[1], data2[1]...)//[]byte("xasdfx")
-	data3[2] = make([]byte, 6)
+	data3 := make([][]byte, 3 + 2)
+	data3[0] = append(data1[0], data2[0]...)//[]byte("y12345")
+	data3[1] = append(data1[1], data2[1]...)//[]byte("x54321")
+	data3[2] = append(data1[2], data2[2]...)//[]byte("z98765")
 	data3[3] = make([]byte, 6)
+	data3[4] = make([]byte, 6)
 
 	err = enc.Encode(data3)
 	fmt.Printf("%+v\n", data3)
 	require.Equal(t, data3[2], append(data1[2], data2[2]...))
 	require.Equal(t, data3[3], append(data1[3], data2[3]...))
-
-	
+	require.Equal(t, data3[4], append(data1[4], data2[4]...))
 }
 
 

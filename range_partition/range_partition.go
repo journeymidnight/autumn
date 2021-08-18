@@ -1000,7 +1000,7 @@ func (rp *RangePartition) close(gracefull bool) error {
 	//FIXME lost data in mt/imm, will have to replay log
 	//doWrite在返回前,会调用最后一次writeRequest并且等待返回, 所以这里
 	//mt和rp.vhead都是只读的
-	if gracefull && rp.mt.MemSize() > (1<<10) {
+	if gracefull && rp.mt.MemSize() > 0 {
 		for {
 			pushedFlushTask := func() bool {
 				rp.Lock()

@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/coreos/etcd/clientv3/concurrency"
 	"github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
+	"go.etcd.io/etcd/client/v3/concurrency"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -396,7 +396,11 @@ func (sc *AutumnStreamClient) MustAllocNewExtent() error {
 	var newExInfo *pb.ExtentInfo
 	var err error
 	var updatedStream *pb.StreamInfo
-	fmt.Printf("Seal on stream %d: sealedLength is %d\n",sc.streamID, sc.end)
+	lastExID, err := sc.getLastExtent()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Seal stream %d on extent %d: sealedLength is %d\n", lastExID, sc.streamID, sc.end)
 
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

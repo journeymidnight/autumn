@@ -18,7 +18,7 @@ def get(name):
     type, encoding = mimetypes.guess_type(name)
     try:
         data = bytearray()
-        meta_file_name = "0:" + name
+        meta_file_name = "b:" + name
         ret = lib.Get(bytes(meta_file_name, "utf8"))
         headers = Headers()
         headers.add('Content-Type', type)
@@ -36,7 +36,7 @@ def get(name):
                 headers.add('Content-Range', 'bytes %d-%d/%d' % (begin, end, size))
                 beginIdx = int(begin / chunk_size)
                 endIdx = int(end / chunk_size)
-                names = ["1:" + name + ":" + str(int(i)) for i in range(beginIdx, endIdx+1)]
+                names = ["a:" + name + ":" + str(int(i)) for i in range(beginIdx, endIdx+1)]
                 #define a function to get chunk
                 def get_partial_chunk():
                     for i, name in enumerate(names):
@@ -54,7 +54,7 @@ def get(name):
             else:#normal get
                 #if ret is chunked file. get all chunks one by one
                 #read chunk size
-                names = ["1:" + name + ":" + str(int(i/chunk_size)) for i in range(0, size, chunk_size)]
+                names = ["a:" + name + ":" + str(int(i/chunk_size)) for i in range(0, size, chunk_size)]
                 headers.add("Content-Length", size)
 
                 def download_chunk():
@@ -75,7 +75,7 @@ def get(name):
 def list():
     try:
         t = ""
-        for e in lib.List(b"", b"0:", (1<<32)-1):
+        for e in lib.List(b"b:", b"b:", (1<<32)-1):
             t += e[2:] + "\n"
         return t, 200, {"Content-Type": "text/plain"}
     except Exception as e:
@@ -85,10 +85,10 @@ chunk_size = 1 * 1024 * 1024
 
 def split(filename, data):
     ## split file into chunks
-    ## each filename is "1:"+filename
+    ## each filename is "a:"+filename
     i = 0 
     for offset in range(0, len(data), chunk_size):
-        chunk_name = "1:" + filename + ":" + str(i)
+        chunk_name = "a:" + filename + ":" + str(i)
         yield chunk_name, data[offset:offset + chunk_size]
         i += 1
 
@@ -100,14 +100,14 @@ def put():
     if len(data) > chunk_size:
         for chunk_name, chunk in split(file.filename, data):
             lib.Put(bytes(chunk_name, "utf8"), chunk)
-        #meta file name is "0:" + filename
-        meta_file_name = "0:" + file.filename
+        #meta file name is "b:" + filename
+        meta_file_name = "b:" + file.filename
         meta_value = struct.pack("!I", len(data)) ##big endian u32
         lib.Put(bytes(meta_file_name, "utf8"), meta_value)
     else:
         #concat struct.pack("!I", len(data)) and data
         value = struct.pack("!I", len(data)) + data
-        lib.Put(bytes("0:"+ file.filename, "utf8"), value)
+        lib.Put(bytes("b:"+ file.filename, "utf8"), value)
     return file.filename
 
 @app.route("/", methods=['GET'])

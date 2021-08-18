@@ -141,6 +141,8 @@ func which(x [][]byte) {
 	}
 }
 
+
+//FIXME: add a channel to make ReadBlocks and Reconstruct asynchronized
 func (ReedSolomon) RebuildECExtent(dataShards, parityShards int, sourceExtent []*extent.Extent, start uint32, replacingIndex int, targetExtent *extent.Extent) error {
 	
 	targetExtent.AssertLock()
