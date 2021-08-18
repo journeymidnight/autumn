@@ -53,9 +53,11 @@ func (lib *AutumnLib) saveRegion(regions *pspb.Regions) {
 	})
 
 	//assert to make sure the regions are sorted
+	//if so, do not update region
 	for i := 0; i < len(newRegions); i++ {
 		if i < len(newRegions) - 1 && bytes.Compare(newRegions[i].Rg.EndKey, newRegions[i+1].Rg.StartKey) != 0 {
-			panic(fmt.Sprintf("region %d end key is not equal to start key of region %d", newRegions[i].PartID, newRegions[i+1].PartID))
+			return
+			//panic(fmt.Sprintf("region %d end key is not equal to start key of region %d", newRegions[i].PartID, newRegions[i+1].PartID))
 		}
 	}
 	lib.Lock()
@@ -100,6 +102,9 @@ func (lib *AutumnLib) Connect() error {
 		for res := range watch1 {
 			//skip to the last, only cares about latest config
 			fmt.Printf("%+v\n", res)
+			if len(res.Events) == 0 {
+				continue
+			}
 			e := res.Events[len(res.Events)-1]
 			var regions pspb.Regions
 			if err = regions.Unmarshal(e.Kv.Value); err != nil {

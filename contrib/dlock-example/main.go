@@ -20,6 +20,16 @@ func main() {
 	})
 	session, err := concurrency.NewSession(client, concurrency.WithTTL(30))
 
+	go func() {
+		for {
+			select {
+			case <-session.Done():
+				fmt.Println("session closed")
+				os.Exit(0)
+			}
+		}
+	}()
+
 	client.Put(context.Background(), "stat", "stat")
 	mutex := concurrency.NewMutex(session, "lock")
 	err = mutex.Lock(context.Background())

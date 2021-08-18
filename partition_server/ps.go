@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"strings"
 	"time"
 
@@ -218,6 +219,19 @@ func (ps *PartitionServer) Init() {
 
 	ps.session = session
 
+	ps.etcdClient = ps.session.Client()
+	
+	//if session is Done, quit
+	go func(){
+		for {
+			select {
+			case <-session.Done():
+				fmt.Println("session closed")
+				xlog.Logger.Fatalf("session closed")
+				os.Exit(0)
+			}
+		}
+	}()
 
 	//session create PSSERVER/{PSID} => {PSDETAIL}
 	var detail = pspb.PSDetail{
