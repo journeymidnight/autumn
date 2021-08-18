@@ -1,7 +1,6 @@
 package range_partition
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 
@@ -121,10 +120,7 @@ func (rp *RangePartition) runGC(discardRatio float64) {
 
 		userKey := y.ParseKey(ei.Log.Key)
 
-		if bytes.Compare(userKey, rp.StartKey) < 0 {
-			return true, nil
-		}
-		if len(rp.EndKey) > 0 && bytes.Compare(rp.EndKey, userKey) <= 0 {
+		if !rp.IsUserKeyInRange(userKey) {
 			return true, nil
 		}
 

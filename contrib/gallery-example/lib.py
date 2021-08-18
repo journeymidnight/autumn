@@ -59,6 +59,7 @@ class AutumnLib:
         return conn
 
     def _update_ps_config(self, events):
+        print(events)
         for event in events.events:
             if type(event) is etcd3.events.PutEvent:
                 psDetail = pspb.PSDetail()

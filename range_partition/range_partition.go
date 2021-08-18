@@ -128,15 +128,13 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		rp.tables = append(rp.tables, tbl)
 
 		key := y.ParseKey(tbl.Smallest())
-		if bytes.Compare(key, startKey) < 0 || (len(endKey) > 0 && bytes.Compare(key, endKey) >= 0) {
-			//smallest key in table is not in range
-			//fmt.Printf("smallest key :%s is out of [%s, %s]\n", key, startKey, endKey)
+
+
+		if !rp.IsUserKeyInRange(key) {
 			rp.hasOverlap = 1
 		}
 		key = y.ParseKey(tbl.Biggest())
-		if bytes.Compare(key, startKey) < 0 || (len(endKey) > 0 && bytes.Compare(key, endKey) >= 0) {
-			//biggest key in table is not in range
-			//fmt.Printf("bigest key :%s is out of [%s, %s]\n", key, startKey, endKey)
+		if !rp.IsUserKeyInRange(key) {
 			rp.hasOverlap = 1
 		}
 	}
@@ -168,6 +166,13 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		//fmt.Printf("from log %v\n", string(ei.Log.Key))
 		//build ValueStruct from EntryInfo
 		entriesReady := []*pb.EntryInfo{ei}
+
+		userKey := y.ParseKey(ei.Log.Key)
+
+
+		if !rp.IsUserKeyInRange(userKey) {
+			return true, nil
+		}
 
 		head := valuePointer{extentID: ei.ExtentID, offset: ei.End}
 		logSizeRead += ei.End - ei.Offset
@@ -301,6 +306,11 @@ func (rp *RangePartition) startWriteLoop() {
 	rp.writeCh = make(chan *request, rp.opt.WriteChCapacity)
 
 	rp.writeStopper.RunWorker(rp.doWrites)
+}
+
+
+func (rp *RangePartition) IsUserKeyInRange(userKey []byte) bool {
+	return bytes.Compare(rp.StartKey, userKey) <= 0 && (len(rp.EndKey) == 0 || bytes.Compare(userKey, rp.EndKey) < 0) 
 }
 
 func (rp *RangePartition) startMemoryFlush() {
@@ -853,6 +863,7 @@ func (rp *RangePartition) Range(prefix []byte, start []byte, limit uint32) [][]b
 
 		if hasOverLap {
 			//if hasOverLap && userKey less than rp.startKey, then continue
+			//这个情况一般不会出现,上次client会找到之前的range,不会到当前range
 			if bytes.Compare(userKey, rp.StartKey) < 0 {
 				continue
 			}
@@ -1000,7 +1011,8 @@ func (rp *RangePartition) close(gracefull bool) error {
 	//FIXME lost data in mt/imm, will have to replay log
 	//doWrite在返回前,会调用最后一次writeRequest并且等待返回, 所以这里
 	//mt和rp.vhead都是只读的
-	if gracefull && rp.mt.MemSize() > 0 {
+	//106是空的skiplist的只有头node的大小
+	if gracefull && rp.mt.MemSize() > 106 {
 		for {
 			pushedFlushTask := func() bool {
 				rp.Lock()

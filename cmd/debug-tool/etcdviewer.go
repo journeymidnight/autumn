@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -86,10 +87,33 @@ func receiveData(client *clientv3.Client) []KV {
 			data = append(data, d)
 		} else if strings.HasPrefix(string(kv.Key), "regions/config") {
 			var config pspb.Regions
+			//Rg's startKey and endKey are []bytes, json encoding will 
+			//convert them to base64, which is not what we want.
 			config.Unmarshal(kv.Value)
+			type easyReadConfig struct {
+				StartKey string `json:"startKey"`
+				EndKey   string `json:"endKey"`
+				PartID   uint64	`json:"PartID"`
+				PSID     uint64 `json:"PSID"`
+			}
+			easyReadMap := make([]easyReadConfig, 0, len(config.Regions))
+			for _, region:= range config.Regions {
+				easyReadMap = append(easyReadMap, easyReadConfig{
+					StartKey: string(region.Rg.StartKey),
+					EndKey:   string(region.Rg.EndKey),
+					PartID:   region.PartID,
+					PSID:     region.PSID,
+				})
+			}
+			//sort by startKEY
+			sort.Slice(easyReadMap, func(i, j int) bool {
+				return easyReadMap[i].StartKey < easyReadMap[j].StartKey
+			})
+
+			value, _:= json.MarshalIndent(easyReadMap, "", "  ")
 			d := KV {
 				Key: string(kv.Key),
-				Value: jsonEncode(&config),
+				Value: string(value),
 			}
 			data = append(data, d)
 
@@ -289,7 +313,7 @@ func main() {
 			}
 			data = utils.MustMarshal(&x)
 		} else {
-			showDialog(fmt.Errorf("unkown key..."))
+			showDialog(fmt.Errorf("updated is not supported"))
 			return
 		}
 
