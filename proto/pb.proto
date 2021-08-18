@@ -15,7 +15,7 @@
 syntax = "proto3";
 package pb;
 
-import "gogoproto/gogo.proto";
+//import "gogoproto/gogo.proto";
 
 
 

@@ -1,7 +1,6 @@
 package partition_server
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"time"
@@ -23,7 +22,7 @@ func (ps *PartitionServer) checkVersion(partID uint64, key []byte) *range_partit
 		fmt.Printf("no such rp %d\n", partID)
 		return nil
 	}
-	if bytes.Compare(rp.StartKey, key) <= 0 && (len(rp.EndKey) == 0 || bytes.Compare(key, rp.EndKey) < 0) {
+	if rp.IsUserKeyInRange(key) {
 		return rp
 	}
 	fmt.Println("key is not in range")

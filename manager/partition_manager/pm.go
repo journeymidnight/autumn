@@ -369,6 +369,7 @@ func (pm *PartitionManager) etcdLeader() uint64 {
 
 //watchPartEvents watch part events
 func (pm *PartitionManager) watchPartEvents(watchCh clientv3.WatchChan, closeCh func()) {
+	var err error
 	for {
 		select {
 		case <-pm.stopper.ShouldStop():
@@ -384,26 +385,33 @@ func (pm *PartitionManager) watchPartEvents(watchCh clientv3.WatchChan, closeCh 
 				switch e.Type.String() {
 				case "PUT":
 					utils.MustUnMarshal(e.Kv.Value, &partMeta)
+					var psID uint64
 					if _, ok := pm.partMeta[partMeta.PartID]; ok {
-						pm.partMeta[partMeta.PartID] = &partMeta
-						continue
+						fmt.Printf("old part %d is updated [%v]\n", partMeta.PartID, partMeta.Rg)
+					} else {
+						fmt.Printf("new part %d is created [%v]\n", partMeta.PartID, partMeta.Rg)
 					}
-					//else this a new Part created.
-					fmt.Printf("new part %d is created [%v]\n", partMeta.PartID, partMeta.Rg)
 					pm.partMeta[partMeta.PartID] = &partMeta
-					//alloc partMeta
-					psID, err := pm.policy.AllocPart(pm.psNodes)
-					if err != nil {
-						//分配错误?
-						xlog.Logger.Errorf("can not alloc parts to partition servers")
-						continue
+
+					//part是否在regions/config里面?
+					if regionInfo, ok := pm.currentRegions.Regions[partMeta.PartID] ; ok {
+						psID = regionInfo.PSID//当split发生时, 保持原来的PartID位置
+					} else {
+						//alloc partMeta
+						psID, err = pm.policy.AllocPart(pm.psNodes)
+						if err != nil {
+							//分配错误?
+							xlog.Logger.Errorf("can not alloc parts to partition servers")
+							continue
+						}
 					}
+
 					pm.currentRegions.Regions[partMeta.PartID] = &pspb.RegionInfo{
 						Rg: partMeta.Rg,
 						PartID: partMeta.PartID,
 						PSID: psID,
 					}
-					fmt.Printf("NEW PART: set regions/config %+v", pm.currentRegions.Regions)
+					fmt.Printf("PART Changed: set regions/config %+v", pm.currentRegions.Regions)
 
 					ops := []clientv3.Op{
 						clientv3.OpPut(fmt.Sprintf("regions/config"), string(utils.MustMarshal(pm.currentRegions))),

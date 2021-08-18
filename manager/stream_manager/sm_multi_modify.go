@@ -195,8 +195,8 @@ func (sm *StreamManager) MultiModifySplit(ctx context.Context, req *pb.MultiModi
 		newBlobStreams.Blobs[i] = i
 	}
 	ops = append(ops, clientv3.OpPut(fmt.Sprintf("PART/%d", newPartID), string(utils.MustMarshal(&newMeta))))
+	
 	//update original meta's EndKey to midKEY
-
 	meta.Rg.EndKey = req.MidKey
 	ops = append(ops, clientv3.OpPut(fmt.Sprintf("PART/%d", req.PartID), string(utils.MustMarshal(&meta))))
 

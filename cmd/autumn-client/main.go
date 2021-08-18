@@ -93,6 +93,9 @@ func benchmark(etcdAddrs []string, op BenchType, threadNum int, duration int, si
 		}
 	}
 
+	 //in the unit of millisecond
+	hist := utils.NewLantencyStatus(0, 1000)
+	
 	n := rand.Int31()
 	go func() {
 		for i := 0; i < threadNum; i++ {
@@ -132,6 +135,7 @@ func benchmark(etcdAddrs []string, op BenchType, threadNum int, duration int, si
 								})
 								lock.Unlock()
 							}
+							hist.Record(int64(time.Since(start).Milliseconds()))
 							atomic.AddUint64(&totalSize, uint64(size))
 							atomic.AddUint64(&count, 1)
 							loop++
@@ -196,7 +200,7 @@ func benchmark(etcdAddrs []string, op BenchType, threadNum int, duration int, si
 			fmt.Println("failed to write result.json")
 		}
 	}
-	printSummary(time.Now().Sub(start), atomic.LoadUint64(&count), atomic.LoadUint64(&totalSize), threadNum, size)
+	printSummary(time.Now().Sub(start), atomic.LoadUint64(&count), atomic.LoadUint64(&totalSize), threadNum, size, hist)
 
 	return nil
 }
@@ -247,8 +251,6 @@ func bootstrap(c *cli.Context) error {
 		Rg:        &pspb.Range{StartKey: []byte(""), EndKey: []byte("")},
 		PartID:    partID,
 	}
-
-
 
 	err = etcd_utils.EtcdSetKV(etcdClient, fmt.Sprintf("PART/%d", partID), utils.MustMarshal(&zeroMeta))
 	if err != nil {
@@ -625,10 +627,11 @@ func wbench(c *cli.Context) error {
 	return benchmark(etcdAddrs, WRITE_T, threadNum, duration, size)
 }
 
-func printSummary(elapsed time.Duration, totalCount uint64, totalSize uint64, threadNum int, size int) {
+func printSummary(elapsed time.Duration, totalCount uint64, totalSize uint64, threadNum int, size int, hist * utils.HistogramStatus) {
 	if elapsed.Seconds() < 1e-9 {
 		return
 	}
+	t := float64(totalSize) / elapsed.Seconds()
 	fmt.Printf("\nSummary\n")
 	fmt.Printf("Threads :%d\n", threadNum)
 	fmt.Printf("Size    :%d\n", size)
@@ -636,6 +639,6 @@ func printSummary(elapsed time.Duration, totalCount uint64, totalSize uint64, th
 	fmt.Printf("Complete requests :%d\n", totalCount)
 	fmt.Printf("Total transferred :%d bytes\n", totalSize)
 	fmt.Printf("Requests per second :%.2f [#/sec]\n", float64(totalCount)/elapsed.Seconds())
-	t := float64(totalSize) / elapsed.Seconds()
-	fmt.Printf("Thoughput per sencond :%s\n", utils.HumanReadableThroughput(t))
+	fmt.Printf("Throughput per second :%s\n", utils.HumanReadableThroughput(t))
+	fmt.Printf("Latency in millisecond p50, p95, p99: %v\n", hist.Histgram([]float64{50, 95, 99}, nil))
 }

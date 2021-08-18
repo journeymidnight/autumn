@@ -1,7 +1,6 @@
 package range_partition
 
 import (
-	"bytes"
 	"context"
 	"sync/atomic"
 	"time"
@@ -109,10 +108,8 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 		for ; it.Valid(); it.Next() {
 
 			userKey := y.ParseKey(it.Key())
-			if bytes.Compare(userKey, rp.StartKey) < 0 {
-				continue
-			}
-			if len(rp.EndKey) > 0 && bytes.Compare(rp.EndKey, userKey) <= 0 {
+
+			if !rp.IsUserKeyInRange(userKey) {
 				continue
 			}
 

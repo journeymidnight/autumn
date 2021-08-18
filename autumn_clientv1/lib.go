@@ -43,15 +43,21 @@ func (lib *AutumnLib) Close() {
 
 func (lib *AutumnLib) saveRegion(regions *pspb.Regions) {
 
-	newRegions := make([]*pspb.RegionInfo, len(regions.Regions))
-	i := 0
+	newRegions := make([]*pspb.RegionInfo, 0, len(regions.Regions))
 	for _, region := range regions.Regions {
-		newRegions[i] = region
-		i++
+		newRegions = append(newRegions, region)		
 	}
+
 	sort.Slice(newRegions, func(i, j int) bool {
 		return bytes.Compare(newRegions[i].Rg.StartKey, newRegions[j].Rg.StartKey) < 0
 	})
+
+	//assert to make sure the regions are sorted
+	for i := 0; i < len(newRegions); i++ {
+		if i < len(newRegions) - 1 && bytes.Compare(newRegions[i].Rg.EndKey, newRegions[i+1].Rg.StartKey) != 0 {
+			panic(fmt.Sprintf("region %d end key is not equal to start key of region %d", newRegions[i].PartID, newRegions[i+1].PartID))
+		}
+	}
 	lib.Lock()
 	lib.regions = newRegions
 	lib.Unlock()
@@ -66,12 +72,16 @@ func (lib *AutumnLib) Connect() error {
 
 	var maxRev int64
 	data, rev, err := etcd_utils.EtcdGetKV(client, "regions/config")
-	if err == nil {
-		var regions pspb.Regions
-		utils.MustUnMarshal(data, &regions)
-		//sort and save regions
-		lib.saveRegion(&regions)
+	if err != nil {
+		return err
 	}
+
+	var regions pspb.Regions
+	utils.MustUnMarshal(data, &regions)
+	//sort and save regions
+	lib.saveRegion(&regions)
+	
+
 	maxRev = utils.Max64(maxRev, rev)
 
 	var kvs []*mvccpb.KeyValue
@@ -241,8 +251,6 @@ func (lib *AutumnLib) Range(ctx context.Context, prefix []byte, start []byte, li
 	if len(sortedRegions) == 0 {
 		return nil, false, errors.New("no regions to write")
 	}
-	//FIXME: 多range partition的情况
-	//idx
 	idx := sort.Search(len(sortedRegions), func(i int) bool {
 		if len(sortedRegions[i].Rg.EndKey) == 0 {
 			return true
@@ -250,6 +258,7 @@ func (lib *AutumnLib) Range(ctx context.Context, prefix []byte, start []byte, li
 		return bytes.Compare(sortedRegions[i].Rg.EndKey, start) > 0
 	})
 	//start from idx
+	//FIXME: pipline to call range function
 	results := make([][]byte, 0)
 	var more bool
 	for i := idx; i < len(sortedRegions) && limit > 0; i++ {
@@ -304,6 +313,7 @@ func (lib *AutumnLib) SplitPart(ctx context.Context, partID uint64) error {
 }
 
 func (lib *AutumnLib) Delete(ctx context.Context, key []byte) error {
+	var err error
 	sortedRegions := lib.getRegions()
 	if len(sortedRegions) == 0 {
 		return errors.New("no regions to write")
@@ -318,14 +328,11 @@ func (lib *AutumnLib) Delete(ctx context.Context, key []byte) error {
 
 	conn := lib.getConn(lib.getPSAddr((sortedRegions[idx].PSID)))
 	client := pspb.NewPartitionKVClient(conn)
-	_, err := client.Delete(ctx, &pspb.DeleteRequest{
+	_, err = client.Delete(ctx, &pspb.DeleteRequest{
 		Key:    key,
 		Partid: sortedRegions[idx].PartID,
 	})
 
-	if err != nil {
-		return err
-	}
 	return err
 
 }

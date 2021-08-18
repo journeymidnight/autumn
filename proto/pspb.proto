@@ -16,6 +16,7 @@ syntax = "proto3";
 
 package pspb;
 
+//import "gogoproto/gogo.proto";
 
 /*
 
