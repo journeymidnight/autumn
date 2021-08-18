@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
-	"github.com/coreos/etcd/clientv3"
 	"github.com/journeymidnight/autumn/autumn_clientv1"
 	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/manager/smclient"
@@ -32,6 +31,7 @@ import (
 	_ "github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
 	"github.com/urfave/cli/v2"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap/zapcore"
 	_ "go.uber.org/zap/zapcore"
 )

@@ -3,10 +3,10 @@ package etcd_utils
 import (
 	"time"
 
-	"github.com/coreos/etcd/clientv3"
-	"github.com/coreos/etcd/embed"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/server/v3/embed"
 )
 
 func ServeETCD(cfg *embed.Config) (*embed.Etcd, *clientv3.Client, error) {

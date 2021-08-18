@@ -306,6 +306,29 @@ func TestWriteECFriendlyBlock(t *testing.T) {
 
 }
 
+
+func BenchmarkExtentWithoutSync(b *testing.B) {
+	extent, err := CreateExtent("localtest.ext", 100)
+	//extent.ResetWriter()
+	defer os.Remove("localtest.ext")
+	if err != nil {
+		panic(err.Error())
+	}
+	n := uint32(4096)
+	block := generateBlock(n)
+	extent.Lock()
+	defer extent.Unlock()
+	for i := 0; i < b.N; i++ {
+		_, _, err = extent.AppendBlocks([]*pb.Block{
+			block,
+		}, false)
+
+		if err != nil {
+			panic(err.Error())
+		}
+	}
+}
+
 func BenchmarkExtent(b *testing.B) {
 	extent, err := CreateExtent("localtest.ext", 100)
 	//extent.ResetWriter()
@@ -315,6 +338,8 @@ func BenchmarkExtent(b *testing.B) {
 	}
 	n := uint32(4096)
 	block := generateBlock(n)
+	extent.Lock()
+	defer extent.Unlock()
 	for i := 0; i < b.N; i++ {
 		_, _, err = extent.AppendBlocks([]*pb.Block{
 			block,

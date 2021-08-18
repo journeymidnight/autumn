@@ -6,8 +6,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/coreos/etcd/embed"
 	"github.com/urfave/cli/v2"
+	"go.etcd.io/etcd/server/v3/embed"
 )
 
 type Config struct {

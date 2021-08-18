@@ -7,7 +7,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/coreos/etcd/clientv3"
 	"github.com/journeymidnight/autumn/conn"
 	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/proto/pb"
@@ -15,6 +14,7 @@ import (
 	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 //extent is copied from replaceID to newNodeID

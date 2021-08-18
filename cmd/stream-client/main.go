@@ -12,7 +12,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/coreos/etcd/clientv3/concurrency"
 	"github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/streamclient"
@@ -20,6 +19,7 @@ import (
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
 	"github.com/urfave/cli/v2"
+	"go.etcd.io/etcd/client/v3/concurrency"
 
 	"go.uber.org/zap/zapcore"
 )

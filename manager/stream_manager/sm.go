@@ -7,8 +7,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/coreos/etcd/clientv3"
-	"github.com/coreos/etcd/embed"
 	"github.com/cornelk/hashmap"
 	"github.com/journeymidnight/autumn/conn"
 	"github.com/journeymidnight/autumn/etcd_utils"
@@ -16,7 +14,9 @@ import (
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
-	"go.etcd.io/etcd/clientv3/concurrency"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/client/v3/concurrency"
+	"go.etcd.io/etcd/server/v3/embed"
 	"google.golang.org/grpc"
 )
 

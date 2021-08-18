@@ -5,13 +5,13 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/coreos/etcd/clientv3"
 	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/pkg/errors"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 //duplicateStream copy all extents in srcStream to desStream.
