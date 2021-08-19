@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	idKey             = "AutumnSMIDKey"
+	IdKey             = "AutumnSMIDKey"
 	electionKeyPrefix = "AutumnSMLeader"
 )
 
@@ -354,7 +354,7 @@ func (sm *StreamManager) allocUniqID(count uint64) (uint64, uint64, error) {
 	sm.allocIdLock.Lock()
 	defer sm.allocIdLock.Unlock()
 
-	return etcd_utils.EtcdAllocUniqID(sm.client, idKey, count)
+	return etcd_utils.EtcdAllocUniqID(sm.client, IdKey, count)
 }
 
 func (sm *StreamManager) RegisterGRPC(grpcServer *grpc.Server) {

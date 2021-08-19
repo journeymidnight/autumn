@@ -21,6 +21,7 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/journeymidnight/autumn/etcd_utils"
+	"github.com/journeymidnight/autumn/manager/stream_manager"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/utils"
@@ -128,7 +129,7 @@ func receiveData(client *clientv3.Client) []KV {
 				Value: fmt.Sprintf("%+v", meta),
 			}
 			data = append(data, d)
-		} else if strings.HasPrefix(string(kv.Key), "AutumnSMIDKey") || strings.HasPrefix(string(kv.Key), "AutumnPMIDKey") {
+		} else if strings.HasPrefix(string(kv.Key), stream_manager.IdKey) || strings.HasPrefix(string(kv.Key), "AutumnPMIDKey") {
 			d := KV{
 				Key:   string(kv.Key),
 				Value: fmt.Sprintf("%d", binary.BigEndian.Uint64(kv.Value)),

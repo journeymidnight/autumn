@@ -1,0 +1,1 @@
+./autumn-client bootstrap --etcdAddr stream-manager:2379 --smAddr stream-manager:3401 --replication  1

@@ -182,7 +182,7 @@ func doWrites(writeCh chan *writeRequest, done chan struct{}, sc *streamclient.A
 	}
 }
 
-func benchmark(etcdAddr []string, smAddr []string, op BenchType, duration int, size int, threadNum int) error {
+func benchmark(etcdAddr []string, smAddr []string, op BenchType, duration int, size int, threadNum int, dataShards int, parityShards int) error {
 
 	sm := smclient.NewSMClient(smAddr)
 	if err := sm.Connect(); err != nil {
@@ -190,7 +190,8 @@ func benchmark(etcdAddr []string, smAddr []string, op BenchType, duration int, s
 	}
 	defer sm.Close()
 	stopper := utils.NewStopper()
-	s, _, err := sm.CreateStream(context.Background(), 3, 0)
+	fmt.Printf("create stream , replication is %d+%d\n", dataShards, parityShards)
+	s, _, err := sm.CreateStream(context.Background(), uint32(dataShards), uint32(parityShards))
 	if err != nil {
 		return err
 	}
@@ -353,7 +354,7 @@ func alloc(c *cli.Context) error {
 	if err := client.Connect(); err != nil {
 		return err
 	}
-	s, e, err := client.CreateStream(context.Background(), 3, 0)
+	s, e, err := client.CreateStream(context.Background(), 1, 0)
 	if err != nil {
 		return err
 	}
@@ -393,6 +394,7 @@ func main() {
 				&cli.IntFlag{Name: "thread", Value: 1, Aliases: []string{"t"}},
 				&cli.IntFlag{Name: "duration", Value: 10, Aliases: []string{"d"}},
 				&cli.IntFlag{Name: "size", Value: 8192, Aliases: []string{"s"}},
+				&cli.StringFlag{Name: "replication", Value:"2+1", Required: true},
 			},
 			Action: wbench,
 		},
@@ -410,13 +412,21 @@ func main() {
 }
 
 func wbench(c *cli.Context) error {
-
+	var err error
 	duration := c.Int("duration")
 	size := c.Int("size")
 	clusterAddrs := utils.SplitAndTrim(c.String("cluster"), ",")
 	etcdAddrs := utils.SplitAndTrim(c.String("etcd"), ",")
 	threadNum := c.Int("thread")
-	return benchmark(etcdAddrs, clusterAddrs, benchWrite, duration, size, threadNum)
+	replication := c.String("replication")
+	//format:3
+	//format:3+2
+	//format:1
+	r, s, err := utils.ParseReplicationString(replication)
+	if err != nil {
+		return err
+	}
+	return benchmark(etcdAddrs, clusterAddrs, benchWrite, duration, size, threadNum, r, s)
 }
 
 func printSummary(elapsed time.Duration, totalCount uint64, totalSize uint64, threadNum int, size int, hist *utils.HistogramStatus) {

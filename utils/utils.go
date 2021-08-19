@@ -6,6 +6,8 @@ import (
 	"io"
 	"math"
 	"math/rand"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -302,4 +304,39 @@ func (f *memory) Write(p []byte) (n int, err error) {
 		f.end = f.pos
 	}
 	return n, nil
+}
+
+
+func ParseReplicationString(replication string) (int, int, error) {
+	re := regexp.MustCompile(`\d+`)
+	parts := re.FindAllString(replication, -1)
+	var r, s int
+	var err error
+
+	switch len(parts) {
+		case 1:
+			//replication
+			r, err = strconv.Atoi(parts[0])
+			if err != nil {
+				return -1, -1, err
+			}
+			if r > 3 {
+				return -1, -1, errors.Errorf("replicat %s is too big", r)
+			}
+		case 2:
+			//erasure code
+			if r, err = strconv.Atoi(parts[0]) ; err != nil {
+				return -1, -1, err
+			}
+		
+			if s, err = strconv.Atoi(parts[1]) ; err != nil {
+				return -1, -1, err
+			}
+			if r == 1 {
+				return -1, -1, errors.Errorf("EC datashard can not be 1")
+			}
+		default:
+			return -1, -1, errors.Errorf("can not parse %s for replication", replication)
+	}
+	return r, s, nil
 }

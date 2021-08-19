@@ -22,13 +22,11 @@ import (
 	"google.golang.org/grpc"
 )
 
-type partID_t = uint64
-type psID_t = uint64
 
 type PartitionServer struct {
 	utils.SafeMutex //protect rangePartitions
-	rangePartitions map[partID_t]*range_partition.RangePartition
-	rangePartitionLocks map[partID_t]*concurrency.Mutex
+	rangePartitions map[uint64]*range_partition.RangePartition
+	rangePartitionLocks map[uint64]*concurrency.Mutex
 	PSID            uint64
 	smClient        *smclient.SMClient
 	etcdClient      *clientv3.Client     
@@ -45,7 +43,7 @@ type PartitionServer struct {
 
 func NewPartitionServer(smAddr []string, etcdAddr []string, PSID uint64, address string) *PartitionServer {
 	return &PartitionServer{
-		rangePartitions: make(map[partID_t]*range_partition.RangePartition),
+		rangePartitions: make(map[uint64]*range_partition.RangePartition),
 		rangePartitionLocks: make(map[uint64]*concurrency.Mutex),
 		smClient:        smclient.NewSMClient(smAddr),
 		PSID:            PSID,
@@ -218,8 +216,6 @@ func (ps *PartitionServer) Init() {
 	utils.Check(err)
 
 	ps.session = session
-
-	ps.etcdClient = ps.session.Client()
 	
 	//if session is Done, quit
 	go func(){
@@ -379,7 +375,7 @@ func (ps *PartitionServer) Shutdown() {
 		rp.Close()
 	}
 	ps.Unlock()
-	time.Sleep(1 * time.Second)
+	time.Sleep(300 * time.Millisecond)
 	//FIXME, will release all mutex as well
 	ps.session.Close()
 }
