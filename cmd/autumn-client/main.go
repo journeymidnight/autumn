@@ -24,6 +24,7 @@ import (
 	"github.com/journeymidnight/autumn/autumn_clientv1"
 	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/manager/smclient"
+	"github.com/journeymidnight/autumn/manager/stream_manager"
 	"github.com/journeymidnight/autumn/node"
 	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/utils"
@@ -226,20 +227,27 @@ func bootstrap(c *cli.Context) error {
 		return errors.New("partition already exists")
 	}
 
+	r, s, err := utils.ParseReplicationString(c.String("replication"))
+	if err != nil {
+		return err
+	}
 	//choose the first one
-
-	log, _, err := smc.CreateStream(context.Background(), 2, 1)
+	log, _, err := smc.CreateStream(context.Background(), uint32(r), uint32(s))
 	if err != nil {
 		fmt.Printf("can not create log stream\n")
 		return err
 	}
-	row, _, err := smc.CreateStream(context.Background(), 2, 1)
+	fmt.Printf("log stream %d created, replication is [%d+%d]\n", log.StreamID, r, s)
+
+	row, _, err := smc.CreateStream(context.Background(), uint32(r), uint32(s))
 	if err != nil {
 		fmt.Printf("can not create row stream\n")
 		return err
 	}
+	fmt.Printf("row stream %d created, replication is [%d+%d]\n", row.StreamID, r, s)
 
-	partID, _, err := etcd_utils.EtcdAllocUniqID(etcdClient, "AutumnSMIDKey", 1)
+
+	partID, _, err := etcd_utils.EtcdAllocUniqID(etcdClient, stream_manager.IdKey , 1)
 	if err != nil {
 		fmt.Printf("can not create partID %v\n", err)
 		return err
@@ -433,6 +441,7 @@ func main() {
 			Flags: []cli.Flag{
 				&cli.StringFlag{Name: "smAddr", Value: "127.0.0.1:3401"},
 				&cli.StringFlag{Name: "etcdAddr", Value: "127.0.0.1:2379"},
+				&cli.StringFlag{Name: "replication", Value:"2+1"},
 			},
 			Action: bootstrap,
 		},
@@ -498,8 +507,9 @@ func main() {
 		},
 		{
 			Name:  "format",
-			Usage: "format --walDir <dir> --listenUrl <addr> --smAddr <addrs> <dir list> ",
+			Usage: "format --walDir <dir> --listenUrl <addr> --smAddr <addrs> --etcdAddr <addrs> <dir list> ",
 			Flags: []cli.Flag{
+				&cli.StringFlag{Name: "etcdAddr", Value: "127.0.0.1:3401"},
 				&cli.StringFlag{Name: "smAddr", Value: "127.0.0.1:3401"},
 				&cli.StringFlag{Name: "listenUrl"},
 				&cli.StringFlag{Name: "walDir"},
@@ -510,8 +520,10 @@ func main() {
 	err := app.Run(os.Args)
 	if err != nil {
 		fmt.Println(err)
+		os.Exit(-1)
 	}
 
+	os.Exit(0)
 }
 
 //FIXME: detect disk and verify , then register first, then write down uuid, node_id, directory level
@@ -532,7 +544,8 @@ func format(c *cli.Context) error {
 	}
 	var err error
 	smAddr := utils.SplitAndTrim(c.String("smAddr"), ",")
-	listenUrl := c.String("listenUrl")
+	etcdAddr := utils.SplitAndTrim(c.String("etcdAddr"), ",")
+	listenURL := c.String("listenUrl")
 
 	walDir := c.String("walDir")
 	if len(walDir) > 0 {
@@ -544,7 +557,7 @@ func format(c *cli.Context) error {
 
 	dirList := c.Args().Slice()
 
-	if len(listenUrl) == 0 {
+	if len(listenURL) == 0 {
 		return errors.New("listenUrl can not be empty")
 	}
 	if len(dirList) == 0 {
@@ -573,7 +586,7 @@ func format(c *cli.Context) error {
 	fmt.Printf("format on disks : %+v", dirList)
 
 	fmt.Printf("register node on stream manager ..\n")
-	nodeID, uuidToDiskID, err := sm.RegisterNode(context.Background(), uuids, listenUrl)
+	nodeID, uuidToDiskID, err := sm.RegisterNode(context.Background(), uuids, listenURL)
 	if err != nil {
 		revert(dirList)
 		return err
@@ -603,8 +616,13 @@ func format(c *cli.Context) error {
 	var config node.Config
 	config.Dirs = dirList
 	config.ID = nodeID
-	config.ListenUrl = listenUrl
 	config.WalDir = walDir
+	config.SmAddr = smAddr
+	config.EtcdAddr = etcdAddr
+
+	//find port and bind to 0.0.0.0:port
+	i := strings.IndexByte(listenURL, ':')
+	config.ListenURL = fmt.Sprintf("0.0.0.0:%s", listenURL[i+1:])
 
 	f, err := os.Create(fmt.Sprintf("en_%d.toml", nodeID))
 	if err != nil {
@@ -614,7 +632,7 @@ func format(c *cli.Context) error {
 	if err = toml.NewEncoder(f).Encode(config); err != nil {
 		return err
 	}
-
+	f.Sync()
 	return nil
 }
 

@@ -1,0 +1,45 @@
+version: '3'
+
+services:
+  partition-server:
+     hostname: partition-server
+     depends_on: 
+        - extent-node
+        - stream-manager
+     image: autumn:latest
+     command: ./autumn-ps --listen partition-server:9955 --psID 12 --smAddr stream-manager:3401 --etcdAddr stream-manager:2379
+     ports:
+       - "9955:9955" 
+  stream-manager:
+     hostname: stream-manager
+     image: autumn:latest
+     command: 
+       ./autumn-manager 
+       --dir sm1.db 
+       --name sm1
+       --listen-client-urls http://0.0.0.0:2379 
+       --advertise-client-urls http://0.0.0.0:2379 
+       --listen-peer-urls http://0.0.0.0:12380  
+       --advertise-peer-urls http://127.0.0.1:12380 
+       --initial-cluster-token sm-cluster-1 
+       --initial-cluster 'sm1=http://127.0.0.1:12380' 
+       --initial-cluster-state new 
+       --listen-grpc 0.0.0.0:3401
+     ports:
+       - "2379:2379" 
+       - "3401:3401"
+  extent-node:
+     hostname: extent-node
+     image: autumn:latest
+     depends_on: 
+       - stream-manager
+         #- dns.mageddo
+     command: sh node_run.sh 
+     #debug
+     #command:  tail -f /dev/null
+     ports:
+       - "4001:4001"
+networks:
+   default:
+     external:
+       name: docker_default

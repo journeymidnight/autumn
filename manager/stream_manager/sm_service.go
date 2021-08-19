@@ -50,10 +50,11 @@ func (sm *StreamManager) CreateStream(ctx context.Context, req *pb.CreateStreamR
 	if req.DataShard == 0 {
 		return errDone(errors.New("req.DataShard can not be 0"))
 	}
-	if req.ParityShard == 0 && req.DataShard != 3 {
-		return errDone(errors.New("replica only support 3 replics"))
+	
+	if req.ParityShard > 0 && req.DataShard < 2 {
+		return errDone(errors.New("DataShard can not be less than 2 when EC is used"))
 	}
-
+	
 
 	nodes := sm.getAllNodeStatus(true)
 
@@ -264,7 +265,7 @@ func (sm *StreamManager) CheckCommitLength(ctx context.Context, req *pb.CheckCom
 	if len(lastExtentInfo.Parity) > 0  {
 		minSize = len(lastExtentInfo.Replicates)
 	} else {
-		minSize = 2
+		minSize = 1
 	}
 	var minimalLength int64 = math.MaxInt64
 
@@ -372,7 +373,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		if len(lastExInfo.Parity) > 0  {
 			minSize = len(lastExInfo.Replicates)
 		} else {
-			minSize = 2
+			minSize = 1
 		}
 		
 		sizes = sm.receiveCommitlength(ctx, nodes, lastExInfo.ExtentID)

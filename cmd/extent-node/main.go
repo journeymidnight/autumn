@@ -13,7 +13,6 @@ import (
 	"go.uber.org/zap"
 )
 
-
 func main() {
 	config, err := node.NewConfig()
 	if err != nil {
@@ -23,15 +22,12 @@ func main() {
 	fmt.Printf("config: %+v\n", config)
 	xlog.InitLog([]string{fmt.Sprintf("node_%d.log", config.ID)}, zap.DebugLevel)
 
-	//FIXME: sm address
-
-	node := node.NewExtentNode(config.ID, config.Dirs, config.WalDir, config.ListenUrl, []string{"127.0.0.1:3401"}, []string{"127.0.0.1:2379"})
+	node := node.NewExtentNode(config.ID, config.Dirs, config.WalDir, config.ListenURL, config.SmAddr, config.EtcdAddr)
 
 	//open all extent files
 
 	err = node.LoadExtents()
 	utils.Check(err)
-
 
 	//start grpc service
 	err = node.ServeGRPC()
