@@ -6,13 +6,13 @@ services:
      depends_on: 
         - extent-node
         - stream-manager
-     image: autumn:latest
+     image: journeymidnight/autumn:latest
      command: ./autumn-ps --listen partition-server:9955 --psID 12 --smAddr stream-manager:3401 --etcdAddr stream-manager:2379
      ports:
        - "9955:9955" 
   stream-manager:
      hostname: stream-manager
-     image: autumn:latest
+     image: journeymidnight/autumn:latest
      command: 
        ./autumn-manager 
        --dir sm1.db 
@@ -30,7 +30,7 @@ services:
        - "3401:3401"
   extent-node:
      hostname: extent-node
-     image: autumn:latest
+     image: journeymidnight/autumn:latest
      depends_on: 
        - stream-manager
          #- dns.mageddo
