@@ -46,7 +46,7 @@ jobs:
           file: ./contrib/docker/Dockerfile
           builder: ${{ steps.buildx.outputs.name }}
           push: true
-          tags:  autumn:latest
+          tags:  journeymidnight/autumn:latest
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache
       - name: Image digest
