@@ -22,6 +22,6 @@ image:
 	done
 	@cp contrib/docker/node_run.sh linux
 	@cp contrib/docker/bootstrap.sh linux
-	docker build -f contrib/docker/Dockerfile -t autumn:$(BUILD_VERSION) .
-	docker tag autumn:$(BUILD_VERSION) autumn:latest
+	docker build -f contrib/docker/Dockerfile -t journeymidnight/autumn:$(BUILD_VERSION) .
+	docker tag journeymidnight/autumn:$(BUILD_VERSION) journeymidnight/autumn:latest
 	rm -rf linux
