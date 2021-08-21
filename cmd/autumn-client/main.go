@@ -213,6 +213,9 @@ func bootstrap(c *cli.Context) error {
 		Endpoints:   etcdUrls,
 		DialTimeout: time.Second,
 	})
+	if err != nil {
+		return err
+	}
 
 	smUrlss := utils.SplitAndTrim(c.String("smUrls"), ",")
 

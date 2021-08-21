@@ -43,11 +43,11 @@ type nodesInfoUpdatedFunc func(event *clientv3.Event)
 
 
 
+//NewExtentManager will block forever until connected to etcd
 func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate extentInfoUpdatedFunc) *ExtentManager {
 
 	client, err := clientv3.New(clientv3.Config{
 		Endpoints:   etcdAddr,
-		DialTimeout: 5*time.Second,
 		DialOptions: []grpc.DialOption{
 			grpc.WithBlock(),
 		},

@@ -31,7 +31,6 @@ func ServeETCD(cfg *embed.Config) (*embed.Etcd, *clientv3.Client, error) {
 		DialTimeout: time.Second,
 	})
 	
-
 	return e, client, err
 
 }

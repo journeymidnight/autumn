@@ -31,6 +31,10 @@ class AutumnLib:
             self.regions = sorted_regions
 
     def _update_regions_config(self, events):
+        if type(events) is not etcd3.watch.WatchResponse:
+            return
+        if len(events.events) == 0:
+            return
         event = events.events[-1]#skip to the last event
         regions = pspb.Regions()
         regions.ParseFromString(event.value)
@@ -53,13 +57,15 @@ class AutumnLib:
         options=[
         ('grpc.max_send_message_length', 33<<20),
         ('grpc.max_receive_message_length', 33<<20),
+        ('grpc.max_reconnect_backoff_ms', 1000),
         ])
         with self.consLock:
             self.cons[addr] = conn
         return conn
 
     def _update_ps_config(self, events):
-        print(events)
+        if type(events) is not etcd3.watch.WatchResponse:
+            return
         for event in events.events:
             if type(event) is etcd3.events.PutEvent:
                 psDetail = pspb.PSDetail()
@@ -137,7 +143,9 @@ class AutumnLib:
 
     def Connect(self):
         try:
-            self.etcdClient = etcd3.client()
+            self.etcdClient = etcd3.client(grpc_options={
+                '"grpc.max_reconnect_backoff_ms': 1000,
+            }.items())
 
             max_revision = 0
             data, meta = self.etcdClient.get("regions/config")

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -19,6 +18,7 @@ import (
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/gogo/protobuf/proto"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"google.golang.org/grpc"
 
 	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/manager/stream_manager"
@@ -49,11 +49,9 @@ streams/4
 streams/6
 */
 
-
-
 func jsonEncode(x proto.Message) string {
 	var jm = &jsonpb.Marshaler{}
-	jm.Indent="  "
+	jm.Indent = "  "
 	ret, err := jm.MarshalToString(x)
 	if err != nil {
 		panic(err)
@@ -67,38 +65,38 @@ func receiveData(client *clientv3.Client) []KV {
 	var data []KV
 	kvs, _, err := etcd_utils.EtcdRange(client, "")
 	if err != nil {
-		panic(err)
+		return nil
 	}
 	for _, kv := range kvs {
 		if strings.HasPrefix(string(kv.Key), "recoveryTasks/") {
 			var task pb.RecoveryTask
 			task.Unmarshal(kv.Value)
-			d := KV {
-				Key: string(kv.Key),
+			d := KV{
+				Key:   string(kv.Key),
 				Value: jsonEncode(&task),
 			}
 			data = append(data, d)
 		} else if strings.HasSuffix(string(kv.Key), "tables") {
 			var table pspb.TableLocations
 			table.Unmarshal(kv.Value)
-			d := KV {
-				Key: string(kv.Key),
+			d := KV{
+				Key:   string(kv.Key),
 				Value: fmt.Sprintf("%+v", table.Locs),
 			}
 			data = append(data, d)
 		} else if strings.HasPrefix(string(kv.Key), "regions/config") {
 			var config pspb.Regions
-			//Rg's startKey and endKey are []bytes, json encoding will 
+			//Rg's startKey and endKey are []bytes, json encoding will
 			//convert them to base64, which is not what we want.
 			config.Unmarshal(kv.Value)
 			type easyReadConfig struct {
 				StartKey string `json:"startKey"`
 				EndKey   string `json:"endKey"`
-				PartID   uint64	`json:"PartID"`
+				PartID   uint64 `json:"PartID"`
 				PSID     uint64 `json:"PSID"`
 			}
 			easyReadMap := make([]easyReadConfig, 0, len(config.Regions))
-			for _, region:= range config.Regions {
+			for _, region := range config.Regions {
 				easyReadMap = append(easyReadMap, easyReadConfig{
 					StartKey: string(region.Rg.StartKey),
 					EndKey:   string(region.Rg.EndKey),
@@ -111,21 +109,21 @@ func receiveData(client *clientv3.Client) []KV {
 				return easyReadMap[i].StartKey < easyReadMap[j].StartKey
 			})
 
-			value, _:= json.MarshalIndent(easyReadMap, "", "  ")
-			d := KV {
-				Key: string(kv.Key),
+			value, _ := json.MarshalIndent(easyReadMap, "", "  ")
+			d := KV{
+				Key:   string(kv.Key),
 				Value: string(value),
 			}
 			data = append(data, d)
 
-		}else if strings.HasPrefix(string(kv.Key), "PART/") {
+		} else if strings.HasPrefix(string(kv.Key), "PART/") {
 			var meta pspb.PartitionMeta
-			if err = meta.Unmarshal(kv.Value) ; err != nil {
+			if err = meta.Unmarshal(kv.Value); err != nil {
 				fmt.Printf("can not parse %s", kv.Key)
 				continue
 			}
 			d := KV{
-				Key: string(kv.Key),
+				Key:   string(kv.Key),
 				Value: fmt.Sprintf("%+v", meta),
 			}
 			data = append(data, d)
@@ -190,7 +188,7 @@ func receiveData(client *clientv3.Client) []KV {
 			var x pb.DiskInfo
 			utils.MustUnMarshal(kv.Value, &x)
 			d := KV{
-				Key: string(kv.Key),
+				Key:   string(kv.Key),
 				Value: jsonEncode(&x),
 			}
 			data = append(data, d)
@@ -215,8 +213,11 @@ func main() {
 
 	client, err := clientv3.New(clientv3.Config{
 		Endpoints:   []string{"http://127.0.0.1:2379"},
-		DialTimeout: time.Second,
+		DialOptions: []grpc.DialOption{
+			grpc.WithBlock(),
+		},
 	})
+
 	if err != nil {
 		panic(err)
 	}
@@ -360,7 +361,3 @@ func main() {
 
 	myWindow.ShowAndRun()
 }
-
-
-
-

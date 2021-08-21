@@ -13,6 +13,7 @@ import (
 
 
 
+const etcdTimeout = 2 * time.Second
 
 func EtcdWatchEvents(c *clientv3.Client, start, end string, startRev int64) (clientv3.WatchChan, func()) {
 	watcher := clientv3.NewWatcher(c)
@@ -37,14 +38,14 @@ func EtcdWatchEvents(c *clientv3.Client, start, end string, startRev int64) (cli
 
 func EtcdSetKV(c *clientv3.Client, key string, val []byte, opts ...clientv3.OpOption) error {
 	kv := clientv3.NewKV(c)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), etcdTimeout)
 	defer cancel()
 	_, err := kv.Put(ctx, key, string(val), opts...)
 	return err
 }
 
 func EtcdSetKVS(c *clientv3.Client, cmps []clientv3.Cmp, ops []clientv3.Op) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), etcdTimeout)
 	defer cancel()
 	txn := clientv3.NewKV(c).Txn(ctx)
 	txn.If(cmps...)
@@ -59,7 +60,7 @@ func EtcdSetKVS(c *clientv3.Client, cmps []clientv3.Cmp, ops []clientv3.Op) erro
 }
 
 func EtcdGetKV(c *clientv3.Client, key string, opts ...clientv3.OpOption) ([]byte, int64, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), etcdTimeout)
 	defer cancel()
 	resp, err := clientv3.NewKV(c).Get(ctx, key, opts...)
 	if err != nil {
@@ -74,13 +75,14 @@ func EtcdGetKV(c *clientv3.Client, key string, opts ...clientv3.OpOption) ([]byt
 
 //EtcdRange return (KeyValue, Revision, error)
 func EtcdRange(c *clientv3.Client, prefix string) ([]*mvccpb.KeyValue, int64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), etcdTimeout)
+	defer cancel()
 	opts := []clientv3.OpOption{
 		clientv3.WithPrefix(),
 		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend),
 		clientv3.WithLimit(0),
 	}
 	kv := clientv3.NewKV(c)
-	ctx := context.Background()
 	resp, err := kv.Get(ctx, prefix, opts...)
 	
 	if err != nil {
