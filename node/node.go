@@ -78,7 +78,7 @@ func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl st
 	utils.AssertTrue(en.em != nil)
 
 	//valid the etcd connection
-	fmt.Printf("validing etcd\n")
+	fmt.Printf("valid etcd\n")
 	_, err := en.em.EtcdClient().AlarmList(context.Background())
 	if err != nil {
 		xlog.Logger.Fatalf("remote ETCD is not valid [%v]", err)

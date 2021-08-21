@@ -37,8 +37,12 @@ func NewAutumnLib(etcdAddr []string) *AutumnLib {
 	}
 }
 
+
 func (lib *AutumnLib) Close() {
 	lib.etcdClient.Close()
+	for i := range lib.conns {
+		lib.conns[i].Close()
+	}
 }
 
 func (lib *AutumnLib) saveRegion(regions *pspb.Regions) {
@@ -70,6 +74,11 @@ func (lib *AutumnLib) Connect() error {
 		Endpoints:   lib.etcdAddr,
 		DialTimeout: time.Second,
 	})
+	
+	if err != nil {
+		return err
+	}
+
 	lib.etcdClient = client
 
 	var maxRev int64
@@ -101,7 +110,6 @@ func (lib *AutumnLib) Connect() error {
 	go func() {
 		for res := range watch1 {
 			//skip to the last, only cares about latest config
-			fmt.Printf("%+v\n", res)
 			if len(res.Events) == 0 {
 				continue
 			}

@@ -206,12 +206,16 @@ func (ps *PartitionServer) Init() {
 	utils.AssertTrue(xlog.Logger != nil)
 
 	//
-	if err := ps.smClient.Connect(); err != nil {
-		xlog.Logger.Fatalf(err.Error())
-	}
+
+
 	ps.extentManager = smclient.NewExtentManager(ps.smClient, ps.etcdURLs, nil)
 	ps.blockReader = streamclient.NewAutumnBlockReader(ps.extentManager, ps.smClient)
 
+	if err := ps.smClient.Connect(); err != nil {
+		xlog.Logger.Fatalf(err.Error())
+	}
+
+	
 	//share the connection with extentManager
 	ps.etcdClient = ps.extentManager.EtcdClient()
 	
