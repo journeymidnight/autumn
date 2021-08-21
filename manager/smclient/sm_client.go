@@ -36,6 +36,20 @@ func NewSMClient(addrs []string) *SMClient {
 	}
 }
 
+func (client *SMClient) Status() error {
+	if len(client.conns) == 0 {
+		return errors.New("not connection to stream server")
+	}
+	for i := range client.conns{
+		c := pb.NewStreamManagerServiceClient(client.conns[i])
+		_, err := c.Status(context.Background(), &pb.StatusRequest{})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Connect to Zero's grpc service, if all of connect failed to connnect, return error
 func (client *SMClient) Connect() error {
 

@@ -47,12 +47,16 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 
 	client, err := clientv3.New(clientv3.Config{
 		Endpoints:   etcdAddr,
-		DialTimeout: time.Second,
+		DialTimeout: 5*time.Second,
+		DialOptions: []grpc.DialOption{
+			grpc.WithBlock(),
+		},
 	})
 
 	if err != nil {
-		return nil
+		xlog.Logger.Fatalf("can not connected to ETCD %v", err)
 	}
+
 	/*
 	ETCD FORMATE:
 	nodes/{id}   => pb.NodeInfo
@@ -289,15 +293,6 @@ func (em *ExtentManager) GetExtentConn(extentID uint64, policy SelectNodePolicy)
 //    c.L.Unlock()
 */
 func (em *ExtentManager) WaitVersion(extentID uint64, version uint64) *pb.ExtentInfo {
-	
-	start := time.Now()
-	defer func(){
-		d := time.Since(start)
-		if d > time.Second*5 {
-			panic(fmt.Sprintf("waiting for %d to long", extentID))
-		}
-		//fmt.Printf("extent %d wait version %d cost %v\n", extentID, version, time.Now().Sub(start))
-	}()
 	var ei *pb.ExtentInfo
 	em.cond.L.Lock()
 	for {

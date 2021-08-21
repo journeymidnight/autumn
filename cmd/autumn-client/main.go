@@ -50,9 +50,9 @@ const (
 	WRITE_T           = "write"
 )
 
-func benchmark(etcdAddrs []string, op BenchType, threadNum int, duration int, size int) error {
+func benchmark(etcdUrlss []string, op BenchType, threadNum int, duration int, size int) error {
 
-	client := autumn_clientv1.NewAutumnLib(etcdAddrs)
+	client := autumn_clientv1.NewAutumnLib(etcdUrlss)
 	//defer client.Close()
 
 	if err := client.Connect(); err != nil {
@@ -208,15 +208,15 @@ func benchmark(etcdAddrs []string, op BenchType, threadNum int, duration int, si
 
 func bootstrap(c *cli.Context) error {
 
-	etcdAddr := utils.SplitAndTrim(c.String("etcdAddr"), ",")
+	etcdUrls := utils.SplitAndTrim(c.String("etcdUrls"), ",")
 	etcdClient, err := clientv3.New(clientv3.Config{
-		Endpoints:   etcdAddr,
+		Endpoints:   etcdUrls,
 		DialTimeout: time.Second,
 	})
 
-	smAddrs := utils.SplitAndTrim(c.String("smAddr"), ",")
+	smUrlss := utils.SplitAndTrim(c.String("smUrls"), ",")
 
-	smc := smclient.NewSMClient(smAddrs)
+	smc := smclient.NewSMClient(smUrlss)
 	if err := smc.Connect(); err != nil {
 		return err
 	}
@@ -270,8 +270,8 @@ func bootstrap(c *cli.Context) error {
 }
 
 func del(c *cli.Context) error {
-	etcdAddr := utils.SplitAndTrim(c.String("etcdAddr"), ",")
-	client := autumn_clientv1.NewAutumnLib(etcdAddr)
+	etcdUrls := utils.SplitAndTrim(c.String("etcdUrls"), ",")
+	client := autumn_clientv1.NewAutumnLib(etcdUrls)
 	//defer client.Close()
 	if err := client.Connect(); err != nil {
 		return err
@@ -286,8 +286,8 @@ func del(c *cli.Context) error {
 }
 
 func get(c *cli.Context) error {
-	etcdAddr := utils.SplitAndTrim(c.String("etcdAddr"), ",")
-	client := autumn_clientv1.NewAutumnLib(etcdAddr)
+	etcdUrls := utils.SplitAndTrim(c.String("etcdUrls"), ",")
+	client := autumn_clientv1.NewAutumnLib(etcdUrls)
 	//defer client.Close()
 
 	if err := client.Connect(); err != nil {
@@ -309,11 +309,11 @@ func get(c *cli.Context) error {
 }
 
 func autumnRange(c *cli.Context) error {
-	etcdAddr := utils.SplitAndTrim(c.String("etcdAddr"), ",")
-	if len(etcdAddr) == 0 {
-		return errors.Errorf("etcdAddr is nil")
+	etcdUrls := utils.SplitAndTrim(c.String("etcdUrls"), ",")
+	if len(etcdUrls) == 0 {
+		return errors.Errorf("etcdUrls is nil")
 	}
-	client := autumn_clientv1.NewAutumnLib(etcdAddr)
+	client := autumn_clientv1.NewAutumnLib(etcdUrls)
 	defer client.Close()
 
 	if err := client.Connect(); err != nil {
@@ -344,11 +344,11 @@ func autumnRange(c *cli.Context) error {
 
 //FIXME: grpc stream is better to send big values
 func put(c *cli.Context) error {
-	etcdAddr := utils.SplitAndTrim(c.String("etcdAddr"), ",")
-	if len(etcdAddr) == 0 {
-		return errors.Errorf("etcdAddr is nil")
+	etcdUrls := utils.SplitAndTrim(c.String("etcdUrls"), ",")
+	if len(etcdUrls) == 0 {
+		return errors.Errorf("etcdUrls is nil")
 	}
-	client := autumn_clientv1.NewAutumnLib(etcdAddr)
+	client := autumn_clientv1.NewAutumnLib(etcdUrls)
 	//defer client.Close()
 
 	if err := client.Connect(); err != nil {
@@ -374,11 +374,11 @@ func put(c *cli.Context) error {
 }
 
 func splitPartition(c *cli.Context) error {
-	etcdAddr := utils.SplitAndTrim(c.String("etcdAddr"), ",")
-	if len(etcdAddr) == 0 {
-		return errors.Errorf("etcdAddr is nil")
+	etcdUrls := utils.SplitAndTrim(c.String("etcdUrls"), ",")
+	if len(etcdUrls) == 0 {
+		return errors.Errorf("etcdUrls is nil")
 	}
-	client := autumn_clientv1.NewAutumnLib(etcdAddr)
+	client := autumn_clientv1.NewAutumnLib(etcdUrls)
 
 	if err := client.Connect(); err != nil {
 		return err
@@ -400,8 +400,8 @@ func splitPartition(c *cli.Context) error {
 }
 
 func info(c *cli.Context) error {
-	smAddrs := utils.SplitAndTrim(c.String("smAddr"), ",")
-	client := smclient.NewSMClient(smAddrs)
+	smUrlss := utils.SplitAndTrim(c.String("smUrls"), ",")
+	client := smclient.NewSMClient(smUrlss)
 	if err := client.Connect(); err != nil {
 		return err
 	}
@@ -428,19 +428,19 @@ func main() {
 	app.Commands = []*cli.Command{
 		{
 			Name:  "info",
-			Usage: "info --smAddr <path>",
+			Usage: "info --smUrls <path>",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "smAddr", Value: "127.0.0.1:3401"},
+				&cli.StringFlag{Name: "smUrls", Value: "127.0.0.1:3401"},
 			},
 			Action: info,
 		},
 
 		{
 			Name:  "bootstrap",
-			Usage: "bootstrap -smAddr <addrs> --etcdAddr <addrs>",
+			Usage: "bootstrap -smUrls <addrs> --etcdUrls <addrs>",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "smAddr", Value: "127.0.0.1:3401"},
-				&cli.StringFlag{Name: "etcdAddr", Value: "127.0.0.1:2379"},
+				&cli.StringFlag{Name: "smUrls", Value: "127.0.0.1:3401"},
+				&cli.StringFlag{Name: "etcdUrls", Value: "127.0.0.1:2379"},
 				&cli.StringFlag{Name: "replication", Value:"2+1"},
 			},
 			Action: bootstrap,
@@ -448,41 +448,41 @@ func main() {
 
 		{
 			Name:  "put",
-			Usage: "put --etcdAddr <addrs> <KEY> <FILE>",
+			Usage: "put --etcdUrls <addrs> <KEY> <FILE>",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "etcdAddr", Value: "127.0.0.1:2379"},
+				&cli.StringFlag{Name: "etcdUrls", Value: "127.0.0.1:2379"},
 			},
 			Action: put,
 		},
 		{
 			Name:  "get",
-			Usage: "get --etcdAddr <addrs> <KEY>",
+			Usage: "get --etcdUrls <addrs> <KEY>",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "etcdAddr", Value: "127.0.0.1:2379"},
+				&cli.StringFlag{Name: "etcdUrls", Value: "127.0.0.1:2379"},
 			},
 			Action: get,
 		},
 		{
 			Name:  "del",
-			Usage: "del --etcdAddr <addrs> <KEY>",
+			Usage: "del --etcdUrls <addrs> <KEY>",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "etcdAddr", Value: "127.0.0.1:2379"},
+				&cli.StringFlag{Name: "etcdUrls", Value: "127.0.0.1:2379"},
 			},
 			Action: del,
 		},
 		{
 			Name:  "split",
-			Usage: "split --etcdAddr <addrs> <PARTID>",
+			Usage: "split --etcdUrls <addrs> <PARTID>",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "etcdAddr", Value: "127.0.0.1:2379"},
+				&cli.StringFlag{Name: "etcdUrls", Value: "127.0.0.1:2379"},
 			},
 			Action: splitPartition,
 		},
 		{
 			Name:  "wbench",
-			Usage: "wbench --etcdAddr <addrs> --thread <num> --duration <duration>",
+			Usage: "wbench --etcdUrls <addrs> --thread <num> --duration <duration>",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "etcdAddr", Value: "127.0.0.1:2379"},
+				&cli.StringFlag{Name: "etcdUrls", Value: "127.0.0.1:2379"},
 				&cli.IntFlag{Name: "thread", Value: 4, Aliases: []string{"t"}},
 				&cli.IntFlag{Name: "duration", Value: 10, Aliases: []string{"d"}},
 				&cli.IntFlag{Name: "size", Value: 8192, Aliases: []string{"s"}},
@@ -496,9 +496,9 @@ func main() {
 		},
 		{
 			Name:  "ls",
-			Usage: "ls --etcdAddr <addrs> <prefix>",
+			Usage: "ls --etcdUrls <addrs> <prefix>",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "etcdAddr", Value: "127.0.0.1:2379"},
+				&cli.StringFlag{Name: "etcdUrls", Value: "127.0.0.1:2379"},
 				&cli.StringFlag{Name: "start", Value: ""},
 				&cli.StringFlag{Name: "prefix", Value: ""},
 				&cli.Int64Flag{Name: "limit", Value: math.MaxUint32},
@@ -507,12 +507,14 @@ func main() {
 		},
 		{
 			Name:  "format",
-			Usage: "format --walDir <dir> --listenUrl <addr> --smAddr <addrs> --etcdAddr <addrs> <dir list> ",
+			Usage: "format --output file.toml --waldir <dir> --listen-url <URL> --sm-urls <URLS> --etcd-urls <URLS> <dir list> ",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "etcdAddr", Value: "127.0.0.1:3401"},
-				&cli.StringFlag{Name: "smAddr", Value: "127.0.0.1:3401"},
-				&cli.StringFlag{Name: "listenUrl"},
-				&cli.StringFlag{Name: "walDir"},
+				&cli.StringFlag{Name: "etcd-urls", Value: "127.0.0.1:2379"},
+				&cli.StringFlag{Name: "sm-urls", Value: "127.0.0.1:3401"},
+				&cli.StringFlag{Name: "listen-url"},
+				&cli.StringFlag{Name: "advertise-url"},
+				&cli.StringFlag{Name: "waldir"},
+				&cli.StringFlag{Name: "output"},
 			},
 			Action: format,
 		},
@@ -543,9 +545,11 @@ func format(c *cli.Context) error {
 		return
 	}
 	var err error
-	smAddr := utils.SplitAndTrim(c.String("smAddr"), ",")
-	etcdAddr := utils.SplitAndTrim(c.String("etcdAddr"), ",")
-	listenURL := c.String("listenUrl")
+	smURLs := utils.SplitAndTrim(c.String("sm-urls"), ",")
+	etcdURLs := utils.SplitAndTrim(c.String("etcd-urls"), ",")
+	listenURL := c.String("listen-url")
+	advertiseURL := c.String("advertise-url")
+	output := c.String("output")
 
 	walDir := c.String("walDir")
 	if len(walDir) > 0 {
@@ -557,6 +561,9 @@ func format(c *cli.Context) error {
 
 	dirList := c.Args().Slice()
 
+	if len(advertiseURL) == 0 {
+		return errors.New("listenUrl can not be empty")
+	}
 	if len(listenURL) == 0 {
 		return errors.New("listenUrl can not be empty")
 	}
@@ -564,7 +571,7 @@ func format(c *cli.Context) error {
 		return errors.New("dir List can not be empty")
 	}
 
-	sm := smclient.NewSMClient(smAddr)
+	sm := smclient.NewSMClient(smURLs)
 
 	if err = sm.Connect(); err != nil {
 		return err
@@ -586,7 +593,7 @@ func format(c *cli.Context) error {
 	fmt.Printf("format on disks : %+v", dirList)
 
 	fmt.Printf("register node on stream manager ..\n")
-	nodeID, uuidToDiskID, err := sm.RegisterNode(context.Background(), uuids, listenURL)
+	nodeID, uuidToDiskID, err := sm.RegisterNode(context.Background(), uuids, advertiseURL)
 	if err != nil {
 		revert(dirList)
 		return err
@@ -617,14 +624,17 @@ func format(c *cli.Context) error {
 	config.Dirs = dirList
 	config.ID = nodeID
 	config.WalDir = walDir
-	config.SmAddr = smAddr
-	config.EtcdAddr = etcdAddr
+	config.SmURLs = smURLs
+	config.EtcdURLs = etcdURLs
+	config.ListenURL = listenURL
+	
+	if len(output) == 0 {
+		fmt.Printf("display config \n")
+		fmt.Printf("%+v\n", config)
+		return nil
+	}
 
-	//find port and bind to 0.0.0.0:port
-	i := strings.IndexByte(listenURL, ':')
-	config.ListenURL = fmt.Sprintf("0.0.0.0:%s", listenURL[i+1:])
-
-	f, err := os.Create(fmt.Sprintf("en_%d.toml", nodeID))
+	f, err := os.Create(output)
 	if err != nil {
 		return err
 	}
@@ -638,11 +648,11 @@ func format(c *cli.Context) error {
 
 func wbench(c *cli.Context) error {
 	threadNum := c.Int("thread")
-	etcdAddr := c.String("etcdAddr")
+	etcdUrls := c.String("etcdUrls")
 	duration := c.Int("duration")
 	size := c.Int("size")
-	etcdAddrs := utils.SplitAndTrim(etcdAddr, ",")
-	return benchmark(etcdAddrs, WRITE_T, threadNum, duration, size)
+	etcdUrlss := utils.SplitAndTrim(etcdUrls, ",")
+	return benchmark(etcdUrlss, WRITE_T, threadNum, duration, size)
 }
 
 func printSummary(elapsed time.Duration, totalCount uint64, totalSize uint64, threadNum int, size int, hist * utils.HistogramStatus) {

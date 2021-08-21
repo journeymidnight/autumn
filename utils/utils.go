@@ -58,6 +58,13 @@ func AssertTrue(b bool) {
 	}
 }
 
+func AssertTruef(b bool, format string, a ...interface{}) {
+	if !b {
+		panic(fmt.Sprintf(format, a...))
+	}
+}
+
+
 func EqualUint32(a, b []uint32) bool {
 	if len(a) != len(b) {
 		return false

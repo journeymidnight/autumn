@@ -8,7 +8,7 @@ import (
 
 	"github.com/journeymidnight/autumn/node"
 	"github.com/journeymidnight/autumn/utils"
-	"github.com/journeymidnight/autumn/xlog"
+	"github.com/journeymidnight/autumn/xlog"	
 
 	"go.uber.org/zap"
 )
@@ -22,7 +22,7 @@ func main() {
 	fmt.Printf("config: %+v\n", config)
 	xlog.InitLog([]string{fmt.Sprintf("node_%d.log", config.ID)}, zap.DebugLevel)
 
-	node := node.NewExtentNode(config.ID, config.Dirs, config.WalDir, config.ListenURL, config.SmAddr, config.EtcdAddr)
+	node := node.NewExtentNode(config.ID, config.Dirs, config.WalDir, config.ListenURL, config.SmURLs, config.EtcdURLs)
 
 	//open all extent files
 

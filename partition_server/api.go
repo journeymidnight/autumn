@@ -188,6 +188,7 @@ func (ps *PartitionServer) SplitPart(ctx context.Context, req *pspb.SplitPartReq
 			return nil, err
 		}
 	}
-	return nil, nil
+	return &pspb.SplitPartResponse{
+	},nil
 }
 

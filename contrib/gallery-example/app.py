@@ -26,7 +26,7 @@ def get(name):
 
         if len(ret.value) == 4:
             size = struct.unpack("!I", ret.value[0:4])[0]
-            if request.headers.has_key("Range"):#suport Range get
+            if "Range" in request.headers:#support Range GET
                 headers.add('Accept-Ranges','bytes')
                 ranges = re.findall(r"\d+", request.headers["Range"])
                 begin = int(ranges[0])
