@@ -16,14 +16,21 @@ import (
 
 func main() {
 
-	var listen string
+	var advertiseListen string
 	var psID string
-	var smAddr string
-	var etcdAddr string
+	var smURLs string
+	var etcdURLs string
+	var listen string
 
 	app := &cli.App{
 		HelpName: "",
 		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:        "advertise-listen",
+				Usage:       "ps grpc advertise listen url, tell cluste the connection",
+				Destination: &advertiseListen,
+				Required:    true,
+			},
 			&cli.StringFlag{
 				Name:        "listen",
 				Usage:       "ps grpc listen url",
@@ -31,19 +38,19 @@ func main() {
 				Required:    true,
 			},
 			&cli.StringFlag{
-				Name:        "psID",
+				Name:        "psid",
 				Usage:       "psID",
 				Destination: &psID,
 				Required:    true,
 			},
 			&cli.StringFlag{
-				Name:        "smAddr",
-				Destination: &smAddr,
+				Name:        "sm-urls",
+				Destination: &smURLs,
 				Required:    true,
 			},
 			&cli.StringFlag{
-				Name:        "etcdAddr",
-				Destination: &etcdAddr,
+				Name:        "etcd-urls",
+				Destination: &etcdURLs,
 				Required:    true,
 			},
 		},
@@ -53,14 +60,17 @@ func main() {
 		panic(err.Error())
 	}
 
-	smAddrs := utils.SplitAndTrim(smAddr, ",")
-	etcdAddrs := utils.SplitAndTrim(etcdAddr, ",")
 	xlog.InitLog([]string{fmt.Sprintf("ps.log")}, zap.DebugLevel)
 	id, err := strconv.ParseUint(psID, 10, 64)
 	if err != nil || id == 0 {
 		panic(fmt.Sprint("psid can not be zero"))
 	}
-	ps := partition_server.NewPartitionServer(smAddrs, etcdAddrs, id, listen)
+
+	fmt.Printf("smURL is %v\n", utils.SplitAndTrim(smURLs, ","))
+	fmt.Printf("etcdURL is %v\n", utils.SplitAndTrim(etcdURLs, ","))
+
+	ps := partition_server.NewPartitionServer(utils.SplitAndTrim(smURLs, ","), 
+	                 utils.SplitAndTrim(etcdURLs, ","), id, advertiseListen, listen)
 
 	ps.Init()
 

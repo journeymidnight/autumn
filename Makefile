@@ -1,6 +1,6 @@
-.PHONY: PRODUCT test all image
+.PHONY: test all image
 BUILD_VERSION  ?= $(shell git describe --always --tags)
-subdirs = extent-node autumn-manager autumn-client autumn-ps autumn-client
+subdirs = extent-node autumn-manager autumn-ps autumn-client
 
 all:
 	@for dir in $(subdirs) debug-tool; do \

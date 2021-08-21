@@ -697,6 +697,13 @@ func (sm *StreamManager) NodesInfo(ctx context.Context, req *pb.NodesInfoRequest
 	}, nil
 }
 
+func (sm *StreamManager) Status(ctx context.Context, req *pb.StatusRequest) (*pb.StatusResponse, error) {
+	return &pb.StatusResponse{
+		Code: pb.Code_OK,
+	}, nil
+}
+
+
 func (sm *StreamManager) ExtentInfo(ctx context.Context, req *pb.ExtentInfoRequest) (*pb.ExtentInfoResponse, error) {
 	
 	errDone := func(err error) (*pb.ExtentInfoResponse, error){

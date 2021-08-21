@@ -392,11 +392,21 @@ message MultiModifySplitResponse {
 	string codeDes = 2;
 }
 
+message StatusRequest {
+
+}
+
+message StatusResponse {
+	Code code = 1;
+	string codeDes = 2;
+}
 
 service StreamManagerService {
 	rpc StreamInfo(StreamInfoRequest) returns (StreamInfoResponse) {}
 	rpc ExtentInfo(ExtentInfoRequest) returns (ExtentInfoResponse) {}
-	rpc NodesInfo(NodesInfoRequest) returns(NodesInfoResponse) {}
+	rpc NodesInfo(NodesInfoRequest) returns (NodesInfoResponse) {}
+	rpc Status(StatusRequest) returns (StatusResponse) {}
+
 	//verify extent should exist on this node...
 	//rpc verifyExtent
 

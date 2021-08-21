@@ -30,9 +30,10 @@ type PartitionServer struct {
 	PSID            uint64
 	smClient        *smclient.SMClient
 	etcdClient      *clientv3.Client     
-	address       string
-	smAddr        []string
-	etcdAddr      []string
+	advertiseURL       string
+	listenURL          string
+	smURLs        []string
+	etcdURLs      []string
 	extentManager *smclient.ExtentManager
 	blockReader   *streamclient.AutumnBlockReader
 	grcpServer    *grpc.Server
@@ -41,15 +42,17 @@ type PartitionServer struct {
 	closeWatchCh  func()
 }
 
-func NewPartitionServer(smAddr []string, etcdAddr []string, PSID uint64, address string) *PartitionServer {
+func NewPartitionServer(smURLs []string, etcdURLs []string, PSID uint64, advertiseURL string, listenURL string) *PartitionServer {
 	return &PartitionServer{
 		rangePartitions: make(map[uint64]*range_partition.RangePartition),
 		rangePartitionLocks: make(map[uint64]*concurrency.Mutex),
-		smClient:        smclient.NewSMClient(smAddr),
+		smClient:        smclient.NewSMClient(smURLs),
 		PSID:            PSID,
-		address:         address,
-		smAddr: smAddr,
-		etcdAddr: etcdAddr,
+		smURLs: smURLs,
+		etcdURLs: etcdURLs,
+		listenURL: listenURL,
+		advertiseURL: advertiseURL,
+
 	}
 }
 
@@ -206,7 +209,7 @@ func (ps *PartitionServer) Init() {
 	if err := ps.smClient.Connect(); err != nil {
 		xlog.Logger.Fatalf(err.Error())
 	}
-	ps.extentManager = smclient.NewExtentManager(ps.smClient, ps.etcdAddr, nil)
+	ps.extentManager = smclient.NewExtentManager(ps.smClient, ps.etcdURLs, nil)
 	ps.blockReader = streamclient.NewAutumnBlockReader(ps.extentManager, ps.smClient)
 
 	//share the connection with extentManager
@@ -231,7 +234,7 @@ func (ps *PartitionServer) Init() {
 
 	//session create PSSERVER/{PSID} => {PSDETAIL}
 	var detail = pspb.PSDetail{
-		Address: ps.address,
+		Address: ps.advertiseURL,
 		PSID: ps.PSID,
 	}
 
@@ -351,7 +354,7 @@ func (ps *PartitionServer) ServeGRPC() error {
 	)
 
 	pspb.RegisterPartitionKVServer(grpcServer, ps)
-	listener, err := net.Listen("tcp", ps.address)
+	listener, err := net.Listen("tcp", ps.listenURL)
 	if err != nil {
 		return err
 	}

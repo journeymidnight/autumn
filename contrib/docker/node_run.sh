@@ -1,14 +1,14 @@
 mkdir -p store/sda
-if [ -f en_1.toml ]; then
-    ./extent-node --config en_1.toml
+if [ -f config.toml ]; then
+    ./extent-node --config config.toml
 else
     while true
     do
-        sleep 1
-        ./autumn-client format --listenUrl extent-node:4001 --etcdAddr stream-manager:2379 --smAddr stream-manager:3401 store/sda
+	    ./autumn-client format --output config.toml --advertise-url $(hostname):4001 --listen-url :4001 --etcd-urls stream-manager:2379 --sm-urls stream-manager:3401 store/sda
         if [ $? -eq "0" ];then
             break
         fi
+        sleep 1
     done
-    ./extent-node --config en_1.toml
+    ./extent-node --config config.toml
 fi

@@ -15,8 +15,8 @@ type Config struct {
 	ListenURL string
 	Dirs      []string
 	WalDir    string
-	SmAddr   []string
-	EtcdAddr []string
+	SmURLs   []string
+	EtcdURLs []string
 }
 
 func NewConfig() (*Config, error) {
@@ -28,8 +28,8 @@ func NewConfig() (*Config, error) {
 	var config Config
 	var configFile string
 	var dirSlice string
-	var smAddrsSlice string
-	var etcdAddrsSlice string
+	var smURLsSlice string
+	var etcdURLsSlice string
 
 	flags := []cli.Flag{
 		&cli.StringFlag{
@@ -39,7 +39,7 @@ func NewConfig() (*Config, error) {
 			Destination: &configFile,
 		},
 		&cli.StringFlag{
-			Name:        "listenUrl",
+			Name:        "listen-url",
 			Usage:       "grpc listen url",
 			Destination: &config.ListenURL,
 		},
@@ -49,20 +49,20 @@ func NewConfig() (*Config, error) {
 			Destination: &dirSlice,
 		},
 		&cli.Uint64Flag{
-			Name:        "ID",
+			Name:        "id",
 			Destination: &config.ID,
 		},
 		&cli.StringFlag{
-			Name:        "walDir",
+			Name:        "waldir",
 			Destination: &config.WalDir,
 		},
 		&cli.StringFlag{
-			Name:        "etcdAddrs",
-			Destination: &etcdAddrsSlice,
+			Name:        "etcd-urls",
+			Destination: &etcdURLsSlice,
 		},
 		(&cli.StringFlag{
-			Name:        "smAddrs",
-			Destination: &smAddrsSlice,
+			Name:        "sm-urls",
+			Destination: &smURLsSlice,
 		}),
 	}
 	app := &cli.App{
@@ -86,8 +86,8 @@ func NewConfig() (*Config, error) {
 		fmt.Printf("node %d reading config file %s\n", config.ID, configFile)
 	} else {
 		config.Dirs = utils.SplitAndTrim(dirSlice, ",")
-		config.SmAddr = utils.SplitAndTrim(smAddrsSlice, ",")
-		config.EtcdAddr = utils.SplitAndTrim(etcdAddrsSlice, ",")
+		config.SmURLs = utils.SplitAndTrim(smURLsSlice, ",")
+		config.EtcdURLs = utils.SplitAndTrim(etcdURLsSlice, ",")
 	}
 	//validate config
 
@@ -99,20 +99,23 @@ func NewConfig() (*Config, error) {
 
 func validateConf(conf *Config) error {
 	if len(conf.ListenURL) == 0 {
-		return errors.Errorf("listenUrl can not be empty")
+		return errors.Errorf("--listen-url can not be empty")
 	}
 
 	if conf.ID == 0 {
-		return errors.Errorf("ID can not be 0")
+		return errors.Errorf("--id can not be 0")
 	}
 
-
-	if len(conf.SmAddr) == 0 {
-		return errors.Errorf("stream manager's address can not be null")
+	if len(conf.Dirs) == 0 {
+		return errors.Errorf("--dir can not be null")
 	}
 
-	if len(conf.EtcdAddr) == 0 {
-		return errors.Errorf("ETCD's address can not be null")
+	if len(conf.SmURLs) == 0 {
+		return errors.Errorf("stream manager's urls  can not be null")
+	}
+
+	if len(conf.EtcdURLs) == 0 {
+		return errors.Errorf("ETCD's urls can not be null")
 	}
 	return nil
 }

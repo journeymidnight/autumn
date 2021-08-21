@@ -15,6 +15,7 @@
 package node
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"path/filepath"
@@ -56,13 +57,13 @@ type ExtentNode struct {
 	recoveryTaskNum  int32
 }
 
-func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl string, smAddr []string, etcdAddr []string) *ExtentNode {
+func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl string, smURLs []string, etcdURLs []string) *ExtentNode {
 	utils.AssertTrue(xlog.Logger != nil)
 
 	en := &ExtentNode{
 		extentMap: new(sync.Map),
 		listenUrl: listenUrl,
-		smClient:  smclient.NewSMClient(smAddr),
+		smClient:  smclient.NewSMClient(smURLs),
 		nodeID:    nodeID,
 		diskFSs: make(map[uint64]*diskFS),
 		
@@ -72,7 +73,17 @@ func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl st
 		return nil
 	}
 	
-	en.em = smclient.NewExtentManager(en.smClient, etcdAddr, en.extentInfoUpdatedfunc)
+	en.em = smclient.NewExtentManager(en.smClient, etcdURLs, en.extentInfoUpdatedfunc)
+
+	utils.AssertTrue(en.em != nil)
+
+	//valid the etcd connection
+	fmt.Printf("validing etcd\n")
+	_, err := en.em.EtcdClient().AlarmList(context.Background())
+	if err != nil {
+		xlog.Logger.Fatalf("remote ETCD is not valid [%v]", err)
+	}
+	
 
 	fmt.Printf("connected to ETCD server\n")
 	//load disk
