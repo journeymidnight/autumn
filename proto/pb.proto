@@ -100,6 +100,7 @@ message Payload {
 
 message CommitLengthRequest {
 	uint64 extentID = 1;
+	int64 revision = 2; //tell node to update lock's revistion to prevent other node from append
 }
 
 message CommitLengthResponse {
@@ -143,14 +144,14 @@ message DF {
 	uint32 online = 3;
 }
 
+
 message DfRequest{
 	repeated RecoveryTask tasks = 1;
 	repeated uint64 diskIDs = 2;
 }
 
+//DfResponse does't need to Code/CodeDes
 message DfResponse{
-	Code code = 1;
-	string codeDes = 2;
 	repeated RecoveryTask doneTask = 4;
 	map<uint64, DF> diskStatus = 5;
 }
