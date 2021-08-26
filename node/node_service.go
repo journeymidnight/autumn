@@ -59,23 +59,31 @@ func (en *ExtentNode) Heartbeat(in *pb.Payload, stream pb.ExtentService_Heartbea
 
 func (en *ExtentNode) ReplicateBlocks(ctx context.Context, req *pb.ReplicateBlocksRequest) (*pb.ReplicateBlocksResponse, error) {
 
+	errDone := func(err error) (*pb.ReplicateBlocksResponse, error) {
+		code, desCode := wire_errors.ConvertToPBCode(err)
+		return &pb.ReplicateBlocksResponse{
+			Code:    code,
+			CodeDes: desCode,
+		}, nil
+	}
+
 	ex := en.getExtent((req.ExtentID))
 	if ex == nil {
-		return nil, errors.Errorf("no suck extent")
+		return errDone(errors.Errorf("node %d have no such extent :%d", en.nodeID, req.ExtentID))
 	}
 	ex.Lock()
 	defer ex.Unlock()
 
 	if ex.HasLock(req.Revision) == false {
-		return nil, errors.Errorf("lock by others")
+		return errDone(wire_errors.LockedByOther)
 	}
 
 	if ex.CommitLength() != req.Commit {
-		return nil, errors.Errorf("primary commitlength is different with replicates %d vs %d", req.Commit, ex.CommitLength())
+		return errDone(errors.Errorf("primary commitlength is different with replicates %d vs %d", req.Commit, ex.CommitLength()))
 	}
 	ret, end, err := en.AppendWithWal(ex.Extent, req.Revision, req.Blocks)
 	if err != nil {
-		return nil, err
+		return errDone(err)
 	}
 	return &pb.ReplicateBlocksResponse{
 		Code:    pb.Code_OK,
@@ -508,17 +516,25 @@ func (en *ExtentNode) chooseDisktoAlloc() uint64 {
 
 func (en *ExtentNode) AllocExtent(ctx context.Context, req *pb.AllocExtentRequest) (*pb.AllocExtentResponse, error) {
 
+	errDone := func(err error) (*pb.AllocExtentResponse, error) {
+		code, desCode := wire_errors.ConvertToPBCode(err)
+		return &pb.AllocExtentResponse{
+			Code:    code,
+			CodeDes: desCode,
+		}, nil
+	}
+
 	i := en.chooseDisktoAlloc()
 	if i == 0 {
 		xlog.Logger.Warnf("can not alloc extent %d", req.ExtentID)
-		return nil, errors.Errorf("can not alloc extent %d", req.ExtentID)
+		return errDone(errors.Errorf("can not alloc extent %d", req.ExtentID))
 	}
 
 
 	ex, err := en.diskFSs[i].AllocExtent(req.ExtentID)
 	if err != nil {
 		xlog.Logger.Warnf("can not alloc extent %d, [%s]", req.ExtentID, err.Error())
-		return nil, err
+		return errDone(err)
 	}
 
 	en.setExtent(req.ExtentID, &ExtentOnDisk{
@@ -558,9 +574,25 @@ func (en *ExtentNode) Seal(ctx context.Context, req *pb.SealRequest) (*pb.SealRe
 
 
 func (en *ExtentNode) CommitLength(ctx context.Context, req *pb.CommitLengthRequest) (*pb.CommitLengthResponse, error) {
+
+	errDone := func(err error) (*pb.CommitLengthResponse, error) {
+		code, desCode := wire_errors.ConvertToPBCode(err)
+		return &pb.CommitLengthResponse{
+			Code:    code,
+			CodeDes: desCode,
+		}, nil
+	}
+
+
 	ex := en.getExtent(req.ExtentID)
 	if ex == nil {
-		return nil, errors.Errorf("do not have extent %d, can not alloc new", req.ExtentID)
+		return errDone(errors.Errorf("do not have extent %d, can not alloc new", req.ExtentID))
+	}
+
+	if req.Revision > 0 {
+		if ex.HasLock(req.Revision) == false {
+			return errDone(wire_errors.LockedByOther)
+		}
 	}
 
 	l := ex.CommitLength()
@@ -568,7 +600,6 @@ func (en *ExtentNode) CommitLength(ctx context.Context, req *pb.CommitLengthRequ
 		Code:   pb.Code_OK,
 		Length: l,
 	}, nil
-
 }
 
 
@@ -622,11 +653,11 @@ func (en *ExtentNode) Df(ctx context.Context, req *pb.DfRequest) (*pb.DfResponse
 	
 
 	return &pb.DfResponse{
-		Code: pb.Code_OK,
 		DiskStatus: dfStatus,
 		DoneTask: doneTasks,
 	}, nil
 }
+
 
 func (en *ExtentNode) ReadEntries(ctx context.Context, req *pb.ReadEntriesRequest) (*pb.ReadEntriesResponse, error) {
 

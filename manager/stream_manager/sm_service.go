@@ -236,10 +236,12 @@ func (sm *StreamManager) CheckCommitLength(ctx context.Context, req *pb.CheckCom
 	}
 
 	haveToSealLastExtent := false
-	sizes := sm.receiveCommitlength(ctx, nodes, tailExtentID)
+	//PS invoke 'CheckCommit' which will invoke receiveCommitlength, 
+	//update req.Revision to the current PS's revision.
+	sizes := sm.receiveCommitlength(ctx, nodes, tailExtentID, req.Revision)
 
 
-	//如果sizes里存在-1或者sizes的值不相等:
+	//examples to haveToSealLastExtent
 	//[-1, 10, 10]
 	//[-1, -1, -1]
 	//[10, 9,  9]
@@ -376,7 +378,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 			minSize = 1
 		}
 		
-		sizes = sm.receiveCommitlength(ctx, nodes, lastExInfo.ExtentID)
+		sizes = sm.receiveCommitlength(ctx, nodes, lastExInfo.ExtentID, req.Revision)
 		
 		for i := range sizes {
 			if sizes[i] != -1 {
@@ -515,7 +517,7 @@ func (sm *StreamManager) sealExtents(ctx context.Context, nodes []*NodeStatus, e
 
 //receiveCommitlength returns minimal commitlength and all node who give us response and who did not
 //-1 if no response
-func (sm *StreamManager) receiveCommitlength(ctx context.Context, nodes []*NodeStatus, extentID uint64) ([]int64) {
+func (sm *StreamManager) receiveCommitlength(ctx context.Context, nodes []*NodeStatus, extentID uint64, revision int64) ([]int64) {
 
 	pctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
@@ -540,6 +542,7 @@ func (sm *StreamManager) receiveCommitlength(ctx context.Context, nodes []*NodeS
 			
 			res, err := c.CommitLength(pctx, &pb.CommitLengthRequest{
 				ExtentID: extentID,
+				Revision: revision,
 			})
 
 			if err != nil { //timeout or other error
