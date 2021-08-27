@@ -27,7 +27,7 @@ func TestAppendReadBlocks(t *testing.T) {
 	br := NewMockBlockReader()
 	client := NewMockStreamClient("log",br)
 	defer client.Close()
-	exID, offsets,_, err := client.Append(context.Background(), []*pb.Block{b})
+	exID, offsets,_, err := client.Append(context.Background(), []*pb.Block{b}, true)
 	assert.Nil(t, err)
 
 	bs,_, err := br.Read(context.Background(), exID, offsets[0], 1)
@@ -53,7 +53,7 @@ func TestAppendReadEntries(t *testing.T) {
 	br := NewMockBlockReader()
 	client := NewMockStreamClient("log", br)
 	defer client.Close()
-	eID, tail, err := client.AppendEntries(context.Background(), cases)
+	eID, tail, err := client.AppendEntries(context.Background(), cases, true)
 
 	require.NoError(t, err)
 	
@@ -97,7 +97,7 @@ func TestAppendReadEntries(t *testing.T) {
 	require.Equal(t, expectedKeys, ans)
 
 	ans = ans[:0]
-	_, _, err = client.AppendEntries(context.Background(), cases)
+	_, _, err = client.AppendEntries(context.Background(), cases, true)
 	require.NoError(t, err)
 
 	iter = client.NewLogEntryIter(WithReadFrom(eID, tail), WithReplay())
@@ -130,7 +130,7 @@ func TestAppendReadBigBlocks(t *testing.T) {
 	}
 	client := NewMockStreamClient("log", NewMockBlockReader())
 	defer client.Close()
-	_, _, err := client.AppendEntries(context.Background(), cases)
+	_, _, err := client.AppendEntries(context.Background(), cases, true)
 
 	require.NoError(t, err)
 

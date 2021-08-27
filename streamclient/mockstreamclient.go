@@ -150,7 +150,7 @@ func (client *MockStreamClient) Truncate(ctx context.Context, extentID uint64, g
 }
 
 //block API, entries has been batched
-func (client *MockStreamClient) AppendEntries(ctx context.Context, entries []*pb.EntryInfo) (uint64, uint32, error) {
+func (client *MockStreamClient) AppendEntries(ctx context.Context, entries []*pb.EntryInfo, mustSync bool) (uint64, uint32, error) {
 	blocks := make([]*pb.Block, 0, len(entries))
 
 	for _, entry := range entries {
@@ -159,7 +159,7 @@ func (client *MockStreamClient) AppendEntries(ctx context.Context, entries []*pb
 			data,
 		})
 	}
-	extentID, offsets, tail, err := client.Append(ctx, blocks)
+	extentID, offsets, tail, err := client.Append(ctx, blocks, mustSync)
 	for i := range entries {
 		entries[i].ExtentID = extentID
 		entries[i].Offset = offsets[i]
@@ -169,7 +169,7 @@ func (client *MockStreamClient) AppendEntries(ctx context.Context, entries []*pb
 }
 
 //block API
-func (client *MockStreamClient) Append(ctx context.Context, blocks []*pb.Block) (uint64, []uint32, uint32, error) {
+func (client *MockStreamClient) Append(ctx context.Context, blocks []*pb.Block, mustSync bool) (uint64, []uint32, uint32, error) {
 	exIndex := len(client.stream) - 1
 	exID := client.stream[exIndex]
 	client.br.Lock()

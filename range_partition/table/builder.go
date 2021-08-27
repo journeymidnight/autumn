@@ -79,10 +79,11 @@ type Builder struct {
 	stream       streamclient.StreamClient
 	writeCh      chan writeBlock
 	stopper      *utils.Stopper
+	mustSync     bool
 }
 
 // NewTableBuilder makes a new TableBuilder.
-func NewTableBuilder(stream streamclient.StreamClient) *Builder {
+func NewTableBuilder(stream streamclient.StreamClient, mustSync bool) *Builder {
 	b := &Builder{
 		tableIndex:   &pspb.TableIndex{},
 		keyHashes:    make([]uint64, 0, 1024), // Avoid some malloc calls.
@@ -90,6 +91,7 @@ func NewTableBuilder(stream streamclient.StreamClient) *Builder {
 		writeCh:      make(chan writeBlock, 16),
 		stopper:      utils.NewStopper(),
 		currentBlock: &pb.Block{Data: make([]byte, 64*KB)},
+		mustSync :   mustSync,
 	}
 
 	b.stopper.RunWorker(func() {
@@ -126,7 +128,7 @@ func NewTableBuilder(stream streamclient.StreamClient) *Builder {
 					return
 				}
 
-				extentID, offsets, _, err := b.stream.Append(context.Background(), blocks)
+				extentID, offsets, _, err := b.stream.Append(context.Background(), blocks, b.mustSync)
 				utils.Check(err)
 
 				for i, offset := range offsets {
@@ -370,7 +372,8 @@ func (b *Builder) FinishAll(headExtentID uint64, headOffset uint32, seqNum uint6
 	checkSum := utils.NewCRC(metaBlock.Data[:meta.Size()]).Value()
 	binary.BigEndian.PutUint32(metaBlock.Data[meta.Size():], checkSum)
 
-	extentID, offsets, _, err := b.stream.Append(context.Background(), []*pb.Block{metaBlock})
+	//make sure all table is synced
+	extentID, offsets, _, err := b.stream.Append(context.Background(), []*pb.Block{metaBlock}, true)
 	if err != nil {
 		return 0, 0, err
 	}

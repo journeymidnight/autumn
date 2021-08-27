@@ -51,7 +51,7 @@ func buildTable(t *testing.T, keyValues [][]string) (streamclient.StreamClient, 
 	br := streamclient.NewMockBlockReader()
 
 	stream := streamclient.NewMockStreamClient("log", br)
-	b := NewTableBuilder(stream)
+	b := NewTableBuilder(stream, true)
 	defer b.Close()
 
 	sort.Slice(keyValues, func(i, j int) bool {
@@ -704,7 +704,7 @@ func TestTableBigValues(t *testing.T) {
 
 	n := 100 // Insert 100 keys.
 
-	builder := NewTableBuilder(stream)
+	builder := NewTableBuilder(stream, true)
 	for i := 0; i < n; i++ {
 		key := y.KeyWithTs([]byte(key("", i)), 0)
 		vs := y.ValueStruct{Value: value(i)}

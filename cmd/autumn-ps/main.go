@@ -21,6 +21,7 @@ func main() {
 	var smURLs string
 	var etcdURLs string
 	var listen string
+	var noSync bool
 
 	app := &cli.App{
 		HelpName: "",
@@ -53,6 +54,11 @@ func main() {
 				Destination: &etcdURLs,
 				Required:    true,
 			},
+			&cli.BoolFlag{
+				Name:      "nosync",
+				Destination: &noSync,
+				Value:    false,
+			},
 		},
 	}
 
@@ -60,6 +66,7 @@ func main() {
 		panic(err.Error())
 	}
 
+	fmt.Printf("nosync is %v", noSync)
 	xlog.InitLog([]string{fmt.Sprintf("ps.log")}, zap.DebugLevel)
 	id, err := strconv.ParseUint(psID, 10, 64)
 	if err != nil || id == 0 {
@@ -70,7 +77,7 @@ func main() {
 	fmt.Printf("etcdURL is %v\n", utils.SplitAndTrim(etcdURLs, ","))
 
 	ps := partition_server.NewPartitionServer(utils.SplitAndTrim(smURLs, ","), 
-	                 utils.SplitAndTrim(etcdURLs, ","), id, advertiseListen, listen)
+	                 utils.SplitAndTrim(etcdURLs, ","), id, advertiseListen, listen, !noSync)
 
 	ps.Init()
 

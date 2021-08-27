@@ -46,7 +46,7 @@ func TestTableIndex(t *testing.T) {
 	stream := streamclient.NewMockStreamClient("log",br)
 	defer stream.Close()
 
-	builder := NewTableBuilder(stream)
+	builder := NewTableBuilder(stream, true)
 
 	blockFirstKeys := make([][]byte, 0)
 	blockCount := 0

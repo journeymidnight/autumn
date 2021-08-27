@@ -332,7 +332,7 @@ func (rp *RangePartition) handleFlushTask(ft flushTask) error {
 
 	iter := ft.mt.NewIterator()
 	defer iter.Close()
-	b := table.NewTableBuilder(rp.rowStream)
+	b := table.NewTableBuilder(rp.rowStream, rp.opt.MustSync)
 	defer b.Close()
 
 	//var vp valuePointer

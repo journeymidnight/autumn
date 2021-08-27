@@ -39,8 +39,8 @@ const (
 type StreamClient interface {
 	Connect() error
 	Close()
-	AppendEntries(ctx context.Context, entries []*pb.EntryInfo) (uint64, uint32, error)
-	Append(ctx context.Context, blocks []*pb.Block) (extentID uint64, offsets []uint32, end uint32, err error)
+	AppendEntries(ctx context.Context, entries []*pb.EntryInfo, mustSync bool) (uint64, uint32, error)
+	Append(ctx context.Context, blocks []*pb.Block, mustSync bool) (extentID uint64, offsets []uint32, end uint32, err error)
 	NewLogEntryIter(opt ...ReadOption) LogEntryIter
 	//Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, uint32, error)
 	Truncate(ctx context.Context, extentID uint64, gabageKey string) (*pb.BlobStreams, error)
@@ -400,7 +400,7 @@ func (sc *AutumnStreamClient) MustAllocNewExtent() error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Seal stream %d on extent %d: sealedLength is %d\n", lastExID, sc.streamID, sc.end)
+	fmt.Printf("Seal stream %d on extent %d: sealedLength is %d\n", sc.streamID, lastExID, sc.end)
 
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -449,7 +449,7 @@ func (sc *AutumnStreamClient) Close() {
 
 //AppendEntries blocks until success
 //make all entries in the same extentID, and fill entires.
-func (sc *AutumnStreamClient) AppendEntries(ctx context.Context, entries []*pb.EntryInfo) (uint64, uint32, error) {
+func (sc *AutumnStreamClient) AppendEntries(ctx context.Context, entries []*pb.EntryInfo, mustSync bool) (uint64, uint32, error) {
 	if len(entries) == 0 {
 		return 0, 0, errors.Errorf("blocks can not be nil")
 	}
@@ -462,7 +462,7 @@ func (sc *AutumnStreamClient) AppendEntries(ctx context.Context, entries []*pb.E
 			data,
 		})
 	}
-	extentID, offsets, tail, err := sc.Append(ctx, blocks)
+	extentID, offsets, tail, err := sc.Append(ctx, blocks, mustSync)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -473,7 +473,7 @@ func (sc *AutumnStreamClient) AppendEntries(ctx context.Context, entries []*pb.E
 	return extentID, tail, err
 }
 
-func (sc *AutumnStreamClient) Append(ctx context.Context, blocks []*pb.Block) (uint64, []uint32, uint32, error) {
+func (sc *AutumnStreamClient) Append(ctx context.Context, blocks []*pb.Block, mustSync bool) (uint64, []uint32, uint32, error) {
 
 	loop := 0
 
@@ -510,6 +510,7 @@ retry:
 		Blocks:   blocks,
 		Eversion: exInfo.Eversion,
 		Revision: sc.streamLock.revision,
+		MustSync: mustSync,
 	})
 	cancel()
 

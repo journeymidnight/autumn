@@ -280,10 +280,16 @@ func (en *ExtentNode) ServeGRPC() error {
 	return nil
 }
 
-//AppendWithWal will write wal and extent in the same time.
-func (en *ExtentNode) AppendWithWal(ex *extent.Extent, rev int64, blocks []*pb.Block) ([]uint32, uint32, error) {
+/*
+1. req.MustSync is false, "nosync append on extent"
+2. req.MustSync is true, noWal or block data is big, "sync append"
+3. req.MustSync is true, hasWal and block data is small, "sync append on wal" and "nosync append on extent" on the same time.
+*/
+func (en *ExtentNode) AppendWithWal(ex *extent.Extent, rev int64, blocks []*pb.Block, mustSync bool) ([]uint32, uint32, error) {
 
-	if en.wal == nil || utils.SizeOfBlocks(blocks) > (2<<20) {
+	if mustSync == false {
+		return ex.AppendBlocks(blocks, false)
+	} else if en.wal == nil || utils.SizeOfBlocks(blocks) > (2<<20) {
 		//force sync write
 		return ex.AppendBlocks(blocks, true)
 	}
