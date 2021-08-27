@@ -141,7 +141,7 @@ message ReadEntriesResponse{
 message DF {
 	uint64 total = 1;
 	uint64 free = 2;
-	uint32 online = 3;
+	bool online = 3;
 }
 
 
@@ -467,6 +467,6 @@ message NodeInfo {
 
 message DiskInfo {
 	uint64 diskID = 1;
-	uint32 online = 2;
+	bool online = 2;
 	string uuid = 3;
 }

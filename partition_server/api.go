@@ -105,11 +105,12 @@ func (ps *PartitionServer) Range(ctx context.Context, req *pspb.RangeRequest) (*
 	
 	out := rp.Range(req.Prefix, req.Start, req.Limit)
 
-	var truncated uint32
+	fmt.Printf("range result is %d\n", len(out))
+	var truncated bool
 	if len(out) == int(req.Limit) {
-		truncated = 1
+		truncated = true
 	} else {
-		truncated = 0
+		truncated = false
 	}
 	return &pspb.RangeResponse{
 		Truncated: truncated,

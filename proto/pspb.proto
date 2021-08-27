@@ -165,7 +165,7 @@ message RangeRequest{
 }
 
 message RangeResponse {
-	uint32 truncated = 1;
+	bool truncated = 1;
 	repeated bytes keys = 2;
 }
 
