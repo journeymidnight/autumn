@@ -85,8 +85,8 @@ func (s *diskFS) SetOffline() {
 	//FIXME: write flag on disk. bad sector or bad file?
 }
 
-func (s *diskFS) Online() uint32 {
-	return atomic.LoadUint32(&s.online)
+func (s *diskFS) Online() bool {
+	return atomic.LoadUint32(&s.online) == 1
 }
 
 func (s *diskFS) pathName(extentID uint64, suffix string) string {

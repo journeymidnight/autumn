@@ -628,7 +628,7 @@ func (sm *StreamManager) RegisterNode(ctx context.Context, req *pb.RegisterNodeR
 	for i := range req.DiskUUIDs {
 		disks[i] = pb.DiskInfo{
 			DiskID: id+uint64(i)+1,
-			Online: 1,
+			Online: true,
 			Uuid: req.DiskUUIDs[i],
 		}
 	}

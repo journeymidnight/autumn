@@ -508,7 +508,7 @@ func (en *ExtentNode) ReadBlocks(ctx context.Context, req *pb.ReadBlocksRequest)
 func (en *ExtentNode) chooseDisktoAlloc() uint64 {
 	//only choose the first disk
 	for _, disk := range en.diskFSs {
-		if disk.Online() == 1{
+		if disk.Online(){
 			return disk.diskID
 		}
 	}
@@ -622,7 +622,7 @@ func (en *ExtentNode) Df(ctx context.Context, req *pb.DfRequest) (*pb.DfResponse
 			total, free, err := disk.Df()
 			if err != nil {
 				dfStatus[diskID] = &pb.DF{
-					0,0,0,
+					0, 0, false,
 				}
 				continue
 			}
@@ -632,7 +632,7 @@ func (en *ExtentNode) Df(ctx context.Context, req *pb.DfRequest) (*pb.DfResponse
 				Online: disk.Online(),
 			}
 		} else {//no such disk
-			dfStatus[diskID] = &pb.DF{0,0,0}
+			dfStatus[diskID] = &pb.DF{0, 0, false}
 		}
 	}
 

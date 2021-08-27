@@ -66,7 +66,6 @@ func main() {
 		panic(err.Error())
 	}
 
-	fmt.Printf("nosync is %v", noSync)
 	xlog.InitLog([]string{fmt.Sprintf("ps.log")}, zap.DebugLevel)
 	id, err := strconv.ParseUint(psID, 10, 64)
 	if err != nil || id == 0 {

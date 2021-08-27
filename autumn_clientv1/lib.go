@@ -294,9 +294,9 @@ func (lib *AutumnLib) Range(ctx context.Context, prefix []byte, start []byte, li
 		}
 
 		limit -= uint32(len(res.Keys))
-		more = (res.Truncated == 1)
+		more = res.Truncated
 		//print len of res.Keys
-		fmt.Printf("i :%d, len of res.Keys %d\n", i, len(res.Keys))
+		fmt.Printf("i :%d, len of res.Keys %d, hasMore? %v\n", i, len(res.Keys), more)
 		results = append(results, res.Keys...)
 
 	}

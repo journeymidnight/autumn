@@ -329,7 +329,7 @@ func (sm *StreamManager) dispatchRecoveryTask(exInfo *pb.ExtentInfo, replaceID u
 		noDiskAvali := true
 		for _, diskID := range nodes[i].Disks {
 			ds := sm.getDiskStatus(diskID)
-			if ds.Online == 1 {
+			if ds.Online {
 				noDiskAvali = false
 				break
 			}
@@ -437,7 +437,7 @@ func (sm *StreamManager) routineDispatchTask() {
 						}
 						
 						diskInfo, ok := sm.cloneDiskInfo(diskID)
-						if !ok || diskInfo.Online == 0 {
+						if !ok || diskInfo.Online == false {
 							go func(exInfo *pb.ExtentInfo, nodeID uint64) {
 								err := sm.dispatchRecoveryTask(exInfo, nodeID)
 								fmt.Printf("extent %d on disk %d is offline, dispatch result is %v\n", exInfo.ExtentID, diskInfo.DiskID, err)
