@@ -45,7 +45,7 @@ func TestLogReplay(t *testing.T) {
 	logStream := streamclient.NewMockStreamClient("log", streamclient.NewMockBlockReader())
 	defer logStream.Close()
 
-	extentID, offset, err := logStream.AppendEntries(context.Background(), cases)
+	extentID, offset, err := logStream.AppendEntries(context.Background(), cases, true)
 	require.NoError(t, err)
 	expecteEI := []*pb.EntryInfo{
 		{

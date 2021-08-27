@@ -21,7 +21,7 @@ func (rp *RangePartition) writeValueLog(reqs []*request) ([]*pb.EntryInfo, value
 		entries = append(entries, req.entries...)
 	}
 
-	extentID, offset, err := rp.logStream.AppendEntries(context.Background(), entries)
+	extentID, offset, err := rp.logStream.AppendEntries(context.Background(), entries, rp.opt.MustSync)
 	if err != nil {
 		return nil, valuePointer{}, err
 	}

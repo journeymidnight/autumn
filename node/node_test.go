@@ -198,7 +198,7 @@ func (suite *ExtentNodeTestSuite) TestAppendReadValue() {
 		[]*pb.Block{
 			{Data:[]byte("hello")},
 			{Data:[]byte("world")},
-		})
+		}, true)
 	suite.Require().Nil(err)
 	suite.Require().True(len(offsets) > 0)
 	//fmt.Printf("%d=>%d, on extent %d\n", offsets[0], end, extentID)
@@ -235,7 +235,7 @@ func (suite *ExtentNodeTestSuite) TestNodeRecoveryDataFromOtherNode() {
 		[]*pb.Block{
 			{Data:[]byte("hello")},
 			{Data:[]byte("world")},
-		})
+		}, true)
 	suite.Require().Nil(err)
 	suite.Require().True(len(offsets) > 0)
 

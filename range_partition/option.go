@@ -16,6 +16,7 @@ writeChCapacity = 64
 type Option struct {
 	MaxSkipList     int64 //max size of skiplist, when compacting, the max is 2 * MaxSkipList
 	WriteChCapacity int   //write channel length
+	MustSync bool 
 }
 
 type OptionFunc func(*Option)
@@ -24,6 +25,7 @@ func DefaultOption() OptionFunc {
 	return func(opt *Option) {
 		opt.MaxSkipList = 64 * MB
 		opt.WriteChCapacity = 64
+		opt.MustSync = true
 	}
 }
 
@@ -31,6 +33,13 @@ func TestOption() OptionFunc {
 	return func(opt *Option) {
 		opt.MaxSkipList = 1 * MB
 		opt.WriteChCapacity = 16
+		opt.MustSync = true
+	}
+}
+
+func WithSync(b bool) OptionFunc {
+	return func(opt *Option) {
+		opt.MustSync = b
 	}
 }
 func WithMaxSkipList(n int64) OptionFunc {

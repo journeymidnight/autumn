@@ -102,10 +102,6 @@ func (sm *StreamManager) routineUpdateDF() {
 			xlog.Logger.Infof("remote server %s has no response", node.Address)
 			return
 		}
-		if res.Code != pb.Code_OK {
-			xlog.Logger.Infof("remote server has error %s", res.CodeDes)
-			return
-		}
 
 		//fmt.Printf("df result is %+v\n", res)
 

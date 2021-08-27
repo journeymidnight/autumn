@@ -23,6 +23,14 @@ import (
 )
 
 
+type PartitionServerConfig struct {
+	advertiseURL       string
+	ListenURL          string
+	SmURLs        []string
+	EtcdURLs      []string
+	MustSync      bool
+}
+
 type PartitionServer struct {
 	utils.SafeMutex //protect rangePartitions
 	rangePartitions map[uint64]*range_partition.RangePartition
@@ -30,10 +38,7 @@ type PartitionServer struct {
 	PSID            uint64
 	smClient        *smclient.SMClient
 	etcdClient      *clientv3.Client     
-	advertiseURL       string
-	listenURL          string
-	smURLs        []string
-	etcdURLs      []string
+	config         PartitionServerConfig
 	extentManager *smclient.ExtentManager
 	blockReader   *streamclient.AutumnBlockReader
 	grcpServer    *grpc.Server
@@ -42,17 +47,19 @@ type PartitionServer struct {
 	closeWatchCh  func()
 }
 
-func NewPartitionServer(smURLs []string, etcdURLs []string, PSID uint64, advertiseURL string, listenURL string) *PartitionServer {
+func NewPartitionServer(smURLs []string, etcdURLs []string, PSID uint64, advertiseURL string, listenURL string, mustSync bool) *PartitionServer {
 	return &PartitionServer{
 		rangePartitions: make(map[uint64]*range_partition.RangePartition),
 		rangePartitionLocks: make(map[uint64]*concurrency.Mutex),
 		smClient:        smclient.NewSMClient(smURLs),
 		PSID:            PSID,
-		smURLs: smURLs,
-		etcdURLs: etcdURLs,
-		listenURL: listenURL,
-		advertiseURL: advertiseURL,
-
+		config: 		PartitionServerConfig{
+			advertiseURL:       advertiseURL,
+			ListenURL:          listenURL,
+			SmURLs:             smURLs,
+			EtcdURLs:           etcdURLs,
+			MustSync:           mustSync,
+		},
 	}
 }
 
@@ -208,7 +215,7 @@ func (ps *PartitionServer) Init() {
 	//
 
 
-	ps.extentManager = smclient.NewExtentManager(ps.smClient, ps.etcdURLs, nil)
+	ps.extentManager = smclient.NewExtentManager(ps.smClient, ps.config.EtcdURLs, nil)
 	ps.blockReader = streamclient.NewAutumnBlockReader(ps.extentManager, ps.smClient)
 
 	if err := ps.smClient.Connect(); err != nil {
@@ -238,7 +245,7 @@ func (ps *PartitionServer) Init() {
 
 	//session create PSSERVER/{PSID} => {PSDETAIL}
 	var detail = pspb.PSDetail{
-		Address: ps.advertiseURL,
+		Address: ps.config.advertiseURL,
 		PSID: ps.PSID,
 	}
 
@@ -344,7 +351,11 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, locs []
 
 
 	rp, err := range_partition.OpenRangePartition(meta.PartID, row, log, ps.blockReader, meta.Rg.StartKey, meta.Rg.EndKey, locs,
-		blobs, setRowStreamTables, openStream, range_partition.DefaultOption(), range_partition.WithMaxSkipList(16<<20))
+		blobs, setRowStreamTables, openStream, 
+		range_partition.DefaultOption(), 
+		range_partition.WithMaxSkipList(16<<20),
+		range_partition.WithSync(ps.config.MustSync),
+	)
 	
 	xlog.Logger.Infof("open range partition %d, StartKey:[%s], EndKey:[%s]: err is %v", meta.PartID, meta.Rg.StartKey, meta.Rg.EndKey, err)
 	return rp, err
@@ -358,7 +369,7 @@ func (ps *PartitionServer) ServeGRPC() error {
 	)
 
 	pspb.RegisterPartitionKVServer(grpcServer, ps)
-	listener, err := net.Listen("tcp", ps.listenURL)
+	listener, err := net.Listen("tcp", ps.config.ListenURL)
 	if err != nil {
 		return err
 	}

@@ -19,7 +19,6 @@ package pb;
 
 
 
-
 message Entry {
 	bytes  key = 1;
 	bytes  value = 2;
@@ -58,6 +57,7 @@ message AppendRequest {
 	repeated Block blocks = 2;
 	uint64 eversion = 3;
 	int64  revision = 4;
+	bool mustSync = 5;
 }
 
 message AppendResponse {
@@ -229,6 +229,8 @@ message ReplicateBlocksRequest {
 	uint32 commit = 2;
 	repeated Block blocks = 3;
 	int64 revision = 4;
+	bool mustSync = 5;
+
 }
 
 message ReplicateBlocksResponse {
