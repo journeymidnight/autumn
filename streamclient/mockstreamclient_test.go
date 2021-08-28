@@ -30,7 +30,7 @@ func TestAppendReadBlocks(t *testing.T) {
 	exID, offsets,_, err := client.Append(context.Background(), []*pb.Block{b}, true)
 	assert.Nil(t, err)
 
-	bs,_, err := br.Read(context.Background(), exID, offsets[0], 1)
+	bs,_, err := br.Read(context.Background(), exID, offsets[0], 1, HintReadThrough)
 	assert.Nil(t, err)
 	assert.Equal(t, b.Data, bs[0].Data)
 }

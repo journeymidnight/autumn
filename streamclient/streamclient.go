@@ -2,9 +2,11 @@ package streamclient
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"time"
 
+	"github.com/dgraph-io/ristretto"
 	"github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
@@ -50,7 +52,7 @@ type StreamClient interface {
 
 //random read block
 type BlockReader interface {
-	Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, uint32, error)
+	Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32, hint byte) ([]*pb.Block, uint32, error)
 }
 
 type LogEntryIter interface {
@@ -62,16 +64,54 @@ type LogEntryIter interface {
 type AutumnBlockReader struct {
 	em *smclient.ExtentManager
 	sm *smclient.SMClient
+	blockCache  *ristretto.Cache
 }
 
 func NewAutumnBlockReader(em *smclient.ExtentManager, sm *smclient.SMClient) *AutumnBlockReader {
+	blockCache, err := ristretto.NewCache(&ristretto.Config{
+		NumCounters: 1e7,     // number of keys to track frequency of (10M).
+		MaxCost:     1 << 30, // maximum cost of cache (1GB).
+		BufferItems: 64,      // number of keys per Get buffer.
+	})
+	if err != nil {
+		panic(err)
+	}
 	return &AutumnBlockReader{
 		em: em,
 		sm: sm,
+		blockCache: blockCache,
 	}
 }
 
-func (br *AutumnBlockReader) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, uint32, error) {
+//hint
+const (
+	HintReadThrough = 1 << 0
+	HintReadFromCache byte = 1 << 1
+)
+
+
+func blockCacheID(extentID uint64, offset uint32) []byte {
+	buf := make([]byte, 12)
+	binary.BigEndian.PutUint64(buf[0:8], extentID)
+	binary.BigEndian.PutUint32(buf[8:12], offset)
+	return buf
+}
+
+type blockInCache struct {
+	block *pb.Block
+	readEnd uint32
+}
+
+func (br *AutumnBlockReader) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32, hint byte) ([]*pb.Block, uint32, error) {
+	//only cache metadata
+	if (hint & HintReadFromCache) > 0 && numOfBlocks == 1{
+		data , ok := br.blockCache.Get(blockCacheID(extentID, offset))
+		if ok && data != nil {
+			x := data.(blockInCache)
+			return []*pb.Block{x.block}, x.readEnd, nil
+		}
+	}
+
 retry:
 	exInfo := br.em.GetExtentInfo(extentID)
 	if exInfo == nil {
@@ -103,6 +143,9 @@ retry:
 		return nil, 0, err
 	}
 
+	if (hint & HintReadFromCache) > 0 && numOfBlocks == 1 {
+		br.blockCache.Set(blockCacheID(extentID, offset), blockInCache{block: res.Blocks[0], readEnd: res.End}, 0)
+	}
 	return res.Blocks, res.End, nil
 }
 

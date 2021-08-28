@@ -64,7 +64,7 @@ func OpenTable(blockReader streamclient.BlockReader,
 	utils.AssertTrue(xlog.Logger != nil)
 
 	//fmt.Printf("read table from %d, %d\n", extentID, offset)
-	blocks, _, err := blockReader.Read(context.Background(), extentID, offset, 1)
+	blocks, _, err := blockReader.Read(context.Background(), extentID, offset,1, streamclient.HintReadFromCache)
 	if err != nil {
 		fmt.Printf("%+v\n", err)
 		return nil, err
@@ -137,7 +137,7 @@ type entriesBlock struct {
 func (t *Table) block(idx int) (*entriesBlock, error) {
 	extentID := t.blockIndex[idx].ExtentID
 	offset := t.blockIndex[idx].Offset
-	blocks, _, err := t.blockReader.Read(context.Background(), extentID, offset, 1)
+	blocks, _, err := t.blockReader.Read(context.Background(), extentID, offset, 1, streamclient.HintReadFromCache)
 	if err != nil {
 		return nil, err
 	}

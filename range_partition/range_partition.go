@@ -909,7 +909,7 @@ func (rp *RangePartition) Get(userKey []byte, version uint64) ([]byte, error) {
 		var vp valuePointer
 		vp.Decode(vs.Value)
 		//fmt.Printf("%s's location is [%d, %d]\n", userKey, vp.extentID, vp.offset)
-		blocks, _, err := rp.blockReader.Read(context.Background(), vp.extentID, vp.offset, 1)
+		blocks, _, err := rp.blockReader.Read(context.Background(), vp.extentID, vp.offset, 1, streamclient.HintReadThrough)
 		if err != nil {
 			return nil, err
 		}
