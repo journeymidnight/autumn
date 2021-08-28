@@ -27,7 +27,7 @@ type MockBlockReader struct {
 }
 
 
-func (br *MockBlockReader) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, uint32, error) {
+func (br *MockBlockReader) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32, hint byte) ([]*pb.Block, uint32, error) {
 	br.RLock()
 	ex := br.exs[extentID]
 	br.RUnlock()
