@@ -91,7 +91,7 @@ function previewImage(url){
         var previewDiv = document.getElementById('preview');
         previewDiv.innerHTML = '';
         previewDiv.appendChild(iframe);
-    }else if (ext == '.jpg' || ext == '.jpeg' || ext == '.png' || ext == '.gif') {
+    }else if (ext == '.jpg' || ext == '.jpeg' || ext == '.png' || ext == '.gif'||ext == ".bmp") {
         var img = new Image();
         img.load(url)
         img.width = 400;
