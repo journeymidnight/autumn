@@ -36,6 +36,7 @@ def get(name):
                 headers.add('Content-Range', 'bytes %d-%d/%d' % (begin, end, size))
                 beginIdx = int(begin / chunk_size)
                 endIdx = int(end / chunk_size)
+                #range is [beginIdx, endIdx]
                 names = ["a:" + name + ":" + str(int(i)) for i in range(beginIdx, endIdx+1)]
                 #define a function to get chunk
                 def get_partial_chunk():
@@ -44,6 +45,9 @@ def get(name):
                         if i == 0:
                             yield ret.value[begin % chunk_size:]
                         elif i == endIdx:
+                            #正常返回: ret.value[:(end + 1)% chunk_size], 其中+1是因为end是最后一个的offset, 但是python的slice的冒号
+                            #后是highvalue, 不包括最后一个, 所以用end+1
+                            #特殊情况: 如果(end + 1)和chunk_size对齐, (end + 1)% chunk_size就是0, 不能得到数据
                             if (end + 1) % chunk_size == 0:
                                 yield ret.value
                             else:
@@ -92,23 +96,51 @@ def split(filename, data):
         yield chunk_name, data[offset:offset + chunk_size]
         i += 1
 
+
+
+def read_full(stream, size):
+    res = bytearray()
+    n = size
+    while n > 0:
+        data = stream.read(n)
+        if not data:
+            break
+        res += data
+        n -= len(res)
+    return bytes(res)
+
+
 @app.route("/put/", methods=['POST'])
 def put():
     file = request.files['file']
-    data = file.read()
     #if len of data is bigger than chunk_size, split data into chunks, and put data one by one
-    if len(data) > chunk_size:
-        for chunk_name, chunk in split(file.filename, data):
-            lib.Put(bytes(chunk_name, "utf8"), chunk)
-        #meta file name is "b:" + filename
-        meta_file_name = "b:" + file.filename
-        meta_value = struct.pack("!I", len(data)) ##big endian u32
-        lib.Put(bytes(meta_file_name, "utf8"), meta_value)
-    else:
-        #concat struct.pack("!I", len(data)) and data
-        value = struct.pack("!I", len(data)) + data
-        lib.Put(bytes("b:"+ file.filename, "utf8"), value)
-    return file.filename
+    i = 0
+    size = 0
+    while True:
+        chunk = read_full(file.stream, chunk_size)
+        if chunk is None:
+            #clean up data to i
+            return "error", 500
+        elif len(chunk) < chunk_size and i == 0:
+            #small files
+            value = struct.pack("!I", len(chunk)) + chunk
+            lib.Put(bytes("b:"+ file.filename, "utf8"), value)
+            return file.filename
+        elif len(chunk) == 0:
+            #end of file
+            meta_file_name = "b:" + file.filename
+            meta_value = struct.pack("!I", size) ##big endian u32
+            lib.Put(bytes(meta_file_name, "utf8"), meta_value)
+            return file.filename
+        elif len(chunk) <= chunk_size:
+            #middle of file
+            filename = "a:" + file.filename + ":" + str(i)
+            lib.Put(bytes(filename, "utf8"), chunk)
+            i += 1
+            size += len(chunk)
+        else:
+            print(len(chunk), chunk_size)
+            return "file too big"
 
 @app.route("/", methods=['GET'])
 def index():
