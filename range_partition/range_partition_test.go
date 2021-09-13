@@ -111,7 +111,7 @@ func TestWriteRead(t *testing.T) {
 		wg.Wait()
 
 		for i := 0; i < 100; i++ {
-			v, err := rp.Get([]byte(fmt.Sprintf("key%d", i)), 300)
+			v, _, err := rp.Get([]byte(fmt.Sprintf("key%d", i)), 300)
 			require.NoError(t, err)
 			require.Equal(t, []byte(fmt.Sprintf("val%d", i)), v)
 		}
@@ -130,7 +130,7 @@ func TestUpdateRead(t *testing.T) {
 		}
 		wg.Wait()
 
-		value, err := rp.Get([]byte("key"), 0)
+		value, _, err := rp.Get([]byte("key"), 0)
 		require.NoError(t, err)
 		require.Equal(t, []byte(fmt.Sprintf("val%d", 99)), value)
 
@@ -141,10 +141,10 @@ func TestGetBig(t *testing.T) {
 	runRPTest(t, func(t *testing.T, rp *RangePartition) {
 		//txnSet(t, db, []byte("key1"), []byte("val1"), 0x08)
 		bigValue := []byte(fmt.Sprintf("%01048576d", 10))
-		err := rp.Write([]byte("key1"), bigValue)
+		_, err := rp.Write([]byte("key1"), bigValue)
 		require.NoError(t, err)
 
-		v, err := rp.Get([]byte("key1"), 0)
+		v, _,  err := rp.Get([]byte("key1"), 0)
 
 		require.NoError(t, err)
 		require.Equal(t, len(bigValue), len(v))
@@ -185,7 +185,7 @@ func TestReopenRangePartition(t *testing.T) {
 		}, TestOption())
 
 	for i := 10; i < 100; i++ {
-		v, err := rp.Get([]byte(fmt.Sprintf("key%d", i)), 300)
+		v, _, err := rp.Get([]byte(fmt.Sprintf("key%d", i)), 300)
 		if err == errNotFound {
 			fmt.Printf("key%d failed\n", i)
 			continue
@@ -234,7 +234,7 @@ func TestReopenRangePartitionWithBig(t *testing.T) {
 		}, TestOption())
 
 	for i := 10; i < 100; i++ {
-		v, err := rp.Get([]byte(fmt.Sprintf("key%d", i)), 300)
+		v, _, err := rp.Get([]byte(fmt.Sprintf("key%d", i)), 300)
 		if err == errNotFound {
 			fmt.Printf("key%d failed\n", i)
 			continue

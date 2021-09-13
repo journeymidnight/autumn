@@ -641,9 +641,9 @@ func (rp *RangePartition) writeToLSM(entries []*pb.EntryInfo) error {
 				})
 		} else {
 			vp := valuePointer{
-				entry.ExtentID,
-				entry.Offset,
-				uint32(len(entry.Log.Value)),
+				extentID:entry.ExtentID,
+				offset:  entry.Offset,
+				len :    uint32(len(entry.Log.Value)), //save extent, offset, len in LSM
 			}
 			rp.mt.Put(entry.Log.Key,
 				y.ValueStruct{
@@ -894,30 +894,57 @@ func (rp *RangePartition) Range(prefix []byte, start []byte, limit uint32) [][]b
 	return out
 }
 
-func (rp *RangePartition) Get(userKey []byte, version uint64) ([]byte, error) {
 
+func (rp *RangePartition) Head(userKey []byte, version uint64) (*pspb.HeadInfo, error) {
 	vs := rp.getValueStruct(userKey, version)
 
 	if vs.Version == 0 {
 		return nil, errNotFound
-	} else if vs.Meta&y.BitDelete > 0 {
+	} else if (vs.Meta & y.BitDelete) > 0 {
 		return nil, errNotFound
 	}
+	dataLen := uint32(0)
+	if vs.Meta & y.BitValuePointer > 0 {
+		var vp valuePointer
+		vp.Decode(vs.Value)
+		dataLen = vp.len
+	} else {
+		dataLen = uint32(len(vs.Value))
+	}
+	
+	return &pspb.HeadInfo{
+		Key: userKey,
+		Len: dataLen,
+		Version: vs.Version,
+	}, nil
 
-	if vs.Meta&y.BitValuePointer > 0 {
+}
+
+func (rp *RangePartition) Get(userKey []byte, version uint64) ([]byte, uint64, error) {
+
+	vs := rp.getValueStruct(userKey, version)
+
+	if vs.Version == 0 {
+		return nil, 0,  errNotFound
+	} else if (vs.Meta & y.BitDelete) > 0 {
+		return nil, 0, errNotFound
+	}
+
+	if vs.Meta & y.BitValuePointer > 0 {
 
 		var vp valuePointer
 		vp.Decode(vs.Value)
 		//fmt.Printf("%s's location is [%d, %d]\n", userKey, vp.extentID, vp.offset)
 		blocks, _, err := rp.blockReader.Read(context.Background(), vp.extentID, vp.offset, 1, streamclient.HintReadThrough)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 
 		entry := y.ExtractLogEntry(blocks[0])
-		return entry.Value, nil
+		return entry.Value, vs.Version, nil
 	}
-	return vs.Value, nil
+
+	return vs.Value, vs.Version, nil
 
 }
 
@@ -1094,7 +1121,7 @@ func (rp *RangePartition) Delete(key []byte) error {
 }
 
 //req.Wait will free the request
-func (rp *RangePartition) Write(key, value []byte) error {
+func (rp *RangePartition) Write(key, value []byte) (uint64, error) {
 	newSeqNumber := atomic.AddUint64(&rp.seqNumber, 1)
 
 	e := &pb.EntryInfo{
@@ -1105,9 +1132,12 @@ func (rp *RangePartition) Write(key, value []byte) error {
 	}
 	req, err := rp.sendToWriteCh([]*pb.EntryInfo{e})
 	if err != nil {
-		return err
+		return 0, err
 	}
-	return req.Wait()
+	if err = req.Wait() ; err != nil {
+		return 0, err
+	}
+	return newSeqNumber, nil
 }
 
 //block API
@@ -1132,7 +1162,7 @@ const vptrSize = unsafe.Sizeof(valuePointer{})
 type valuePointer struct {
 	extentID uint64
 	offset   uint32
-	len      uint32
+	len      uint32 //only used when saving big object
 }
 
 // Encode encodes Pointer into byte buffer.
