@@ -109,6 +109,7 @@ message PutRequest {
 
 message PutResponse {
 	bytes key = 1;
+	uint64 version = 2;
 }
 
 
@@ -130,6 +131,7 @@ message GetRequest {
 message GetResponse {
 	bytes key = 1;
 	bytes value = 2;
+	uint64 version = 3;
 }
 
 message RequestOp {
@@ -178,6 +180,21 @@ message SplitPartResponse {
 }
 
 
+message HeadRequest {
+	bytes key = 1;
+	uint64 partid = 2;
+}
+
+message HeadResponse {
+	HeadInfo info = 1;
+}
+
+message HeadInfo {
+	bytes key = 1;
+	uint64 version = 2;
+	uint32 len = 3;
+}
+
 service PartitionKV {
 	/*
 	option (google.api.http) = {
@@ -187,6 +204,7 @@ service PartitionKV {
 	*/
 	rpc Batch(BatchRequest) returns (BatchResponse) {}
 	rpc Put(PutRequest) returns (PutResponse) {}
+	rpc Head(HeadRequest) returns (HeadResponse) {}
 	rpc Get (GetRequest) returns (GetResponse) {}
 	rpc Delete(DeleteRequest) returns (DeleteResponse) {}
 	rpc Range(RangeRequest) returns (RangeResponse) {}

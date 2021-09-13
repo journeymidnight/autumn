@@ -288,14 +288,37 @@ func del(c *cli.Context) error {
 
 }
 
+
+func head(c *cli.Context) error {
+	etcdUrls := utils.SplitAndTrim(c.String("etcdUrls"), ",")
+	client := autumn_clientv1.NewAutumnLib(etcdUrls)
+	if err := client.Connect(); err != nil {
+		return err
+	}
+	defer client.Close()
+	key := c.Args().First()
+	if len(key) == 0 {
+		return errors.New("no key")
+	}
+
+	_ , version, length, err := client.Head(context.Background(), []byte(key))
+	if err != nil {
+		return err
+	}
+	fmt.Printf("key: %s, version: %d, length: %d\n", key, version, length)
+	return nil
+	
+}
+
 func get(c *cli.Context) error {
 	etcdUrls := utils.SplitAndTrim(c.String("etcdUrls"), ",")
 	client := autumn_clientv1.NewAutumnLib(etcdUrls)
-	//defer client.Close()
 
 	if err := client.Connect(); err != nil {
 		return err
 	}
+	defer client.Close()
+
 	key := c.Args().First()
 	if len(key) == 0 {
 		return errors.New("no key")
@@ -464,6 +487,14 @@ func main() {
 				&cli.StringFlag{Name: "etcdUrls", Value: "127.0.0.1:2379"},
 			},
 			Action: get,
+		},
+		{
+			Name:  "head",
+			Usage: "head --etcdUrls <addrs> <KEY>",
+			Flags: []cli.Flag{
+				&cli.StringFlag{Name: "etcdUrls", Value: "127.0.0.1:2379"},
+			},
+			Action: head,
 		},
 		{
 			Name:  "del",

@@ -38,7 +38,9 @@ func (ps *PartitionServer) Put(ctx context.Context, req *pspb.PutRequest) (*pspb
 	if rp == nil {
 		return nil, errors.New("no such partid")
 	}
-	if err := rp.Write(req.Key, req.Value); err != nil {
+	var version uint64
+	var err error
+	if version, err = rp.Write(req.Key, req.Value); err != nil {
 		if err == wire_errors.LockedByOther {
 			partID := req.Partid
 			defer func(){
@@ -50,12 +52,28 @@ func (ps *PartitionServer) Put(ctx context.Context, req *pspb.PutRequest) (*pspb
 				delete(ps.rangePartitionLocks, partID)
 			}()
 		}
-	
-		
+
 		return nil, err
 	}
-	return &pspb.PutResponse{Key: req.Key}, nil
+	return &pspb.PutResponse{
+		Key: req.Key,
+		Version: version,
+	}, nil
+}
 
+func (ps *PartitionServer) Head(ctx context.Context, req *pspb.HeadRequest) (*pspb.HeadResponse, error) {
+	rp := ps.checkVersion(req.Partid, req.Key)
+	if rp == nil {
+		return nil, errors.New("no such partid")
+	}
+	info, err := rp.Head(req.Key, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	return &pspb.HeadResponse{
+		Info: info,
+	}, nil
 }
 
 func (ps *PartitionServer) Get(ctx context.Context, req *pspb.GetRequest) (*pspb.GetResponse, error) {
@@ -68,13 +86,14 @@ func (ps *PartitionServer) Get(ctx context.Context, req *pspb.GetRequest) (*pspb
 	//0, 取当前seqnumber
 	//math.MaxUint64, 取最新的
 	//其他, 取指定的version
-	v, err := rp.Get(req.Key, 0)
+	d, v, err := rp.Get(req.Key, 0)
 	if err != nil {
 		return nil, err
 	}
 	return &pspb.GetResponse{
 		Key:   req.Key,
-		Value: v,
+		Value: d,
+		Version: v,
 	}, nil
 
 }

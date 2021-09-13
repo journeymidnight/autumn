@@ -325,6 +325,7 @@ func (lib *AutumnLib) SplitPart(ctx context.Context, partID uint64) error {
 	return err
 }
 
+
 func (lib *AutumnLib) Delete(ctx context.Context, key []byte) error {
 	var err error
 	sortedRegions := lib.getRegions()
@@ -348,4 +349,29 @@ func (lib *AutumnLib) Delete(ctx context.Context, key []byte) error {
 
 	return err
 
+}
+
+//Head return key []byte, version uint64, len uint32
+func (lib *AutumnLib) Head(ctx context.Context, key []byte) ([]byte, uint64, uint32, error) {
+	sortedRegions := lib.getRegions()
+	if len(sortedRegions) == 0 {
+		return nil,0,0, errors.New("no regions to write")
+	}
+	//idx
+	idx := sort.Search(len(sortedRegions), func(i int) bool {
+		if len(sortedRegions[i].Rg.EndKey) == 0 {
+			return true
+		}
+		return bytes.Compare(sortedRegions[i].Rg.EndKey, key) > 0
+	})
+
+	conn := lib.getConn(lib.getPSAddr((sortedRegions[idx].PSID)))
+	client := pspb.NewPartitionKVClient(conn)
+	res, err := client.Head(ctx, &pspb.HeadRequest{
+		Key: key,
+		Partid: sortedRegions[idx].PartID})
+	if err != nil {
+		return nil,0,0, err
+	}
+	return res.Info.Key, res.Info.Version, res.Info.Len, err
 }
