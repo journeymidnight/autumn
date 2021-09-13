@@ -363,7 +363,6 @@ func (sm *StreamManager) RegisterGRPC(grpcServer *grpc.Server) {
 }
 
 func (sm *StreamManager) Close() {
-	if sm.isLeader > 0 {
-		sm.stopper.Stop()
-	}
+	sm.client.Close()
+	sm.grcpServer.Stop()
 }

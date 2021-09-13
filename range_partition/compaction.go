@@ -13,10 +13,23 @@ import (
 	"github.com/journeymidnight/autumn/xlog"
 )
 
+type PickupTables interface {
+	PickupTables(opt *Option, tbls []*table.Table) []*table.Table
+}
+
+type DefaultPickupPolicy struct {}
+
+
+func (p DefaultPickupPolicy) PickupTables(opt *Option, tbls []*table.Table) []*table.Table {
+
+}
+
 func (rp *RangePartition) startCompact() {
 	rp.compactStopper = utils.NewStopper()
+	//only one compact goroutine
 	rp.compactStopper.RunWorker(rp.compact)
 }
+
 
 func (rp *RangePartition) compact() {
 	randTicker := utils.NewRandomTicker(10*time.Minute, 20*time.Minute)
@@ -24,9 +37,21 @@ func (rp *RangePartition) compact() {
 		select {
 		// Can add a done channel or other stuff.
 		case <-randTicker.C:
-			//pick tables
-			//doCompact
+			rp.tableLock.RLock()
+			allTables := make([]*table.Table, 0, len(rp.tables))
+			for _, t := range rp.tables {
+				allTables = append(allTables, t)
+				t.IncrRef()
+			}
+			rp.tableLock.RUnlock()
+			compactTables := rp.pickTables(rp.opt, allTables)
+
+			rp.doCompact(compactTables)
+			for i := range allTables {
+				allTables[i].DecrRef()
+			}
 		case <-rp.compactStopper.ShouldStop():
+			randTicker.Stop()
 			return
 		}
 	}
@@ -154,6 +179,7 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 		<-resultCh
 	}
 
+	//FIXME
 	eID := tbls[len(tbls)-1].Loc.ExtentID
 
 	//last table's meta extentd
