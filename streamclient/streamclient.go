@@ -20,16 +20,6 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-/*
-At the start of a partition load, the partition server
-sends a “check for commit length” to the primary EN of the last extent of these two streams.
-This checks whether all the replicas are available and that they all have the same length.
-If not, the extent is sealed and reads are only performed, during partition load,
-against a replica sealed by the SM
-
-相当于hdfs的lease recovery
-*/
-
 const (
 	KB = 1024
 	MB = 1024 * KB
@@ -222,6 +212,14 @@ type AutumnEntryIter struct {
 	conn               *grpc.ClientConn
 }
 
+
+/*
+At the start of a partition load, the partition server
+sends a “check for commit length” to the primary EN of the last extent of these two streams.
+This checks whether all the replicas are available and that they all have the same length.
+If not, the extent is sealed and reads are only performed, during partition load,
+against a replica sealed by the SM
+*/
 func (sc *AutumnStreamClient) checkCommitLength() {
 	//if last extent is not sealed, we must 'Check Commit length' for all replicates,
 	//if any error happend, we seal and create a new extent

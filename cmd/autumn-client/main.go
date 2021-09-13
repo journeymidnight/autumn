@@ -94,9 +94,9 @@ func benchmark(etcdUrlss []string, op BenchType, threadNum int, duration int, si
 		}
 	}
 
-	 //in the unit of millisecond
+	//in the unit of millisecond
 	hist := utils.NewLantencyStatus(0, 1000)
-	
+
 	n := rand.Int31()
 	go func() {
 		for i := 0; i < threadNum; i++ {
@@ -249,8 +249,7 @@ func bootstrap(c *cli.Context) error {
 	}
 	fmt.Printf("row stream %d created, replication is [%d+%d]\n", row.StreamID, r, s)
 
-
-	partID, _, err := etcd_utils.EtcdAllocUniqID(etcdClient, stream_manager.IdKey , 1)
+	partID, _, err := etcd_utils.EtcdAllocUniqID(etcdClient, stream_manager.IdKey, 1)
 	if err != nil {
 		fmt.Printf("can not create partID %v\n", err)
 		return err
@@ -444,7 +443,7 @@ func main() {
 			Flags: []cli.Flag{
 				&cli.StringFlag{Name: "smUrls", Value: "127.0.0.1:3401"},
 				&cli.StringFlag{Name: "etcdUrls", Value: "127.0.0.1:2379"},
-				&cli.StringFlag{Name: "replication", Value:"2+1"},
+				&cli.StringFlag{Name: "replication", Value: "2+1"},
 			},
 			Action: bootstrap,
 		},
@@ -554,7 +553,7 @@ func format(c *cli.Context) error {
 	advertiseURL := c.String("advertise-url")
 	output := c.String("output")
 
-	walDir := c.String("walDir")
+	walDir := c.String("waldir")
 	if len(walDir) > 0 {
 		_, err := os.Stat(walDir)
 		if err != nil {
@@ -630,7 +629,7 @@ func format(c *cli.Context) error {
 	config.SmURLs = smURLs
 	config.EtcdURLs = etcdURLs
 	config.ListenURL = listenURL
-	
+
 	if len(output) == 0 {
 		fmt.Printf("display config \n")
 		fmt.Printf("%+v\n", config)
@@ -658,7 +657,7 @@ func wbench(c *cli.Context) error {
 	return benchmark(etcdUrlss, WRITE_T, threadNum, duration, size)
 }
 
-func printSummary(elapsed time.Duration, totalCount uint64, totalSize uint64, threadNum int, size int, hist * utils.HistogramStatus) {
+func printSummary(elapsed time.Duration, totalCount uint64, totalSize uint64, threadNum int, size int, hist *utils.HistogramStatus) {
 	if elapsed.Seconds() < 1e-9 {
 		return
 	}
