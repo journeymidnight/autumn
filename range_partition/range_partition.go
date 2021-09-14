@@ -73,7 +73,11 @@ type RangePartition struct {
 	openStream OpenStreamFunc //doGC的时候,
 	setLocs    SetRowStreamTableFunc
 
+
 	hasOverlap uint32 //atomic
+
+	//compaction pickup table policy
+	pickupTablePolicy PickupTables
 }
 
 //TODO
@@ -371,15 +375,6 @@ func (rp *RangePartition) handleFlushTask(ft flushTask) error {
 
 	rp.tableLock.Lock()
 	rp.tables = append(rp.tables, tbl)
-	//run insertsort to make sure rp.tables is sorted by lastSeq
-	/*
-		for j := len(rp.tables) - 1; j > 0 && rp.tables[j].LastSeq < rp.tables[j-1].LastSeq; j-- {
-			//swap [j] and [j-1]
-			tmp := rp.tables[j]
-			rp.tables[j] = rp.tables[j-1]
-			rp.tables[j-1] = tmp
-		}
-	*/
 	rp.tableLock.Unlock()
 
 	xlog.Logger.Debugf("flushed table %s to %s seq[%d], head %d\n", y.ParseKey(first), y.ParseKey(last), tbl.LastSeq, tbl.VpOffset)
@@ -816,7 +811,7 @@ func (rp *RangePartition) newIterator() y.Iterator {
 	return table.NewMergeIterator(iters, false)
 }
 
-func (rp *RangePartition) getTablesForKey(userKey []byte) ([]*table.Table, func()) {
+func (rp *RangePartition) getTablesForKey(userKey []byte) []*table.Table {
 	var out []*table.Table
 
 	rp.tableLock.RLock()
@@ -826,7 +821,6 @@ func (rp *RangePartition) getTablesForKey(userKey []byte) ([]*table.Table, func(
 		end := y.ParseKey(t.Biggest())
 		if bytes.Compare(userKey, start) >= 0 && bytes.Compare(userKey, end) <= 0 {
 			out = append(out, t)
-			t.IncrRef()
 		}
 	}
 	//返回的tables按照SeqNum排序, SeqNum大的在前(新的table在前), 保证如果出现vesion相同
@@ -838,11 +832,7 @@ func (rp *RangePartition) getTablesForKey(userKey []byte) ([]*table.Table, func(
 		})
 	}
 
-	return out, func() {
-		for _, t := range out {
-			t.DecrRef()
-		}
-	}
+	return out
 }
 
 func (rp *RangePartition) Range(prefix []byte, start []byte, limit uint32) [][]byte {
@@ -969,8 +959,7 @@ func (rp *RangePartition) getValueStruct(userKey []byte, version uint64) y.Value
 		}
 	}
 
-	tables, decr := rp.getTablesForKey(userKey)
-	defer decr()
+	tables := rp.getTablesForKey(userKey)
 	hash := farm.Fingerprint64(userKey)
 	//search each tables to find element which has the max version
 	for _, th := range tables {

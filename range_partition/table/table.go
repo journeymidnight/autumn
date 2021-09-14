@@ -3,7 +3,6 @@ package table
 import (
 	"context"
 	"fmt"
-	"sync/atomic"
 
 	"github.com/dgraph-io/ristretto"
 	"github.com/dgraph-io/ristretto/z"
@@ -32,7 +31,7 @@ type Table struct {
 	// The following are initialized once and const.
 	smallest, biggest []byte // Smallest and largest keys (with timestamps).
 
-	// Stores the total size of key-values stored in this table (including the size on vlog).
+	// Stores the total size of key-values stored in this table (exclude the size on vlog).
 	EstimatedSize uint64
 	bf            *z.Bloom
 	Cache         *ristretto.Cache
@@ -44,6 +43,7 @@ type Table struct {
 	VpOffset   uint32
 }
 
+/*
 // IncrRef increments the refcount (having to do with whether the file should be deleted)
 func (t *Table) IncrRef() {
 	atomic.AddInt32(&t.ref, 1)
@@ -57,6 +57,7 @@ func (t *Table) DecrRef() error {
 	}
 	return nil
 }
+*/
 
 func OpenTable(blockReader streamclient.BlockReader,
 	extentID uint64, offset uint32) (*Table, error) {
@@ -199,7 +200,6 @@ func (t *Table) initBiggestAndSmallest() error {
 
 // NewIterator returns a new iterator of the Table
 func (t *Table) NewIterator(reversed bool) *Iterator {
-	t.IncrRef() // Important.
 	ti := &Iterator{t: t, reversed: reversed}
 	ti.next()
 	return ti
