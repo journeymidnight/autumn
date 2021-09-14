@@ -2,6 +2,8 @@ package range_partition
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"sync/atomic"
 	"time"
 
@@ -13,16 +15,82 @@ import (
 	"github.com/journeymidnight/autumn/xlog"
 )
 
+//given all tables in range partition, if eID is not 0, caller can call stream.Truncate(eID) to
+//truncate the stream, in our system, every extentID is bigger than 0.
+
 type PickupTables interface {
-	PickupTables(opt *Option, tbls []*table.Table) []*table.Table
+	PickupTables(tbls []*table.Table) (tables []*table.Table, eID uint64)
 }
 
-type DefaultPickupPolicy struct {}
-
-
-func (p DefaultPickupPolicy) PickupTables(opt *Option, tbls []*table.Table) []*table.Table {
-
+type DefaultPickupPolicy struct {
+	compactRatio float64
+	headRatio    float64
+	n int //at most n tables to be merged
+	MaxSkipList int64
 }
+
+
+func (p DefaultPickupPolicy) PickupTables(tbls []*table.Table) ([]*table.Table, uint64) {
+
+	utils.AssertTruef(p.n > 1, "PickupPolicy: n must be greater than 1")
+
+	//rule1:
+	//if tables are on multiple extents, and the table size on the first extent is less then headRatio * all table size
+	//pickup all tables on the first extent and the first table on the second extent
+	//if we have merged the first table on the second extent, we can truncate the first extent safely
+	totalSize := uint64(0)
+	extents := make([]uint64, 0, len(tbls))
+	accumulatedSize := make(map[uint64]uint64)
+	chosenTbls := make([]*table.Table, 0, p.n)
+	for _, t := range tbls {
+		totalSize += t.EstimatedSize
+		extents = append(extents, t.Loc.ExtentID)
+		accumulatedSize[t.Loc.ExtentID] += t.EstimatedSize
+	}
+
+	if len(tbls) > 1 && accumulatedSize[extents[0]] < uint64(math.Round(p.headRatio*float64(totalSize))) {
+		chosenExtentID := extents[0]
+		var truncateID uint64
+		//find all tables on chosenExtentID and table on the first extent
+		var i int
+		for i = 0; i < len(tbls) && i < p.n ; i++ {
+			if extents[i] == chosenExtentID {
+				chosenTbls = append(chosenTbls, tbls[i])
+			} else if extents[i] != chosenExtentID {
+				chosenTbls = append(chosenTbls, tbls[i])
+				truncateID = tbls[i].Loc.ExtentID
+				break
+			}
+		}
+		/*
+		If we just merged ALL the tables on the first extent, and did not reach the second extente
+		in the next merge, we can still not reclaim the first extent.
+		So if last table of chosenTbls is the last table on the first extent, we exclude this table.
+		when next minor compaction happens, we will reach the second extent and truncate the first extent.
+		*/
+		//at least chosenTbles have two elements
+		lastTableExtentID := chosenTbls[len(chosenTbls)-1].Loc.ExtentID
+		if lastTableExtentID == chosenExtentID && i < len(tbls) && lastTableExtentID != tbls[i].Loc.ExtentID {
+			chosenTbls = chosenTbls[:len(chosenTbls)-1]
+			truncateID = 0
+		}
+		return chosenTbls, truncateID
+	}
+
+	//rule2:
+	//chose any table whose size is less than compactRatio * MaxSkipListSize, at most n tables
+	for i := 0; i < len(tbls) && i < p.n; i++ {
+		if tbls[i].EstimatedSize < uint64(math.Round(p.compactRatio*float64(p.MaxSkipList))) {
+			chosenTbls = append(chosenTbls, tbls[i])
+		}
+	}
+	if len(chosenTbls) > 1 {
+		return chosenTbls, 0
+	}
+	return nil, 0
+}
+
+
 
 func (rp *RangePartition) startCompact() {
 	rp.compactStopper = utils.NewStopper()
@@ -41,14 +109,22 @@ func (rp *RangePartition) compact() {
 			allTables := make([]*table.Table, 0, len(rp.tables))
 			for _, t := range rp.tables {
 				allTables = append(allTables, t)
-				t.IncrRef()
 			}
 			rp.tableLock.RUnlock()
-			compactTables := rp.pickTables(rp.opt, allTables)
 
-			rp.doCompact(compactTables)
-			for i := range allTables {
-				allTables[i].DecrRef()
+			compactTables, eID := rp.pickupTablePolicy.PickupTables(allTables)
+			if compactTables == nil {
+				continue
+			}
+			rp.doCompact(compactTables, false)
+			rp.removeTables(compactTables)
+			//truncate
+			if eID != 0 {
+				//last table's meta extentd
+				_, err := rp.rowStream.Truncate(context.Background(), eID, "")
+				if err != nil {
+					xlog.Logger.Warnf("LOG Truncate extent %d error %v", eID, err)
+				}
 			}
 		case <-rp.compactStopper.ShouldStop():
 			randTicker.Stop()
@@ -57,36 +133,27 @@ func (rp *RangePartition) compact() {
 	}
 }
 
-func (rp *RangePartition) deprecateTables(tbls []*table.Table) {
+func (rp *RangePartition) removeTables(tbls []*table.Table) {
 
 	rp.tableLock.Lock()
 	defer rp.tableLock.Unlock()
 
-	var i, j int
-	var newTables []*table.Table
-	for i < len(tbls) && j < len(rp.tables) {
-		if tbls[i].LastSeq == rp.tables[j].LastSeq {
-			i++
-			j++ //同时存在
-		} else if tbls[i].LastSeq < rp.tables[j].LastSeq {
-			i++ //只在tbls存在
-		} else {
-			newTables = append(newTables, rp.tables[j])
-			j++ //只在rp.tables存在
+	tblsIndex := make(map[string]bool)
+	for _, t := range tbls {
+		tblsIndex[fmt.Sprintf("%d-%d", t.Loc.ExtentID, t.Loc.Offset)] = true
+	}
+
+	for i := len(rp.tables) - 1; i >= 0; i-- {
+		if _, ok := tblsIndex[fmt.Sprintf("%d-%d", rp.tables[i].Loc.ExtentID, rp.tables[i].Loc.Offset)]; ok {
+			//exclude the table which is to be deprecate
+			rp.tables = append(rp.tables[:i], rp.tables[i+1:]...)
 		}
 	}
-
-	for ; j < len(rp.tables); j++ {
-		newTables = append(newTables, rp.tables[j])
-	}
-
 	var tableLocs []*pspb.Location
-	for _, t := range newTables {
+	for _, t := range rp.tables {
 		tableLocs = append(tableLocs, &t.Loc)
 	}
 	rp.updateTableLocs(tableLocs)
-
-	rp.tables = newTables
 }
 
 func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
@@ -179,14 +246,6 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 		<-resultCh
 	}
 
-	//FIXME
-	eID := tbls[len(tbls)-1].Loc.ExtentID
-
-	//last table's meta extentd
-	_, err := rp.rowStream.Truncate(context.Background(), eID, "")
-	if err != nil {
-		xlog.Logger.Warnf("LOG Truncate extent %d error %v", eID, err)
-	}
 
 	//在这个时间, 虽然有可能memstore还没有完全刷下去, 但是rp.Close调用会等待flushTask全部执行完成.
 	//另外, 在分裂时选择midKey后, 会有一个assert确保midKey在startKey和endKey之间

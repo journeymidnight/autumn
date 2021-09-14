@@ -74,7 +74,6 @@ func  TestMidKey(t *testing.T) {
 	table, err := OpenTable(br, id, offset)
 
 	require.NoError(t, err)
-	defer table.DecrRef()
 
 	require.Equal(t, []byte("key2002"), y.ParseKey(table.MidKey()))
 }
@@ -88,7 +87,6 @@ func TestSeekToFirst(t *testing.T) {
 			table, err := OpenTable(br, id, offset)
 
 			require.NoError(t, err)
-			defer table.DecrRef()
 			it := table.NewIterator(false)
 			defer it.Close()
 			it.seekToFirst()
@@ -108,7 +106,6 @@ func TestSeekToLast(t *testing.T) {
 			defer stream.Close()
 			table, err := OpenTable(br, id, offset)
 			require.NoError(t, err)
-			defer table.DecrRef()
 			it := table.NewIterator(false)
 			defer it.Close()
 			it.seekToLast()
@@ -134,7 +131,6 @@ func TestSeek(t *testing.T) {
 	table, err := OpenTable(br, id, offset)
 
 	require.NoError(t, err)
-	defer table.DecrRef()
 
 	it := table.NewIterator(false)
 	defer it.Close()
@@ -175,7 +171,6 @@ func TestSeekForPrev(t *testing.T) {
 	table, err := OpenTable(br, id, offset)
 
 	require.NoError(t, err)
-	defer table.DecrRef()
 
 	it := table.NewIterator(false)
 	defer it.Close()
@@ -217,7 +212,6 @@ func TestIterateFromStart(t *testing.T) {
 			table, err := OpenTable(br, id, offset)
 
 			require.NoError(t, err)
-			defer table.DecrRef()
 			ti := table.NewIterator(false)
 			defer ti.Close()
 			ti.reset()
@@ -248,7 +242,7 @@ func TestIterateFromEnd(t *testing.T) {
 			table, err := OpenTable(br, id, offset)
 
 			require.NoError(t, err)
-			defer table.DecrRef()
+			
 			ti := table.NewIterator(false)
 			defer ti.Close()
 			ti.reset()
@@ -276,7 +270,6 @@ func TestTable(t *testing.T) {
 	table, err := OpenTable(br, id, offset)
 
 	require.NoError(t, err)
-	defer table.DecrRef()
 	ti := table.NewIterator(false)
 	defer ti.Close()
 	kid := 1010
@@ -310,7 +303,7 @@ func TestIterateBackAndForth(t *testing.T) {
 	table, err := OpenTable(br, id, offset)
 
 	require.NoError(t, err)
-	defer table.DecrRef()
+	
 
 	seek := y.KeyWithTs([]byte(key("key", 1010)), 0)
 
@@ -357,7 +350,7 @@ func TestUniIterator(t *testing.T) {
 	table, err := OpenTable(br, id, offset)
 
 	require.NoError(t, err)
-	defer table.DecrRef()
+	
 	{
 		it := table.NewIterator(false)
 		defer it.Close()
@@ -394,7 +387,6 @@ func TestConcatIteratorOneTable(t *testing.T) {
 	tbl, err := OpenTable(br, id, offset)
 
 	require.NoError(t, err)
-	defer tbl.DecrRef()
 
 	it := NewConcatIterator([]*Table{tbl}, false)
 	defer it.Close()
@@ -420,13 +412,10 @@ func TestConcatIterator(t *testing.T) {
 
 	tbl, err := OpenTable(br, id, offset)
 	require.NoError(t, err)
-	defer tbl.DecrRef()
 	tbl2, err := OpenTable(br2, id2, offset2)
 	require.NoError(t, err)
-	defer tbl2.DecrRef()
 	tbl3, err := OpenTable(br3, id3, offset3)
 	require.NoError(t, err)
-	defer tbl3.DecrRef()
 
 	{
 		it := NewConcatIterator([]*Table{tbl, tbl2, tbl3}, false)
@@ -520,10 +509,8 @@ func TestMergingIterator(t *testing.T) {
 	}
 	tbl1, err := OpenTable(br1, id1, offset1)
 	require.NoError(t, err)
-	defer tbl1.DecrRef()
 	tbl2, err := OpenTable(br2, id2, offset2)
 	require.NoError(t, err)
-	defer tbl2.DecrRef()
 	it1 := tbl1.NewIterator(false)
 	it2 := NewConcatIterator([]*Table{tbl2}, false)
 	it := NewMergeIterator([]y.Iterator{it1, it2}, false)
@@ -570,10 +557,8 @@ func TestMergingIteratorReversed(t *testing.T) {
 	}
 	tbl1, err := OpenTable(br1, id1, offset1)
 	require.NoError(t, err)
-	defer tbl1.DecrRef()
 	tbl2, err := OpenTable(br2, id2, offset2)
 	require.NoError(t, err)
-	defer tbl2.DecrRef()
 	it1 := tbl1.NewIterator(true)
 	it2 := NewConcatIterator([]*Table{tbl2}, true)
 	it := NewMergeIterator([]y.Iterator{it1, it2}, true)
@@ -605,10 +590,8 @@ func TestMergingIteratorTakeOne(t *testing.T) {
 	defer f2.Close()
 	t1, err := OpenTable(br1, id1, offset1)
 	require.NoError(t, err)
-	defer t1.DecrRef()
 	t2, err := OpenTable(br2, id2, offset2)
 	require.NoError(t, err)
-	defer t2.DecrRef()
 
 	it1 := NewConcatIterator([]*Table{t1}, false)
 	it2 := NewConcatIterator([]*Table{t2}, false)
@@ -654,10 +637,8 @@ func TestMergingIteratorTakeTwo(t *testing.T) {
 
 	t1, err := OpenTable(br1, id1, offset1)
 	require.NoError(t, err)
-	defer t1.DecrRef()
 	t2, err := OpenTable(br2, id2, offset2)
 	require.NoError(t, err)
-	defer t2.DecrRef()
 
 	it1 := NewConcatIterator([]*Table{t1}, false)
 	it2 := NewConcatIterator([]*Table{t2}, false)
@@ -716,7 +697,6 @@ func TestTableBigValues(t *testing.T) {
 
 	tbl, err := OpenTable(br, id, offset)
 	require.NoError(t, err, "unable to open table")
-	defer tbl.DecrRef()
 
 	itr := tbl.NewIterator(false)
 	require.True(t, itr.Valid())
@@ -743,7 +723,6 @@ var cacheConfig = ristretto.Config{
 func BenchmarkRead(b *testing.B) {
 	n := int(5 * 1e6)
 	tbl := getTableForBenchmarks(b, n, nil)
-	defer tbl.DecrRef()
 
 	b.ResetTimer()
 	// Iterate b.N times over the entire table.
@@ -762,7 +741,6 @@ func BenchmarkReadAndBuild(b *testing.B) {
 
 	var cache, _ = ristretto.NewCache(&cacheConfig)
 	tbl := getTableForBenchmarks(b, n, cache)
-	defer tbl.DecrRef()
 
 	b.ResetTimer()
 	// Iterate b.N times over the entire table.
@@ -811,7 +789,6 @@ func BenchmarkReadMerged(b *testing.B) {
 		tbl, err := OpenTable(f, opts)
 		y.Check(err)
 		tables = append(tables, tbl)
-		defer tbl.DecrRef()
 	}
 
 	b.ResetTimer()
@@ -855,7 +832,6 @@ func BenchmarkChecksum(b *testing.B) {
 func BenchmarkRandomRead(b *testing.B) {
 	n := int(5 * 1e6)
 	tbl := getTableForBenchmarks(b, n, nil)
-	defer tbl.DecrRef()
 
 	r := rand.New(rand.NewSource(time.Now().Unix()))
 

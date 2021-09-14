@@ -34,7 +34,7 @@ type StreamClient interface {
 	AppendEntries(ctx context.Context, entries []*pb.EntryInfo, mustSync bool) (uint64, uint32, error)
 	Append(ctx context.Context, blocks []*pb.Block, mustSync bool) (extentID uint64, offsets []uint32, end uint32, err error)
 	NewLogEntryIter(opt ...ReadOption) LogEntryIter
-	//Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]*pb.Block, uint32, error)
+	//truncate extent BEFORE extentID
 	Truncate(ctx context.Context, extentID uint64, gabageKey string) (*pb.BlobStreams, error)
 	//FIXME: stat => ([]extentID , offset)
 	End() uint32

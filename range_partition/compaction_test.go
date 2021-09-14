@@ -53,10 +53,7 @@ func TestCompaction(t *testing.T) {
 	rp.tableLock.RUnlock()
 
 	rp.doCompact(tbls, true)
-	rp.deprecateTables(tbls)
-	for _, t := range tbls {
-		t.DecrRef()
-	}
+	rp.removeTables(tbls)
 	fmt.Printf("after compaction %d\n", len(rp.tables))
 
 }
