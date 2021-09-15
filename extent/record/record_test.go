@@ -255,7 +255,7 @@ func TestReopenLogWriter(t *testing.T) {
 
 	w := NewLogWriter(f, 0, 0)
 	w.WriteRecord([]byte("hello"))
-	w.WriteRecord([]byte("world"))
+	_, lastEnd, _ := w.WriteRecord([]byte("world"))
 	w.Close()
 	f.Close()
 
@@ -271,7 +271,7 @@ func TestReopenLogWriter(t *testing.T) {
 	data := make([]byte, (32 << 10))
 	utils.SetRandStringBytes(data)
 	start, end, _ := w.WriteRecord(data)
-	require.Equal(t, int64(24), start)
+	require.Equal(t, lastEnd, start) 
 	xend := ComputeEnd(uint32(start), uint32(len(data)))
 
 	require.Equal(t, end, int64(xend))
@@ -286,11 +286,11 @@ func TestBasicReadWrite(t *testing.T) {
 
 	start, end, _ := w.WriteRecord([]byte("hello"))
 	require.Equal(t, int64(0), start)
-	require.Equal(t, int64(12), end) //len("hello") + 7
+	require.Equal(t, int64(14), end) //len("hello") + HeaderSize
 
 	start, end, _ = w.WriteRecord([]byte("world"))
-	require.Equal(t, int64(12), start)
-	require.Equal(t, int64(24), end) //len("world") + 7 + start
+	require.Equal(t, int64(14), start)
+	require.Equal(t, int64(28), end) //len("world") + HeaderSize + start
 
 	data := make([]byte, (64 << 10))
 	utils.SetRandStringBytes(data)
@@ -323,7 +323,7 @@ func TestBasicReadWrite(t *testing.T) {
 	f.Seek(0, io.SeekStart)
 	reader = NewReader(f)
 	buf.Reset()
-	reader.SeekRecord(12)
+	reader.SeekRecord(14) //len("hello") + HeaderSize
 	r, err := reader.Next()
 	require.Nil(t, err)
 	d, err := ioutil.ReadAll(r)
@@ -647,7 +647,7 @@ func BenchmarkNormalWrite(b *testing.B) {
 	}
 }
 func BenchmarkRecordWrite(b *testing.B) {
-	for _, size := range []int{8, 16, 32, 64, 128, 1 << 20} {
+	for _, size := range []int{8, 16, 32, 64, 128, 1 << 20, 2 << 20} {
 		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
 			w := NewLogWriter(ioutil.Discard, 0, 0)
 			defer w.Close()

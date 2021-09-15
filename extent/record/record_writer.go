@@ -327,26 +327,26 @@ func (w *LogWriter) emitFragment(n int, p []byte) []byte {
 	b := w.block
 	i := b.written
 	first := n == 0
-	last := BlockSize-i-HeaderSize >= int32(len(p))
+	last := BlockSize - i - HeaderSize >= int32(len(p))
 
 	if last {
 		if first {
-			b.buf[i+6] = fullChunkType
+			b.buf[i+8] = fullChunkType
 		} else {
-			b.buf[i+6] = lastChunkType
+			b.buf[i+8] = lastChunkType
 		}
 	} else {
 		if first {
-			b.buf[i+6] = firstChunkType
+			b.buf[i+8] = firstChunkType
 		} else {
-			b.buf[i+6] = middleChunkType
+			b.buf[i+8] = middleChunkType
 		}
 	}
 
 	r := copy(b.buf[i+HeaderSize:], p)
 	j := i + int32(HeaderSize+r)
-	binary.LittleEndian.PutUint32(b.buf[i+0:i+4], utils.NewCRC(b.buf[i+6:j]).Value())
-	binary.LittleEndian.PutUint16(b.buf[i+4:i+6], uint16(r))
+	binary.LittleEndian.PutUint32(b.buf[i+0:i+4], utils.NewCRC(b.buf[i+8:j]).Value())
+	binary.LittleEndian.PutUint32(b.buf[i+4:i+8], uint32(r))
 	atomic.StoreInt32(&b.written, j)
 
 	if BlockSize-b.written < HeaderSize {

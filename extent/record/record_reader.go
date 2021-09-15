@@ -98,9 +98,9 @@ const (
 )
 
 const (
-	BlockSize     = 64 * 1024
+	BlockSize     = 128 * 1024
 	BlockSizeMask = BlockSize - 1
-	HeaderSize    = 7
+	HeaderSize    = 9
 )
 
 var (
@@ -176,8 +176,8 @@ func (r *Reader) nextChunk(wantFirst bool) error {
 	for {
 		if r.j+HeaderSize <= r.n {
 			checksum := binary.LittleEndian.Uint32(r.buf[r.j+0 : r.j+4])
-			length := binary.LittleEndian.Uint16(r.buf[r.j+4 : r.j+6])
-			chunkType := r.buf[r.j+6]
+			length := binary.LittleEndian.Uint32(r.buf[r.j+4 : r.j+8])
+			chunkType := r.buf[r.j+8]
 
 			if checksum == 0 && length == 0 && chunkType == 0 {
 				if wantFirst || r.recovering {
