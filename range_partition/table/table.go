@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/dgraph-io/ristretto"
 	"github.com/dgraph-io/ristretto/z"
 	"github.com/gogo/protobuf/proto"
 	"github.com/journeymidnight/autumn/proto/pspb"
@@ -34,8 +33,7 @@ type Table struct {
 	// Stores the total size of key-values stored in this table (exclude the size on vlog).
 	EstimatedSize uint64
 	bf            *z.Bloom
-	Cache         *ristretto.Cache
-	BfCache       *ristretto.Cache
+	//cache ??
 
 	Loc        pspb.Location
 	LastSeq    uint64
@@ -207,4 +205,8 @@ func (t *Table) NewIterator(reversed bool) *Iterator {
 
 func (t *Table) DoesNotHave(hash uint64) bool {
 	return !t.bf.Has(hash)
+}
+
+func (t *Table) FirstOccurrence() uint64 {
+	return t.blockIndex[0].ExtentID
 }

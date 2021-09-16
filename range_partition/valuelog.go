@@ -148,7 +148,7 @@ func (rp *RangePartition) runGC(discardRatio float64) {
 
 			//?batch?
 			if len(wb) > 4 || ei.EstimatedSize+size > 16*MB {
-				req, err := rp.sendToWriteCh(wb)
+				req, err := rp.sendToWriteCh(wb, true)
 				if err != nil {
 					return false, err
 				}
