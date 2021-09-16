@@ -1,1 +1,1 @@
-ps:./autumn-ps --advertise-listen 127.0.0.1:9955 --listen :9955 --psid 12 --sm-urls 127.0.0.1:3401 --etcd-urls 127.0.0.1:2379
+ps:./autumn-ps --advertise-listen 127.0.0.1:9955 --listen :9955 --psid 12 --sm-urls 127.0.0.1:3401 --etcd-urls 127.0.0.1:2379 --nosync

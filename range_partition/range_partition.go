@@ -337,7 +337,7 @@ func (rp *RangePartition) handleFlushTask(ft flushTask) error {
 
 	iter := ft.mt.NewIterator()
 	defer iter.Close()
-	b := table.NewTableBuilder(rp.rowStream, rp.opt.MustSync)
+	b := table.NewTableBuilder(rp.rowStream)
 	defer b.Close()
 
 	//var vp valuePointer
@@ -563,8 +563,12 @@ func (rp *RangePartition) writeRequests(reqs []*request) error {
 		return nil
 	}
 
-	//
 	if reqs[len(reqs)-1].isGCRequest {
+		/*
+			re-read again to find any key was written before GCrequest, if any, 
+			we just abort the gc entry.
+		*/
+
 		//build index for previous entries
 		index := make(map[string]bool)
 		for i := 0; i < len(reqs)-1; i++ {
