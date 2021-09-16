@@ -159,7 +159,7 @@ func (rp *RangePartition) compact() {
 			rp.tableLock.RUnlock()
 
 			compactTables, eID := rp.pickupTablePolicy.PickupTables(allTables)
-			if compactTables == nil {
+			if len(compactTables) == 0 {
 				continue
 			}
 			fmt.Printf("do compaction tasks for tables %+v\n", compactTables)

@@ -78,11 +78,10 @@ type Builder struct {
 	stream       streamclient.StreamClient
 	writeCh      chan writeBlock
 	stopper      *utils.Stopper
-	mustSync     bool
 }
 
 // NewTableBuilder makes a new TableBuilder.
-func NewTableBuilder(stream streamclient.StreamClient, mustSync bool) *Builder {
+func NewTableBuilder(stream streamclient.StreamClient) *Builder {
 	b := &Builder{
 		tableIndex:   &pspb.TableIndex{},
 		keyHashes:    make([]uint64, 0, 1024), // Avoid some malloc calls.
@@ -90,7 +89,6 @@ func NewTableBuilder(stream streamclient.StreamClient, mustSync bool) *Builder {
 		writeCh:      make(chan writeBlock, 16),
 		stopper:      utils.NewStopper(),
 		currentBlock: &pb.Block{Data: make([]byte, 64*KB)},
-		mustSync :   mustSync,
 	}
 
 	b.stopper.RunWorker(func() {
@@ -127,7 +125,7 @@ func NewTableBuilder(stream streamclient.StreamClient, mustSync bool) *Builder {
 					return
 				}
 
-				extentID, offsets, _, err := b.stream.Append(context.Background(), blocks, b.mustSync)
+				extentID, offsets, _, err := b.stream.Append(context.Background(), blocks, false)
 				utils.Check(err)
 
 				for i, offset := range offsets {
