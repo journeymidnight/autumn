@@ -66,7 +66,6 @@ func (ps *PartitionServer) Get(ctx context.Context, req *pspb.GetRequest) (*pspb
 	}
 	//version可有三种
 	//0, 取当前seqnumber
-	//math.MaxUint64, 取最新的
 	//其他, 取指定的version
 	v, err := rp.Get(req.Key, 0)
 	if err != nil {

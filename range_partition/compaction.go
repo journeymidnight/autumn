@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -17,7 +18,8 @@ import (
 
 //given all tables in range partition, if eID is not 0, caller can call stream.Truncate(eID) to
 //truncate the stream, in our system, every extentID is bigger than 0.
-
+//RETURN: if tables is nil, do not compact
+//
 type PickupTables interface {
 	PickupTables(tbls []*table.Table) (tables []*table.Table, eID uint64)
 }
@@ -26,66 +28,110 @@ type DefaultPickupPolicy struct {
 	compactRatio float64
 	headRatio    float64
 	n int //at most n tables to be merged
-	MaxSkipList int64
+	opt *Option
 }
 
-
+//In size-tiered compaction, newer and smaller SSTables are successively merged into older and larger SSTables
 func (p DefaultPickupPolicy) PickupTables(tbls []*table.Table) ([]*table.Table, uint64) {
 
 	utils.AssertTruef(p.n > 1, "PickupPolicy: n must be greater than 1")
 
-	//rule1:
-	//if tables are on multiple extents, and the table size on the first extent is less then headRatio * all table size
-	//pickup all tables on the first extent and the first table on the second extent
-	//if we have merged the first table on the second extent, we can truncate the first extent safely
+	if len(tbls) < 2 {
+		return nil, 0
+	}
+	
+	/*
+	rule1:
+	if tables are on multiple extents, and the table size on the first extent is less then headRatio * all table size
+	pickup all tables on the first extent, and compact them and truncate.
+	for invariance: all tables must are sorted, we can only compact neighbor tables
+	*/
+
 	totalSize := uint64(0)
 	extents := make([]uint64, 0, len(tbls))
 	accumulatedSize := make(map[uint64]uint64)
-	chosenTbls := make([]*table.Table, 0, p.n)
+	compactTbls := make([]*table.Table, 0, p.n)
 	for _, t := range tbls {
 		totalSize += t.EstimatedSize
-		extents = append(extents, t.Loc.ExtentID)
+		extents = append(extents, t.FirstOccurrence())
 		accumulatedSize[t.Loc.ExtentID] += t.EstimatedSize
 	}
 
 	if len(tbls) > 1 && accumulatedSize[extents[0]] < uint64(math.Round(p.headRatio*float64(totalSize))) {
+		chosenTbls := make([]*table.Table, 0, p.n)
 		chosenExtentID := extents[0]
 		var truncateID uint64
-		//find all tables on chosenExtentID and table on the first extent
-		var i int
-		for i = 0; i < len(tbls) && i < p.n ; i++ {
+		//find all tables on chosenExtentID
+		for i := 0; i < len(tbls) && i < p.n ; i++ {
 			if extents[i] == chosenExtentID {
 				chosenTbls = append(chosenTbls, tbls[i])
 			} else if extents[i] != chosenExtentID {
-				chosenTbls = append(chosenTbls, tbls[i])
-				truncateID = tbls[i].Loc.ExtentID
+				truncateID = tbls[i].FirstOccurrence() //truncateID the second extentID
 				break
 			}
 		}
-		/*
-		If we just merged ALL the tables on the first extent, and did not reach the second extente
-		in the next merge, we can still not reclaim the first extent.
-		So if last table of chosenTbls is the last table on the first extent, we exclude this table.
-		when next minor compaction happens, we will reach the second extent and truncate the first extent.
-		*/
-		//at least chosenTbles have two elements
-		lastTableExtentID := chosenTbls[len(chosenTbls)-1].Loc.ExtentID
-		if lastTableExtentID == chosenExtentID && i < len(tbls) && lastTableExtentID != tbls[i].Loc.ExtentID {
-			chosenTbls = chosenTbls[:len(chosenTbls)-1]
-			truncateID = 0
+
+		//sort both chosenTbls and tbls by LastSeq
+		sort.Slice(tbls, func(i,j int)bool {
+			return tbls[i].LastSeq < tbls[j].LastSeq
+		})
+		sort.Slice(chosenTbls, func(i, j int) bool {
+			return chosenTbls[i].LastSeq < chosenTbls[j].LastSeq
+		})
+
+		i := sort.Search(len(tbls), func(i int) bool {
+			return tbls[i].LastSeq == chosenTbls[0].LastSeq
+		})
+		j := 0 
+		utils.AssertTruef(i >=0 , "search should always succeed")
+
+		for i < len(tbls) && j < len(chosenTbls) && len(compactTbls) < p.n{
+			if tbls[i].LastSeq < chosenTbls[j].LastSeq {
+				compactTbls = append(compactTbls, tbls[i])//fix holes in chosenTbls
+				i ++
+			} else if tbls[i].LastSeq == chosenTbls[j].LastSeq {
+				compactTbls = append(compactTbls, tbls[i])
+				i ++
+				j ++
+			} else {//tbls[i].LastSeq > chosenTbls[j].LastSeq
+				utils.AssertTruef(false, "chosenTbls is subset of tbls, should never happen")
+			}
 		}
-		return chosenTbls, truncateID
+
+		//do we have all tables on extent[0]?
+		if j == len(chosenTbls) {
+			return compactTbls, truncateID
+		}
+		return compactTbls, 0
+
 	}
 
-	//rule2:
-	//chose any table whose size is less than compactRatio * MaxSkipListSize, at most n tables
+	/*
+	rule2:
+	choose a table whose size is less than compactRatio * totalSize, start from this table's previous table if any,
+	to the next table whose size is less than compactRatio * totalSize
+	merge newer and smaller SSTables into older and larger SSTables
+	*/
+
+	//sort tables by lastSeq.
+	sort.Slice(tbls, func(i,j int)bool {
+		return tbls[i].LastSeq < tbls[j].LastSeq
+	})
+	
 	for i := 0; i < len(tbls) && i < p.n; i++ {
-		if tbls[i].EstimatedSize < uint64(math.Round(p.compactRatio*float64(p.MaxSkipList))) {
-			chosenTbls = append(chosenTbls, tbls[i])
+		if tbls[i].EstimatedSize < uint64(math.Round(p.compactRatio*float64(p.opt.MaxSkipList))) {
+			if len(compactTbls) == 0 && i > 0 {
+				compactTbls = append(compactTbls, tbls[i-1])
+			} else {
+				compactTbls = append(compactTbls, tbls[i])
+			}
+		} else if len(compactTbls) > 0 {
+			compactTbls = append(compactTbls, tbls[i])
+			break
 		}
 	}
-	if len(chosenTbls) > 1 {
-		return chosenTbls, 0
+	if len(compactTbls) > 1 {
+		return compactTbls, 0
 	}
 	return nil, 0
 }
@@ -100,7 +146,7 @@ func (rp *RangePartition) startCompact() {
 
 
 func (rp *RangePartition) compact() {
-	randTicker := utils.NewRandomTicker(10*time.Minute, 20*time.Minute)
+	randTicker := utils.NewRandomTicker(10*time.Second, 20*time.Second)
 	for {
 		select {
 		// Can add a done channel or other stuff.
@@ -116,6 +162,7 @@ func (rp *RangePartition) compact() {
 			if compactTables == nil {
 				continue
 			}
+			fmt.Printf("do compaction tasks for tables %+v\n", compactTables)
 			rp.doCompact(compactTables, false)
 			rp.removeTables(compactTables)
 			//truncate
@@ -160,8 +207,12 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 	if len(tbls) == 0 {
 		return
 	}
-	//tbls的顺序是在stream里面的顺序
-
+	//tbls的顺序是在stream里面的顺序, 改为按照seqNum排序
+	//如果key完全一样, 在iter前面的优先级高
+	sort.Slice(tbls, func(i, j int) bool {
+		return tbls[i].LastSeq > tbls[j].LastSeq
+	})
+	
 	var iters []y.Iterator
 	var maxSeq uint64
 	var head valuePointer

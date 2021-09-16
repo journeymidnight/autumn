@@ -143,14 +143,6 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		}
 	}
 
-	//SORT all tables, by lastSeq
-	//rp.table MUST be ordered
-	/*
-		sort.Slice(rp.tables, func(i, j int) bool {
-			return rp.tables[i].LastSeq < rp.tables[j].LastSeq
-		})
-	*/
-
 	var lastTable *table.Table
 	rp.seqNumber = 0
 	for i := range rp.tables {
@@ -241,6 +233,14 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	//start real write
 	rp.startWriteLoop()
 
+	rp.pickupTablePolicy = DefaultPickupPolicy{
+		compactRatio: 0.5,
+		headRatio: 0.3,
+		n :5,
+		opt: rp.opt,
+	}
+	
+	rp.startCompact()
 	//do compactions:FIXME, doCompactions放到另一个goroutine里面执行
 
 	/*
@@ -455,7 +455,7 @@ func (rp *RangePartition) updateTableLocs(tableLocs []*pspb.Location) {
 	if len(tableLocs) == 0 {
 		return
 	}
-	fmt.Printf("updating tables %+v\n", tableLocs)
+	// %+v\n", tableLocs)
 	backoff := 100 * time.Millisecond
 	for {
 		err := rp.setLocs(rp.PartID, tableLocs)
@@ -482,9 +482,10 @@ var requestPool = sync.Pool{
 
 type request struct {
 	// Input values, 这个以后可能有多个Entry..., 比如一个request里面
-	//A = "x", A:time = "y", A:md5 = "asdfasdf"
+	//A = "x", A:time = "20191224", A:md5 = "fbd80028d33edaa2d7bace539f534cb2"
 	entries []*pb.EntryInfo
 
+	isGCRequest bool
 	// Output values and wait group stuff below
 	wg  sync.WaitGroup
 	Err error
@@ -533,6 +534,7 @@ func (req *request) reset() {
 	req.wg = sync.WaitGroup{}
 	req.Err = nil
 	req.ref = 0
+	req.isGCRequest = false
 }
 
 func (req *request) IncrRef() {
@@ -554,21 +556,42 @@ func (req *request) Wait() error {
 	return err
 }
 
-/*
-func (rp *RangePartition) writeLog(reqs []*request) ([]*pb.EntryInfo, valuePointer, error) {
-	if atomic.LoadInt32(&rp.blockWrites) == 1 {
-		return nil, valuePointer{}, ErrBlockedWrites
-	}
-	utils.AssertTrue(len(reqs) != 0)
-
-	return writeValueLog(rp.logStream, reqs)
-}
-*/
 
 // writeRequests is called serially by only one goroutine.
 func (rp *RangePartition) writeRequests(reqs []*request) error {
 	if len(reqs) == 0 {
 		return nil
+	}
+
+	//
+	if reqs[len(reqs)-1].isGCRequest {
+		//build index for previous entries
+		index := make(map[string]bool)
+		for i := 0; i < len(reqs)-1; i++ {
+			for j := 0; j < len(reqs[i].entries); j++ {
+				userKey := y.ParseKey(reqs[i].entries[j].Log.Key)
+				//could overwrite
+				index[string(userKey)] = true
+			}
+		}
+		gcRequest := reqs[len(reqs)-1]
+		for i := len(gcRequest.entries) - 1; i >= 0; i-- {
+			userKey := y.ParseKey(gcRequest.entries[i].Log.Key)
+			
+			if _, ok := index[string(userKey)]; ok {
+				//exlude this entry
+				gcRequest.entries = append(gcRequest.entries[:i], gcRequest.entries[i+1:]...)
+				continue
+			}
+
+			vs := rp.getValueStruct(userKey, 0)
+			if vs.Version > y.ParseTs(gcRequest.entries[i].Log.Key) {
+				//exclude this entry
+				gcRequest.entries = append(gcRequest.entries[:i], gcRequest.entries[i+1:]...)
+				continue
+			}
+		}
+	
 	}
 
 	done := func(err error) {
@@ -705,7 +728,9 @@ func (rp *RangePartition) doWrites() {
 			reqs = append(reqs, r)
 
 			//FIXME: if (reqs + r) too big, send reqs, and create new reqs including r
-			if rp.isReqsTooBig(reqs) {
+			//if req's entries are gc request, it means reqs is big enough, send it
+			//the last element of reqs is gc request, writeRequests MUST check last element first
+			if r.isGCRequest ||rp.isReqsTooBig(reqs) {
 				pendingCh <- struct{}{} // blocking.
 				goto writeCase
 			}
@@ -728,12 +753,8 @@ func (rp *RangePartition) doWrites() {
 			select {
 			case r = <-rp.writeCh:
 				reqs = append(reqs, r)
-				/*
-					if isReqsTooBig(reqs) {
-						pendingCh <- struct{}{} // blocking.
-						goto writeCase
-					}
-				*/
+				//因为close时, 一定先停GC, 所以reqs不会有gc request, 我们把所有req
+				//收集到, 然后提交
 			default:
 				pendingCh <- struct{}{} // Push to pending before doing a write.
 				writeRequests(reqs)
@@ -911,57 +932,45 @@ func (rp *RangePartition) Get(userKey []byte, version uint64) ([]byte, error) {
 
 }
 
-/*
-internal APIs/block
-由于userKEY的seq不能保证总是最新的在后面, 所以所有的readkey操作, 需要读所有的memtable和table
-原因:
-1: gc时, seqNum不变, 导致memtale里面的seqNum比之前的小
-2: 如果做双logstream, replaystream时也会导致memtablel里面的seqNum顺序不一致
-3. 如果做多version的情况, 比如最大支持最近20个version, 也需要读所有memtable和table
-
-场景:
-1. 随机读一个key, 读所有memtable和table, 找到seqNum最高的
-2. range一部分key, 读所有memttable和table, 即使是seqNum相同, 但是不关心seqNum和对应的value
-3. 随机读一个key, 如果有2个key有相同的SeqNum, 在相同的seqnum情况下, memtable保证有序, tables也通过lastSeq保证
-有序, 首先应该读到时间更新的KEY
-
-*/
-
 func (rp *RangePartition) getValueStruct(userKey []byte, version uint64) y.ValueStruct {
 
 	mtables, decr := rp.getMemTables()
 	defer decr()
 
 	var internalKey []byte
+
 	if version == 0 {
+		//find the latest version
 		internalKey = y.KeyWithTs(userKey, atomic.LoadUint64(&rp.seqNumber))
 	} else {
 		internalKey = y.KeyWithTs(userKey, version)
-
 	}
-	var maxVs y.ValueStruct
 
 	//search in rp.mt and rp.imm
 	for i := 0; i < len(mtables); i++ {
 		//samekey and the vs is the smallest bigger than req's version
 		vs := mtables[i].Get(internalKey)
 
+		//fmt.Printf("search result of internalKey %s:%d is %+v\n",userKey, y.ParseTs(internalKey),  vs)
 		if vs.Meta == 0 && vs.Value == nil {
 			//not found, userKey not match
 			continue
 		}
+
 		// Found the required version of the key, return immediately.
-		if vs.Version == version {
+		if version > 0  && vs.Version == version {
 			return vs
 		}
-		if maxVs.Version < vs.Version {
-			maxVs = vs
+
+		if version == 0 && vs.Version > 0 {
+			return vs
 		}
 	}
 
 	tables := rp.getTablesForKey(userKey)
 	hash := farm.Fingerprint64(userKey)
-	//search each tables to find element which has the max version
+
+	var maxVs y.ValueStruct
 	for _, th := range tables {
 		if th.DoesNotHave(hash) {
 			continue
@@ -974,9 +983,16 @@ func (rp *RangePartition) getValueStruct(userKey []byte, version uint64) y.Value
 		}
 
 		if y.SameKey(internalKey, iter.Key()) {
-			if version := y.ParseTs(iter.Key()); version > maxVs.Version {
+			vsVersion := y.ParseTs(iter.Key()); 
+			if version > 0 && vsVersion == version {
 				maxVs = iter.ValueCopy()
 				maxVs.Version = version
+				break
+			}
+			if version == 0 && vsVersion > 0 {
+				maxVs = iter.ValueCopy()
+				maxVs.Version = vsVersion
+				break
 			}
 		}
 	}
@@ -995,6 +1011,8 @@ func (rp *RangePartition) close(gracefull bool) error {
 	xlog.Logger.Infof("Closing RangePartion %d", rp.PartID)
 	atomic.StoreInt32(&rp.blockWrites, 1)
 
+	//FIXME: stop GC first
+	rp.compactStopper.Stop()
 	rp.writeStopper.Stop()
 	close(rp.writeCh)
 
@@ -1047,7 +1065,7 @@ func (rp *RangePartition) WriteAsync(key, value []byte, f func(error)) {
 		},
 	}
 
-	req, err := rp.sendToWriteCh([]*pb.EntryInfo{e})
+	req, err := rp.sendToWriteCh([]*pb.EntryInfo{e}, false)
 	if err != nil {
 		f(err)
 		return
@@ -1075,7 +1093,7 @@ func (rp *RangePartition) Delete(key []byte) error {
 		},
 	}
 
-	req, err := rp.sendToWriteCh([]*pb.EntryInfo{e})
+	req, err := rp.sendToWriteCh([]*pb.EntryInfo{e}, false)
 	if err != nil {
 		return err
 	}
@@ -1092,7 +1110,7 @@ func (rp *RangePartition) Write(key, value []byte) error {
 			Value: value,
 		},
 	}
-	req, err := rp.sendToWriteCh([]*pb.EntryInfo{e})
+	req, err := rp.sendToWriteCh([]*pb.EntryInfo{e}, false)
 	if err != nil {
 		return err
 	}
@@ -1100,7 +1118,7 @@ func (rp *RangePartition) Write(key, value []byte) error {
 }
 
 //block API
-func (rp *RangePartition) sendToWriteCh(entries []*pb.EntryInfo) (*request, error) {
+func (rp *RangePartition) sendToWriteCh(entries []*pb.EntryInfo, isGC bool) (*request, error) {
 	if atomic.LoadInt32(&rp.blockWrites) == 1 {
 		return nil, ErrBlockedWrites
 	}
@@ -1112,6 +1130,7 @@ func (rp *RangePartition) sendToWriteCh(entries []*pb.EntryInfo) (*request, erro
 
 	req.wg.Add(1)
 	req.IncrRef()
+	req.isGCRequest = isGC
 	rp.writeCh <- req
 	return req, nil
 }
