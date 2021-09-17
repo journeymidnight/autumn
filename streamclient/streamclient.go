@@ -35,9 +35,11 @@ type StreamClient interface {
 	Append(ctx context.Context, blocks []*pb.Block, mustSync bool) (extentID uint64, offsets []uint32, end uint32, err error)
 	NewLogEntryIter(opt ...ReadOption) LogEntryIter
 	//truncate extent BEFORE extentID
-	Truncate(ctx context.Context, extentID uint64, gabageKey string) (*pb.BlobStreams, error)
-	//FIXME: stat => ([]extentID , offset)
-	End() uint32
+	Truncate(ctx context.Context, extentID uint64, blobKey string) (*pb.StreamInfo, error)
+	//CommitEnd() is offset of current extent
+	CommitEnd() uint32
+	//total number of extents
+	NumOfExtents() int
 }
 
 //random read block
@@ -383,7 +385,7 @@ func (sc *AutumnStreamClient) NewLogEntryIter(opts ...ReadOption) LogEntryIter {
 
 //Truncate keeps extentID, if gabageKey is not nil, move all extents before extentID to gabageKey, else
 //unref all extents.
-func (sc *AutumnStreamClient) Truncate(ctx context.Context, extentID uint64, gabageKey string) (*pb.BlobStreams, error) {
+func (sc *AutumnStreamClient) Truncate(ctx context.Context, extentID uint64, blobKey string) (*pb.StreamInfo, error) {
 
 	var i int
 	for i = range sc.streamInfo.ExtentIDs {
@@ -395,8 +397,15 @@ func (sc *AutumnStreamClient) Truncate(ctx context.Context, extentID uint64, gab
 		return nil, errNoTruncate
 	}
 
-	return sc.smClient.TruncateStream(ctx, sc.streamID, extentID,
-		sc.streamLock.ownerKey, sc.streamLock.revision, int64(sc.streamInfo.Sversion), gabageKey)
+	blobStream, updatedStream, err := sc.smClient.TruncateStream(ctx, sc.streamID, extentID,
+		sc.streamLock.ownerKey, sc.streamLock.revision, int64(sc.streamInfo.Sversion), blobKey)
+
+	if err != nil {
+		return nil, err
+	}
+
+	sc.streamInfo = updatedStream
+	return blobStream, nil
 }
 
 func (sc *AutumnStreamClient) getExtentIndexFromID(extentID uint64) int {
@@ -428,7 +437,7 @@ func (sc *AutumnStreamClient) getLastExtent() (uint64, error) {
 	return extentID, nil
 }
 
-func (sc *AutumnStreamClient) End() uint32 {
+func (sc *AutumnStreamClient) CommitEnd() uint32 {
 	return sc.end
 }
 
@@ -589,6 +598,7 @@ retry:
 	//fmt.Printf("extent %d updated end is %d\n", extentID, sc.end)
 	//检查offset结果, 如果已经超过MaxExtentSize, 调用StreamAllocExtent
 	utils.AssertTrue(res.End > 0)
+	
 	if res.End > MaxExtentSize {
 		if err = sc.MustAllocNewExtent(); err != nil {
 			return 0, nil, 0, err
@@ -596,4 +606,9 @@ retry:
 	}
 	//update end
 	return extentID, res.Offsets, res.End, nil
+}
+
+//NumOfExtents returns the number of extents
+func (sc *AutumnStreamClient) NumOfExtents() int {
+	return len(sc.streamInfo.ExtentIDs)
 }

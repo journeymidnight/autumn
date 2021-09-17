@@ -117,9 +117,7 @@ func (ps *PartitionServer) getPartitionMeta(partID uint64) (int64, *pspb.Partiti
 				continue
 			}
 			blob = make([]uint64, 0, len(rblob.Blobs))
-			for k := range rblob.Blobs {
-				blob = append(blob, k)
-			}
+			copy(blob, rblob.Blobs)
 		} else if strings.HasSuffix(string(kv.Key), "discard") {
 			//TODO
 		} else {

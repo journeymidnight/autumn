@@ -802,8 +802,8 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 	}
 	
 	var blobs pb.BlobStreams
-	if len(req.GabageKey) > 0  {
-		data, _, err := etcd_utils.EtcdGetKV(sm.client, req.GabageKey)
+	if len(req.BlobKey) > 0  {
+		data, _, err := etcd_utils.EtcdGetKV(sm.client, req.BlobKey)
 		if err != nil {
 			return errDone(err)
 		}
@@ -812,11 +812,13 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 		}
 	}
 
+
 	//duplicated truncated
 	if streamInfo.Sversion > uint64(req.Sversion) {
+		//BlobStreamInfo is unknown, it could be last blob stream
 		return &pb.TruncateResponse{
 			Code: pb.Code_OK,
-			Blobs: &blobs,
+			UpdatedStreamInfo: streamInfo,
 		}, nil
 	}
 
@@ -841,7 +843,7 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 	newStreamInfo := pb.StreamInfo{
 		StreamID:  req.StreamID,
 		ExtentIDs: newExtentIDs,
-		Sversion: streamInfo.Sversion+1,
+		Sversion: streamInfo.Sversion + 1,
 	}
 
 	//update current stream
@@ -851,8 +853,10 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 		clientv3.OpPut(streamKey, string(sdata)),
 	}
 
+	var newBlobStreamID uint64
+	var newBlobStream *pb.StreamInfo
 
-	if len(req.GabageKey) == 0 {
+	if len(req.BlobKey) == 0 {
 		//delete extents whose ref == 1
 		var exToBeDeleted []*pb.ExtentInfo
 		var exToBeUpdated  []*pb.ExtentInfo
@@ -894,24 +898,22 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 
 	} else {
 		//create a new stream, and add it to req.GabageKey, it will run gc in the future.
-		var newGabageStreamID uint64
-		if newGabageStreamID, _, err = sm.allocUniqID(1) ; err != nil {
+		if newBlobStreamID, _, err = sm.allocUniqID(1) ; err != nil {
 			return errDone(err)
 		}
+		newBlobStream = &pb.StreamInfo{
+			StreamID:  newBlobStreamID,
+			ExtentIDs: oldExtentIDs,
+			Sversion: 1,
+		}
 
-		blobs.Blobs[newGabageStreamID] = newGabageStreamID
+		blobs.Blobs = append(blobs.Blobs, newBlobStreamID)
 
-		sdata := utils.MustMarshal(
-			&pb.StreamInfo{
-				StreamID:  newGabageStreamID,
-				ExtentIDs: oldExtentIDs,
-				Sversion: 1,
-			},
-		)
+		sdata := utils.MustMarshal(newBlobStream)
 		//transfer old extent to new stream
 		//add add stream to gabages
-		ops = append(ops, clientv3.OpPut(formatStreamKey(newGabageStreamID), string(sdata)))
-		ops = append(ops, clientv3.OpPut(req.GabageKey, string(utils.MustMarshal(&blobs))))
+		ops = append(ops, clientv3.OpPut(formatStreamKey(newBlobStreamID), string(sdata)))
+		ops = append(ops, clientv3.OpPut(req.BlobKey, string(utils.MustMarshal(&blobs))))
 	}
 	
 
@@ -925,12 +927,16 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 		return errDone(err)
 	}
 
+	if newBlobStream != nil {
+		sm.streams.Set(newBlobStreamID, newBlobStream)
+	}
 	sm.streams.Set(req.StreamID, &newStreamInfo)
 
 	return &pb.TruncateResponse{
 		Code: pb.Code_OK,
-		Blobs: &blobs,
-		}, nil
+		UpdatedStreamInfo: &newStreamInfo,
+		BlobStreamInfo: newBlobStream,
+	}, nil
 
 }
 

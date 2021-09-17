@@ -25,6 +25,7 @@ import (
 const (
 	KB = 1024
 	MB = KB * 1024
+	GB = MB * 1024
 )
 
 var (
@@ -34,10 +35,11 @@ var (
 )
 
 type OpenStreamFunc func(si pb.StreamInfo) streamclient.StreamClient
-type SetRowStreamTableFunc func(id uint64, tables []*pspb.Location) error
+type SetRowStreamTableFunc func(partID uint64, tables []*pspb.Location) error
 
 type RangePartition struct {
 	discard *discardManager
+	blobKey string
 	//metaStream *streamclient.StreamClient //设定metadata结构
 	logStream streamclient.StreamClient
 	//从ValueStruct中得到的地址, 用blockReader读出来, 因为它可能在[logStream, []blobStreams]里面
@@ -70,14 +72,17 @@ type RangePartition struct {
 	opt *Option
 
 	//functions
-	openStream OpenStreamFunc //doGC的时候,
+	openStream OpenStreamFunc //doGC, read log stream.
 	setLocs    SetRowStreamTableFunc
 
 
-	hasOverlap uint32 //atomic
 
 	//compaction pickup table policy
 	pickupTablePolicy PickupTables
+
+	hasOverlap uint32 //atomic
+	compactRunning int32
+	gcRunning  int32
 }
 
 //TODO
@@ -111,11 +116,12 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		openStream:  openStream,
 		setLocs:     setlocs,
 		opt:         opt,
+		blobKey:     fmt.Sprintf("PARTSTATS/%d/blobStreams",id),	
 	}
 	rp.startMemoryFlush()
 
-	fmt.Printf("log end is %d\n", logStream.End())
-	fmt.Printf("row end is %d\n", rowStream.End())
+	fmt.Printf("log end is %d\n", logStream.CommitEnd())
+	fmt.Printf("row end is %d\n", rowStream.CommitEnd())
 	fmt.Printf("table locs is %v\n", tableLocs)
 
 	//replay log
@@ -303,7 +309,7 @@ func (rp *RangePartition) CanSplit() bool {
 }
 
 func (rp *RangePartition) LogRowStreamEnd() (uint32, uint32) {
-	return rp.logStream.End(), rp.rowStream.End()
+	return rp.logStream.CommitEnd(), rp.rowStream.CommitEnd()
 }
 
 func (rp *RangePartition) startWriteLoop() {
@@ -1161,4 +1167,12 @@ func (p *valuePointer) Decode(b []byte) {
 	// pointer alignment issues. See https://github.com/dgraph-io/badger/issues/1096
 	// and comment https://github.com/dgraph-io/badger/pull/1097#pullrequestreview-307361714
 	copy(((*[vptrSize]byte)(unsafe.Pointer(p))[:]), b[:vptrSize])
+}
+
+
+func (rp *RangePartition) RunMajorCompaction() {
+}
+//RunGC is an async function
+func (rp *RangePartition) RunGC(discardRatio float64) {
+	go rp.runGC(discardRatio)
 }
