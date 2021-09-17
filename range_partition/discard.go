@@ -5,47 +5,50 @@ import (
 	"github.com/journeymidnight/autumn/utils"
 )
 
+
+type STREAMno = uint64
+type EXTENTno = uint64
+
 type discardManager struct {
-	streams         map[uint64]pb.StreamInfo
-	reverseIndex    map[uint64][]uint64 //extentID=>[stream1, stream2]
-	discardOfStream map[uint64]int64
+	streams         map[STREAMno]*pb.StreamInfo
+	reverseIndex    map[EXTENTno]uint64 //extentID=>stream1
+	discardOfStream map[STREAMno]int64
 	utils.SafeMutex
 }
 
-func NewDiscardManager(si map[uint64]pb.StreamInfo) *discardManager {
+func NewDiscardManager(si map[uint64]*pb.StreamInfo) *discardManager {
 	dsm := &discardManager{
-		reverseIndex:    make(map[uint64][]uint64),
+		reverseIndex:    make(map[uint64]uint64),
 		discardOfStream: make(map[uint64]int64),
 	}
 
 	dsm.streams = si
 	for streamID, extentIDs := range si {
 		for _, extentID := range extentIDs.ExtentIDs {
-			dsm.reverseIndex[extentID] = append(dsm.reverseIndex[extentID], streamID)
+			dsm.reverseIndex[extentID] = streamID
 		}
 	}
 	return dsm
 }
 
-//input : map[exteintID]=>len(free data)
+//input : map[extentID]=>len(free data)
 func (dsm *discardManager) UpdateDiscardStats(stats map[uint64]int64) {
 	dsm.RLock()
 	defer dsm.RUnlock()
 	for extentID, discard := range stats {
-		for _, streamID := range dsm.reverseIndex[extentID] {
+		if streamID, ok := dsm.reverseIndex[extentID]; ok {
 			dsm.discardOfStream[streamID] += discard
 		}
 	}
-
 }
 
-func (dsm *discardManager) MaxDiscard() *pb.StreamInfo {
+func (dsm *discardManager) MaxDiscard() (*pb.StreamInfo, int64) {
 	dsm.RLock()
 	defer dsm.RUnlock()
 	maxDiscard := int64(0)
 	maxStreamID := uint64(0)
 	if len(dsm.discardOfStream) == 0 {
-		return nil
+		return nil, maxDiscard
 	}
 	for streamID, discard := range dsm.discardOfStream {
 		if maxDiscard < discard {
@@ -55,16 +58,21 @@ func (dsm *discardManager) MaxDiscard() *pb.StreamInfo {
 
 	}
 	ret := dsm.streams[maxStreamID]
-	return &ret
+	return ret, maxDiscard
 }
 
-func (dsm *discardManager) AddBlobStream(si pb.StreamInfo) {
+//update internal state from ne
+func (dsm *discardManager) MergeBlobStream(newBlobStream *pb.StreamInfo) {
+	if newBlobStream == nil {
+		return
+	}
 	dsm.Lock()
 	defer dsm.Unlock()
 
-	dsm.streams[si.StreamID] = si
 
-	for _, extentID := range si.ExtentIDs {
-		dsm.reverseIndex[extentID] = append(dsm.reverseIndex[extentID], extentID)
+	dsm.streams[newBlobStream.StreamID] = newBlobStream
+
+	for _, extentID := range newBlobStream.ExtentIDs {
+		dsm.reverseIndex[extentID] = newBlobStream.StreamID
 	}
 }

@@ -3,6 +3,7 @@ package range_partition
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/range_partition/y"
@@ -24,6 +25,15 @@ func (rp *RangePartition) writeValueLog(reqs []*request) ([]*pb.EntryInfo, value
 	extentID, offset, err := rp.logStream.AppendEntries(context.Background(), entries, rp.opt.MustSync)
 	if err != nil {
 		return nil, valuePointer{}, err
+	}
+
+	if (rp.logStream.NumOfExtents() > 3 && rp.logStream.CommitEnd() > rp.opt.TruncateSize) || rp.logStream.NumOfExtents() > 8 {
+		blobStream, err := rp.logStream.Truncate(context.Background(), extentID, rp.blobKey)
+		if err == nil {
+			rp.discard.MergeBlobStream(blobStream)
+		} else {
+			xlog.Logger.Errorf("Truncate error %v", err)
+		}
 	}
 
 	//FIXME
@@ -72,10 +82,13 @@ func replayLog(stream streamclient.StreamClient, startExtentID uint64, startOffs
 }
 
 //policy
+//FIXME	
 func (rp *RangePartition) pickLog(discardRatio float64) *pb.StreamInfo {
-	return rp.discard.MaxDiscard()
-
+	stream, holeSize := rp.discard.MaxDiscard()
+	fmt.Printf("picked stream %+v, holeSize is %+v", stream, holeSize)
+	return stream
 }
+
 
 func discardEntry(ei *pb.EntryInfo, vs y.ValueStruct) bool {
 	if vs.Version != y.ParseTs(ei.Log.Key) {
@@ -88,7 +101,17 @@ func discardEntry(ei *pb.EntryInfo, vs y.ValueStruct) bool {
 	return false
 }
 
+
+
+
 func (rp *RangePartition) runGC(discardRatio float64) {
+	if atomic.CompareAndSwapInt32(&rp.gcRunning, 0, 1) == false {
+		return
+	}
+	defer func(){
+		atomic.StoreInt32(&rp.gcRunning, 0)
+	}()
+
 	streamInfo := rp.pickLog(discardRatio)
 	if streamInfo == nil {
 		return
@@ -126,7 +149,7 @@ func (rp *RangePartition) runGC(discardRatio float64) {
 
 		//startKey <= userKey < endKey
 
-		vs := rp.getValueStruct(userKey, 0) //get the lasted version, do not support multiversion
+		vs := rp.getValueStruct(userKey, 0) //get the lasted version
 
 		if discardEntry(ei, vs) {
 			return true, nil

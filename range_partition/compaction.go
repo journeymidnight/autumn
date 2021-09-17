@@ -204,9 +204,11 @@ func (rp *RangePartition) removeTables(tbls []*table.Table) {
 }
 
 func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
+
 	if len(tbls) == 0 {
 		return
 	}
+
 	//tbls的顺序是在stream里面的顺序, 改为按照seqNum排序
 	//如果key完全一样, 在iter前面的优先级高
 	sort.Slice(tbls, func(i, j int) bool {

@@ -134,10 +134,10 @@ func (sm *StreamManager) MultiModifySplit(ctx context.Context, req *pb.MultiModi
 
 	
 
-	var garbageStreams pb.BlobStreams
-	garbageStreams.Unmarshal(data)
+	var blobStreams pb.BlobStreams
+	blobStreams.Unmarshal(data)
 
-	n := 1 + 2 + len(garbageStreams.Blobs) // 1 == new partID, 2 == rowStream + logStream
+	n := 1 + 2 + len(blobStreams.Blobs) // 1 == new partID, 2 == rowStream + logStream
 	
 	var ops []clientv3.Op
 	start, end, err := sm.allocUniqID(uint64(n))
@@ -170,8 +170,8 @@ func (sm *StreamManager) MultiModifySplit(ctx context.Context, req *pb.MultiModi
 
 
 	i := start + 2
-	for gabageStreamID := range garbageStreams.Blobs {
-		f, s, err = sm.duplicateStream(&ops, gabageStreamID, i, 0) 
+	for _, blobStreamID := range blobStreams.Blobs {
+		f, s, err = sm.duplicateStream(&ops, blobStreamID, i, 0) 
 		if err != nil {
 			return errDone(err)
 		}
@@ -189,11 +189,13 @@ func (sm *StreamManager) MultiModifySplit(ctx context.Context, req *pb.MultiModi
 		Rg:&pspb.Range{StartKey: req.MidKey, EndKey: meta.Rg.EndKey},
 		PartID: newPartID,
 	}
+
 	var newBlobStreams pb.BlobStreams
-	newBlobStreams.Blobs = make(map[uint64]uint64)
+	newBlobStreams.Blobs = make([]uint64, 0)
 	for i := start + 2; i < end -1 ; i ++ {
-		newBlobStreams.Blobs[i] = i
+		newBlobStreams.Blobs = append(newBlobStreams.Blobs, i)
 	}
+	
 	ops = append(ops, clientv3.OpPut(fmt.Sprintf("PART/%d", newPartID), string(utils.MustMarshal(&newMeta))))
 	
 	//update original meta's EndKey to midKEY

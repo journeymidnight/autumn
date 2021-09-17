@@ -366,17 +366,19 @@ message TruncateRequest {
 	string ownerKey = 3; //ownerKey, revision is used for locking
 	int64  revision = 4;
 	int64  sversion = 5;//当前stream的version,用来去重. client的sversion只会小于等于sm的sversion, 否则返回ClientStreamVersionTooHigh
-	string gabageKey = 6; //if gabageKey == "", delete extents, else "create new stream, and add it to gabageKey"
+	string blobKey = 6; //if blobKey == "", delete extents, else "create new stream, and add it to gabageKey"
 }
 
 message	BlobStreams {
-	map<uint64, uint64> blobs = 1;
+	//list of streamID
+	repeated uint64 blobs = 1;
 }
 
 message TruncateResponse {
 	Code code = 1;
 	string codeDes = 2;
-	BlobStreams blobs = 3;
+	StreamInfo updatedStreamInfo = 3;
+	StreamInfo blobStreamInfo = 4;
 }
 
 

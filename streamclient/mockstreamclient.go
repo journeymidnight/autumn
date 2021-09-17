@@ -105,7 +105,12 @@ func OpenMockStreamClient(si pb.StreamInfo, br *MockBlockReader) StreamClient {
 	}
 }
 
-func (client *MockStreamClient) End() uint32 {
+
+func (client *MockStreamClient) NumOfExtents() int{
+	return len(client.stream)
+}
+
+func (client *MockStreamClient) CommitEnd() uint32 {
 	//fake function
 	return 0
 }
@@ -114,7 +119,7 @@ func (client *MockStreamClient) CheckCommitLength() error {
 	return nil
 }
 
-func (client *MockStreamClient) Truncate(ctx context.Context, extentID uint64, gabageKey string) (*pb.BlobStreams , error) {
+func (client *MockStreamClient) Truncate(ctx context.Context, extentID uint64, gabageKey string) (*pb.StreamInfo , error) {
 
 	var i int
 	for i = range client.stream {

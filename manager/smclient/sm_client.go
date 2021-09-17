@@ -371,10 +371,11 @@ func (client *SMClient) StreamInfo(ctx context.Context, streamIDs []uint64) (map
 	return streamInfos, extentInfos, err	
 }
 
-func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, extentID uint64, ownerKey string, revision int64, sversion int64, gabageKey string) (*pb.BlobStreams ,error) {
-	err := ErrTimeOut
+//TruncateStream returns newBlobStream and updatedStream, all extents on newBlobStream should have be sealed
+func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, extentID uint64, ownerKey string, revision int64, sversion int64, blobKey string) (blobStream *pb.StreamInfo, updatedStream *pb.StreamInfo , err error) {
+	err = ErrTimeOut
 	var res *pb.TruncateResponse
-	var gabageStreams *pb.BlobStreams
+	//split only stream into two streams, [newBlobStream, updatedStream]
 	client.try(func(conn *grpc.ClientConn) bool {
 		c := pb.NewStreamManagerServiceClient(conn)
 		res, err = c.Truncate(ctx, &pb.TruncateRequest{
@@ -383,7 +384,7 @@ func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, ext
 			OwnerKey: ownerKey,
 			Revision: revision,
 			Sversion: sversion,
-			GabageKey: gabageKey,
+			BlobKey: blobKey,
 		})
 		
 		if err == context.Canceled || err == context.DeadlineExceeded {
@@ -401,11 +402,12 @@ func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, ext
 			}
 			return false
 		}
-		gabageStreams = res.Blobs
+		blobStream = res.BlobStreamInfo
+		updatedStream = res.UpdatedStreamInfo
 		return false
 	}, 500*time.Millisecond)
 
-	return gabageStreams, err	
+	return 
 }
 	
 
