@@ -259,6 +259,7 @@ func (lib *AutumnLib) Get(ctx context.Context, key []byte) ([]byte, error) {
 
 }
 
+
 func (lib *AutumnLib) Range(ctx context.Context, prefix []byte, start []byte, limit uint32) ([][]byte, bool, error) {
 	sortedRegions := lib.getRegions()
 	if len(sortedRegions) == 0 {
@@ -319,11 +320,34 @@ func (lib *AutumnLib) SplitPart(ctx context.Context, partID uint64) error {
 	conn := lib.getConn(lib.getPSAddr(sortedRegions[foundRegion].PSID))
 	client := pspb.NewPartitionKVClient(conn)
 	_, err := client.SplitPart(ctx, &pspb.SplitPartRequest{
-		PartID: partID,
+		Partid: partID,
 	})
 
 	return err
 }
+
+func (lib *AutumnLib) Maintenance(ctx context.Context, partID uint64, gc bool, compact bool) error {
+	sortedRegions := lib.getRegions()
+	foundRegion := -1
+	for i := 0; i < len(sortedRegions); i++ {
+		if sortedRegions[i].PartID == partID {
+			foundRegion = i
+		}
+	}
+	if foundRegion == -1 {
+		return errors.New("partition not found")
+	}
+
+	conn := lib.getConn(lib.getPSAddr(sortedRegions[foundRegion].PSID))
+	client  := pspb.NewPartitionKVClient(conn)
+	_, err := client.Maintenance(ctx, &pspb.MaintenanceRequest{
+		Partid: partID,
+		Gc:     gc,
+		MajorCompact: compact,
+	})
+	return err
+}
+
 
 func (lib *AutumnLib) Delete(ctx context.Context, key []byte) error {
 	var err error

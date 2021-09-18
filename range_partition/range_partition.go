@@ -35,7 +35,8 @@ var (
 )
 
 type OpenStreamFunc func(si pb.StreamInfo) streamclient.StreamClient
-type SetRowStreamTableFunc func(partID uint64, tables []*pspb.Location) error
+//type SetRowStreamTableFunc func(partID uint64, tables []*pspb.Location) error
+type SetETCDKV func(key, value string) error
 
 type RangePartition struct {
 	discard *discardManager
@@ -47,7 +48,6 @@ type RangePartition struct {
 	blockReader streamclient.BlockReader
 
 	rowStream       streamclient.StreamClient
-	logRotates      int32
 	writeCh         chan *request
 	blockWrites     int32
 	mt              *skiplist.Skiplist
@@ -57,7 +57,6 @@ type RangePartition struct {
 	flushStopper   *utils.Stopper
 	flushChan      chan flushTask
 	writeStopper   *utils.Stopper
-	compactStopper *utils.Stopper
 	tableLock      utils.SafeMutex //protect tables
 	tables         []*table.Table
 	seqNumber      uint64
@@ -73,7 +72,7 @@ type RangePartition struct {
 
 	//functions
 	openStream OpenStreamFunc //doGC, read log stream.
-	setLocs    SetRowStreamTableFunc
+	setKV  SetETCDKV
 
 
 
@@ -81,8 +80,12 @@ type RangePartition struct {
 	pickupTablePolicy PickupTables
 
 	hasOverlap uint32 //atomic
-	compactRunning int32
-	gcRunning  int32
+
+	majorCompactChan chan struct{}
+	compactStopper *utils.Stopper
+
+	gcRunChan 	     chan struct{}
+	gcStopper  	*utils.Stopper
 }
 
 //TODO
@@ -90,8 +93,8 @@ type RangePartition struct {
 
 func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	logStream streamclient.StreamClient, blockReader streamclient.BlockReader,
-	startKey []byte, endKey []byte, tableLocs []*pspb.Location, blobStreams []uint64,
-	setlocs SetRowStreamTableFunc,
+	startKey []byte, endKey []byte, tableLocs []*pspb.Location, blobStreams map[uint64]*pb.StreamInfo,
+	setKV SetETCDKV,
 	openStream OpenStreamFunc, opts ...OptionFunc,
 ) (*RangePartition, error) {
 
@@ -106,7 +109,6 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		rowStream:   rowStream,
 		logStream:   logStream,
 		blockReader: blockReader,
-		logRotates:  0,
 		mt:          skiplist.NewSkiplist(int64(opt.MaxSkipList)),
 		imm:         nil,
 		blockWrites: 0,
@@ -114,9 +116,10 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		EndKey:      endKey,
 		PartID:      id,
 		openStream:  openStream,
-		setLocs:     setlocs,
+		setKV:     setKV,
 		opt:         opt,
-		blobKey:     fmt.Sprintf("PARTSTATS/%d/blobStreams",id),	
+		blobKey:     fmt.Sprintf("PARTSTATS/%d/blobStreams",id),
+		discard:     NewDiscardManager(blobStreams),
 	}
 	rp.startMemoryFlush()
 
@@ -159,6 +162,9 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 			lastTable = rp.tables[i]
 		}
 	}
+
+	//ASSERT, FIXME
+	rp.CheckTableOrder(rp.tables)
 
 	//FIXME:poor performace: prefetch read will be better
 	replayedLog := 0
@@ -247,27 +253,8 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	}
 	
 	rp.startCompact()
+	rp.startGC()
 	//do compactions:FIXME, doCompactions放到另一个goroutine里面执行
-
-	/*
-		var tbls []*table.Table
-		rp.tableLock.RLock()
-		for _, t := range rp.tables {
-			tbls = append(tbls, t)
-		}
-		rp.tableLock.RUnlock()
-
-
-		if len(tbls) <= 1 {
-			return rp, nil
-		}
-
-		rp.doCompact(tbls, true)
-		rp.deprecateTables(tbls)
-		for _, t := range tbls {
-			t.DecrRef()
-		}
-	*/
 
 	return rp, nil
 }
@@ -461,10 +448,15 @@ func (rp *RangePartition) updateTableLocs(tableLocs []*pspb.Location) {
 	if len(tableLocs) == 0 {
 		return
 	}
-	// %+v\n", tableLocs)
+
+	key := fmt.Sprintf("PARTSTATS/%d/tables", rp.PartID)
+	var locations pspb.TableLocations
+	locations.Locs = tableLocs
+	data := utils.MustMarshal(&locations)
+
 	backoff := 100 * time.Millisecond
 	for {
-		err := rp.setLocs(rp.PartID, tableLocs)
+		err := rp.setKV(key, string(data))
 		if err != nil {
 			xlog.Logger.Errorf("failed to set tableLocs for %d, retry...", rp.PartID)
 			time.Sleep(2 * backoff)
@@ -783,7 +775,6 @@ func (rp *RangePartition) ensureRoomForWrite(entries []*pb.EntryInfo, head value
 	rp.Lock()
 	defer rp.Unlock()
 
-	forceFlush := atomic.LoadInt32(&rp.logRotates) >= 1
 	n := int64(0)
 	for i := range entries {
 		n += int64(estimatedSizeInSkl(entries[i].Log))
@@ -791,7 +782,7 @@ func (rp *RangePartition) ensureRoomForWrite(entries []*pb.EntryInfo, head value
 
 	utils.AssertTrue(n <= rp.opt.MaxSkipList)
 
-	if !forceFlush && rp.mt.MemSize()+n < rp.opt.MaxSkipList {
+	if rp.mt.MemSize()+n < rp.opt.MaxSkipList {
 		return nil
 	}
 	utils.AssertTrue(rp.mt != nil)
@@ -802,7 +793,6 @@ func (rp *RangePartition) ensureRoomForWrite(entries []*pb.EntryInfo, head value
 	select {
 	case rp.flushChan <- flushTask{mt: rp.mt, vptr: head, seqNum: seqNum, isCompact: false}:
 		// After every memtable flush, let's reset the counter.
-		atomic.StoreInt32(&rp.logRotates, 0)
 
 		// Ensure value log is synced to disk so this memtable's contents wouldn't be lost.
 
@@ -1022,6 +1012,7 @@ func (rp *RangePartition) close(gracefull bool) error {
 	atomic.StoreInt32(&rp.blockWrites, 1)
 
 	//FIXME: stop GC first
+	rp.gcStopper.Stop()
 	rp.compactStopper.Stop()
 	rp.writeStopper.Stop()
 	close(rp.writeCh)
@@ -1088,6 +1079,25 @@ func (rp *RangePartition) WriteAsync(key, value []byte, f func(error)) {
 
 }
 
+//submit a major compaction task 
+func (rp *RangePartition) SubmitCompaction() error{
+	select {
+	case rp.majorCompactChan <- struct{}{}:
+		return nil
+	default:
+		return errors.New("major compaction busy")
+	}
+}
+
+func (rp *RangePartition) SubmitGC() error {
+	select {
+	case rp.gcRunChan <- struct{}{}:
+		return nil
+	default:
+		return errors.New("gc busy")
+	}
+}
+
 func (rp *RangePartition) Delete(key []byte) error {
 	//search
 	vs := rp.getValueStruct(key, 0)
@@ -1109,6 +1119,44 @@ func (rp *RangePartition) Delete(key []byte) error {
 	}
 	return req.Wait()
 }
+
+
+
+//检查是否所有tables全局有序, 否则panic
+func (rp *RangePartition) CheckTableOrder(out []*table.Table) {
+
+	tbls := make([]*table.Table, 0, len(out))
+	copy(tbls, out)
+	//sort tbls by lastSeq
+	sort.Slice(tbls, func(i, j int) bool {
+		return tbls[i].LastSeq > tbls[j].LastSeq
+	})
+	//
+	index := make(map[string]uint64)
+
+	if len(tbls) < 2 {
+		return
+	}
+	
+	for _, tbl := range tbls {
+		it := tbl.NewIterator(false)
+		for ; it.Valid(); it.Next() {
+			userKey := y.ParseKey(it.Key())
+			ts := y.ParseTs(it.Key())
+			if prevTs, ok := index[string(userKey)]; ok {
+				if prevTs < ts {
+					panic(fmt.Sprintf("table order error, key is %s ,prevTs %d, ts %d on table %d", 
+					string(userKey), prevTs, ts, tbl.LastSeq))
+				}
+			} else {
+				index[string(userKey)] = ts
+			}
+		}
+	}
+
+}
+
+
 
 //req.Wait will free the request
 func (rp *RangePartition) Write(key, value []byte) error {
@@ -1167,12 +1215,4 @@ func (p *valuePointer) Decode(b []byte) {
 	// pointer alignment issues. See https://github.com/dgraph-io/badger/issues/1096
 	// and comment https://github.com/dgraph-io/badger/pull/1097#pullrequestreview-307361714
 	copy(((*[vptrSize]byte)(unsafe.Pointer(p))[:]), b[:vptrSize])
-}
-
-
-func (rp *RangePartition) RunMajorCompaction() {
-}
-//RunGC is an async function
-func (rp *RangePartition) RunGC(discardRatio float64) {
-	go rp.runGC(discardRatio)
 }

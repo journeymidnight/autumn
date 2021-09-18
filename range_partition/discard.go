@@ -1,6 +1,8 @@
 package range_partition
 
 import (
+	"fmt"
+
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
 )
@@ -13,22 +15,38 @@ type discardManager struct {
 	streams         map[STREAMno]*pb.StreamInfo
 	reverseIndex    map[EXTENTno]uint64 //extentID=>stream1
 	discardOfStream map[STREAMno]int64
+	dirty bool
+	stopper *utils.Stopper //goroutine to update discard stats
 	utils.SafeMutex
 }
 
 func NewDiscardManager(si map[uint64]*pb.StreamInfo) *discardManager {
-	dsm := &discardManager{
+	dm := &discardManager{
 		reverseIndex:    make(map[uint64]uint64),
 		discardOfStream: make(map[uint64]int64),
+		dirty: false,
 	}
 
-	dsm.streams = si
+	dm.streams = si
 	for streamID, extentIDs := range si {
 		for _, extentID := range extentIDs.ExtentIDs {
-			dsm.reverseIndex[extentID] = streamID
+			dm.reverseIndex[extentID] = streamID
 		}
 	}
-	return dsm
+	fmt.Printf("NewDiscardManager streams is %d\n", len(dm.streams))
+
+	//update discard stats from time to time
+	go func(){
+		for {
+
+			dm.UpdateDiscardStats(dm.discardOfStream)
+		}
+	}()
+	return dm
+}
+
+func (dsm *discardManager) Close() {
+
 }
 
 //input : map[extentID]=>len(free data)
@@ -45,6 +63,10 @@ func (dsm *discardManager) UpdateDiscardStats(stats map[uint64]int64) {
 func (dsm *discardManager) MaxDiscard() (*pb.StreamInfo, int64) {
 	dsm.RLock()
 	defer dsm.RUnlock()
+
+	if len(dsm.streams) == 0 {
+		return nil, 0
+	}
 	maxDiscard := int64(0)
 	maxStreamID := uint64(0)
 	if len(dsm.discardOfStream) == 0 {
@@ -69,7 +91,9 @@ func (dsm *discardManager) MergeBlobStream(newBlobStream *pb.StreamInfo) {
 	dsm.Lock()
 	defer dsm.Unlock()
 
-
+	if len(dsm.streams) == 0 {
+		return
+	}
 	dsm.streams[newBlobStream.StreamID] = newBlobStream
 
 	for _, extentID := range newBlobStream.ExtentIDs {

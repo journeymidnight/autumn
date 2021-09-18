@@ -910,6 +910,10 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 		blobs.Blobs = append(blobs.Blobs, newBlobStreamID)
 
 		sdata := utils.MustMarshal(newBlobStream)
+
+		fmt.Printf("space: %s, update blobs from %+v\n", req.BlobKey, blobs.Blobs)
+		fmt.Printf("space: %s, update blobs to %+v\n", req.BlobKey, blobs.Blobs)
+
 		//transfer old extent to new stream
 		//add add stream to gabages
 		ops = append(ops, clientv3.OpPut(formatStreamKey(newBlobStreamID), string(sdata)))

@@ -118,15 +118,22 @@ func (p DefaultPickupPolicy) PickupTables(tbls []*table.Table) ([]*table.Table, 
 		return tbls[i].LastSeq < tbls[j].LastSeq
 	})
 	
-	for i := 0; i < len(tbls) && i < p.n; i++ {
-		if tbls[i].EstimatedSize < uint64(math.Round(p.compactRatio*float64(p.opt.MaxSkipList))) {
-			if len(compactTbls) == 0 && i > 0 {
+	throttle := uint64(math.Round(p.compactRatio*float64(p.opt.MaxSkipList)))
+
+	for i := 0; i < len(tbls); i++ {
+		for tbls[i].EstimatedSize < throttle && i < len(tbls) && len(compactTbls) < p.n {
+			//merge to older and larger SSTables
+			if i > 0 && len(compactTbls) == 0 {
 				compactTbls = append(compactTbls, tbls[i-1])
-			} else {
+			}
+			compactTbls = append(compactTbls, tbls[i])
+			i ++
+		}
+		if len(compactTbls) > 0 {
+			//corner case : 1, 100, 100, 100
+			if len(compactTbls) == 1 {
 				compactTbls = append(compactTbls, tbls[i])
 			}
-		} else if len(compactTbls) > 0 {
-			compactTbls = append(compactTbls, tbls[i])
 			break
 		}
 	}
@@ -140,17 +147,41 @@ func (p DefaultPickupPolicy) PickupTables(tbls []*table.Table) ([]*table.Table, 
 
 func (rp *RangePartition) startCompact() {
 	rp.compactStopper = utils.NewStopper()
+	rp.majorCompactChan = make(chan struct{},1)
 	//only one compact goroutine
 	rp.compactStopper.RunWorker(rp.compact)
 }
+
 
 
 func (rp *RangePartition) compact() {
 	randTicker := utils.NewRandomTicker(10*time.Second, 20*time.Second)
 	for {
 		select {
-		// Can add a done channel or other stuff.
-		case <-randTicker.C:
+		case <- rp.majorCompactChan:
+			rp.tableLock.RLock()
+			allTables := make([]*table.Table, 0, len(rp.tables))
+			for _, t := range rp.tables {
+				allTables = append(allTables, t)
+			}
+			rp.tableLock.RUnlock()
+			if len(allTables) == 0 {
+				return
+			}
+			eID := allTables[len(allTables)- 1].Loc.ExtentID
+			fmt.Printf("do major compaction tasks for tables %+v\n", allTables)
+			rp.doCompact(allTables, true)
+			rp.removeTables(allTables)
+			if eID != 0 {
+				//last table's meta extentd
+				_, err := rp.rowStream.Truncate(context.Background(), eID, "")
+				if err != nil {
+					xlog.Logger.Warnf("LOG Truncate extent %d error %v", eID, err)
+				}
+			}
+			fmt.Printf("fininshed major compaction tasks for tables %+v\n", allTables)
+
+		case <- randTicker.C:
 			rp.tableLock.RLock()
 			allTables := make([]*table.Table, 0, len(rp.tables))
 			for _, t := range rp.tables {
@@ -162,7 +193,7 @@ func (rp *RangePartition) compact() {
 			if len(compactTables) == 0 {
 				continue
 			}
-			fmt.Printf("do compaction tasks for tables %+v\n", compactTables)
+			fmt.Printf("do minor compaction tasks for tables %+v\n", compactTables)
 			rp.doCompact(compactTables, false)
 			rp.removeTables(compactTables)
 			//truncate
@@ -173,6 +204,8 @@ func (rp *RangePartition) compact() {
 					xlog.Logger.Warnf("LOG Truncate extent %d error %v", eID, err)
 				}
 			}
+			fmt.Printf("finished minor compaction tasks for tables %+v\n", compactTables)
+
 		case <-rp.compactStopper.ShouldStop():
 			randTicker.Stop()
 			return
@@ -232,12 +265,12 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 	it.Rewind()
 
 	//FIXME
-	discardStats := make(map[uint32]int64)
+	discardStats := make(map[uint64]int64)
 	updateStats := func(vs y.ValueStruct) {
-		if vs.Meta&y.BitValuePointer > 0 { //big Value
+		if (vs.Meta & y.BitValuePointer) > 0 { //big Value
 			var vp valuePointer
 			vp.Decode(vs.Value)
-			discardStats[uint32(vp.extentID)] += int64(vp.len)
+			discardStats[vp.extentID] += int64(vp.len)
 		}
 	}
 
@@ -299,7 +332,8 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 		<-resultCh
 	}
 
-
+	rp.discard.UpdateDiscardStats(discardStats)
+	
 	//在这个时间, 虽然有可能memstore还没有完全刷下去, 但是rp.Close调用会等待flushTask全部执行完成.
 	//另外, 在分裂时选择midKey后, 会有一个assert确保midKey在startKey和endKey之间
 	if major {

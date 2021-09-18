@@ -272,12 +272,12 @@ func bootstrap(c *cli.Context) error {
 }
 
 func del(c *cli.Context) error {
-	etcdUrls := utils.SplitAndTrim(c.String("etcdUrls"), ",")
-	client := autumn_clientv1.NewAutumnLib(etcdUrls)
-	//defer client.Close()
-	if err := client.Connect(); err != nil {
+	client, err := connectToAutumn(c)
+	if err != nil {
 		return err
 	}
+	defer client.Close()
+
 	key := c.Args().First()
 	if len(key) == 0 {
 		return errors.New("no key")
@@ -288,13 +288,12 @@ func del(c *cli.Context) error {
 }
 
 func get(c *cli.Context) error {
-	etcdUrls := utils.SplitAndTrim(c.String("etcdUrls"), ",")
-	client := autumn_clientv1.NewAutumnLib(etcdUrls)
-	//defer client.Close()
-
-	if err := client.Connect(); err != nil {
+	client, err := connectToAutumn(c)
+	if err != nil {
 		return err
 	}
+	defer client.Close()
+
 	key := c.Args().First()
 	if len(key) == 0 {
 		return errors.New("no key")
@@ -311,11 +310,10 @@ func get(c *cli.Context) error {
 }
 
 func autumnRange(c *cli.Context) error {
-	etcdUrls := utils.SplitAndTrim(c.String("etcdUrls"), ",")
-	if len(etcdUrls) == 0 {
-		return errors.Errorf("etcdUrls is nil")
+	client, err := connectToAutumn(c)
+	if err != nil {
+		return err
 	}
-	client := autumn_clientv1.NewAutumnLib(etcdUrls)
 	defer client.Close()
 
 	if err := client.Connect(); err != nil {
@@ -324,7 +322,6 @@ func autumnRange(c *cli.Context) error {
 	start := c.String("start")
 	prefix := c.String("prefix")
 	limit := c.Int("limit")
-	var err error
 
 	if len(start) == 0 && len(prefix) > 0 {
 		start = prefix
@@ -346,12 +343,11 @@ func autumnRange(c *cli.Context) error {
 
 //FIXME: grpc stream is better to send big values
 func put(c *cli.Context) error {
-	etcdUrls := utils.SplitAndTrim(c.String("etcdUrls"), ",")
-	if len(etcdUrls) == 0 {
-		return errors.Errorf("etcdUrls is nil")
+	client, err := connectToAutumn(c)
+	if err != nil {
+		return err
 	}
-	client := autumn_clientv1.NewAutumnLib(etcdUrls)
-	//defer client.Close()
+	defer client.Close()
 
 	if err := client.Connect(); err != nil {
 		return err
@@ -375,17 +371,50 @@ func put(c *cli.Context) error {
 	return nil
 }
 
-func splitPartition(c *cli.Context) error {
-	etcdUrls := utils.SplitAndTrim(c.String("etcdUrls"), ",")
-	if len(etcdUrls) == 0 {
-		return errors.Errorf("etcdUrls is nil")
-	}
-	client := autumn_clientv1.NewAutumnLib(etcdUrls)
-
-	if err := client.Connect(); err != nil {
+func gc(c *cli.Context) error {
+	client, err := connectToAutumn(c)
+	if err != nil {
 		return err
 	}
+	defer client.Close()
+	partIDString := c.Args().First()
 
+	if len(partIDString) == 0 {
+		return errors.New("partID is nil")
+
+	}
+	partID, err := strconv.ParseUint(partIDString, 10, 64)
+	if err != nil {
+		return errors.Errorf("partID is not int: %s", partIDString)
+	}
+	return client.Maintenance(context.Background(), partID, true, false)
+}
+
+
+func compact(c *cli.Context) error {
+	client, err := connectToAutumn(c)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	partIDString := c.Args().First()
+
+	if len(partIDString) == 0 {
+		return errors.New("partID is nil")
+
+	}
+	partID, err := strconv.ParseUint(partIDString, 10, 64)
+	if err != nil {
+		return errors.Errorf("partID is not int: %s", partIDString)
+	}
+	return client.Maintenance(context.Background(), partID, false, true)
+}
+
+func splitPartition(c *cli.Context) error {
+	client, err := connectToAutumn(c)
+	if err != nil {
+		return err
+	}
 	defer client.Close()
 
 	partIDString := c.Args().First()
@@ -480,6 +509,23 @@ func main() {
 			},
 			Action: splitPartition,
 		},
+		{
+			Name:  "gc",
+			Usage: "gc --etcdUrls <addrs> <PARTID>",
+			Flags: []cli.Flag{
+				&cli.StringFlag{Name: "etcdUrls", Value: "127.0.0.1:2379"},
+			},
+			Action: gc,
+		},
+		{
+			Name:  "compact",
+			Usage: "compact --etcdUrls <addrs> <PARTID>",
+			Flags: []cli.Flag{
+				&cli.StringFlag{Name: "etcdUrls", Value: "127.0.0.1:2379"},
+			},
+			Action: compact,
+		},
+
 		{
 			Name:  "wbench",
 			Usage: "wbench --etcdUrls <addrs> --thread <num> --duration <duration>",
@@ -671,4 +717,16 @@ func printSummary(elapsed time.Duration, totalCount uint64, totalSize uint64, th
 	fmt.Printf("Requests per second :%.2f [#/sec]\n", float64(totalCount)/elapsed.Seconds())
 	fmt.Printf("Throughput per second :%s\n", utils.HumanReadableThroughput(t))
 	fmt.Printf("Latency in millisecond p50, p95, p99: %v\n", hist.Histgram([]float64{50, 95, 99}, nil))
+}
+
+func connectToAutumn(c *cli.Context) (*autumn_clientv1.AutumnLib, error) {
+	etcdUrls := utils.SplitAndTrim(c.String("etcdUrls"), ",")
+	if len(etcdUrls) == 0 {
+		return nil, errors.Errorf("etcdUrls is nil")
+	}
+	client := autumn_clientv1.NewAutumnLib(etcdUrls)
+	if err := client.Connect(); err != nil {
+		return nil, err
+	}
+	return client, nil
 }
