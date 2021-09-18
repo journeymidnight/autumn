@@ -328,28 +328,26 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, locs []
 		return streamclient.NewStreamClient(ps.smClient, ps.extentManager, si.StreamID, streamclient.MutexToLock(mutex))
 	}
 
-	setRowStreamTables :=  func(id uint64, tables []*pspb.Location) error {
-		utils.AssertTrue(id == meta.PartID)
-
-		var locations pspb.TableLocations
-		locations.Locs = tables
-		data := utils.MustMarshal(&locations)
-		//make sure lock
-	
+	setETCDKV :=  func(key, value string) error {
 		return etcd_utils.EtcdSetKVS(ps.etcdClient, 
 			[]clientv3.Cmp{clientv3.Compare(clientv3.CreateRevision(mutex.Key()), "=", mutex.Header().Revision)},
-		    []clientv3.Op{clientv3.OpPut(fmt.Sprintf("PARTSTATS/%d/tables", meta.PartID), string(data)),
+		    []clientv3.Op{clientv3.OpPut(key, value),
 		})
 	}
-
 
 
 	utils.AssertTrue(meta.Rg != nil)
 	utils.AssertTrue(meta.PartID != 0)
 
 
+	//get blobStreams from blobs
+	blobStreams, _, err := ps.smClient.StreamInfo(context.Background(), blobs)
+	if err != nil {
+		xlog.Logger.Errorf(err.Error())
+	}
+
 	rp, err := range_partition.OpenRangePartition(meta.PartID, row, log, ps.blockReader, meta.Rg.StartKey, meta.Rg.EndKey, locs,
-		blobs, setRowStreamTables, openStream, 
+		blobStreams, setETCDKV, openStream, 
 		range_partition.DefaultOption(), 
 		range_partition.WithMaxSkipList(16<<20),
 		range_partition.WithSync(ps.config.MustSync),

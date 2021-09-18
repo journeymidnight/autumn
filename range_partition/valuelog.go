@@ -3,7 +3,6 @@ package range_partition
 import (
 	"context"
 	"fmt"
-	"sync/atomic"
 
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/range_partition/y"
@@ -22,15 +21,16 @@ func (rp *RangePartition) writeValueLog(reqs []*request) ([]*pb.EntryInfo, value
 		entries = append(entries, req.entries...)
 	}
 
-	extentID, offset, err := rp.logStream.AppendEntries(context.Background(), entries, rp.opt.MustSync)
+	extentID, tail, err := rp.logStream.AppendEntries(context.Background(), entries, rp.opt.MustSync)
 	if err != nil {
 		return nil, valuePointer{}, err
 	}
 
-	if (rp.logStream.NumOfExtents() > 3 && rp.logStream.CommitEnd() > rp.opt.TruncateSize) || rp.logStream.NumOfExtents() > 8 {
+	if (rp.logStream.NumOfExtents() > 2 && rp.logStream.CommitEnd() > rp.opt.TruncateSize) || rp.logStream.NumOfExtents() > 5 {
 		blobStream, err := rp.logStream.Truncate(context.Background(), extentID, rp.blobKey)
-		if err == nil {
+		if err == nil{
 			rp.discard.MergeBlobStream(blobStream)
+			fmt.Printf("truncated log on extent %d for space %s, new stream is %d\n", extentID, rp.blobKey, blobStream.StreamID)
 		} else {
 			xlog.Logger.Errorf("Truncate error %v", err)
 		}
@@ -38,7 +38,7 @@ func (rp *RangePartition) writeValueLog(reqs []*request) ([]*pb.EntryInfo, value
 
 	//FIXME
 	//if rp.logStream.Size() > 4GB then rp.logStream.Truncate()
-	return entries, valuePointer{extentID: extentID, offset: offset}, nil
+	return entries, valuePointer{extentID: extentID, offset: tail}, nil
 }
 
 func replayLog(stream streamclient.StreamClient, startExtentID uint64, startOffset uint32, replay bool, replayFunc func(*pb.EntryInfo) (bool, error)) error {
@@ -102,16 +102,25 @@ func discardEntry(ei *pb.EntryInfo, vs y.ValueStruct) bool {
 }
 
 
+func (rp *RangePartition) startGC() {
+	rp.gcStopper = utils.NewStopper()
+	rp.gcRunChan = make(chan struct{}, 1)
+	//only one compact goroutine
+	rp.gcStopper.RunWorker(func() {
+		for {
+			select {
+				case <- rp.gcStopper.ShouldStop():
+					return
+				case <- rp.gcRunChan:
+					rp.runGC(0.5)
+			}
+		}
+	})
+}
+
 
 
 func (rp *RangePartition) runGC(discardRatio float64) {
-	if atomic.CompareAndSwapInt32(&rp.gcRunning, 0, 1) == false {
-		return
-	}
-	defer func(){
-		atomic.StoreInt32(&rp.gcRunning, 0)
-	}()
-
 	streamInfo := rp.pickLog(discardRatio)
 	if streamInfo == nil {
 		return

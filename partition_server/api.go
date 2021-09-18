@@ -116,12 +116,37 @@ func (ps *PartitionServer) Range(ctx context.Context, req *pspb.RangeRequest) (*
 	}, nil
 }
 
-func (ps *PartitionServer) SplitPart(ctx context.Context, req *pspb.SplitPartRequest) (*pspb.SplitPartResponse, error) {
+
+func (ps *PartitionServer) Maintenance(ctx context.Context, req *pspb.MaintenanceRequest) (*pspb.MaintenanceResponse, error) {
 	ps.RLock()
-	rp := ps.rangePartitions[req.PartID]
+	rp := ps.rangePartitions[req.Partid]
 	ps.RUnlock()
 	if rp == nil {
-		fmt.Printf("no such rp %d\n", req.PartID)
+		fmt.Printf("no such rp %d\n", req.Partid)
+		return nil, errors.New("no such partid")
+	}
+
+	if req.Gc && req.MajorCompact {
+		return nil, errors.New("gc and major compact can not be both true")
+	}
+
+	var err error
+	
+	if req.Gc {
+		err = rp.SubmitGC()
+	} else if req.MajorCompact {
+		err = rp.SubmitCompaction()
+	}
+
+	return &pspb.MaintenanceResponse{}, err
+}
+
+func (ps *PartitionServer) SplitPart(ctx context.Context, req *pspb.SplitPartRequest) (*pspb.SplitPartResponse, error) {
+	ps.RLock()
+	rp := ps.rangePartitions[req.Partid]
+	ps.RUnlock()
+	if rp == nil {
+		fmt.Printf("no such rp %d\n", req.Partid)
 		return nil, errors.New("no such partid")
 	}
 	
@@ -134,30 +159,23 @@ func (ps *PartitionServer) SplitPart(ctx context.Context, req *pspb.SplitPartReq
 	if !ok {
 		return nil, errors.New("ps has no lock on partID")
 	}
-	defer func() {
-		ps.Lock()
-		delete(ps.rangePartitionLocks, rp.PartID)
-		ps.Unlock()
-		mutex.Unlock(context.Background())
-	}()
+
 
 
 	//stop incoming requests and make sure only one is calling "rp.Close, rp.Split"
 	ps.Lock()
-	if _, ok := ps.rangePartitions[req.PartID] ; !ok {
+	if _, ok := ps.rangePartitions[req.Partid] ; !ok {
 		ps.Unlock()
 		return nil, errors.New("no such partid")
 	}
-	delete(ps.rangePartitions, req.PartID)
+	delete(ps.rangePartitions, req.Partid)
 	ps.Unlock()
 
 
-	
-	midKey := rp.GetSplitPoint()
 
-	if len(midKey) == 0 {
-		return nil, errors.New("mid key is zero")
-	}
+
+
+	midKey := rp.GetSplitPoint()
 	
 
 	rp.Close()
@@ -166,13 +184,14 @@ func (ps *PartitionServer) SplitPart(ctx context.Context, req *pspb.SplitPartReq
 	xlog.Logger.Infof("rp %d is closed", rp.PartID)
 	
 	
-	//LogRowStreamEnd MUST called before rp.Close()
+	//LogRowStreamEnd MUST be called after rp.Close()
 	//sm service use logEnd and rowEnd to seal log stream and row stream
 	logEnd, rowEnd := rp.LogRowStreamEnd()
+	rp = nil
 
 	backOffTime := time.Second
 	for {
-		err := ps.smClient.MultiModifySplit(ctx, rp.PartID, midKey, mutex.Key(), mutex.Header().Revision, logEnd, rowEnd)
+		err := ps.smClient.MultiModifySplit(ctx, req.Partid, midKey, mutex.Key(), mutex.Header().Revision, logEnd, rowEnd)
 		xlog.Logger.Infof("range partionion %d split: resut is %v", err)
 		if err == nil {
 			break
@@ -187,6 +206,15 @@ func (ps *PartitionServer) SplitPart(ctx context.Context, req *pspb.SplitPartReq
 			return nil, err
 		}
 	}
+
+	defer func() {
+		//release distributed lock
+		ps.Lock()
+		delete(ps.rangePartitionLocks, req.Partid)
+		ps.Unlock()
+		mutex.Unlock(context.Background())
+	}()
+
 	return &pspb.SplitPartResponse{
 	},nil
 }

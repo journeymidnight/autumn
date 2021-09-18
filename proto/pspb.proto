@@ -171,12 +171,20 @@ message RangeResponse {
 
 
 message SplitPartRequest {
-	uint64 PartID = 1;
+	uint64 partid = 1;
 }
 
 message SplitPartResponse {
 }
 
+message MaintenanceRequest {
+	uint64 partid = 1;
+	bool gc = 2;
+	bool majorCompact = 3;
+}
+
+message MaintenanceResponse {
+}
 
 service PartitionKV {
 	/*
@@ -194,4 +202,5 @@ service PartitionKV {
 	//ps management API
 	//system performace
 	rpc SplitPart(SplitPartRequest) returns (SplitPartResponse) {}
+	rpc Maintenance(MaintenanceRequest) returns (MaintenanceResponse) {}
 }
