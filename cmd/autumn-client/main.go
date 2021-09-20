@@ -50,9 +50,9 @@ const (
 	WRITE_T           = "write"
 )
 
-func benchmark(etcdUrlss []string, op BenchType, threadNum int, duration int, size int) error {
+func benchmark(etcdUrls []string, op BenchType, threadNum int, duration int, size int) error {
 
-	client := autumn_clientv1.NewAutumnLib(etcdUrlss)
+	client := autumn_clientv1.NewAutumnLib(etcdUrls)
 	//defer client.Close()
 
 	if err := client.Connect(); err != nil {
@@ -208,7 +208,7 @@ func benchmark(etcdUrlss []string, op BenchType, threadNum int, duration int, si
 
 func bootstrap(c *cli.Context) error {
 
-	etcdUrls := utils.SplitAndTrim(c.String("etcdUrls"), ",")
+	etcdUrls := utils.SplitAndTrim(c.String("etcd-urls"), ",")
 	etcdClient, err := clientv3.New(clientv3.Config{
 		Endpoints:   etcdUrls,
 		DialTimeout: time.Second,
@@ -217,7 +217,7 @@ func bootstrap(c *cli.Context) error {
 		return err
 	}
 
-	smUrlss := utils.SplitAndTrim(c.String("smUrls"), ",")
+	smUrlss := utils.SplitAndTrim(c.String("sm-urls"), ",")
 
 	smc := smclient.NewSMClient(smUrlss)
 	if err := smc.Connect(); err != nil {
@@ -273,7 +273,7 @@ func bootstrap(c *cli.Context) error {
 }
 
 func del(c *cli.Context) error {
-	etcdUrls := utils.SplitAndTrim(c.String("etcdUrls"), ",")
+	etcdUrls := utils.SplitAndTrim(c.String("etcd-urls"), ",")
 	client := autumn_clientv1.NewAutumnLib(etcdUrls)
 	//defer client.Close()
 	if err := client.Connect(); err != nil {
@@ -290,7 +290,7 @@ func del(c *cli.Context) error {
 
 
 func head(c *cli.Context) error {
-	etcdUrls := utils.SplitAndTrim(c.String("etcdUrls"), ",")
+	etcdUrls := utils.SplitAndTrim(c.String("etcd-urls"), ",")
 	client := autumn_clientv1.NewAutumnLib(etcdUrls)
 	if err := client.Connect(); err != nil {
 		return err
@@ -311,7 +311,7 @@ func head(c *cli.Context) error {
 }
 
 func get(c *cli.Context) error {
-	etcdUrls := utils.SplitAndTrim(c.String("etcdUrls"), ",")
+	etcdUrls := utils.SplitAndTrim(c.String("etcd-urls"), ",")
 	client := autumn_clientv1.NewAutumnLib(etcdUrls)
 
 	if err := client.Connect(); err != nil {
@@ -335,7 +335,7 @@ func get(c *cli.Context) error {
 }
 
 func autumnRange(c *cli.Context) error {
-	etcdUrls := utils.SplitAndTrim(c.String("etcdUrls"), ",")
+	etcdUrls := utils.SplitAndTrim(c.String("etcd-urls"), ",")
 	if len(etcdUrls) == 0 {
 		return errors.Errorf("etcdUrls is nil")
 	}
@@ -370,7 +370,7 @@ func autumnRange(c *cli.Context) error {
 
 //FIXME: grpc stream is better to send big values
 func put(c *cli.Context) error {
-	etcdUrls := utils.SplitAndTrim(c.String("etcdUrls"), ",")
+	etcdUrls := utils.SplitAndTrim(c.String("etcd-urls"), ",")
 	if len(etcdUrls) == 0 {
 		return errors.Errorf("etcdUrls is nil")
 	}
@@ -400,7 +400,7 @@ func put(c *cli.Context) error {
 }
 
 func splitPartition(c *cli.Context) error {
-	etcdUrls := utils.SplitAndTrim(c.String("etcdUrls"), ",")
+	etcdUrls := utils.SplitAndTrim(c.String("etcd-urls"), ",")
 	if len(etcdUrls) == 0 {
 		return errors.Errorf("etcdUrls is nil")
 	}
@@ -426,8 +426,8 @@ func splitPartition(c *cli.Context) error {
 }
 
 func info(c *cli.Context) error {
-	smUrlss := utils.SplitAndTrim(c.String("smUrls"), ",")
-	client := smclient.NewSMClient(smUrlss)
+	smUrls := utils.SplitAndTrim(c.String("sm-urls"), ",")
+	client := smclient.NewSMClient(smUrls)
 	if err := client.Connect(); err != nil {
 		return err
 	}
@@ -454,19 +454,19 @@ func main() {
 	app.Commands = []*cli.Command{
 		{
 			Name:  "info",
-			Usage: "info --smUrls <path>",
+			Usage: "info --sm-urls <path>",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "smUrls", Value: "127.0.0.1:3401"},
+				&cli.StringFlag{Name: "sm-urls", Value: "127.0.0.1:3401"},
 			},
 			Action: info,
 		},
 
 		{
 			Name:  "bootstrap",
-			Usage: "bootstrap -smUrls <addrs> --etcdUrls <addrs>",
+			Usage: "bootstrap --sm-urls <addrs> --etcd-urls <addrs>",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "smUrls", Value: "127.0.0.1:3401"},
-				&cli.StringFlag{Name: "etcdUrls", Value: "127.0.0.1:2379"},
+				&cli.StringFlag{Name: "sm-urls", Value: "127.0.0.1:3401"},
+				&cli.StringFlag{Name: "etcd-urls", Value: "127.0.0.1:2379"},
 				&cli.StringFlag{Name: "replication", Value:"2+1"},
 			},
 			Action: bootstrap,
@@ -474,9 +474,9 @@ func main() {
 
 		{
 			Name:  "put",
-			Usage: "put --etcdUrls <addrs> <KEY> <FILE>",
+			Usage: "put --etcd-urls <addrs> <KEY> <FILE>",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "etcdUrls", Value: "127.0.0.1:2379"},
+				&cli.StringFlag{Name: "etcd-urls", Value: "127.0.0.1:2379"},
 			},
 			Action: put,
 		},
@@ -484,39 +484,39 @@ func main() {
 			Name:  "get",
 			Usage: "get --etcdUrls <addrs> <KEY>",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "etcdUrls", Value: "127.0.0.1:2379"},
+				&cli.StringFlag{Name: "etcd-urls", Value: "127.0.0.1:2379"},
 			},
 			Action: get,
 		},
 		{
 			Name:  "head",
-			Usage: "head --etcdUrls <addrs> <KEY>",
+			Usage: "head --etcd-urls <addrs> <KEY>",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "etcdUrls", Value: "127.0.0.1:2379"},
+				&cli.StringFlag{Name: "etcd-urls", Value: "127.0.0.1:2379"},
 			},
 			Action: head,
 		},
 		{
 			Name:  "del",
-			Usage: "del --etcdUrls <addrs> <KEY>",
+			Usage: "del --etcd-urls <addrs> <KEY>",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "etcdUrls", Value: "127.0.0.1:2379"},
+				&cli.StringFlag{Name: "etcd-urls", Value: "127.0.0.1:2379"},
 			},
 			Action: del,
 		},
 		{
 			Name:  "split",
-			Usage: "split --etcdUrls <addrs> <PARTID>",
+			Usage: "split --etcd-urls <addrs> <PARTID>",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "etcdUrls", Value: "127.0.0.1:2379"},
+				&cli.StringFlag{Name: "etcd-urls", Value: "127.0.0.1:2379"},
 			},
 			Action: splitPartition,
 		},
 		{
 			Name:  "wbench",
-			Usage: "wbench --etcdUrls <addrs> --thread <num> --duration <duration>",
+			Usage: "wbench --etcd-urls <addrs> --thread <num> --duration <duration>",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "etcdUrls", Value: "127.0.0.1:2379"},
+				&cli.StringFlag{Name: "etcd-urls", Value: "127.0.0.1:2379"},
 				&cli.IntFlag{Name: "thread", Value: 4, Aliases: []string{"t"}},
 				&cli.IntFlag{Name: "duration", Value: 10, Aliases: []string{"d"}},
 				&cli.IntFlag{Name: "size", Value: 8192, Aliases: []string{"s"}},
@@ -530,9 +530,9 @@ func main() {
 		},
 		{
 			Name:  "ls",
-			Usage: "ls --etcdUrls <addrs> <prefix>",
+			Usage: "ls --etcd-urls <addrs> <prefix>",
 			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "etcdUrls", Value: "127.0.0.1:2379"},
+				&cli.StringFlag{Name: "etcd-urls", Value: "127.0.0.1:2379"},
 				&cli.StringFlag{Name: "start", Value: ""},
 				&cli.StringFlag{Name: "prefix", Value: ""},
 				&cli.Int64Flag{Name: "limit", Value: math.MaxUint32},
@@ -682,11 +682,10 @@ func format(c *cli.Context) error {
 
 func wbench(c *cli.Context) error {
 	threadNum := c.Int("thread")
-	etcdUrls := c.String("etcdUrls")
 	duration := c.Int("duration")
 	size := c.Int("size")
-	etcdUrlss := utils.SplitAndTrim(etcdUrls, ",")
-	return benchmark(etcdUrlss, WRITE_T, threadNum, duration, size)
+	etcdUrls := utils.SplitAndTrim(c.String("etcd-urls"), ",")
+	return benchmark(etcdUrls, WRITE_T, threadNum, duration, size)
 }
 
 func printSummary(elapsed time.Duration, totalCount uint64, totalSize uint64, threadNum int, size int, hist * utils.HistogramStatus) {

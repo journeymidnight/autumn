@@ -1,1 +1,1 @@
-./autumn-client bootstrap --etcdAddr stream-manager:2379 --smAddr stream-manager:3401 --replication  1
+docker-compose exec -T stream-manager bash -c './autumn-client bootstrap --replication  1'
