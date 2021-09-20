@@ -66,4 +66,16 @@ jobs:
           password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN}}  
     - name: Push image
       run : docker push journeymidnight/autumn:latest
-
+  Benchmark:
+    runs-on: ubuntu-latest
+    needs: Deploy
+    if: github.ref == 'refs/heads/main'
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+    - name: Start cluster
+      run: cd contrib/docker/ && docker-compose up -d
+    - name: Bootstrap
+      run: sleep 5 && cd contrib/docker/ && sh bootstrap.sh
+    - name: Bench
+      run: cd contrib/docker && sh bench.sh
