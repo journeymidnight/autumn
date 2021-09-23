@@ -82,6 +82,7 @@ message ReadBlocksRequest {
 	uint32 offset = 2;
 	uint32 numOfBlocks = 3;
 	uint64 eversion = 4;
+	bool onlyLastBlock = 5;
 }
 
 message ReadBlocksResponse {
@@ -125,7 +126,7 @@ message SealResponse {
 message ReadEntriesRequest {
 	uint64 extentID = 1;
 	uint32 offset = 2;
-	uint32 replay = 3;
+	bool replay = 3;
 	uint64 eversion = 4;
 }
 
@@ -270,7 +271,6 @@ message StreamAllocExtentRequest {
 	string ownerKey = 2; //ownerKey, revision is used for locking
 	int64 revision = 3;
 	uint32 end = 4;
-	int64 sversion = 5;
 }
 
 message StreamAllocExtentResponse {
@@ -280,30 +280,6 @@ message StreamAllocExtentResponse {
 	ExtentInfo lastExInfo = 4;//主要是发送lastExInfo.eversion, 客户端waitforversion
 }
 
-/*
-message StreamAllocExtentRequest{
-	uint64 streamID = 1;
-	uint64 extentToSeal = 2;
-	string ownerKey = 5; //ownerKey, revision is used for locking
-	int64  revision = 6;
-	uint32 checkCommitLength = 7; //if checkCommitLength > 0, do not use end.
-	                              //if checkCommitLength ==0, end is the sealedlength, and all nodes are avaliable
-	uint32 end = 8;
-	int64 sversion = 9; //当前stream的version,用来去重. client的sversion只会小于等于sm的sversion, 否则返回ClientStreamVersionTooHigh
-}
-
-
-message StreamAllocExtentResponse{
-	Code code = 1;
-	string codeDes = 2;
-	uint64 streamID = 3;
-	//one of extent or return end of last extent
-	ExtentInfo extent = 4;
-	uint32 end = 5;
-
-	uint64 Sversion = 6;//with ExtentInfo:FIXME: 以后和CheckCommitLength分开
-}
-*/
 
 
 message StreamInfoRequest {
@@ -365,20 +341,14 @@ message TruncateRequest {
 	uint64 extentID = 2;
 	string ownerKey = 3; //ownerKey, revision is used for locking
 	int64  revision = 4;
-	int64  sversion = 5;//当前stream的version,用来去重. client的sversion只会小于等于sm的sversion, 否则返回ClientStreamVersionTooHigh
-	string blobKey = 6; //if blobKey == "", delete extents, else "create new stream, and add it to gabageKey"
 }
 
-message	BlobStreams {
-	//list of streamID
-	repeated uint64 blobs = 1;
-}
+
 
 message TruncateResponse {
 	Code code = 1;
 	string codeDes = 2;
 	StreamInfo updatedStreamInfo = 3;
-	StreamInfo blobStreamInfo = 4;
 }
 
 
@@ -400,11 +370,27 @@ message MultiModifySplitResponse {
 message StatusRequest {
 
 }
-
 message StatusResponse {
 	Code code = 1;
 	string codeDes = 2;
 }
+
+
+message PunchHolesRequest{
+	uint64 streamID = 1;
+	repeated uint64 extentIDs = 2;
+
+	string ownerKey = 4; //ownerKey, revision is used for locking
+	int64 revision = 5;
+
+}
+
+message PunchHolesResponse {
+	Code code = 1;
+	string codeDes = 2;
+	StreamInfo stream = 3;
+}
+
 
 service StreamManagerService {
 	rpc StreamInfo(StreamInfoRequest) returns (StreamInfoResponse) {}
@@ -416,7 +402,10 @@ service StreamManagerService {
 	//rpc verifyExtent
 
 	rpc CheckCommitLength(CheckCommitLengthRequest) returns (CheckCommitLengthResponse) {}
+
 	rpc StreamAllocExtent(StreamAllocExtentRequest) returns  (StreamAllocExtentResponse) {}
+
+	rpc StreamPunchHoles(PunchHolesRequest) returns (PunchHolesResponse) {}
 	
 	rpc CreateStream(CreateStreamRequest) returns  (CreateStreamResponse) {}
 	rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse) {}
@@ -458,7 +447,6 @@ sm_service什么时候删除extentInfo[ref==0]? 任何时候都可以
 message StreamInfo {
 	uint64 streamID = 1;
 	repeated uint64 extentIDs = 2;
-	uint64 sversion = 3;
 }
 
 message NodeInfo {

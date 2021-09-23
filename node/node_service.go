@@ -435,9 +435,12 @@ waitResult:
 		finalErr = successRet[0].Error
 		offsets = successRet[0].Offsets
 	} else {
-		//collect errChan, find err
+		//collect errChan, if err is not wire_errors.NotFound
 		errBuf := new(bytes.Buffer)
 		for r := range errChan {
+			if r.Error == wire_errors.NotFound {
+				return errDone(r.Error)
+			}
 			errBuf.WriteString(r.Error.Error())
 			errBuf.WriteString("\n")
 		}
@@ -485,11 +488,21 @@ func (en *ExtentNode) ReadBlocks(ctx context.Context, req *pb.ReadBlocksRequest)
 	if ex == nil {
 		return nil, errors.Errorf("node %d have no such extent :%d", en.nodeID, req.ExtentID)
 	}
-	blocks, offsets, end, err := ex.ReadBlocks(req.Offset, req.NumOfBlocks, (32 << 20)) //不是这个
+
+	var blocks []*pb.Block
+	var end uint32
+	var err error
+	var offsets []uint32
+
+	if req.OnlyLastBlock {
+		blocks, offsets, end, err = ex.ReadLastBlock()
+	} else {
+		blocks, offsets, end, err = ex.ReadBlocks(req.Offset, req.NumOfBlocks, (32 << 20)) 	
+	}
+
 	if err != nil && err != wire_errors.EndOfExtent {
 		return errDone(err)
 	}
-
 
 	xlog.Logger.Debugf("request extentID: %d, offset: %d, numOfBlocks: %d, response len(%d), %v ", req.ExtentID, req.Offset, req.NumOfBlocks,
 		len(blocks), err)
@@ -676,10 +689,6 @@ func (en *ExtentNode) ReadEntries(ctx context.Context, req *pb.ReadEntriesReques
 		return errDone(errors.Errorf("no such extent %d", req.ExtentID))
 	}
 
-	replay := false
-	if req.Replay > 0 {
-		replay = true
-	}
 	//fmt.Printf("start SmartRead\n")
 	res, _ := en.SmartReadBlocks(ctx, &pb.ReadBlocksRequest{
 		ExtentID: req.ExtentID,
@@ -701,7 +710,7 @@ func (en *ExtentNode) ReadEntries(ctx context.Context, req *pb.ReadEntriesReques
 
 	entries := make([]*pb.EntryInfo, len(res.Blocks))
 	for i := 0 ; i < len(res.Blocks); i ++ {
-		entry, err := extent.ExtractEntryInfo(res.Blocks[i], ex.ID, res.Offsets[i], replay)
+		entry, err := extent.ExtractEntryInfo(res.Blocks[i], ex.ID, res.Offsets[i], req.Replay)
 		if err != nil {
 			xlog.Logger.Errorf("unmarshal entries error %v\n", err)
 			continue

@@ -234,7 +234,7 @@ func (client *SMClient) CheckCommitLength(ctx context.Context, streamID uint64, 
 	return stream, lastEx, end, err
 }
 
-func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64, Sversion int64,
+func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64,
 	ownerKey string, revision int64, end uint32) (*pb.StreamInfo , *pb.ExtentInfo, error) {
 
 	err := ErrTimeOut
@@ -247,7 +247,6 @@ func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64, 
 			StreamID: streamID,
 			OwnerKey: ownerKey,
 			Revision: revision,
-			Sversion: Sversion,
 			End: end,
 		})
 		if err == context.Canceled || err == context.DeadlineExceeded {
@@ -371,11 +370,47 @@ func (client *SMClient) StreamInfo(ctx context.Context, streamIDs []uint64) (map
 	return streamInfos, extentInfos, err	
 }
 
-//TruncateStream returns newBlobStream and updatedStream, all extents on newBlobStream should have be sealed
-func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, extentID uint64, ownerKey string, revision int64, sversion int64, blobKey string) (blobStream *pb.StreamInfo, updatedStream *pb.StreamInfo , err error) {
+func (client *SMClient) PunchHoles(ctx context.Context, streamID uint64, holes []uint64, ownerKey string, revision int64) (updatedStream *pb.StreamInfo, err error) {
+	err = ErrTimeOut
+	var res *pb.PunchHolesResponse
+	client.try(func(conn *grpc.ClientConn) bool {
+		c := pb.NewStreamManagerServiceClient(conn)
+		res, err = c.StreamPunchHoles(ctx, &pb.PunchHolesRequest{
+			StreamID: streamID,
+			ExtentIDs: holes,
+			Revision: revision,
+			OwnerKey: ownerKey,
+		})
+
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			return false
+		}
+		if err != nil {
+			xlog.Logger.Warnf(err.Error())
+			return true
+		}
+
+		if res.Code != pb.Code_OK {
+			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
+			//if remote is not a leader, retry
+			if err == wire_errors.NotLeader {
+				return true
+			}
+			return false
+		}
+
+		updatedStream = res.Stream
+		return false
+
+	}, 500*time.Millisecond)
+	
+	return
+}
+
+
+func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, extentID uint64, ownerKey string, revision int64) (updatedStream *pb.StreamInfo , err error) {
 	err = ErrTimeOut
 	var res *pb.TruncateResponse
-	//split only stream into two streams, [newBlobStream, updatedStream]
 	client.try(func(conn *grpc.ClientConn) bool {
 		c := pb.NewStreamManagerServiceClient(conn)
 		res, err = c.Truncate(ctx, &pb.TruncateRequest{
@@ -383,8 +418,6 @@ func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, ext
 			ExtentID: extentID,
 			OwnerKey: ownerKey,
 			Revision: revision,
-			Sversion: sversion,
-			BlobKey: blobKey,
 		})
 		
 		if err == context.Canceled || err == context.DeadlineExceeded {
@@ -402,7 +435,6 @@ func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, ext
 			}
 			return false
 		}
-		blobStream = res.BlobStreamInfo
 		updatedStream = res.UpdatedStreamInfo
 		return false
 	}, 500*time.Millisecond)
@@ -446,41 +478,3 @@ func (client *SMClient) MultiModifySplit(ctx context.Context, partID uint64, mid
 
 	return err	
 }
-
-
-/*
-func (client *SMClient) SubmitRecoveryTask(ctx context.Context, extentID uint64, replaceID uint64) error {
-	
-	err := errors.New("can not find connection to stream manager")
-	var res *pb.SubmitRecoveryTaskResponse
-	client.try(func(conn *grpc.ClientConn) bool {
-		c := pb.NewStreamManagerServiceClient(conn)
-		res, err = c.SubmitRecoveryTask(ctx, &pb.SubmitRecoveryTaskRequest{
-			Task : &pb.RecoveryTask{
-				ExtentID: extentID,
-				ReplaceID: replaceID,
-			},
-		})
-		if err == context.Canceled || err == context.DeadlineExceeded {
-			return false
-		}
-		if err != nil {
-			xlog.Logger.Warnf(err.Error())
-			return true
-		}
-		if res.Code != pb.Code_OK {
-			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
-			//if remote is not a leader, retry
-			if err == wire_errors.NotLeader {
-				return true
-			}
-			return false
-		}
-
-		return false
-	}, 500*time.Millisecond)
-
-	return err
-
-}
-*/
