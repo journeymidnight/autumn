@@ -287,6 +287,41 @@ func TestValidBlock(t *testing.T) {
 	require.Equal(t, record.ComputeEnd(0, 4096), start)
 }
 
+
+
+
+func TestReadLastBlock(t *testing.T) {
+	
+	cases := []*pb.Block{
+		generateBlock(65<<10),
+		generateBlock(1234),
+		generateBlock(4096),
+		generateBlock(1),
+	}
+
+	extent, err := CreateExtent("localtest.ext", 100)
+	assert.Nil(t, err)
+	defer os.Remove("localtest.ext")
+
+	extent.Lock()
+	extent.AppendBlocks(cases, true)
+	extent.Unlock()
+
+
+	block, start, tail, err := extent.ReadLastBlock()
+	require.Nil(t, err)
+	require.Equal(t, cases[len(cases) - 1], block[0])
+	require.Equal(t, extent.commitLength, tail)
+
+	//assert ComputeEnd
+	_, offsets, _, err := extent.ReadBlocks(0, 100, 10<<20)
+	offset := uint32(0)
+	for i := 0; i < len(cases); i++ {
+		require.Equal(t, offset, offsets[i])
+		offset = record.ComputeEnd(offset, uint32(len(cases[i].Data)))
+	}
+	require.Equal(t, offsets[len(offsets) -1 ], start[0])
+}
 func TestWriteECFriendlyBlock(t *testing.T) {
 	extent, err := CreateExtent("localtest.ext", 100)
 	require.Nil(t, err)

@@ -546,6 +546,49 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 	return ret, offsets, end, nil
 }
 
+//return data, offset, end, error
+func (ex *Extent) ReadLastBlock() ([]*pb.Block, []uint32, uint32, error) {
+
+	wrapReader := ex.GetReader() //thread-safe
+	offset := int64(atomic.LoadUint32(&ex.commitLength) & ^uint32(record.BlockSizeMask))
+	//floor of offset for record.BlockSize
+	var data []byte
+	var reader io.Reader
+	var err error
+	var end uint32
+	var start uint32
+	LOOP:
+	for ; offset >= 0; offset -= record.BlockSize{
+		rr := record.NewReader(wrapReader)
+		rr.SeekRecord(offset)
+		for {
+			reader, err = rr.Next()
+			if err == io.EOF {
+				if data != nil {
+					break LOOP
+				}
+				break
+			}
+			if err != nil {
+				//block crc is bad:
+				break
+			}
+			
+			start = uint32(rr.Offset())
+			data, err = ioutil.ReadAll(reader)
+			if err != nil {
+				//block crc is bad:
+				break
+			}
+			end = uint32(rr.End())
+		}
+	}
+	if data == nil {
+		return nil, nil, 0, wire_errors.NotFound
+	}
+	return []*pb.Block{{Data: data}}, []uint32{start}, end, nil
+}
+
 func (ex *Extent) CommitLength() uint32 {
 	return atomic.LoadUint32(&ex.commitLength)
 }

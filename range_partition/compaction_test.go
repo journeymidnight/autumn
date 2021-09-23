@@ -23,7 +23,7 @@ func TestCompaction(t *testing.T) {
 
 	var server streamclient.MockEtcd
 	rp, err := OpenRangePartition(3, rowStream, logStream, br,
-		[]byte(""), []byte(""), nil, nil, server.SetRowStreamTables, func(si pb.StreamInfo) streamclient.StreamClient {
+		[]byte(""), []byte(""), nil, nil, server.SetKV, func(si pb.StreamInfo) streamclient.StreamClient {
 			return streamclient.OpenMockStreamClient(si, br)
 		}, TestOption())
 

@@ -1,3 +1,16 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package streamclient
 
 import (
@@ -15,6 +28,7 @@ import (
 	"github.com/pkg/errors"
 	"go.etcd.io/etcd/client/v3/concurrency"
 
+	"github.com/gogo/protobuf/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -32,14 +46,16 @@ type StreamClient interface {
 	Connect() error
 	Close()
 	AppendEntries(ctx context.Context, entries []*pb.EntryInfo, mustSync bool) (uint64, uint32, error)
+	ReadLastBlock(ctx context.Context) (*pb.Block, error)
 	Append(ctx context.Context, blocks []*pb.Block, mustSync bool) (extentID uint64, offsets []uint32, end uint32, err error)
+	PunchHoles(ctx context.Context, extentIDs []uint64) error
 	NewLogEntryIter(opt ...ReadOption) LogEntryIter
 	//truncate extent BEFORE extentID
-	Truncate(ctx context.Context, extentID uint64, blobKey string) (*pb.StreamInfo, error)
+	Truncate(ctx context.Context, extentID uint64) error
 	//CommitEnd() is offset of current extent
 	CommitEnd() uint32
 	//total number of extents
-	NumOfExtents() int
+	StreamInfo() *pb.StreamInfo
 }
 
 //random read block
@@ -50,7 +66,6 @@ type BlockReader interface {
 type LogEntryIter interface {
 	HasNext() (bool, error)
 	Next() *pb.EntryInfo
-	//CheckCommitLength() error
 }
 
 type AutumnBlockReader struct {
@@ -144,8 +159,10 @@ retry:
 type readOption struct {
 	ReadFromStart bool
 	ExtentID      uint64
-	Offset        uint32
-	Replay        bool
+	Offset       uint32
+	Replay       bool
+	//max extents we can read
+	MaxExtents   int
 }
 
 type ReadOption func(*readOption)
@@ -155,19 +172,25 @@ func WithReplay() ReadOption {
 		opt.Replay = true
 	}
 }
-func WithReadFromStart() ReadOption {
+
+func WithReadFromStart(maxExtents int) ReadOption {
+	//WithReadFromStart is conflict with WithReadFrom
 	return func(opt *readOption) {
 		opt.ReadFromStart = true
+		opt.MaxExtents = maxExtents
 	}
 }
 
-func WithReadFrom(extentID uint64, offset uint32) ReadOption {
+func WithReadFrom(extentID uint64, offset uint32, maxExtents int) ReadOption {
+	//WithReadFrom is conflict with WithReadFromStart
 	return func(opt *readOption) {
 		opt.ReadFromStart = false
 		opt.ExtentID = extentID
 		opt.Offset = offset
+		opt.MaxExtents = maxExtents
 	}
 }
+
 
 type StreamLock struct {
 	revision int64
@@ -191,6 +214,8 @@ type AutumnStreamClient struct {
 	streamID   uint64
 	streamLock StreamLock
 	end        uint32
+
+	utils.SafeMutex//protect streamInfo from allocStream, Truncate, PunchHole
 }
 
 func NewStreamClient(sm *smclient.SMClient, em *smclient.ExtentManager, streamID uint64, streamLock StreamLock) *AutumnStreamClient {
@@ -210,8 +235,9 @@ type AutumnEntryIter struct {
 	currentExtentIndex int
 	noMore             bool
 	cache              []*pb.EntryInfo
-	replay             uint32
+	replay             bool
 	conn               *grpc.ClientConn
+	n                  int//number of extents we have read
 }
 
 
@@ -231,13 +257,10 @@ func (sc *AutumnStreamClient) checkCommitLength() {
 
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		stream, lastEx, end, err := sc.smClient.CheckCommitLength(ctx, sc.streamID, sc.streamLock.ownerKey, sc.streamLock.revision)
+		_, lastEx, end, err := sc.smClient.CheckCommitLength(ctx, sc.streamID, sc.streamLock.ownerKey, sc.streamLock.revision)
 		xlog.Logger.Infof("CheckCommitLength %v, new extent: %v", err, lastEx)
 		cancel()
 		if err == nil {
-			if stream.Sversion > sc.streamInfo.Sversion {
-				sc.streamInfo = stream
-			}
 			sc.em.WaitVersion(lastEx.ExtentID, lastEx.Eversion)
 			sc.end = end
 			break
@@ -249,6 +272,82 @@ func (sc *AutumnStreamClient) checkCommitLength() {
 	}
 
 }
+
+
+func (sc *AutumnStreamClient) ReadLastBlock(ctx context.Context) (*pb.Block, error) {
+
+	if len(sc.streamInfo.ExtentIDs) == 0 {
+		return nil, errors.Errorf("no extent in stream")
+	}
+
+	findValidLastExtent := func(i int) (*pb.ExtentInfo, int) {
+		for ;i >= 0; i-- {
+			exID, err := sc.getExtentFromIndex(i)
+			if err != nil {
+				return nil, -1
+			}
+			//extent is sealed and SealedLength is 0, skip to preivous extent
+			info := sc.em.GetExtentInfo(exID)
+			if info.Avali > 0 && info.SealedLength == 0 {
+				continue
+			}
+			return info, i
+		}
+		return nil, -1
+	}
+
+
+	getLastBlock := func(exInfo *pb.ExtentInfo) ([]*pb.Block, error) {
+		retry:
+			exInfo = sc.em.GetExtentInfo(exInfo.ExtentID)
+			if exInfo == nil {
+				return nil, errors.Errorf("no such extent")
+			}
+			conn := sc.em.GetExtentConn(exInfo.ExtentID, smclient.AlivePolicy{})
+			if conn == nil {
+				return nil, errors.Errorf("unable to get extent connection.")
+			}
+			c := pb.NewExtentServiceClient(conn)
+			res, err := c.SmartReadBlocks(ctx, &pb.ReadBlocksRequest{
+				ExtentID:    exInfo.ExtentID,
+				Eversion:    exInfo.Eversion,
+				OnlyLastBlock: true,
+			})
+			if err != nil {
+				return nil, err
+			}
+			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
+			if err == wire_errors.VersionLow {
+				sc.em.WaitVersion(exInfo.ExtentID, exInfo.Eversion+1)
+				goto retry
+			} else if err != nil {
+				return nil, err
+			}
+			return res.Blocks, nil
+	}
+
+	i := len(sc.streamInfo.ExtentIDs) - 1;
+	for i >= 0 {
+		exInfo, idx := findValidLastExtent(i)
+		if idx == -1 {
+			return nil, wire_errors.NotFound			
+		}
+
+		blocks, err := getLastBlock(exInfo)
+		if err == wire_errors.NotFound {
+			i = idx - 1
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		
+		utils.AssertTrue(len(blocks) == 1)
+		return blocks[0], nil
+	}
+	return nil, wire_errors.NotFound	
+}
+
 
 func (iter *AutumnEntryIter) HasNext() (bool, error) {
 	if len(iter.cache) == 0 {
@@ -280,7 +379,6 @@ func (iter *AutumnEntryIter) receiveEntries() error {
 
 	extentID, err := iter.sc.getExtentFromIndex(iter.currentExtentIndex)
 	if err != nil {
-		//utils.AssertTrue(!iter.noMore)
 		return err
 	}
 retry:
@@ -306,7 +404,7 @@ retry:
 	res, err := c.ReadEntries(ctx, &pb.ReadEntriesRequest{
 		ExtentID: extentID,
 		Offset:   iter.currentOffset,
-		Replay:   uint32(iter.replay),
+		Replay:   iter.replay,
 		Eversion: exInfo.Eversion,
 	})
 	cancel()
@@ -342,8 +440,8 @@ retry:
 		iter.currentOffset = 0
 		iter.currentExtentIndex++
 		iter.conn = nil
-		//如果stream是BlobStream, 最后一个extent也返回EndOfExtent
-		if iter.currentExtentIndex == len(iter.sc.streamInfo.ExtentIDs) {
+		iter.n ++
+		if iter.currentExtentIndex == len(iter.sc.streamInfo.ExtentIDs) || iter.n >= iter.opt.MaxExtents {
 			iter.noMore = true
 		}
 		fmt.Printf("readentries currentIndex is %d in %v nomore?%v\n", iter.currentExtentIndex, iter.sc.streamInfo.ExtentIDs, iter.noMore)
@@ -364,28 +462,40 @@ func (sc *AutumnStreamClient) NewLogEntryIter(opts ...ReadOption) LogEntryIter {
 	leIter := &AutumnEntryIter{
 		sc:  sc,
 		opt: readOpt,
+		n :  0,
 	}
+
 	if readOpt.Replay {
-		leIter.replay = 1
+		leIter.replay = true
 	}
+	
 	if readOpt.ReadFromStart {
 		leIter.currentExtentIndex = 0
 		leIter.currentOffset = 0
 	} else {
 		leIter.currentOffset = readOpt.Offset
 		leIter.currentExtentIndex = sc.getExtentIndexFromID(readOpt.ExtentID)
-		/*
-			if leIter.currentExtentIndex < 0 {
-				return nil, errors.Errorf("can not find extentID %d in stream %d", opt.ExtentID, sc.streamID)
-			}
-		*/
 	}
 	return leIter
 }
 
-//Truncate keeps extentID, if gabageKey is not nil, move all extents before extentID to gabageKey, else
-//unref all extents.
-func (sc *AutumnStreamClient) Truncate(ctx context.Context, extentID uint64, blobKey string) (*pb.StreamInfo, error) {
+
+func (sc *AutumnStreamClient) PunchHoles(ctx context.Context, extentIDs []uint64) error {
+	sc.Lock()
+	defer sc.Unlock()
+	
+	updatedStream, err := sc.smClient.PunchHoles(ctx, sc.streamID, extentIDs, sc.streamLock.ownerKey, sc.streamLock.revision)
+	if err != nil {
+		return err
+	}
+	sc.streamInfo = updatedStream
+	return nil
+}
+
+
+func (sc *AutumnStreamClient) Truncate(ctx context.Context, extentID uint64) error {
+	sc.Lock()
+	defer sc.Unlock()
 
 	var i int
 	for i = range sc.streamInfo.ExtentIDs {
@@ -394,18 +504,18 @@ func (sc *AutumnStreamClient) Truncate(ctx context.Context, extentID uint64, blo
 		}
 	}
 	if i == 0 {
-		return nil, errNoTruncate
+		return errNoTruncate
 	}
 
-	blobStream, updatedStream, err := sc.smClient.TruncateStream(ctx, sc.streamID, extentID,
-		sc.streamLock.ownerKey, sc.streamLock.revision, int64(sc.streamInfo.Sversion), blobKey)
+	updatedStream, err := sc.smClient.TruncateStream(ctx, sc.streamID, extentID,
+		sc.streamLock.ownerKey, sc.streamLock.revision)
 
 	if err != nil {
-		return nil, err
+		return  err
 	}
 
 	sc.streamInfo = updatedStream
-	return blobStream, nil
+	return nil
 }
 
 func (sc *AutumnStreamClient) getExtentIndexFromID(extentID uint64) int {
@@ -443,6 +553,10 @@ func (sc *AutumnStreamClient) CommitEnd() uint32 {
 
 //alloc new extent, and reset sc.end = 0
 func (sc *AutumnStreamClient) MustAllocNewExtent() error {
+
+	sc.Lock()
+	defer sc.Unlock()
+
 	var newExInfo *pb.ExtentInfo
 	var err error
 	var updatedStream *pb.StreamInfo
@@ -454,7 +568,7 @@ func (sc *AutumnStreamClient) MustAllocNewExtent() error {
 
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		updatedStream, newExInfo, err = sc.smClient.StreamAllocExtent(ctx, sc.streamID, int64(sc.streamInfo.Sversion),
+		updatedStream, newExInfo, err = sc.smClient.StreamAllocExtent(ctx, sc.streamID,
 			sc.streamLock.ownerKey, sc.streamLock.revision, sc.end)
 		cancel()
 		if err == nil {
@@ -608,7 +722,7 @@ retry:
 	return extentID, res.Offsets, res.End, nil
 }
 
-//NumOfExtents returns the number of extents
-func (sc *AutumnStreamClient) NumOfExtents() int {
-	return len(sc.streamInfo.ExtentIDs)
+func (sc *AutumnStreamClient) StreamInfo() *pb.StreamInfo {
+	//copy sc.streamInfo
+	return proto.Clone(sc.streamInfo).(*pb.StreamInfo)
 }

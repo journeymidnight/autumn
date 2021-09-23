@@ -89,7 +89,7 @@ func runRPTest(t *testing.T, test func(t *testing.T, rp *RangePartition)) {
 	defer rowStream.Close()
 	var server streamclient.MockEtcd
 	rp,_ := OpenRangePartition(3, rowStream, logStream, br,
-		[]byte(""), []byte(""), nil, nil, server.SetRowStreamTables, func(si pb.StreamInfo) streamclient.StreamClient {
+		[]byte(""), []byte(""), nil, nil, server.SetKV, func(si pb.StreamInfo) streamclient.StreamClient {
 			return streamclient.OpenMockStreamClient(si, br)
 		}, TestOption())
 	defer func() {
@@ -164,7 +164,7 @@ func TestReopenRangePartition(t *testing.T) {
 	var server streamclient.MockEtcd
 
 	rp, _ := OpenRangePartition(3, rowStream, logStream, br,
-		[]byte(""), []byte(""), nil, nil, server.SetRowStreamTables, func(si pb.StreamInfo) streamclient.StreamClient {
+		[]byte(""), []byte(""), nil, nil, server.SetKV, func(si pb.StreamInfo) streamclient.StreamClient {
 			return streamclient.OpenMockStreamClient(si, br)
 		}, TestOption())
 
@@ -180,7 +180,7 @@ func TestReopenRangePartition(t *testing.T) {
 
 	//reopen with tables
 	rp , _ = OpenRangePartition(3, rowStream, logStream, br,
-		[]byte(""), []byte(""), server.Tables, nil, server.SetRowStreamTables, func(si pb.StreamInfo) streamclient.StreamClient {
+		[]byte(""), []byte(""), server.Tables, nil, server.SetKV, func(si pb.StreamInfo) streamclient.StreamClient {
 			return streamclient.OpenMockStreamClient(si, br)
 		}, TestOption())
 
@@ -207,7 +207,7 @@ func TestReopenRangePartitionWithBig(t *testing.T) {
 	var server streamclient.MockEtcd
 
 	rp, _ := OpenRangePartition(3, rowStream, logStream, br,
-		[]byte(""), []byte(""), nil, nil, server.SetRowStreamTables, func(si pb.StreamInfo) streamclient.StreamClient {
+		[]byte(""), []byte(""), nil, nil, server.SetKV, func(si pb.StreamInfo) streamclient.StreamClient {
 			return streamclient.OpenMockStreamClient(si, br)
 		}, TestOption())
 
@@ -229,7 +229,7 @@ func TestReopenRangePartitionWithBig(t *testing.T) {
 
 	//reopen with tables
 	rp, _ = OpenRangePartition(3, rowStream, logStream, br,
-		[]byte(""), []byte(""), server.Tables, nil, server.SetRowStreamTables, func(si pb.StreamInfo) streamclient.StreamClient {
+		[]byte(""), []byte(""), server.Tables, nil, server.SetKV, func(si pb.StreamInfo) streamclient.StreamClient {
 			return streamclient.OpenMockStreamClient(si, br)
 		}, TestOption())
 

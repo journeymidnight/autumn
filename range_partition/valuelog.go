@@ -3,6 +3,7 @@ package range_partition
 import (
 	"context"
 	"fmt"
+	"math"
 
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/range_partition/y"
@@ -48,9 +49,9 @@ func replayLog(stream streamclient.StreamClient, startExtentID uint64, startOffs
 		opts = append(opts, streamclient.WithReplay())
 	}
 	if startOffset == 0 && startExtentID == 0 {
-		opts = append(opts, streamclient.WithReadFromStart())
+		opts = append(opts, streamclient.WithReadFromStart(math.MaxInt))
 	} else {
-		opts = append(opts, streamclient.WithReadFrom(startExtentID, startOffset))
+		opts = append(opts, streamclient.WithReadFrom(startExtentID, startOffset, math.MaxInt))
 	}
 
 

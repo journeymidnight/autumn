@@ -9,7 +9,6 @@ import (
 
 	"github.com/journeymidnight/autumn/extent"
 	"github.com/journeymidnight/autumn/proto/pb"
-	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/pkg/errors"
@@ -38,7 +37,7 @@ func (br *MockBlockReader) Read(ctx context.Context, extentID uint64, offset uin
 	}
 
 	blocks, _, end, err := ex.ReadBlocks(offset, numOfBlocks, (32 << 20))
-	if err == wire_errors.EndOfExtent || err == wire_errors.EndOfStream {
+	if err == wire_errors.EndOfExtent {
 		return blocks, end, io.EOF
 	}
 	if err != nil {
@@ -48,11 +47,13 @@ func (br *MockBlockReader) Read(ctx context.Context, extentID uint64, offset uin
 }
 
 type MockStreamClient struct {
+	StreamClient
 	stream          []uint64
 	names           []string
 	ID              uint64
 	suffix          string
 	br              *MockBlockReader
+	utils.SafeMutex
 }
 
 
@@ -106,9 +107,6 @@ func OpenMockStreamClient(si pb.StreamInfo, br *MockBlockReader) StreamClient {
 }
 
 
-func (client *MockStreamClient) NumOfExtents() int{
-	return len(client.stream)
-}
 
 func (client *MockStreamClient) CommitEnd() uint32 {
 	//fake function
@@ -119,7 +117,11 @@ func (client *MockStreamClient) CheckCommitLength() error {
 	return nil
 }
 
-func (client *MockStreamClient) Truncate(ctx context.Context, extentID uint64, gabageKey string) (*pb.StreamInfo , error) {
+
+func (client *MockStreamClient) Truncate(ctx context.Context, extentID uint64) (error) {
+
+	client.Lock()
+	defer client.Unlock()
 
 	var i int
 	for i = range client.stream {
@@ -128,30 +130,13 @@ func (client *MockStreamClient) Truncate(ctx context.Context, extentID uint64, g
 		}
 	}
 	if i == len(client.stream) {
-		return nil, errNoTruncate
+		return nil
 	}
-/*
-	f := func(id uint64, start int, end int) pb.StreamInfo {
-		var array []uint64
-		for i := start; i < end; i++ {
-			array = append(array, client.stream[i])
-		}
-		return pb.StreamInfo{
-			StreamID:  id,
-			ExtentIDs: array,
-		}
-	}
-*/
-	//update smclient...
-	/*
-	blobStreamID := rand.Uint64()
-	blobStreamInfo := f(blobStreamID, 0, i)
 
-	myStreamInfo := f(client.ID, i, len(client.stream))
-	client.stream = client.stream[i:]//升级自己
-	*/
-	//生成新的blobstream,
-	return nil, nil
+	//exclude i
+	client.stream = client.stream[:i]
+	
+	return nil
 }
 
 //block API, entries has been batched
@@ -184,9 +169,11 @@ func (client *MockStreamClient) Append(ctx context.Context, blocks []*pb.Block, 
 	ex.Lock()
 	defer ex.Unlock()
 
-	offsets, end, err := ex.AppendBlocks(blocks, true)
+	offsets, end, err := ex.AppendBlocks(blocks, mustSync)
 
 	if ex.CommitLength() > uint32(testThreshold) {
+		client.Lock()
+		defer client.Unlock()
 		//seal
 		ex.Seal(ex.CommitLength())
 		//create new
@@ -217,6 +204,59 @@ func (client *MockStreamClient) Close() {
 }
 
 func (client *MockStreamClient) Connect() error {
+	return nil
+}
+
+func (client *MockStreamClient) StreamInfo() *pb.StreamInfo {
+	tmp := make([]uint64, len(client.stream))
+	copy(tmp, client.stream)
+	return &pb.StreamInfo{
+		StreamID: client.ID,
+		ExtentIDs: tmp,
+	}
+}
+
+func (client *MockStreamClient) ReadLastBlock(ctx context.Context) (*pb.Block, error) {
+	exIndex := len(client.stream) - 1
+	exID := client.stream[exIndex]
+	client.br.Lock()
+	ex := client.br.exs[exID]
+	client.br.Unlock()
+
+	ex.Lock()
+	defer ex.Unlock()
+
+	blocks, _, _, err := ex.ReadLastBlock()
+	if err != nil {
+		return nil, err
+	}
+	return blocks[0], nil
+}
+
+func (client *MockStreamClient) PunchHoles(ctx context.Context, extentIDs []uint64) error {
+	client.Lock()
+	defer client.Unlock()
+
+	if len(client.stream) == 0 {
+		return nil
+	}
+	//build index for extentIDs
+	index := make(map[uint64]bool)
+	lastEx := client.stream[len(client.stream)-1]
+	for _, exID := range extentIDs {
+		if exID != lastEx {
+			index[exID] = true
+		}
+	}
+
+	//remove extentIDs from stream
+	for i := len(client.stream) - 1; i >= 0; i-- {
+		if _, ok := index[client.stream[i]]; ok {
+			//exluce this extent
+			client.stream = append(client.stream[:i], client.stream[i+1:]...)
+		}
+	}
+
 	return nil
 }
 
@@ -260,6 +300,8 @@ type MockLockEntryIter struct {
 	noMore        bool
 	cache         []*pb.EntryInfo
 	replay        bool
+	n                  int//number of extents we have read
+
 }
 
 
@@ -297,12 +339,10 @@ func (iter *MockLockEntryIter) receiveEntries() error {
 	case wire_errors.EndOfExtent:
 		iter.currentOffset = 0
 		iter.currentIndex++
-		if iter.currentIndex == len(iter.sc.stream) {
+		iter.n ++
+		if iter.currentIndex == len(iter.sc.stream) || iter.n >= iter.opt.MaxExtents {
 			iter.noMore = true
 		}
-		return nil
-	case wire_errors.EndOfStream:
-		iter.noMore = true
 		return nil
 	default:
 		return errors.Errorf("unexpected error %s", err.Error())
@@ -318,11 +358,3 @@ func (iter *MockLockEntryIter) Next() *pb.EntryInfo {
 	return ret
 }
 
-type MockEtcd struct {
-	Tables []*pspb.Location
-}
-
-func (c *MockEtcd) SetRowStreamTables(id uint64, tables []*pspb.Location) error {
-	c.Tables = tables
-	return nil
-}
