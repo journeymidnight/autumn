@@ -113,7 +113,7 @@ func (rp *RangePartition) runGC(extentID uint64) {
 		//if small file, ei.Log.Value must be nil
 		//if big file, len(ei.Log.Value) > 0
 		if (ei.Log.Meta & uint32(y.BitValuePointer)) == 0{
-			//fmt.Printf("discard small entry, key: %s\n", userKey)
+			fmt.Printf("discard small entry, key: %s\n", streamclient.FormatEntry(ei))
 			utils.AssertTrue(ei.Log.Value == nil)
 			return true, nil
 		}
@@ -125,10 +125,15 @@ func (rp *RangePartition) runGC(extentID uint64) {
 		//startKey <= userKey < endKey
 
 		vs := rp.getValueStruct(userKey, 0) //get the latest version
+
 		if discardEntry(ei, vs) {
-			//fmt.Printf("discard entry, key: %s\n", userKey)
+			fmt.Printf("discard entry, key: %s\n", streamclient.FormatEntry(ei))
 			return true, nil
 		}
+
+        /*
+		rp.Write(userKey, []byte("TEST"))
+        */
 
 		utils.AssertTrue(len(vs.Value) > 0)
 		var vp valuePointer

@@ -194,6 +194,8 @@ func (client *MockStreamClient) Append(ctx context.Context, blocks []*pb.Block, 
 func (client *MockStreamClient) Close() {
 	for _, exID := range client.stream {
 		name := fileName(exID, client.suffix)
+		//fmt.Printf("delete %s\n", name)
+
 		client.br.Lock()
 		ex := client.br.exs[exID]
 		ex.Close()
@@ -253,8 +255,11 @@ func (client *MockStreamClient) PunchHoles(ctx context.Context, extentIDs []uint
 	for i := len(client.stream) - 1; i >= 0; i-- {
 		if _, ok := index[client.stream[i]]; ok {
 			//exluce this extent and delete file
+			name := fileName(client.stream[i], client.suffix)
+			//fmt.Printf("delete hole %s\n", name)
+			os.Remove(name)
 			client.stream = append(client.stream[:i], client.stream[i+1:]...)
-			os.Remove(fileName(client.stream[i], client.suffix))
+
 		}
 	}
 

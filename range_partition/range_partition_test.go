@@ -112,7 +112,7 @@ func TestWriteRead(t *testing.T) {
 		wg.Wait()
 
 		for i := 0; i < 100; i++ {
-			v, err := rp.Get([]byte(fmt.Sprintf("key%d", i)), 0)
+			v, err := rp.Get([]byte(fmt.Sprintf("key%d", i)))
 			require.NoError(t, err)
 			require.Equal(t, []byte(fmt.Sprintf("val%d", i)), v)
 		}
@@ -131,7 +131,7 @@ func TestUpdateRead(t *testing.T) {
 		}
 		wg.Wait()
 
-		value, err := rp.Get([]byte("key"), 0)
+		value, err := rp.Get([]byte("key"))
 		require.NoError(t, err)
 		require.Equal(t, []byte(fmt.Sprintf("val%d", 99)), value)
 
@@ -145,7 +145,7 @@ func TestGetBig(t *testing.T) {
 		err := rp.Write([]byte("key1"), bigValue)
 		require.NoError(t, err)
 
-		v, err := rp.Get([]byte("key1"), 0)
+		v, err := rp.Get([]byte("key1"))
 
 		require.NoError(t, err)
 		require.Equal(t, len(bigValue), len(v))
@@ -187,7 +187,7 @@ func TestReopenRangePartition(t *testing.T) {
 		}, TestOption())
 
 	for i := 10; i < 100; i++ {
-		v, err := rp.Get([]byte(fmt.Sprintf("key%d", i)), 0)
+		v, err := rp.Get([]byte(fmt.Sprintf("key%d", i)))
 		if err == errNotFound {
 			fmt.Printf("key%d failed\n", i)
 			continue
@@ -237,7 +237,7 @@ func TestReopenRangePartitionWithBig(t *testing.T) {
 		}, TestOption())
 
 	for i := 10; i < 100; i++ {
-		v, err := rp.Get([]byte(fmt.Sprintf("key%d", i)), 0)
+		v, err := rp.Get([]byte(fmt.Sprintf("key%d", i)))
 		if err == errNotFound {
 			fmt.Printf("key%d failed\n", i)
 			continue

@@ -744,6 +744,6 @@ func FormatEntry(entry *pb.EntryInfo) string {
 	case 0:
 		flag = "norm"
 	}
-	return fmt.Sprintf("%s~%d on extent %d:(%d-%d), [%s]",
+	return fmt.Sprintf("%s~%d on extent %d:(%d-%d) [%s]",
 	y.ParseKey(entry.Log.Key), y.ParseTs(entry.Log.Key), entry.ExtentID, entry.Offset, entry.End, flag)
 }

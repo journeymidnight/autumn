@@ -67,7 +67,7 @@ func (ps *PartitionServer) Get(ctx context.Context, req *pspb.GetRequest) (*pspb
 	//version可有三种
 	//0, 取当前seqnumber
 	//其他, 取指定的version
-	v, err := rp.Get(req.Key, 0)
+	v, err := rp.Get(req.Key)
 	if err != nil {
 		return nil, err
 	}
