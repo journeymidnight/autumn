@@ -610,7 +610,14 @@ func (ex *Extent) ReadEntries(offset uint32, maxTotalSize uint32, replay bool) (
 			xlog.Logger.Error(err)
 			continue
 		}
+		//fill end field in EntryInfo
+		if i == len(blocks) -1 {
+			e.End = end
+		} else {
+			e.End = offsets[i+1]
+		}
 		ret = append(ret, e)
+
 	}
 
 	return ret, end, err

@@ -716,6 +716,7 @@ func (en *ExtentNode) ReadEntries(ctx context.Context, req *pb.ReadEntriesReques
 			continue
 		}
 		//fmt.Printf("Read entries %s\n", string(entry.Log.Key))
+		//fill end field in EntryInfo
 		if i == len(res.Blocks)-1 {
 			entry.End = res.End
 		} else {

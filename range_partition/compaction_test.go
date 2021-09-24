@@ -17,13 +17,13 @@ func TestCompaction(t *testing.T) {
 	br := streamclient.NewMockBlockReader()
 	logStream := streamclient.NewMockStreamClient("log", br)
 	rowStream := streamclient.NewMockStreamClient("sst", br)
+	metaStream := streamclient.NewMockStreamClient("meta", br)
 
 	defer logStream.Close()
 	defer rowStream.Close()
 
-	var server streamclient.MockEtcd
-	rp, err := OpenRangePartition(3, rowStream, logStream, br,
-		[]byte(""), []byte(""), nil, nil, server.SetKV, func(si pb.StreamInfo) streamclient.StreamClient {
+	rp, err := OpenRangePartition(3, metaStream, rowStream, logStream, br,
+		[]byte(""), []byte(""), func(si pb.StreamInfo) streamclient.StreamClient {
 			return streamclient.OpenMockStreamClient(si, br)
 		}, TestOption())
 
@@ -55,5 +55,9 @@ func TestCompaction(t *testing.T) {
 	rp.doCompact(tbls, true)
 	rp.removeTables(tbls)
 	fmt.Printf("after compaction %d\n", len(rp.tables))
+
+	rp.Close()
+
+
 
 }

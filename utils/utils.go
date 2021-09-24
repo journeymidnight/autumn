@@ -97,6 +97,16 @@ func Check(err error) {
 	}
 }
 
+func HumanReadableSize(t uint64) string {
+	units := []string{"B", "KB", "MB", "GB", "TB", "PB", "EB"}
+	power := int(math.Log10(float64(t)) / 3)
+	if power >= len(units) {
+		return ""
+	}
+
+	return fmt.Sprintf("%.1f %s", float64(t)/math.Pow(1000, float64(power)), units[power])
+
+}
 func HumanReadableThroughput(t float64) string {
 	if t < 0 || t < 1e-9 { //if t <=0 , return ""
 		return ""

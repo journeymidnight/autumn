@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -31,6 +32,7 @@ import (
 	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/journeymidnight/autumn/streamclient"
 	"github.com/journeymidnight/autumn/utils"
+	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
 )
@@ -48,19 +50,14 @@ var (
 )
 
 type OpenStreamFunc func(si pb.StreamInfo) streamclient.StreamClient
-//type SetRowStreamTableFunc func(partID uint64, tables []*pspb.Location) error
-type SetKV func(key, value string) error
 
 type RangePartition struct {
-	discard *discardManager
-	blobKey string
-	//metaStream *streamclient.StreamClient //设定metadata结构
-	logStream streamclient.StreamClient
-	//从ValueStruct中得到的地址, 用blockReader读出来, 因为它可能在[logStream, []blobStreams]里面
-	//我们不需要读每个stream
+	logStream       streamclient.StreamClient
+	rowStream       streamclient.StreamClient
+	metaStream      streamclient.StreamClient
+
 	blockReader streamclient.BlockReader
 
-	rowStream       streamclient.StreamClient
 	writeCh         chan *request
 	blockWrites     int32
 	mt              *skiplist.Skiplist
@@ -85,8 +82,6 @@ type RangePartition struct {
 
 	//functions
 	openStream OpenStreamFunc //doGC, read log stream.
-	setKV  SetKV
-
 
 
 	//compaction pickup table policy
@@ -104,10 +99,9 @@ type RangePartition struct {
 //TODO
 //interface KV save some values
 
-func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
+func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStream streamclient.StreamClient,
 	logStream streamclient.StreamClient, blockReader streamclient.BlockReader,
-	startKey []byte, endKey []byte, tableLocs []*pspb.Location, blobStreams map[uint64]*pb.StreamInfo,
-	setKV SetKV,
+	startKey []byte, endKey []byte,
 	openStream OpenStreamFunc, opts ...OptionFunc,
 ) (*RangePartition, error) {
 
@@ -121,6 +115,7 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	rp := &RangePartition{
 		rowStream:   rowStream,
 		logStream:   logStream,
+		metaStream:  metaStream,
 		blockReader: blockReader,
 		mt:          skiplist.NewSkiplist(int64(opt.MaxSkipList)),
 		imm:         nil,
@@ -129,21 +124,32 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		EndKey:      endKey,
 		PartID:      id,
 		openStream:  openStream,
-		setKV:     setKV,
 		opt:         opt,
-		blobKey:     fmt.Sprintf("PARTSTATS/%d/blobStreams",id),
-		discard:     NewDiscardManager(blobStreams),
 	}
 	rp.startMemoryFlush()
 
 	fmt.Printf("log end is %d\n", logStream.CommitEnd())
 	fmt.Printf("row end is %d\n", rowStream.CommitEnd())
-	fmt.Printf("table locs is %v\n", tableLocs)
+	fmt.Printf("meta end is %d\n", metaStream.CommitEnd())
+
+	var tableLocs pspb.TableLocations
+
+
+	block, err := metaStream.ReadLastBlock(context.Background())
+	if err == wire_errors.NotFound {
+		tableLocs.Locs = nil
+	} else if err != nil {
+		return nil, err
+	} else {
+		utils.MustUnMarshal(block.Data, &tableLocs)
+	}
+
+	fmt.Printf("table locs is %v\n", tableLocs.Locs)
 
 	//replay log
 	//open tables
 	//tableLocs的顺序就是在logStream里面的顺序
-	for _, tLoc := range tableLocs {
+	for _, tLoc := range tableLocs.Locs {
 	retry:
 		tbl, err := table.OpenTable(rp.blockReader, tLoc.ExtentID, tLoc.Offset)
 		if err != nil {
@@ -234,7 +240,8 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 
 	start := time.Now()
 	if lastTable == nil {
-		err := replayLog(rp.logStream, 0, 0, true, replay)
+		//err := replayLog(rp.logStream, 0, 0, true, replay)
+		err := replayLog(rp.logStream, replay, streamclient.WithReadFromStart(math.MaxUint32), streamclient.WithReplay())
 		if err != nil {
 			return nil, err
 		}
@@ -246,7 +253,9 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 				offset:   lastTable.VpOffset,
 			}
 		*/
-		err := replayLog(rp.logStream, lastTable.VpExtentID, lastTable.VpOffset, true, replay)
+		//err := replayLog(rp.logStream, lastTable.VpExtentID, lastTable.VpOffset, true, replay)
+		err := replayLog(rp.logStream, replay, streamclient.WithReadFrom(lastTable.VpExtentID, lastTable.VpOffset, math.MaxUint32), streamclient.WithReplay())
+
 		if err != nil {
 			return nil, err
 		}
@@ -462,21 +471,24 @@ func (rp *RangePartition) updateTableLocs(tableLocs []*pspb.Location) {
 		return
 	}
 
-	key := fmt.Sprintf("PARTSTATS/%d/tables", rp.PartID)
 	var locations pspb.TableLocations
 	locations.Locs = tableLocs
 	data := utils.MustMarshal(&locations)
-
-	backoff := 100 * time.Millisecond
+	//fmt.Printf("update table locations %v\n", tableLocs)
+	backoff := 50 * time.Millisecond
 	for {
-		err := rp.setKV(key, string(data))
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second * 5)
+		_, _, _, err := rp.metaStream.Append(ctx, []*pb.Block{{data}}, rp.opt.MustSync)
+		cancel()
 		if err != nil {
 			xlog.Logger.Errorf("failed to set tableLocs for %d, retry...", rp.PartID)
-			time.Sleep(2 * backoff)
+			backoff = backoff * 2
+			time.Sleep(backoff)
 			continue
 		}
 		break
 	}
+
 }
 
 //read metaStream, connect commitlog, rowDataStreamand blobDataStream
