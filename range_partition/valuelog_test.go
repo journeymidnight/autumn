@@ -12,6 +12,89 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+/*
+TO TEST repeated read during GC
+1. uncomment rp.Write(userKey, "test") in runGC to simulate a write during GC
+2. ensureRoomForWrite MUST flush for every entry.
+This is to ensure all tables are ordered.
+*/
+/*
+WARNING: DO NOT DELETE THIS TEST!!!
+func TestRunRepeatRead(t *testing.T) {
+	br := streamclient.NewMockBlockReader()
+	logStream := streamclient.NewMockStreamClient("log", br)
+	rowStream := streamclient.NewMockStreamClient("sst", br)
+	metaStream := streamclient.NewMockStreamClient("meta", br)
+
+	defer logStream.Close()
+	defer rowStream.Close()
+	defer metaStream.Close()
+
+	rp, _ := OpenRangePartition(1, metaStream, rowStream, logStream, br,
+		[]byte(""), []byte(""), func(si pb.StreamInfo) streamclient.StreamClient {
+			return streamclient.OpenMockStreamClient(si, br)
+		}, TestOption())
+
+	data1 := []byte(fmt.Sprintf("data1%01048576d", 10)) //1MB
+	require.Nil(t, rp.Write([]byte("test"),data1))
+
+	rp.runGC(logStream.StreamInfo().ExtentIDs[0])
+
+
+	data, err := rp.Get([]byte("test"))
+	require.Nil(t, err)
+	require.Equal(t, 4, len(data))
+	rp.Close()
+}
+*/
+
+//WARNING: mockstreamclient.testThreshold MUST BE 1M to run this test.
+func TestRunGCSameObject(t *testing.T) {
+	br := streamclient.NewMockBlockReader()
+	logStream := streamclient.NewMockStreamClient("log", br)
+	rowStream := streamclient.NewMockStreamClient("sst", br)
+	metaStream := streamclient.NewMockStreamClient("meta", br)
+
+	defer logStream.Close()
+	defer rowStream.Close()
+	defer metaStream.Close()
+
+	rp, _ := OpenRangePartition(1, metaStream, rowStream, logStream, br,
+		[]byte(""), []byte(""), func(si pb.StreamInfo) streamclient.StreamClient {
+			return streamclient.OpenMockStreamClient(si, br)
+		}, TestOption())
+	
+	data1 := []byte(fmt.Sprintf("data1%01048576d", 10)) //1MB
+	data2 := []byte(fmt.Sprintf("data2%01048576d", 10)) //1MB
+	require.Nil(t, rp.Write([]byte("TEST"),data1)) 
+	require.Nil(t, rp.Write([]byte("TEST"),data2)) 
+
+	replayLog(logStream, func(ei *pb.EntryInfo) (bool, error) {
+		fmt.Printf("%s\n", streamclient.FormatEntry(ei))
+		return true, nil
+	}, streamclient.WithReadFromStart(math.MaxUint32), streamclient.WithReplay())
+
+
+	rp.runGC(logStream.StreamInfo().ExtentIDs[0])
+
+	//KEY TEST~1 will be gc
+
+	data, err := rp.Get([]byte("TEST"))
+	
+	require.Nil(t, err)
+	require.Equal(t, data2, data)
+	require.NotEqual(t, data1, data)
+
+
+	/*
+	replayLog(logStream, func(ei *pb.EntryInfo) (bool, error) {
+		fmt.Printf("%s\n", streamclient.FormatEntry(ei))
+		return true, nil
+	}, streamclient.WithReadFromStart(math.MaxUint32), streamclient.WithReplay())
+	*/
+
+}
+
 //WARNING: mockstreamclient.testThreshold MUST BE 1M to run this test.
 func TestRunGCMiddle(t *testing.T) {
 	br := streamclient.NewMockBlockReader()
@@ -47,7 +130,7 @@ func TestRunGCMiddle(t *testing.T) {
 	fmt.Printf("run GC on second Extent %d\n", secondEx)
 	rp.runGC(secondEx)
 
-	v , err := rp.Get([]byte("c0"), 0)
+	v , err := rp.Get([]byte("c0"))
 	require.Nil(t, err)
 	require.Equal(t, []byte("xx"), v)
 

@@ -586,31 +586,11 @@ func (rp *RangePartition) writeRequests(reqs []*request) error {
 		return nil
 	}
 
-	if reqs[len(reqs)-1].isGCRequest {
-		/*
-			re-read again to find any key was written before GCrequest, if any, 
-			we just abort the gc entry.
-		*/
-
-		//build index for previous entries
-		index := make(map[string]bool)
-		for i := 0; i < len(reqs)-1; i++ {
-			for j := 0; j < len(reqs[i].entries); j++ {
-				userKey := y.ParseKey(reqs[i].entries[j].Log.Key)
-				//could overwrite
-				index[string(userKey)] = true
-			}
-		}
-		gcRequest := reqs[len(reqs)-1]
+	if reqs[0].isGCRequest {
+		utils.AssertTruef(len(reqs) == 1, "GC request should be the only request")
+		gcRequest := reqs[0]
 		for i := len(gcRequest.entries) - 1; i >= 0; i-- {
 			userKey := y.ParseKey(gcRequest.entries[i].Log.Key)
-			
-			if _, ok := index[string(userKey)]; ok {
-				//exlude this entry
-				gcRequest.entries = append(gcRequest.entries[:i], gcRequest.entries[i+1:]...)
-				continue
-			}
-
 			vs := rp.getValueStruct(userKey, 0)
 			if vs.Version > y.ParseTs(gcRequest.entries[i].Log.Key) {
 				//exclude this entry
@@ -618,8 +598,8 @@ func (rp *RangePartition) writeRequests(reqs []*request) error {
 				continue
 			}
 		}
-	
 	}
+	
 
 	done := func(err error) {
 		for _, r := range reqs {
@@ -752,12 +732,23 @@ func (rp *RangePartition) doWrites() {
 		}
 
 		for {
-			reqs = append(reqs, r)
+			if r.isGCRequest{
+				pendingCh <- struct{}{} // blocking.
+				if len(reqs) > 0 {
+					writeRequests(reqs)
+				}
+				reqs = make([]*request, 1)
+				reqs[0] = r
+				goto writeCase
+				
+			} else {
+				reqs = append(reqs, r)
+			}
 
 			//FIXME: if (reqs + r) too big, send reqs, and create new reqs including r
 			//if req's entries are gc request, it means reqs is big enough, send it
 			//the last element of reqs is gc request, writeRequests MUST check last element first
-			if r.isGCRequest ||rp.isReqsTooBig(reqs) {
+			if rp.isReqsTooBig(reqs) {
 				pendingCh <- struct{}{} // blocking.
 				goto writeCase
 			}
@@ -807,7 +798,7 @@ func (rp *RangePartition) ensureRoomForWrite(entries []*pb.EntryInfo, head value
 
 	utils.AssertTrue(n <= rp.opt.MaxSkipList)
 
-	if rp.mt.MemSize()+n < rp.opt.MaxSkipList {
+	if rp.mt.MemSize() + n < rp.opt.MaxSkipList {
 		return nil
 	}
 	utils.AssertTrue(rp.mt != nil)
@@ -930,9 +921,9 @@ func (rp *RangePartition) Range(prefix []byte, start []byte, limit uint32) [][]b
 	return out
 }
 
-func (rp *RangePartition) Get(userKey []byte, version uint64) ([]byte, error) {
+func (rp *RangePartition) Get(userKey []byte) ([]byte, error) {
 
-	vs := rp.getValueStruct(userKey, version)
+	vs := rp.getValueStruct(userKey, 0)
 
 	if vs.Version == 0 {
 		return nil, errNotFound
