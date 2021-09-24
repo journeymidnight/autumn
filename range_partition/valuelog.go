@@ -3,7 +3,6 @@ package range_partition
 import (
 	"context"
 	"fmt"
-	"math"
 
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/range_partition/y"
@@ -26,42 +25,14 @@ func (rp *RangePartition) writeValueLog(reqs []*request) ([]*pb.EntryInfo, value
 	if err != nil {
 		return nil, valuePointer{}, err
 	}
-
-	if (rp.logStream.NumOfExtents() > 2 && rp.logStream.CommitEnd() > rp.opt.TruncateSize) || rp.logStream.NumOfExtents() > 5 {
-		blobStream, err := rp.logStream.Truncate(context.Background(), extentID, rp.blobKey)
-		if err == nil{
-			rp.discard.MergeBlobStream(blobStream)
-			fmt.Printf("truncated log on extent %d for space %s, new stream is %d\n", extentID, rp.blobKey, blobStream.StreamID)
-		} else {
-			xlog.Logger.Errorf("Truncate error %v", err)
-		}
-	}
-
-	//FIXME
-	//if rp.logStream.Size() > 4GB then rp.logStream.Truncate()
 	return entries, valuePointer{extentID: extentID, offset: tail}, nil
+
 }
 
-func replayLog(stream streamclient.StreamClient, startExtentID uint64, startOffset uint32, replay bool, replayFunc func(*pb.EntryInfo) (bool, error)) error {
-	var opts []streamclient.ReadOption
-
-	if replay {
-		opts = append(opts, streamclient.WithReplay())
-	}
-	if startOffset == 0 && startExtentID == 0 {
-		opts = append(opts, streamclient.WithReadFromStart(math.MaxInt))
-	} else {
-		opts = append(opts, streamclient.WithReadFrom(startExtentID, startOffset, math.MaxInt))
-	}
-
-
+func replayLog(stream streamclient.StreamClient, replayFunc func(*pb.EntryInfo) (bool, error), opts ...streamclient.ReadOption) error {
 
 	iter := stream.NewLogEntryIter(opts...)
-	
-	
-
-	fmt.Println("CheckCommitLength Done")
-	
+		
 	for {
 		ok, err := iter.HasNext()
 		if err != nil {
@@ -84,12 +55,11 @@ func replayLog(stream streamclient.StreamClient, startExtentID uint64, startOffs
 
 //policy
 //FIXME	
+/*
 func (rp *RangePartition) pickLog(discardRatio float64) *pb.StreamInfo {
-	stream, holeSize := rp.discard.MaxDiscard()
-	fmt.Printf("picked stream %+v, holeSize is %+v", stream, holeSize)
-	return stream
-}
 
+}
+*/
 
 func discardEntry(ei *pb.EntryInfo, vs y.ValueStruct) bool {
 	if vs.Version != y.ParseTs(ei.Log.Key) {
@@ -113,7 +83,7 @@ func (rp *RangePartition) startGC() {
 				case <- rp.gcStopper.ShouldStop():
 					return
 				case <- rp.gcRunChan:
-					rp.runGC(0.5)
+					//rp.runGC(extentID)
 			}
 		}
 	})
@@ -121,37 +91,32 @@ func (rp *RangePartition) startGC() {
 
 
 
-func (rp *RangePartition) runGC(discardRatio float64) {
-	streamInfo := rp.pickLog(discardRatio)
-	if streamInfo == nil {
-		return
-	}
+func (rp *RangePartition) runGC(extentID uint64) {
 
-	var candidate streamclient.StreamClient
-
-	candidate = rp.openStream(*streamInfo)
-
-	candidate.Connect()
 	var count, moved int
-	var freed uint64
-	var size uint64
+	var freeSize uint64
+	var moveSize uint64
 	wb := make([]*pb.EntryInfo, 0, 100)
 
 	fe := func(ei *pb.EntryInfo) (bool, error) {
+
 		count++
 		if count%100000 == 0 {
 			xlog.Logger.Debugf("Processing entry %d", count)
 		}
 
-		freed += ei.EstimatedSize
-
-		//if small file, ei.Log.Value must be nil
-		//if big file, len(ei.Log.Value) > 0
-		if ei.Log.Value == nil {
-			return true, nil
-		}
+		freeSize += ei.EstimatedSize
 
 		userKey := y.ParseKey(ei.Log.Key)
+
+		//fmt.Printf("processing %s\n", userKey)
+		//if small file, ei.Log.Value must be nil
+		//if big file, len(ei.Log.Value) > 0
+		if (ei.Log.Meta & uint32(y.BitValuePointer)) == 0{
+			//fmt.Printf("discard small entry, key: %s\n", userKey)
+			utils.AssertTrue(ei.Log.Value == nil)
+			return true, nil
+		}
 
 		if !rp.IsUserKeyInRange(userKey) {
 			return true, nil
@@ -159,9 +124,9 @@ func (rp *RangePartition) runGC(discardRatio float64) {
 
 		//startKey <= userKey < endKey
 
-		vs := rp.getValueStruct(userKey, 0) //get the lasted version
-
+		vs := rp.getValueStruct(userKey, 0) //get the latest version
 		if discardEntry(ei, vs) {
+			//fmt.Printf("discard entry, key: %s\n", userKey)
 			return true, nil
 		}
 
@@ -179,24 +144,47 @@ func (rp *RangePartition) runGC(discardRatio float64) {
 				},
 			}
 
-			//?batch?
-			if len(wb) > 4 || ei.EstimatedSize+size > 16*MB {
+			//fmt.Printf("MOVE %s\n", userKey)
+			if len(wb) > 4 {
+				//如果是GC request, 在写入log之前,还要再读一遍key, 如果有新Key已经写入, 则放弃
 				req, err := rp.sendToWriteCh(wb, true)
 				if err != nil {
 					return false, err
 				}
-				go func() {
-					//Wait() will release req
-					req.Wait()
-				}()
+				req.Wait() //wait for write complete and reclaim memory
+				wb = wb[:0]
 			}
 			wb = append(wb, ne)
-			size += ei.EstimatedSize
-
+			moveSize += ei.EstimatedSize
 		}
 		return true, nil
 	}
 
-	replayLog(candidate, 0, 0, false, fe)
+	err := replayLog(rp.logStream, fe, streamclient.WithReadFrom(extentID, 0, 1))
+	if err != nil {
+		xlog.Logger.Errorf("replayLog error: %v", err)
+		return
+	}
+
+	//flush wb
+	if len(wb) > 0 {
+		req, err := rp.sendToWriteCh(wb, true)
+		if err != nil {
+			xlog.Logger.Errorf("sendToWriteCh error: %v", err)
+			return
+		}
+		req.Wait()
+	}
+
+	err = rp.logStream.PunchHoles(context.Background(), []uint64{extentID})
+	if err != nil {
+		xlog.Logger.Errorf("PunchHoles error: %v", err)
+		return
+	}
+
+	fmt.Printf("GC: processed %d entries, %d entries moved, %v freed bytes, %v moved bytes\n", count, moved, 
+	utils.HumanReadableSize(freeSize), utils.HumanReadableSize(moveSize))
+
+	xlog.Logger.Infof("GC: processed %d entries, %d entries moved, %d freed bytes, %d moved bytes", count, moved, freeSize, moveSize)
 
 }

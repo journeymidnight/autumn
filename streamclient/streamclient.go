@@ -22,6 +22,7 @@ import (
 	"github.com/dgraph-io/ristretto"
 	"github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/proto/pb"
+	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/journeymidnight/autumn/xlog"
@@ -39,7 +40,7 @@ const (
 	MB = 1024 * KB
 	GB = 1024 * MB
 
-	MaxExtentSize = 64 * MB
+	HardMaxExtentSize = 3 * GB //Hard limit of extent size
 )
 
 type StreamClient interface {
@@ -162,7 +163,7 @@ type readOption struct {
 	Offset       uint32
 	Replay       bool
 	//max extents we can read
-	MaxExtents   int
+	MaxExtentRead   int
 }
 
 type ReadOption func(*readOption)
@@ -173,11 +174,11 @@ func WithReplay() ReadOption {
 	}
 }
 
-func WithReadFromStart(maxExtents int) ReadOption {
+func WithReadFromStart(MaxExtentRead int) ReadOption {
 	//WithReadFromStart is conflict with WithReadFrom
 	return func(opt *readOption) {
 		opt.ReadFromStart = true
-		opt.MaxExtents = maxExtents
+		opt.MaxExtentRead = MaxExtentRead
 	}
 }
 
@@ -187,7 +188,7 @@ func WithReadFrom(extentID uint64, offset uint32, maxExtents int) ReadOption {
 		opt.ReadFromStart = false
 		opt.ExtentID = extentID
 		opt.Offset = offset
-		opt.MaxExtents = maxExtents
+		opt.MaxExtentRead = maxExtents
 	}
 }
 
@@ -214,17 +215,21 @@ type AutumnStreamClient struct {
 	streamID   uint64
 	streamLock StreamLock
 	end        uint32
+	maxExtentSize uint32
 
 	utils.SafeMutex//protect streamInfo from allocStream, Truncate, PunchHole
 }
 
-func NewStreamClient(sm *smclient.SMClient, em *smclient.ExtentManager, streamID uint64, streamLock StreamLock) *AutumnStreamClient {
+func NewStreamClient(sm *smclient.SMClient, em *smclient.ExtentManager, maxExtentSize uint32, streamID uint64, streamLock StreamLock) *AutumnStreamClient {
 	utils.AssertTrue(xlog.Logger != nil)
+
+	utils.AssertTruef(maxExtentSize < HardMaxExtentSize, "maxExtentSize %d is too large", maxExtentSize)
 	return &AutumnStreamClient{
 		smClient:   sm,
 		em:         em,
 		streamID:   streamID,
 		streamLock: streamLock,
+		maxExtentSize: maxExtentSize,
 	}
 }
 
@@ -441,7 +446,7 @@ retry:
 		iter.currentExtentIndex++
 		iter.conn = nil
 		iter.n ++
-		if iter.currentExtentIndex == len(iter.sc.streamInfo.ExtentIDs) || iter.n >= iter.opt.MaxExtents {
+		if iter.currentExtentIndex == len(iter.sc.streamInfo.ExtentIDs) || iter.n >= iter.opt.MaxExtentRead {
 			iter.noMore = true
 		}
 		fmt.Printf("readentries currentIndex is %d in %v nomore?%v\n", iter.currentExtentIndex, iter.sc.streamInfo.ExtentIDs, iter.noMore)
@@ -713,7 +718,7 @@ retry:
 	//检查offset结果, 如果已经超过MaxExtentSize, 调用StreamAllocExtent
 	utils.AssertTrue(res.End > 0)
 	
-	if res.End > MaxExtentSize {
+	if res.End > sc.maxExtentSize {
 		if err = sc.MustAllocNewExtent(); err != nil {
 			return 0, nil, 0, err
 		}
@@ -725,4 +730,20 @@ retry:
 func (sc *AutumnStreamClient) StreamInfo() *pb.StreamInfo {
 	//copy sc.streamInfo
 	return proto.Clone(sc.streamInfo).(*pb.StreamInfo)
+}
+
+//add String() function to pb.StringInfo
+
+func FormatEntry(entry *pb.EntryInfo) string {
+	var flag string
+	switch entry.Log.Meta {
+	case 2:
+		flag = "blob"
+	case 1:
+		flag = "delete"
+	case 0:
+		flag = "norm"
+	}
+	return fmt.Sprintf("%s~%d on extent %d:(%d-%d), [%s]",
+	y.ParseKey(entry.Log.Key), y.ParseTs(entry.Log.Key), entry.ExtentID, entry.Offset, entry.End, flag)
 }

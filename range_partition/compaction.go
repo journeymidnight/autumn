@@ -174,7 +174,7 @@ func (rp *RangePartition) compact() {
 			rp.removeTables(allTables)
 			if eID != 0 {
 				//last table's meta extentd
-				_, err := rp.rowStream.Truncate(context.Background(), eID, "")
+				err := rp.rowStream.Truncate(context.Background(), eID)
 				if err != nil {
 					xlog.Logger.Warnf("LOG Truncate extent %d error %v", eID, err)
 				}
@@ -199,7 +199,7 @@ func (rp *RangePartition) compact() {
 			//truncate
 			if eID != 0 {
 				//last table's meta extentd
-				_, err := rp.rowStream.Truncate(context.Background(), eID, "")
+				err := rp.rowStream.Truncate(context.Background(), eID)
 				if err != nil {
 					xlog.Logger.Warnf("LOG Truncate extent %d error %v", eID, err)
 				}
@@ -331,8 +331,6 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 	for i := 0; i < numBuilds; i++ {
 		<-resultCh
 	}
-
-	rp.discard.UpdateDiscardStats(discardStats)
 	
 	//在这个时间, 虽然有可能memstore还没有完全刷下去, 但是rp.Close调用会等待flushTask全部执行完成.
 	//另外, 在分裂时选择midKey后, 会有一个assert确保midKey在startKey和endKey之间

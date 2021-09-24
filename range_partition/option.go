@@ -35,7 +35,7 @@ func TestOption() OptionFunc {
 	return func(opt *Option) {
 		opt.MaxSkipList = 1 * MB
 		opt.WriteChCapacity = 16
-		opt.MustSync = true
+		opt.MustSync = false
 		opt.TruncateSize = 8 * MB
 	}
 }

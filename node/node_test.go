@@ -176,7 +176,9 @@ func (suite *ExtentNodeTestSuite) TearDownSuite() {
 	os.RemoveAll(suite.tmpdir)
 
 }
-
+const (
+	testExtentSize = (1 << 20)
+)
 func (suite *ExtentNodeTestSuite) TestAppendReadValue() {
 	sm := smclient.NewSMClient([]string{"127.0.0.1:3401"})
 	err := sm.Connect()
@@ -192,7 +194,7 @@ func (suite *ExtentNodeTestSuite) TestAppendReadValue() {
 
 	suite.mutex.Lock(context.Background())
 	defer suite.mutex.Unlock(context.Background())
-	sc := streamclient.NewStreamClient(sm, em, si.StreamID, streamclient.MutexToLock(suite.mutex))
+	sc := streamclient.NewStreamClient(sm, em, testExtentSize, si.StreamID, streamclient.MutexToLock(suite.mutex))
 	err = sc.Connect()
 	suite.Require().Nil(err)
 	extentID, offsets, end, err := sc.Append(context.Background(),
@@ -229,7 +231,7 @@ func (suite *ExtentNodeTestSuite) TestNodeRecoveryDataFromOtherNode() {
 	suite.mutex.Lock(context.Background())
 	defer suite.mutex.Unlock(context.Background())
 
-	sc := streamclient.NewStreamClient(sm, em, si.StreamID, streamclient.MutexToLock(suite.mutex))
+	sc := streamclient.NewStreamClient(sm, em, testExtentSize, si.StreamID, streamclient.MutexToLock(suite.mutex))
 	err = sc.Connect()
 	suite.Require().Nil(err)
 	extentID, offsets, _, err := sc.Append(context.Background(),
@@ -281,7 +283,7 @@ func (suite *ExtentNodeTestSuite) TestTruncateStream() {
 	suite.mutex.Lock(context.Background())
 	defer suite.mutex.Unlock(context.Background())
 
-	sc := streamclient.NewStreamClient(sm, em, si.StreamID, streamclient.MutexToLock(suite.mutex))
+	sc := streamclient.NewStreamClient(sm, em, testExtentSize, si.StreamID, streamclient.MutexToLock(suite.mutex))
 	err = sc.Connect()
 	suite.Require().Nil(err)
 
@@ -326,7 +328,7 @@ func (suite *ExtentNodeTestSuite) TestPunchHole() {
 	suite.mutex.Lock(context.Background())
 	defer suite.mutex.Unlock(context.Background())
 
-	sc := streamclient.NewStreamClient(sm, em, si.StreamID, streamclient.MutexToLock(suite.mutex))
+	sc := streamclient.NewStreamClient(sm, em, testExtentSize, si.StreamID, streamclient.MutexToLock(suite.mutex))
 	err = sc.Connect()
 	suite.Require().Nil(err)
 
@@ -374,7 +376,7 @@ func (suite *ExtentNodeTestSuite) TestReadLastBlock() {
 	suite.mutex.Lock(context.Background())
 	defer suite.mutex.Unlock(context.Background())
 
-	sc := streamclient.NewStreamClient(sm, em, si.StreamID, streamclient.MutexToLock(suite.mutex))
+	sc := streamclient.NewStreamClient(sm, em, testExtentSize, si.StreamID, streamclient.MutexToLock(suite.mutex))
 	err = sc.Connect()
 	suite.Require().Nil(err)
 

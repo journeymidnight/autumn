@@ -252,8 +252,9 @@ func (client *MockStreamClient) PunchHoles(ctx context.Context, extentIDs []uint
 	//remove extentIDs from stream
 	for i := len(client.stream) - 1; i >= 0; i-- {
 		if _, ok := index[client.stream[i]]; ok {
-			//exluce this extent
+			//exluce this extent and delete file
 			client.stream = append(client.stream[:i], client.stream[i+1:]...)
+			os.Remove(fileName(client.stream[i], client.suffix))
 		}
 	}
 
@@ -340,7 +341,7 @@ func (iter *MockLockEntryIter) receiveEntries() error {
 		iter.currentOffset = 0
 		iter.currentIndex++
 		iter.n ++
-		if iter.currentIndex == len(iter.sc.stream) || iter.n >= iter.opt.MaxExtents {
+		if iter.currentIndex == len(iter.sc.stream) || iter.n >= iter.opt.MaxExtentRead {
 			iter.noMore = true
 		}
 		return nil
