@@ -62,7 +62,7 @@ func buildTable(t *testing.T, keyValues [][]string) (streamclient.StreamClient, 
 		b.Add(y.KeyWithTs([]byte(kv[0]), 0), y.ValueStruct{Value: []byte(kv[1]), Meta: 'A'})
 	}
 	b.FinishBlock()                          //finish current block
-	ex, offset, err := b.FinishAll(0, 0, 10) //finish all table
+	ex, offset, err := b.FinishAll(0, 0, 10, nil) //finish all table
 	assert.Nil(t, err)
 	return stream, br, ex, offset
 }
@@ -692,12 +692,14 @@ func TestTableBigValues(t *testing.T) {
 		builder.Add(key, vs)
 	}
 	builder.FinishBlock()
-	id, offset, err := builder.FinishAll(0, 0, 0)
+	id, offset, err := builder.FinishAll(0, 0, 0, map[uint64]int64{10:10})
 	require.NoError(t, err)
 
 	tbl, err := OpenTable(br, id, offset)
 	require.NoError(t, err, "unable to open table")
+	require.Equal(t, map[uint64]int64{10:10}, tbl.Discards)
 
+	
 	itr := tbl.NewIterator(false)
 	require.True(t, itr.Valid())
 

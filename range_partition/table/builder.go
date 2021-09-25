@@ -336,7 +336,7 @@ The table structure looks like
 //return metablock position(extentID, offset, error)
 //tailExtentID和tailOffset表示当前commitLog对应的结尾, 在打开commitlog后, 从(tailExtentID, tailOffset)开始的
 //block读数据, 生成mt
-func (b *Builder) FinishAll(headExtentID uint64, headOffset uint32, seqNum uint64) (uint64, uint32, error) {
+func (b *Builder) FinishAll(headExtentID uint64, headOffset uint32, seqNum uint64, discards map[uint64]int64) (uint64, uint32, error) {
 
 	close(b.writeCh)
 	b.stopper.Wait()
@@ -355,6 +355,7 @@ func (b *Builder) FinishAll(headExtentID uint64, headOffset uint32, seqNum uint6
 		VpOffset:         headOffset,
 		SeqNum:           seqNum,
 		TableIndex:       b.tableIndex,
+		Discards:  		  discards,
 	}
 
 

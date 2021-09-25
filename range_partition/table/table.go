@@ -25,7 +25,6 @@ type Table struct {
 	utils.SafeMutex
 	blockReader streamclient.BlockReader //only to read
 	blockIndex []*pspb.BlockOffset
-	ref        int32 // For file garbage collection. Atomic.
 
 	// The following are initialized once and const.
 	smallest, biggest []byte // Smallest and largest keys (with timestamps).
@@ -35,27 +34,14 @@ type Table struct {
 	bf            *z.Bloom
 	//cache ??
 
-	Loc        pspb.Location
+	Loc        pspb.Location //saved address in rowStream
 	LastSeq    uint64
+	 //all data before [vpExtentID, vpOffset] is in rowStream. log replay starts from [vpExtentID, vpOffset]
 	VpExtentID uint64
-	VpOffset   uint32
+	VpOffset   uint32  
+	//extentID => discard count
+	Discards   map[uint64]int64   
 }
-
-/*
-// IncrRef increments the refcount (having to do with whether the file should be deleted)
-func (t *Table) IncrRef() {
-	atomic.AddInt32(&t.ref, 1)
-}
-
-// DecrRef decrements the refcount and possibly deletes the table
-func (t *Table) DecrRef() error {
-	ref := atomic.AddInt32(&t.ref, ^int32(0))
-	if ref == 0 {
-		//TODO: remove table
-	}
-	return nil
-}
-*/
 
 func OpenTable(blockReader streamclient.BlockReader,
 	extentID uint64, offset uint32) (*Table, error) {
@@ -104,7 +90,7 @@ func OpenTable(blockReader streamclient.BlockReader,
 		LastSeq:    meta.SeqNum,
 		VpExtentID: meta.VpExtentID,
 		VpOffset:   meta.VpOffset,
-		ref:        1,
+		Discards:   meta.Discards,
 	}
 
 	//read bloom filter
