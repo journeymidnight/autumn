@@ -8,7 +8,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/range_partition/skiplist"
 	"github.com/journeymidnight/autumn/range_partition/table"
 	"github.com/journeymidnight/autumn/range_partition/y"
@@ -171,7 +170,6 @@ func (rp *RangePartition) compact() {
 			eID := allTables[len(allTables)- 1].Loc.ExtentID
 			fmt.Printf("do major compaction tasks for tables %+v\n", allTables)
 			rp.doCompact(allTables, true)
-			rp.removeTables(allTables)
 			if eID != 0 {
 				//last table's meta extentd
 				err := rp.rowStream.Truncate(context.Background(), eID)
@@ -195,8 +193,6 @@ func (rp *RangePartition) compact() {
 			}
 			fmt.Printf("do minor compaction tasks for tables %+v\n", compactTables)
 			rp.doCompact(compactTables, false)
-			rp.removeTables(compactTables)
-			//truncate
 			if eID != 0 {
 				//last table's meta extentd
 				err := rp.rowStream.Truncate(context.Background(), eID)
@@ -213,32 +209,9 @@ func (rp *RangePartition) compact() {
 	}
 }
 
-func (rp *RangePartition) removeTables(tbls []*table.Table) {
-
-	rp.tableLock.Lock()
-	defer rp.tableLock.Unlock()
-
-	tblsIndex := make(map[string]bool)
-	for _, t := range tbls {
-		tblsIndex[fmt.Sprintf("%d-%d", t.Loc.ExtentID, t.Loc.Offset)] = true
-	}
-
-	for i := len(rp.tables) - 1; i >= 0; i-- {
-		if _, ok := tblsIndex[fmt.Sprintf("%d-%d", rp.tables[i].Loc.ExtentID, rp.tables[i].Loc.Offset)]; ok {
-			//exclude the table which is to be deprecate
-			rp.tables = append(rp.tables[:i], rp.tables[i+1:]...)
-		}
-	}
-	var tableLocs []*pspb.Location
-	for _, t := range rp.tables {
-		tableLocs = append(tableLocs, &t.Loc)
-	}
-	rp.updateTableLocs(tableLocs)
-}
-
 func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 
-	if len(tbls) == 0 {
+	if len(tbls) < 2 {
 		return
 	}
 
@@ -247,16 +220,32 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 	sort.Slice(tbls, func(i, j int) bool {
 		return tbls[i].LastSeq > tbls[j].LastSeq
 	})
+
+	discards := make(map[uint64]int64)
 	
 	var iters []y.Iterator
 	var maxSeq uint64
 	var head valuePointer
+	head = valuePointer{
+		extentID: tbls[0].VpExtentID,
+		offset:   tbls[0].VpOffset,
+	}
+
 	for _, table := range tbls {
-		if table.LastSeq > maxSeq {
-			maxSeq = table.LastSeq
-			head = valuePointer{extentID: table.VpExtentID, offset: table.VpOffset}
+		//merge discards
+		for k, v := range table.Discards {
+			discards[k] += v
 		}
 		iters = append(iters, table.NewIterator(false))
+	}
+
+
+	updateStats := func(vs y.ValueStruct) {
+		if (vs.Meta & y.BitValuePointer) > 0 { //big Value
+			var vp valuePointer
+			vp.Decode(vs.Value)
+			discards[vp.extentID] += int64(vp.len)
+		}
 	}
 
 	it := table.NewMergeIterator(iters, false)
@@ -264,19 +253,9 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 
 	it.Rewind()
 
-	//FIXME
-	discardStats := make(map[uint64]int64)
-	updateStats := func(vs y.ValueStruct) {
-		if (vs.Meta & y.BitValuePointer) > 0 { //big Value
-			var vp valuePointer
-			vp.Decode(vs.Value)
-			discardStats[vp.extentID] += int64(vp.len)
-		}
-	}
-
 	var numBuilds int
 	resultCh := make(chan struct{})
-	//ignore keep multiple versions and snapshot support
+
 	capacity := int64(2 * rp.opt.MaxSkipList)
 	for it.Valid() {
 		var skipKey []byte
@@ -287,6 +266,7 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 
 			userKey := y.ParseKey(it.Key())
 
+			//fmt.Printf("processing %s~%d\n", y.ParseKey(it.Key()), y.ParseTs(it.Key()))
 			if !rp.IsUserKeyInRange(userKey) {
 				continue
 			}
@@ -306,12 +286,12 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 			skipKey = y.SafeCopy(skipKey, it.Key())
 
 			if major && isDeletedOrExpired(vs.Meta, vs.ExpiresAt) {
-				updateStats(it.Value())
+				updateStats(it.Value()) //it is expired && bolb value, add discard
 				numSkips++
 				continue
 			}
 
-			if memStore.MemSize()+int64(estimatedVS(it.Key(), it.Value())) > capacity {
+			if memStore.MemSize() + int64(estimatedVS(it.Key(), it.Value())) > capacity {
 				break
 			}
 			numKeys++
@@ -321,9 +301,36 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 		xlog.Logger.Debugf("LOG Compact %d tables Added %d keys. Skipped %d keys. Iteration took: %v, ", len(tbls),
 			numKeys, numSkips, time.Since(timeStart))
 
-		//这里的memstore没有用户会读, 所以不需要incref, 等待flushtask会decref, 自动释放内存
-		//compact出来的table的seqNum一定
-		rp.flushChan <- flushTask{mt: memStore, vptr: head, seqNum: maxSeq, isCompact: true, resultCh: resultCh}
+		
+		if memStore.Empty() {
+			return
+		}
+
+		task := flushTask{
+			mt: memStore, 
+			vptr: head, 
+			seqNum: maxSeq, 
+			isCompact: true, 
+			resultCh: resultCh,
+		}
+		//if this the last table, attach removedTables and discards 
+		if !it.Valid() {
+			//Only consider existing sealed extent
+			logStreamInfo := rp.logStream.StreamInfo()
+			extentIdx := make(map[uint64]bool)
+			for i := 0 ;i < len(logStreamInfo.ExtentIDs) - 1 ; i++ {
+				extentIdx[logStreamInfo.ExtentIDs[i]] = true
+			}
+			for k := range discards {
+				if _, ok := extentIdx[k]; !ok {
+					delete(discards, k)
+				}
+			}
+			task.removedTable = tbls
+			task.discards = discards
+		}
+		//fmt.Printf("send task %+v", task.discards)
+		rp.flushChan <- task
 		numBuilds++
 	}
 

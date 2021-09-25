@@ -729,6 +729,8 @@ retry:
 
 func (sc *AutumnStreamClient) StreamInfo() *pb.StreamInfo {
 	//copy sc.streamInfo
+	sc.RLock()
+	defer sc.RUnlock()
 	return proto.Clone(sc.streamInfo).(*pb.StreamInfo)
 }
 

@@ -109,8 +109,13 @@ func OpenMockStreamClient(si pb.StreamInfo, br *MockBlockReader) StreamClient {
 
 
 func (client *MockStreamClient) CommitEnd() uint32 {
-	//fake function
-	return 0
+	exIndex := len(client.stream) - 1
+	exID := client.stream[exIndex]
+	client.br.Lock()
+	ex := client.br.exs[exID]
+	client.br.Unlock()
+	return ex.CommitLength()
+	
 }
 
 func (client *MockStreamClient) CheckCommitLength() error {
@@ -210,6 +215,8 @@ func (client *MockStreamClient) Connect() error {
 }
 
 func (client *MockStreamClient) StreamInfo() *pb.StreamInfo {
+	client.Lock()
+	defer client.Unlock()
 	tmp := make([]uint64, len(client.stream))
 	copy(tmp, client.stream)
 	return &pb.StreamInfo{

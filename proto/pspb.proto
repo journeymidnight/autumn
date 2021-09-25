@@ -83,6 +83,7 @@ message BlockMeta {
     uint64  vpExtentID = 4;
     uint32  vpOffset = 5;
     uint64  seqNum = 6;
+	map<uint64, int64> discards = 7;
 }
 
 message BlockOffset {

@@ -128,10 +128,13 @@ func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStre
 	}
 	rp.startMemoryFlush()
 
+	/*
 	fmt.Printf("log end is %d\n", logStream.CommitEnd())
 	fmt.Printf("row end is %d\n", rowStream.CommitEnd())
 	fmt.Printf("meta end is %d\n", metaStream.CommitEnd())
+	*/
 
+	
 	var tableLocs pspb.TableLocations
 
 
@@ -174,15 +177,17 @@ func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStre
 	var lastTable *table.Table
 	rp.seqNumber = 0
 	for i := range rp.tables {
-		fmt.Printf("table %d, table lastSeq %d, vp [%d, %d], len of table %d\n", 
-				i, rp.tables[i].LastSeq, rp.tables[i].VpExtentID, rp.tables[i].VpOffset, rp.tables[i].EstimatedSize)
+		/*
+		fmt.Printf("table %d, table lastSeq %d, loc [%d, %d], len of table %d\n", 
+				i, rp.tables[i].LastSeq, rp.tables[i].Loc.ExtentID, rp.tables[i].Loc.Offset, rp.tables[i].EstimatedSize)
+		*/
 		if rp.tables[i].LastSeq > rp.seqNumber {
 			rp.seqNumber = rp.tables[i].LastSeq
 			lastTable = rp.tables[i]
 		}
 	}
 
-	//ASSERT, FIXME
+	//ASSERT
 	rp.CheckTableOrder(rp.tables)
 
 	//FIXME:poor performace: prefetch read will be better
@@ -240,21 +245,14 @@ func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStre
 
 	start := time.Now()
 	if lastTable == nil {
-		//err := replayLog(rp.logStream, 0, 0, true, replay)
 		err := replayLog(rp.logStream, replay, streamclient.WithReadFromStart(math.MaxUint32), streamclient.WithReplay())
 		if err != nil {
 			return nil, err
 		}
 	} else {
 		//fmt.Printf("replay log from vp extent %d, offset [%d]\n", lastTable.VpExtentID, lastTable.VpOffset)
-		/*
-			rp.vhead = valuePointer{
-				extentID: lastTable.VpExtentID,
-				offset:   lastTable.VpOffset,
-			}
-		*/
-		//err := replayLog(rp.logStream, lastTable.VpExtentID, lastTable.VpOffset, true, replay)
-		err := replayLog(rp.logStream, replay, streamclient.WithReadFrom(lastTable.VpExtentID, lastTable.VpOffset, math.MaxUint32), streamclient.WithReplay())
+		err := replayLog(rp.logStream, replay, 
+			streamclient.WithReadFrom(lastTable.VpExtentID, lastTable.VpOffset, math.MaxUint32), streamclient.WithReplay())
 
 		if err != nil {
 			return nil, err
@@ -285,8 +283,11 @@ type flushTask struct {
 	mt        *skiplist.Skiplist
 	vptr      valuePointer
 	seqNum    uint64
+
 	isCompact bool          //如果是compact任务, 不需要修改rp.mt
 	resultCh  chan struct{} //也可以用wg, 但是防止未来还需要发数据
+	removedTable []*table.Table //一次compact可以新建多个table, 只有最后一个table有removedTable和discard
+	discards     map[uint64]int64
 }
 
 //split相关, 提供相关参数给上层
@@ -343,12 +344,9 @@ func (rp *RangePartition) startMemoryFlush() {
 }
 
 // handleFlushTask must be run serially.
-func (rp *RangePartition) handleFlushTask(ft flushTask) error {
-	// There can be a scenario, when empty memtable is flushed. For example, memtable is empty and
-	// after writing request to value log, rotation count exceeds db.LogRotatesToFlush.
-	if ft.mt.Empty() {
-		return nil
-	}
+func (rp *RangePartition) handleFlushTask(ft flushTask) (*table.Table, error) {
+	//ft.mt can not be empty
+	utils.AssertTruef(ft.mt.Empty() == false, "flush task with empty memtable")
 
 	iter := ft.mt.NewIterator()
 	defer iter.Close()
@@ -362,39 +360,29 @@ func (rp *RangePartition) handleFlushTask(ft flushTask) error {
 		if first == nil {
 			first = iter.Key()
 		}
-		/*
-			vs := iter.Value()
-			if vs.Meta&bitValuePointer > 0 {
-				vp.Decode(vs.Value)
-			}
-		*/
 		//fmt.Printf("%s:%s\n", string(iter.Key()), iter.Value().Value)
 		b.Add(iter.Key(), iter.Value())
 		last = iter.Key()
 	}
 
 	b.FinishBlock()
-	id, offset, err := b.FinishAll(ft.vptr.extentID, ft.vptr.offset, ft.seqNum)
+
+	id, offset, err := b.FinishAll(ft.vptr.extentID, ft.vptr.offset, ft.seqNum, ft.discards)
 	if err != nil {
 		xlog.Logger.Errorf("ERROR while build table: %v", err)
-		return err
+		return nil, err
 	}
 
 	tbl, err := table.OpenTable(rp.blockReader, id, offset)
 	if err != nil {
 		xlog.Logger.Errorf("ERROR while opening table: %v", err)
-		return err
+		return nil, err
 	}
 
-	// We own a ref on tbl.
-
-	rp.tableLock.Lock()
-	rp.tables = append(rp.tables, tbl)
-	rp.tableLock.Unlock()
 
 	xlog.Logger.Debugf("flushed table %s to %s seq[%d], head %d\n", y.ParseKey(first), y.ParseKey(last), tbl.LastSeq, tbl.VpOffset)
 
-	return nil
+	return tbl, nil
 }
 
 func (rp *RangePartition) getMemTables() ([]*skiplist.Skiplist, func()) {
@@ -423,14 +411,19 @@ func (rp *RangePartition) getMemTables() ([]*skiplist.Skiplist, func()) {
 // flushMemtable must keep running until we send it an empty flushTask. If there
 // are errors during handling the flush task, we'll retry indefinitely.
 func (rp *RangePartition) flushMemtable() {
+
+	compactedTbls := make([]*table.Table, 0, 10)
+
 	for ft := range rp.flushChan {
 		if ft.mt == nil {
 			// We close db.flushChan now, instead of sending a nil ft.mt.
 			continue
 		}
 		//save to rowStream
+		var tbl *table.Table
+		var err error
 		for {
-			err := rp.handleFlushTask(ft)
+			tbl, err = rp.handleFlushTask(ft)
 			if err == nil {
 				if !ft.isCompact {
 					// Update s.imm. Need a lock.
@@ -450,35 +443,64 @@ func (rp *RangePartition) flushMemtable() {
 			time.Sleep(time.Second)
 		}
 
-		//save table offset in PM
-		var tableLocs []*pspb.Location
-		rp.tableLock.RLock()
-		for _, t := range rp.tables {
-			tableLocs = append(tableLocs, &t.Loc)
-		}
-		rp.updateTableLocs(tableLocs)
-		rp.tableLock.RUnlock()
-
+		// update metastream with new tables
 		if ft.isCompact {
+			//last table was compated, save it in metaStream
+			compactedTbls = append(compactedTbls, tbl)
+			if len(ft.removedTable) > 0 {
+				tblsIndex := make(map[string]bool)
+				for _, t := range ft.removedTable {
+					tblsIndex[fmt.Sprintf("%d-%d", t.Loc.ExtentID, t.Loc.Offset)] = true
+				}
+				rp.tableLock.Lock()
+
+				//remove table
+				for i := len(rp.tables) - 1; i >= 0; i-- {
+					if _, ok := tblsIndex[fmt.Sprintf("%d-%d", rp.tables[i].Loc.ExtentID, rp.tables[i].Loc.Offset)]; ok {
+						//fmt.Printf("remove table %v\n", rp.tables[i].Loc)
+						//exclude the table which is to be deprecated
+						rp.tables = append(rp.tables[:i], rp.tables[i+1:]...)
+					}
+				}
+				//add table
+				rp.tables = append(rp.tables, compactedTbls...)
+				compactedTbls = compactedTbls[:0]
+
+				rp.tableLock.Unlock()
+				//save table
+				rp.saveTableLocs()
+			}
 			ft.resultCh <- struct{}{}
+		} else {
+			//add new table to tables
+			rp.tableLock.Lock()
+            rp.tables = append(rp.tables, tbl)
+            rp.tableLock.Unlock()
+
+			//save tables to metaStream
+			rp.saveTableLocs()
 		}
 
 	}
 }
 
-func (rp *RangePartition) updateTableLocs(tableLocs []*pspb.Location) {
-	if len(tableLocs) == 0 {
-		return
-	}
-
+func (rp *RangePartition) saveTableLocs() {
 	var locations pspb.TableLocations
-	locations.Locs = tableLocs
+
+	//save all table's offset in metaStream
+	rp.tableLock.RLock()
+	for _, t := range rp.tables {
+		locations.Locs = append(locations.Locs, &t.Loc)
+	}
+	rp.tableLock.RUnlock()
+
 	data := utils.MustMarshal(&locations)
-	//fmt.Printf("update table locations %v\n", tableLocs)
+
+	//fmt.Printf("Set table locations %v\n", locations.Locs)
 	backoff := 50 * time.Millisecond
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second * 5)
-		_, _, _, err := rp.metaStream.Append(ctx, []*pb.Block{{data}}, rp.opt.MustSync)
+		_, _, _, err := rp.metaStream.Append(ctx, []*pb.Block{{Data:data}}, rp.opt.MustSync)
 		cancel()
 		if err != nil {
 			xlog.Logger.Errorf("failed to set tableLocs for %d, retry...", rp.PartID)
@@ -488,7 +510,11 @@ func (rp *RangePartition) updateTableLocs(tableLocs []*pspb.Location) {
 		}
 		break
 	}
-
+	//metaStream should not be too large
+	metaStreamInfo := rp.metaStream.StreamInfo()
+	if len(metaStreamInfo.ExtentIDs) > 2 {
+		rp.metaStream.Truncate(context.Background(), metaStreamInfo.ExtentIDs[len(metaStreamInfo.ExtentIDs)-1])
+	}
 }
 
 //read metaStream, connect commitlog, rowDataStreamand blobDataStream
@@ -1027,7 +1053,7 @@ func (rp *RangePartition) close(gracefull bool) error {
 	xlog.Logger.Infof("Closing RangePartion %d", rp.PartID)
 	atomic.StoreInt32(&rp.blockWrites, 1)
 
-	//FIXME: stop GC first
+	//stop GC first
 	rp.gcStopper.Stop()
 	rp.compactStopper.Stop()
 	rp.writeStopper.Stop()
@@ -1037,7 +1063,7 @@ func (rp *RangePartition) close(gracefull bool) error {
 	//doWrite在返回前,会调用最后一次writeRequest并且等待返回, 所以这里
 	//mt和rp.vhead都是只读的
 	//106是空的skiplist的只有头node的大小
-	if gracefull && rp.mt.MemSize() > 106 {
+	if gracefull && rp.mt.Empty() == false {
 		for {
 			pushedFlushTask := func() bool {
 				rp.Lock()
