@@ -3,6 +3,7 @@ package range_partition
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/range_partition/y"
@@ -83,7 +84,46 @@ func (rp *RangePartition) startGC() {
 				case <- rp.gcStopper.ShouldStop():
 					return
 				case <- rp.gcRunChan:
-					//rp.runGC(extentID)
+					//chose an extent to compact
+				
+					logStreamInfo := rp.logStream.StreamInfo()
+					if len(logStreamInfo.ExtentIDs) < 2 {
+						continue
+					}
+					tbls := rp.getTables()
+
+					discards := getDiscards(tbls)
+					validDiscard(discards, logStreamInfo.ExtentIDs[:len(logStreamInfo.ExtentIDs)-1])
+					//sort discards by its value
+					canndidates := make([]uint64, 0, len(discards))
+					for k, _ := range discards {
+						canndidates = append(canndidates, k)
+					}
+					sort.Slice(canndidates, func(i, j int) bool {
+						return discards[canndidates[i]] > discards[canndidates[j]]
+					})
+
+					holes := make([]uint64, 0, 3)
+					for i := 0 ; i < len(canndidates) && i < 3; i++ {
+						exID := canndidates[i]
+						size, err := rp.blockReader.SealedLength(exID)
+						if err != nil {
+							xlog.Logger.Errorf("get sealed length error: %v in runGC", err)
+							continue
+						}
+						if size == 0 {
+							continue
+						}
+						radio := float64(discards[exID]) / float64(size)
+						if radio > 0.4 {
+							rp.runGC(exID)
+							holes = append(holes, exID)
+						}
+					}
+					//TODO: retry if failed
+					if err := rp.logStream.PunchHoles(context.Background(), holes); err != nil {
+						xlog.Logger.Errorf("punch holes error: %v in runGC", err)
+					}
 			}
 		}
 	})
@@ -113,7 +153,7 @@ func (rp *RangePartition) runGC(extentID uint64) {
 		//if small file, ei.Log.Value must be nil
 		//if big file, len(ei.Log.Value) > 0
 		if (ei.Log.Meta & uint32(y.BitValuePointer)) == 0{
-			fmt.Printf("discard small entry, key: %s\n", streamclient.FormatEntry(ei))
+			//fmt.Printf("discard small entry, key: %s\n", streamclient.FormatEntry(ei))
 			utils.AssertTrue(ei.Log.Value == nil)
 			return true, nil
 		}
@@ -127,7 +167,7 @@ func (rp *RangePartition) runGC(extentID uint64) {
 		vs := rp.getValueStruct(userKey, 0) //get the latest version
 
 		if discardEntry(ei, vs) {
-			fmt.Printf("discard entry, key: %s\n", streamclient.FormatEntry(ei))
+			//fmt.Printf("discard blob entry, key: %s\n", streamclient.FormatEntry(ei))
 			return true, nil
 		}
 
