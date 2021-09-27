@@ -346,8 +346,8 @@ func (sm *StreamManager) StreamPunchHoles(ctx context.Context, req *pb.PunchHole
 
 	for i := len(streamInfo.ExtentIDs) - 1; i >= 0; i-- {
 		if _, ok := index[streamInfo.ExtentIDs[i]]; ok {
-			streamInfo.ExtentIDs = append(streamInfo.ExtentIDs[:i], streamInfo.ExtentIDs[i+1:]...)
 			punchedExtents = append(punchedExtents, streamInfo.ExtentIDs[i])
+			streamInfo.ExtentIDs = append(streamInfo.ExtentIDs[:i], streamInfo.ExtentIDs[i+1:]...)
 		}
 	}
 
@@ -411,7 +411,7 @@ func (sm *StreamManager) StreamPunchHoles(ctx context.Context, req *pb.PunchHole
 		return errDone(err)
 	}
 
-	sm.streams.Set(req.StreamID, &streamInfo)
+	sm.streams.Set(req.StreamID, streamInfo)
 
 	return &pb.PunchHolesResponse{
 		Code: pb.Code_OK,
