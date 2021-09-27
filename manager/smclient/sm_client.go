@@ -444,7 +444,7 @@ func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, ext
 	
 
 func (client *SMClient) MultiModifySplit(ctx context.Context, partID uint64, midKey []byte, 
-	ownerKey string, revision int64, logEnd, rowEnd uint32) error {
+	ownerKey string, revision int64, logEnd, rowEnd, metaEnd uint32) error {
 	err := ErrTimeOut
 	var res *pb.MultiModifySplitResponse
 	client.try(func(conn *grpc.ClientConn) bool {
@@ -456,6 +456,7 @@ func (client *SMClient) MultiModifySplit(ctx context.Context, partID uint64, mid
 			Revision: revision,
 			LogStreamSealedLength: logEnd,
 			RowStreamSealedLength: rowEnd,
+			MetaStreamSealedLength: metaEnd,
 		})
 		
 		if err == context.Canceled || err == context.DeadlineExceeded {

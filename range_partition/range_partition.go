@@ -80,10 +80,6 @@ type RangePartition struct {
 
 	opt *Option
 
-	//functions
-	openStream OpenStreamFunc //doGC, read log stream.
-
-
 	//compaction pickup table policy
 	pickupTablePolicy PickupTables
 
@@ -102,7 +98,7 @@ type RangePartition struct {
 func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStream streamclient.StreamClient,
 	logStream streamclient.StreamClient, blockReader streamclient.BlockReader,
 	startKey []byte, endKey []byte,
-	openStream OpenStreamFunc, opts ...OptionFunc,
+	opts ...OptionFunc,
 ) (*RangePartition, error) {
 
 	utils.AssertTrue(len(opts) > 0)
@@ -123,7 +119,6 @@ func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStre
 		StartKey:    startKey,
 		EndKey:      endKey,
 		PartID:      id,
-		openStream:  openStream,
 		opt:         opt,
 	}
 	rp.startMemoryFlush()
@@ -318,8 +313,17 @@ func (rp *RangePartition) CanSplit() bool {
 	return atomic.LoadUint32(&rp.hasOverlap) == 0 && len(rp.tables) > 0
 }
 
-func (rp *RangePartition) LogRowStreamEnd() (uint32, uint32) {
-	return rp.logStream.CommitEnd(), rp.rowStream.CommitEnd()
+type CommitEnds struct {
+	LogEnd uint32
+	RowEnd uint32
+	MetaEnd uint32
+}
+func (rp *RangePartition) LogRowMetaStreamEnd() CommitEnds {
+	return CommitEnds{
+		LogEnd: rp.logStream.CommitEnd(),
+		RowEnd: rp.rowStream.CommitEnd(),
+		MetaEnd: rp.metaStream.CommitEnd(),
+	}
 }
 
 func (rp *RangePartition) startWriteLoop() {

@@ -121,6 +121,9 @@ func (rp *RangePartition) startGC() {
 						}
 					}
 					//TODO: retry if failed
+					//delete extent for stream
+					fmt.Printf("delete extent [%v], for stream %d\n", holes, logStreamInfo.StreamID)
+					//delete extent for block
 					if err := rp.logStream.PunchHoles(context.Background(), holes); err != nil {
 						xlog.Logger.Errorf("punch holes error: %v in runGC", err)
 					}

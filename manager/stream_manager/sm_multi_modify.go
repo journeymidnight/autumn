@@ -118,15 +118,8 @@ func (sm *StreamManager) MultiModifySplit(ctx context.Context, req *pb.MultiModi
 		//return errDone(errors.Errorf("midkey is %s, not in [%s, %s)", req.MidKey, meta.Rg.StartKey, meta.Rg.EndKey))
 	}
 
-	//copy rowStream, logStream	
-	
-	tableLocsData , _, err := etcd_utils.EtcdGetKV(sm.client, fmt.Sprintf("PARTSTATS/%d/tables", req.PartID))
-	if err != nil {
-		return errDone(err)
-	}
-
-
-	n := 1 + 2 // 1 == new partID, 2 == rowStream + logStream
+	//copy rowStream, logStream	and metaStream
+	n := 1 + 3 // 1 == new partID, 2 == rowStream + logStream + metaStream
 	
 	var ops []clientv3.Op
 	start, end, err := sm.allocUniqID(uint64(n))
@@ -135,11 +128,10 @@ func (sm *StreamManager) MultiModifySplit(ctx context.Context, req *pb.MultiModi
 		return errDone(err)
 	}
 
-	//seal meta.LogStream first
-
 	var successOps []func()
 	var failedOps []func()
 
+	//WARNING: can not change orders : log, row,meta
 	f, s, err := sm.duplicateStream(&ops,  meta.LogStream, start, req.LogStreamSealedLength)
 	if err != nil {
 		return errDone(err)
@@ -148,7 +140,6 @@ func (sm *StreamManager) MultiModifySplit(ctx context.Context, req *pb.MultiModi
 	failedOps = append(failedOps, f)
 	
 
-	//seal meta.RowStream first
 	f, s, err = sm.duplicateStream(&ops, meta.RowStream, start +1, req.RowStreamSealedLength)
 	if err != nil {
 		return errDone(err)
@@ -156,12 +147,19 @@ func (sm *StreamManager) MultiModifySplit(ctx context.Context, req *pb.MultiModi
 	successOps = append(successOps, s)
 	failedOps = append(failedOps, f)
 	
+	f, s, err = sm.duplicateStream(&ops, meta.MetaStream, start +2, req.MetaStreamSealedLength)
+	if err != nil {
+		return errDone(err)
+	}
+	successOps = append(successOps, s)
+	failedOps = append(failedOps, f)
 
 	
 	newPartID := end - 1
 	newMeta := pspb.PartitionMeta{
 		LogStream: start,
 		RowStream: start+1,
+		MetaStream: start+2,
 		Rg:&pspb.Range{StartKey: req.MidKey, EndKey: meta.Rg.EndKey},
 		PartID: newPartID,
 	}
@@ -172,10 +170,6 @@ func (sm *StreamManager) MultiModifySplit(ctx context.Context, req *pb.MultiModi
 	meta.Rg.EndKey = req.MidKey
 	ops = append(ops, clientv3.OpPut(fmt.Sprintf("PART/%d", req.PartID), string(utils.MustMarshal(&meta))))
 
-
-	if len(tableLocsData) > 0 {
-		ops = append(ops, clientv3.OpPut(fmt.Sprintf("PARTSTATS/%d/tables", newPartID), string(tableLocsData)))
-	}
 	
 
 	err = etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{

@@ -90,9 +90,7 @@ func runRPTest(t *testing.T, test func(t *testing.T, rp *RangePartition)) {
 	defer rowStream.Close()
 	defer metaStream.Close()
 	rp,_ := OpenRangePartition(3, metaStream, rowStream, logStream, br,
-		[]byte(""), []byte(""), func(si pb.StreamInfo) streamclient.StreamClient {
-			return streamclient.OpenMockStreamClient(si, br)
-		}, TestOption())
+		[]byte(""), []byte(""), TestOption())
 	defer func() {
 		require.NoError(t, rp.Close())
 	}()
@@ -166,9 +164,7 @@ func TestReopenRangePartition(t *testing.T) {
 	defer metaStream.Close()
 
 	rp, _ := OpenRangePartition(3, metaStream, rowStream, logStream, br,
-		[]byte(""), []byte(""), func(si pb.StreamInfo) streamclient.StreamClient {
-			return streamclient.OpenMockStreamClient(si, br)
-		}, TestOption())
+		[]byte(""), []byte(""), TestOption())
 
 	var wg sync.WaitGroup
 	for i := 10; i < 100; i++ {
@@ -182,9 +178,7 @@ func TestReopenRangePartition(t *testing.T) {
 
 	//reopen with tables
 	rp , _ = OpenRangePartition(3, metaStream, rowStream, logStream, br,
-		[]byte(""), []byte(""), func(si pb.StreamInfo) streamclient.StreamClient {
-			return streamclient.OpenMockStreamClient(si, br)
-		}, TestOption())
+		[]byte(""), []byte(""), TestOption())
 
 	for i := 10; i < 100; i++ {
 		v, err := rp.Get([]byte(fmt.Sprintf("key%d", i)))
@@ -210,9 +204,7 @@ func TestReopenRangePartitionWithBig(t *testing.T) {
 	defer metaStream.Close()
 
 	rp, _ := OpenRangePartition(3, metaStream, rowStream, logStream, br,
-		[]byte(""), []byte(""), func(si pb.StreamInfo) streamclient.StreamClient {
-			return streamclient.OpenMockStreamClient(si, br)
-		}, TestOption())
+		[]byte(""), []byte(""), TestOption())
 
 	var expectedValue [][]byte
 	var wg sync.WaitGroup
@@ -232,9 +224,7 @@ func TestReopenRangePartitionWithBig(t *testing.T) {
 
 	//reopen with tables
 	rp, _ = OpenRangePartition(3, metaStream, rowStream, logStream, br,
-		[]byte(""), []byte(""), func(si pb.StreamInfo) streamclient.StreamClient {
-			return streamclient.OpenMockStreamClient(si, br)
-		}, TestOption())
+		[]byte(""), []byte(""), TestOption())
 
 	for i := 10; i < 100; i++ {
 		v, err := rp.Get([]byte(fmt.Sprintf("key%d", i)))

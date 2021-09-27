@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"strings"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -13,7 +12,6 @@ import (
 
 	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/manager/smclient"
-	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/range_partition"
 	"github.com/journeymidnight/autumn/streamclient"
@@ -71,68 +69,28 @@ func formatPartLock(partID uint64) string {
 
 //FIXME: discard implement
 //
-func (ps *PartitionServer) getPartitionMeta(partID uint64) (int64, *pspb.PartitionMeta, []*pspb.Location, []uint64, error) {
+func (ps *PartitionServer) getPartitionMeta(partID uint64) (int64, *pspb.PartitionMeta, error) {
 	/*
 	PART/{PartID} => {id, id <startKey, endKEY>} //immutable
-
-    PARTSTATS/{PartID}/tables => [(extentID,offset),...,(extentID,offset)]
-    PARTSTATS/{PartID}/blobStreams => [id,...,id]
-    PARTSTATS/{PartID}/discard => <DATA>
     */
 
 	var rev int64
 	data, newRev, err := etcd_utils.EtcdGetKV(ps.etcdClient, fmt.Sprintf("PART/%d", partID))
 	if err != nil {
-		return 0, nil, nil, nil, err
+		return 0, nil, err
 	}
 	rev = utils.Max64(newRev, rev)
 	var meta pspb.PartitionMeta
 	if err = meta.Unmarshal(data); err != nil {
-		return 0, nil, nil, nil, err
-	}
-	
-	kvs, newRev, err := etcd_utils.EtcdRange(ps.etcdClient, fmt.Sprintf("PARTSTATS/%d", partID))
-	if err != nil {
-		return 0, nil, nil, nil, err
-	}
-	rev = utils.Max64(newRev, rev)
-
-	var rlocs pspb.TableLocations
-	var locs []*pspb.Location
-
-	var rblob pb.BlobStreams
-	var blob []uint64
-
-
-	for _, kv := range kvs {
-		if strings.HasSuffix(string(kv.Key), "tables") {
-			if err = rlocs.Unmarshal(kv.Value) ; err != nil {
-				xlog.Logger.Warnf("parse %s error", kv.Key)
-				continue
-			}
-			locs = rlocs.Locs
-		} else if strings.HasSuffix(string(kv.Key), "blobStreams") {
-			if err = rblob.Unmarshal(kv.Value); err != nil {
-				xlog.Logger.Warnf("parse %s error", kv.Key)
-				continue
-			}
-			blob = make([]uint64, 0, len(rblob.Blobs))
-			copy(blob, rblob.Blobs)
-		} else if strings.HasSuffix(string(kv.Key), "discard") {
-			//TODO
-		} else {
-			xlog.Logger.Warnf("unkown key %s", kv.Key)
-		}
+		return 0, nil, err
 	}
 
-	return rev, &meta, locs, blob, nil
+	return rev, &meta , nil
 }
 
 func (ps *PartitionServer) parseRegionAndStart(regions *pspb.Regions) int64{
 	var rev int64
 	var meta *pspb.PartitionMeta
-	var blobs []uint64
-	var locs []*pspb.Location
 	var err error
 	fmt.Printf("current region: %+v\n", regions.Regions)
 
@@ -181,7 +139,7 @@ func (ps *PartitionServer) parseRegionAndStart(regions *pspb.Regions) int64{
 		}
 
 		fmt.Printf("getPartionMeta %d\n", region.PartID)
-		if rev, meta, locs ,blobs, err = ps.getPartitionMeta(region.PartID) ; err != nil {
+		if rev, meta, err = ps.getPartitionMeta(region.PartID) ; err != nil {
 			xlog.Logger.Errorf(err.Error())
 			mutex.Unlock(context.Background())
 			continue
@@ -189,7 +147,7 @@ func (ps *PartitionServer) parseRegionAndStart(regions *pspb.Regions) int64{
 
 		xlog.Logger.Infof("range partition %d starting, meta: %v", meta.PartID, meta)
 		fmt.Printf("range partition %d starting, meta: %v", meta.PartID, meta)
-		rp, err := ps.startRangePartition(meta, locs, blobs, mutex)
+		rp, err := ps.startRangePartition(meta, mutex)
 		if err != nil {
 			xlog.Logger.Errorf(err.Error())
 			mutex.Unlock(context.Background())
@@ -297,11 +255,11 @@ func (ps *PartitionServer) Init() {
 
 }
 
-func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, locs []*pspb.Location, blobs []uint64, mutex *concurrency.Mutex) (*range_partition.RangePartition, error) {
+func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, mutex *concurrency.Mutex) (*range_partition.RangePartition, error) {
 	//1. pmclient get info
 	//2. streamclient connect
 	//3. open RangePartition
-	var row, log *streamclient.AutumnStreamClient
+	var row, log, metaLog *streamclient.AutumnStreamClient
 
 	cleanup := func() {
 		if row != nil {
@@ -310,29 +268,27 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, locs []
 		if log != nil {
 			log.Close()
 		}
+		if metaLog != nil {
+			metaLog.Close()
+		}
 	}
 
-	row = streamclient.NewStreamClient(ps.smClient, ps.extentManager, meta.RowStream, streamclient.MutexToLock(mutex))
+
+	row = streamclient.NewStreamClient(ps.smClient, ps.extentManager,  (16 << 20), meta.RowStream, streamclient.MutexToLock(mutex))
 	if err := row.Connect(); err != nil {
 		return nil, err
 	}
 
-	log = streamclient.NewStreamClient(ps.smClient, ps.extentManager, meta.LogStream, streamclient.MutexToLock(mutex))
-
+	log = streamclient.NewStreamClient(ps.smClient, ps.extentManager, (16 << 20), meta.LogStream, streamclient.MutexToLock(mutex))
 	if err := log.Connect(); err != nil {
 		cleanup()
 		return nil, err
 	}
 
-	openStream := func(si pb.StreamInfo) streamclient.StreamClient {
-		return streamclient.NewStreamClient(ps.smClient, ps.extentManager, si.StreamID, streamclient.MutexToLock(mutex))
-	}
-
-	setETCDKV :=  func(key, value string) error {
-		return etcd_utils.EtcdSetKVS(ps.etcdClient, 
-			[]clientv3.Cmp{clientv3.Compare(clientv3.CreateRevision(mutex.Key()), "=", mutex.Header().Revision)},
-		    []clientv3.Op{clientv3.OpPut(key, value),
-		})
+	metaLog = streamclient.NewStreamClient(ps.smClient, ps.extentManager, (1 << 20), meta.MetaStream, streamclient.MutexToLock(mutex))
+	if err := metaLog.Connect(); err != nil {
+		cleanup()
+		return nil, err
 	}
 
 
@@ -340,14 +296,7 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, locs []
 	utils.AssertTrue(meta.PartID != 0)
 
 
-	//get blobStreams from blobs
-	blobStreams, _, err := ps.smClient.StreamInfo(context.Background(), blobs)
-	if err != nil {
-		xlog.Logger.Errorf(err.Error())
-	}
-
-	rp, err := range_partition.OpenRangePartition(meta.PartID, row, log, ps.blockReader, meta.Rg.StartKey, meta.Rg.EndKey, locs,
-		blobStreams, setETCDKV, openStream, 
+	rp, err := range_partition.OpenRangePartition(meta.PartID, metaLog, row, log, ps.blockReader, meta.Rg.StartKey, meta.Rg.EndKey,
 		range_partition.DefaultOption(), 
 		range_partition.WithMaxSkipList(16<<20),
 		range_partition.WithSync(ps.config.MustSync),

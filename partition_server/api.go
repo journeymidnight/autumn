@@ -186,12 +186,14 @@ func (ps *PartitionServer) SplitPart(ctx context.Context, req *pspb.SplitPartReq
 	
 	//LogRowStreamEnd MUST be called after rp.Close()
 	//sm service use logEnd and rowEnd to seal log stream and row stream
-	logEnd, rowEnd := rp.LogRowStreamEnd()
+	ends := rp.LogRowMetaStreamEnd()
 	rp = nil
 
 	backOffTime := time.Second
 	for {
-		err := ps.smClient.MultiModifySplit(ctx, req.Partid, midKey, mutex.Key(), mutex.Header().Revision, logEnd, rowEnd)
+		err := ps.smClient.MultiModifySplit(ctx, req.Partid, midKey, mutex.Key(), mutex.Header().Revision, 
+		ends.LogEnd, ends.RowEnd, ends.MetaEnd)
+
 		xlog.Logger.Infof("range partionion %d split: resut is %v", err)
 		if err == nil {
 			break

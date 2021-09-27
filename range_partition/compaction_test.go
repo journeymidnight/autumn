@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/range_partition/table"
 	"github.com/journeymidnight/autumn/streamclient"
@@ -27,9 +26,7 @@ func TestCompaction(t *testing.T) {
 	defer metaStream.Close()
 
 	rp, err := OpenRangePartition(3, metaStream, rowStream, logStream, br,
-		[]byte(""), []byte(""), func(si pb.StreamInfo) streamclient.StreamClient {
-			return streamclient.OpenMockStreamClient(si, br)
-		}, TestOption())
+		[]byte(""), []byte(""), TestOption())
 
 	require.Nil(t, err)
 	defer rp.Close()
@@ -89,9 +86,7 @@ func TestDicardBigData(t *testing.T) {
 	defer metaStream.Close()
 
 	rp, err := OpenRangePartition(1, metaStream, rowStream, logStream, br,
-		[]byte(""), []byte(""), func(si pb.StreamInfo) streamclient.StreamClient {
-			return streamclient.OpenMockStreamClient(si, br)
-		}, TestOption())
+		[]byte(""), []byte(""),  TestOption())
 	
 	require.Nil(t, err)
 
@@ -124,9 +119,7 @@ func TestDicardBigData(t *testing.T) {
 
 	//open again
 	rp, err = OpenRangePartition(1, metaStream, rowStream, logStream, br,
-		[]byte(""), []byte(""), func(si pb.StreamInfo) streamclient.StreamClient {
-			return streamclient.OpenMockStreamClient(si, br)
-		}, TestOption())
+		[]byte(""), []byte(""), TestOption())
 	
 	require.Nil(t, err)
 
@@ -154,9 +147,7 @@ func TestDicardBigData(t *testing.T) {
 
 	//open rp again again
 	rp, err = OpenRangePartition(1, metaStream, rowStream, logStream, br,
-		[]byte(""), []byte(""), func(si pb.StreamInfo) streamclient.StreamClient {
-			return streamclient.OpenMockStreamClient(si, br)
-		}, TestOption())
+		[]byte(""), []byte(""), TestOption())
 	
 	require.Nil(t, err)
 	defer rp.Close()

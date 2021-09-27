@@ -62,9 +62,7 @@ func TestRunGCSameObject(t *testing.T) {
 	defer metaStream.Close()
 
 	rp, _ := OpenRangePartition(1, metaStream, rowStream, logStream, br,
-		[]byte(""), []byte(""), func(si pb.StreamInfo) streamclient.StreamClient {
-			return streamclient.OpenMockStreamClient(si, br)
-		}, TestOption())
+		[]byte(""), []byte(""), TestOption())
 	
 	data1 := []byte(fmt.Sprintf("data1%01048576d", 10)) //1MB
 	data2 := []byte(fmt.Sprintf("data2%01048576d", 10)) //1MB
@@ -110,9 +108,7 @@ func TestRunGCMiddle(t *testing.T) {
 
 
 	rp, _ := OpenRangePartition(3, metaStream, rowStream, logStream, br,
-		[]byte(""), []byte(""), func(si pb.StreamInfo) streamclient.StreamClient {
-			return streamclient.OpenMockStreamClient(si, br)
-		}, TestOption())
+		[]byte(""), []byte(""), TestOption())
 
 	for i := 0 ;i < 2 ; i ++ {
 		require.Nil(t, rp.Write([]byte(fmt.Sprintf("a%d", i)), []byte("xx")))
@@ -161,9 +157,7 @@ func TestRunGCMove(t *testing.T) {
 
 
 	rp, _ := OpenRangePartition(3, metaStream, rowStream, logStream, br,
-		[]byte(""), []byte(""), func(si pb.StreamInfo) streamclient.StreamClient {
-			return streamclient.OpenMockStreamClient(si, br)
-		}, TestOption())
+		[]byte(""), []byte(""), TestOption())
 	
 	
 	for i := 0 ;i < 2 ; i ++ {
@@ -282,9 +276,7 @@ func TestSubmitGC(t *testing.T) {
 	defer metaStream.Close()
 
 	rp, err := OpenRangePartition(1, metaStream, rowStream, logStream, br,
-		[]byte(""), []byte(""), func(si pb.StreamInfo) streamclient.StreamClient {
-			return streamclient.OpenMockStreamClient(si, br)
-		}, TestOption())
+		[]byte(""), []byte(""), TestOption())
 	
 	require.Nil(t, err)
 
@@ -314,9 +306,7 @@ func TestSubmitGC(t *testing.T) {
 
 	//open again
 	rp, err = OpenRangePartition(1, metaStream, rowStream, logStream, br,
-		[]byte(""), []byte(""), func(si pb.StreamInfo) streamclient.StreamClient {
-			return streamclient.OpenMockStreamClient(si, br)
-		}, TestOption())
+		[]byte(""), []byte(""), TestOption())
 	
 	require.Nil(t, err)
 

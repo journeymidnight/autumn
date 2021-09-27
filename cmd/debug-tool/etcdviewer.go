@@ -76,14 +76,6 @@ func receiveData(client *clientv3.Client) []KV {
 				Value: jsonEncode(&task),
 			}
 			data = append(data, d)
-		} else if strings.HasSuffix(string(kv.Key), "blobStreams") {
-			var blobs pb.BlobStreams
-			blobs.Unmarshal(kv.Value)
-			d := KV{
-				Key:   string(kv.Key),
-				Value: fmt.Sprintf("%+v", blobs.Blobs),
-			}
-			data = append(data, d)
 		} else if strings.HasSuffix(string(kv.Key), "tables") {
 			var table pspb.TableLocations
 			table.Unmarshal(kv.Value)

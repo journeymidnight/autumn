@@ -359,7 +359,7 @@ message MultiModifySplitRequest {
 	int64 revision = 4;
 	uint32 logStreamSealedLength = 5;
 	uint32 rowStreamSealedLength = 6;
-	uint32 rowStreamSealedLength = 7;
+	uint32 metaStreamSealedLength = 7;
 }
 
 

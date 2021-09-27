@@ -69,6 +69,7 @@ message PartitionMeta {
 	uint64 rowStream = 3;
 	Range  rg = 7;
 	uint64 PartID = 8;
+	uint64 metaStream = 9;
 }
 
  message PSDetail {

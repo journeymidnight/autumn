@@ -249,6 +249,14 @@ func bootstrap(c *cli.Context) error {
 	}
 	fmt.Printf("row stream %d created, replication is [%d+%d]\n", row.StreamID, r, s)
 
+	meta, _, err := smc.CreateStream(context.Background(), uint32(r),1)
+	if err != nil {
+		fmt.Printf("can not create meta stream\n")
+		return err
+	}
+	fmt.Printf("meta stream %d created, replication is [%d+%d]\n", row.StreamID, r, s)
+
+
 	partID, _, err := etcd_utils.EtcdAllocUniqID(etcdClient, stream_manager.IdKey, 1)
 	if err != nil {
 		fmt.Printf("can not create partID %v\n", err)
@@ -256,8 +264,9 @@ func bootstrap(c *cli.Context) error {
 	}
 
 	zeroMeta := pspb.PartitionMeta{
-		LogStream: log.StreamID,
-		RowStream: row.StreamID,
+		LogStream:  log.StreamID,
+		RowStream:  row.StreamID,
+		MetaStream: meta.StreamID,
 		Rg:        &pspb.Range{StartKey: []byte(""), EndKey: []byte("")},
 		PartID:    partID,
 	}
