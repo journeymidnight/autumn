@@ -49,17 +49,14 @@ func TestCompaction(t *testing.T) {
 
 	time.Sleep(time.Second)
 
-	rp.tableLock.RLock()
-	fmt.Printf("before compaction %d\n", len(rp.tables))
-	beforeNums := len(rp.tables)
-	for _, t := range rp.tables {
-		tbls = append(tbls, t)
-	}
-	rp.tableLock.RUnlock()
+	tbls = rp.getTables()
+	beforeNums := len(tbls)
+
 
 	rp.doCompact(tbls, true)
-	fmt.Printf("after compaction %d\n", len(rp.tables))
-	afterNums := len(rp.tables)
+
+	tbls = rp.getTables()
+	afterNums := len(tbls)
 
 	require.Less(t, afterNums,beforeNums)
 
@@ -134,12 +131,7 @@ func TestDicardBigData(t *testing.T) {
 	require.Nil(t, err)
 
 
-	var tbls []*table.Table
-	rp.tableLock.RLock()
-	for _, t := range rp.tables {
-		tbls = append(tbls, t)
-	}
-	rp.tableLock.RUnlock()
+	tbls := rp.getTables()
 
 
 	rp.doCompact(tbls, true)
@@ -151,14 +143,13 @@ func TestDicardBigData(t *testing.T) {
 
 	require.Equal(t, 1, len(rp.tables))
 	require.Equal(t, 2, len(rp.tables[0].Discards))
-	/*
+	
 	for _, t := range rp.tables {
 		fmt.Printf("table %v ,size %d discards %v\n", t.Loc, t.EstimatedSize,  t.Discards)
 	}
-	*/
+	
 
 	rp.Close()
-
 
 
 	//open rp again again
@@ -171,12 +162,7 @@ func TestDicardBigData(t *testing.T) {
 	defer rp.Close()
 
 
-
-	rp.tableLock.RLock()
-	for _, t := range rp.tables {
-		tbls = append(tbls, t)
-	}
-	rp.tableLock.RUnlock()
+	tbls = rp.getTables()
 
 
 	rp.doCompact(tbls, true)

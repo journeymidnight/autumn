@@ -464,6 +464,7 @@ func (rp *RangePartition) flushMemtable() {
 				}
 				//add table
 				rp.tables = append(rp.tables, compactedTbls...)
+				//fmt.Printf("new tables %+v", compactedTbls)
 				compactedTbls = compactedTbls[:0]
 
 				rp.tableLock.Unlock()
@@ -872,6 +873,15 @@ func (rp *RangePartition) newIterator() y.Iterator {
 	}
 	rp.tableLock.RUnlock()
 	return table.NewMergeIterator(iters, false)
+}
+
+
+func (rp *RangePartition) getTables() []*table.Table {
+	rp.tableLock.RLock()
+	allTables := make([]*table.Table, len(rp.tables), len(rp.tables))
+	copy(allTables, rp.tables)
+	rp.tableLock.RUnlock()
+	return allTables
 }
 
 func (rp *RangePartition) getTablesForKey(userKey []byte) []*table.Table {

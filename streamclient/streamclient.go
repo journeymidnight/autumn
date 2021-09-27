@@ -54,7 +54,7 @@ type StreamClient interface {
 	//truncate extent BEFORE extentID
 	Truncate(ctx context.Context, extentID uint64) error
 	//CommitEnd() is offset of current extent
-	CommitEnd() uint32
+	CommitEnd() uint32 //FIMME:remove this
 	//total number of extents
 	StreamInfo() *pb.StreamInfo
 }
@@ -62,6 +62,7 @@ type StreamClient interface {
 //random read block
 type BlockReader interface {
 	Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32, hint byte) ([]*pb.Block, uint32, error)
+	SealedLength(extentID uint64) (uint64, error)
 }
 
 type LogEntryIter interface {
@@ -109,6 +110,16 @@ type blockInCache struct {
 	block *pb.Block
 	readEnd uint32
 }
+
+
+func (br *AutumnBlockReader) SealedLength(extentID uint64) (uint64, error) {
+	exInfo := br.em.GetExtentInfo(extentID)
+	if exInfo == nil || exInfo.Avali == 0 {
+		return 0, errors.Errorf("extent %d not exist or not sealed", extentID)
+	}
+	return exInfo.SealedLength, nil
+}
+
 
 func (br *AutumnBlockReader) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32, hint byte) ([]*pb.Block, uint32, error) {
 	//only cache metadata

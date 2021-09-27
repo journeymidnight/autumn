@@ -147,7 +147,6 @@ func (p DefaultPickupPolicy) PickupTables(tbls []*table.Table) ([]*table.Table, 
 func (rp *RangePartition) startCompact() {
 	rp.compactStopper = utils.NewStopper()
 	rp.majorCompactChan = make(chan struct{},1)
-	//only one compact goroutine
 	rp.compactStopper.RunWorker(rp.compact)
 }
 
@@ -158,14 +157,9 @@ func (rp *RangePartition) compact() {
 	for {
 		select {
 		case <- rp.majorCompactChan:
-			rp.tableLock.RLock()
-			allTables := make([]*table.Table, 0, len(rp.tables))
-			for _, t := range rp.tables {
-				allTables = append(allTables, t)
-			}
-			rp.tableLock.RUnlock()
-			if len(allTables) == 0 {
-				return
+			allTables := rp.getTables()
+			if len(allTables) < 2 {
+				continue
 			}
 			eID := allTables[len(allTables)- 1].Loc.ExtentID
 			fmt.Printf("do major compaction tasks for tables %+v\n", allTables)
@@ -178,17 +172,10 @@ func (rp *RangePartition) compact() {
 				}
 			}
 			fmt.Printf("fininshed major compaction tasks for tables %+v\n", allTables)
-
 		case <- randTicker.C:
-			rp.tableLock.RLock()
-			allTables := make([]*table.Table, 0, len(rp.tables))
-			for _, t := range rp.tables {
-				allTables = append(allTables, t)
-			}
-			rp.tableLock.RUnlock()
-
+			allTables := rp.getTables()
 			compactTables, eID := rp.pickupTablePolicy.PickupTables(allTables)
-			if len(compactTables) == 0 {
+			if len(compactTables) < 2 {
 				continue
 			}
 			fmt.Printf("do minor compaction tasks for tables %+v\n", compactTables)
@@ -221,7 +208,7 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 		return tbls[i].LastSeq > tbls[j].LastSeq
 	})
 
-	discards := make(map[uint64]int64)
+	discards := getDiscards(tbls)
 	
 	var iters []y.Iterator
 	var maxSeq uint64
@@ -231,15 +218,11 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 		offset:   tbls[0].VpOffset,
 	}
 
+
 	for _, table := range tbls {
-		//merge discards
-		for k, v := range table.Discards {
-			discards[k] += v
-		}
 		iters = append(iters, table.NewIterator(false))
 	}
-
-
+	
 	updateStats := func(vs y.ValueStruct) {
 		if (vs.Meta & y.BitValuePointer) > 0 { //big Value
 			var vp valuePointer
@@ -313,19 +296,10 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 			isCompact: true, 
 			resultCh: resultCh,
 		}
-		//if this the last table, attach removedTables and discards 
 		if !it.Valid() {
-			//Only consider existing sealed extent
-			logStreamInfo := rp.logStream.StreamInfo()
-			extentIdx := make(map[uint64]bool)
-			for i := 0 ;i < len(logStreamInfo.ExtentIDs) - 1 ; i++ {
-				extentIdx[logStreamInfo.ExtentIDs[i]] = true
-			}
-			for k := range discards {
-				if _, ok := extentIdx[k]; !ok {
-					delete(discards, k)
-				}
-			}
+			//if this the last table, attach removedTables and discards 
+			
+			validDiscard(discards, rp.logStream.StreamInfo().ExtentIDs)
 			task.removedTable = tbls
 			task.discards = discards
 		}
@@ -344,6 +318,32 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 	if major {
 		atomic.StoreUint32(&rp.hasOverlap, 0)
 	}
+}
+
+
+
+func validDiscard(discards map[uint64]int64, extentIDs []uint64) map[uint64]int64 {
+	extentIdx := make(map[uint64]bool)
+	for _, extentID := range extentIDs {
+		extentIdx[extentID] = true
+	}
+	for extentID := range discards {
+		if _, ok := extentIdx[extentID]; !ok {
+			delete(discards, extentID)
+		}
+	}
+	return discards
+}
+
+func getDiscards(tbls []*table.Table) map[uint64]int64 {
+	discards := make(map[uint64]int64)
+
+	for _, tbl := range tbls {
+		for k, v := range tbl.Discards {
+			discards[k] += v
+		}
+	}
+	return discards
 }
 
 func isDeletedOrExpired(meta byte, expiresAt uint64) bool {

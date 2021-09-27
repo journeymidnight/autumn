@@ -25,6 +25,15 @@ type MockBlockReader struct {
 	utils.SafeMutex //protect exs
 }
 
+func (br *MockBlockReader) SealedLength(extentID uint64) (uint64, error) {
+	br.RLock()
+	ex := br.exs[extentID]
+	br.RUnlock()
+	if ex == nil || !ex.IsSeal(){
+		return 0, errors.New("extentID not good")
+	}
+	return uint64(ex.CommitLength()), nil
+}
 
 func (br *MockBlockReader) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32, hint byte) ([]*pb.Block, uint32, error) {
 	br.RLock()

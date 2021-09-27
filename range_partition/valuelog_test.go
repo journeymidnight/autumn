@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/range_partition/y"
@@ -265,4 +267,74 @@ func TestLogReplay(t *testing.T) {
 		return true, nil
 	}, streamclient.WithReadFrom(extentID, offset, math.MaxUint32))
 
+}
+
+
+
+func TestSubmitGC(t *testing.T) {
+	br := streamclient.NewMockBlockReader()
+	logStream := streamclient.NewMockStreamClient("log", br)
+	rowStream := streamclient.NewMockStreamClient("sst", br)
+	metaStream := streamclient.NewMockStreamClient("meta", br)
+
+	defer logStream.Close()
+	defer rowStream.Close()
+	defer metaStream.Close()
+
+	rp, err := OpenRangePartition(1, metaStream, rowStream, logStream, br,
+		[]byte(""), []byte(""), func(si pb.StreamInfo) streamclient.StreamClient {
+			return streamclient.OpenMockStreamClient(si, br)
+		}, TestOption())
+	
+	require.Nil(t, err)
+
+	data1 := []byte(fmt.Sprintf("data1%01048576d", 10)) //1MB
+	data2 := []byte(fmt.Sprintf("data2%01048576d", 10)) //1MB
+	require.Nil(t, rp.Write([]byte("a"),data1)) 
+	require.Nil(t, rp.Write([]byte("b"),data2)) 
+
+	rp.Delete([]byte("a"))
+	rp.Delete([]byte("b"))
+
+
+	
+	var wg sync.WaitGroup
+	for i := 0; i < 2000; i++ {
+		wg.Add(1)
+		k := fmt.Sprintf("%04d", i)
+		v := make([]byte, 1000)
+		rp.WriteAsync([]byte(k), []byte(v), func(e error) {
+			wg.Done()
+		})
+	}
+	wg.Wait()
+
+	rp.Close()
+
+
+	//open again
+	rp, err = OpenRangePartition(1, metaStream, rowStream, logStream, br,
+		[]byte(""), []byte(""), func(si pb.StreamInfo) streamclient.StreamClient {
+			return streamclient.OpenMockStreamClient(si, br)
+		}, TestOption())
+	
+	require.Nil(t, err)
+
+	require.Nil(t, rp.SubmitCompaction())
+
+	time.Sleep(1 * time.Second)
+
+	//fmt.Println(rp.logStream.StreamInfo().GetExtentIDs())
+	require.Equal(t, 4, len(rp.logStream.StreamInfo().GetExtentIDs()))
+
+	require.Nil(t, rp.SubmitGC())
+
+	time.Sleep(1 * time.Second)
+
+	require.Equal(t, 2, len(rp.logStream.StreamInfo().GetExtentIDs()))
+	//fmt.Println(rp.logStream.StreamInfo().GetExtentIDs())
+
+	
+	rp.Close()
+	
 }
