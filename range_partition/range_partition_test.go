@@ -74,7 +74,6 @@ func _writeToLSM(skl *skiplist.Skiplist, entires []*pb.EntryInfo) int64 {
 	return skl.MemSize()
 }
 
-
 func mockUpdateStream([]pb.StreamInfo) {
 
 }
@@ -89,7 +88,7 @@ func runRPTest(t *testing.T, test func(t *testing.T, rp *RangePartition)) {
 	defer logStream.Close()
 	defer rowStream.Close()
 	defer metaStream.Close()
-	rp,_ := OpenRangePartition(3, metaStream, rowStream, logStream, br,
+	rp, _ := OpenRangePartition(3, metaStream, rowStream, logStream, br,
 		[]byte(""), []byte(""), TestOption())
 	defer func() {
 		require.NoError(t, rp.Close())
@@ -155,9 +154,9 @@ func TestGetBig(t *testing.T) {
 func TestReopenRangePartition(t *testing.T) {
 
 	br := streamclient.NewMockBlockReader()
-	logStream := streamclient.NewMockStreamClient("log",br)
-	rowStream := streamclient.NewMockStreamClient("sst",br)
-	metaStream := streamclient.NewMockStreamClient("meta",br)
+	logStream := streamclient.NewMockStreamClient("log", br)
+	rowStream := streamclient.NewMockStreamClient("sst", br)
+	metaStream := streamclient.NewMockStreamClient("meta", br)
 
 	defer logStream.Close()
 	defer rowStream.Close()
@@ -177,7 +176,7 @@ func TestReopenRangePartition(t *testing.T) {
 	rp.Close()
 
 	//reopen with tables
-	rp , _ = OpenRangePartition(3, metaStream, rowStream, logStream, br,
+	rp, _ = OpenRangePartition(3, metaStream, rowStream, logStream, br,
 		[]byte(""), []byte(""), TestOption())
 
 	for i := 10; i < 100; i++ {
@@ -220,7 +219,6 @@ func TestReopenRangePartitionWithBig(t *testing.T) {
 	}
 	wg.Wait()
 	rp.close(false)
-
 
 	//reopen with tables
 	rp, _ = OpenRangePartition(3, metaStream, rowStream, logStream, br,
@@ -281,5 +279,21 @@ func TestRange(t *testing.T) {
 		*/
 		require.Equal(t, array, out)
 
+	})
+}
+
+func TestHead(t *testing.T) {
+	runRPTest(t, func(t *testing.T, rp *RangePartition) {
+		rp.Write([]byte("key0"), []byte("val0"))
+		info, err := rp.Head([]byte("key0"))
+		require.Nil(t, err)
+		require.Equal(t, len("val0"), int(info.Len))
+
+		bigValue := []byte(fmt.Sprintf("%01048576d", 10))
+
+		rp.Write([]byte("key0"), bigValue)
+		info, err = rp.Head([]byte("key0"))
+		require.Nil(t, err)
+		require.Equal(t, len(bigValue), int(info.Len))
 	})
 }

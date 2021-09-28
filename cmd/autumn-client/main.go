@@ -249,13 +249,12 @@ func bootstrap(c *cli.Context) error {
 	}
 	fmt.Printf("row stream %d created, replication is [%d+%d]\n", row.StreamID, r, s)
 
-	meta, _, err := smc.CreateStream(context.Background(), uint32(r),  0)
+	meta, _, err := smc.CreateStream(context.Background(), uint32(r), 0)
 	if err != nil {
 		fmt.Printf("can not create meta stream\n")
 		return err
 	}
 	fmt.Printf("meta stream %d created, replication is [%d+%d]\n", row.StreamID, r, s)
-
 
 	partID, _, err := etcd_utils.EtcdAllocUniqID(etcdClient, stream_manager.IdKey, 1)
 	if err != nil {
@@ -267,8 +266,8 @@ func bootstrap(c *cli.Context) error {
 		LogStream:  log.StreamID,
 		RowStream:  row.StreamID,
 		MetaStream: meta.StreamID,
-		Rg:        &pspb.Range{StartKey: []byte(""), EndKey: []byte("")},
-		PartID:    partID,
+		Rg:         &pspb.Range{StartKey: []byte(""), EndKey: []byte("")},
+		PartID:     partID,
 	}
 
 	err = etcd_utils.EtcdSetKV(etcdClient, fmt.Sprintf("PART/%d", partID), utils.MustMarshal(&zeroMeta))
@@ -296,7 +295,6 @@ func del(c *cli.Context) error {
 
 }
 
-
 func head(c *cli.Context) error {
 	etcdUrls := utils.SplitAndTrim(c.String("etcd-urls"), ",")
 	client := autumn_clientv1.NewAutumnLib(etcdUrls)
@@ -309,13 +307,13 @@ func head(c *cli.Context) error {
 		return errors.New("no key")
 	}
 
-	_ , version, length, err := client.Head(context.Background(), []byte(key))
+	_, length, err := client.Head(context.Background(), []byte(key))
 	if err != nil {
 		return err
 	}
-	fmt.Printf("key: %s, version: %d, length: %d\n", key, version, length)
+	fmt.Printf("key: %s, length: %d\n", key, length)
 	return nil
-	
+
 }
 
 func get(c *cli.Context) error {
@@ -421,7 +419,6 @@ func gc(c *cli.Context) error {
 	return client.Maintenance(context.Background(), partID, autumn_clientv1.AutoGCTask{})
 }
 
-
 func forcegc(c *cli.Context) error {
 	client, err := connectToAutumn(c)
 	if err != nil {
@@ -438,7 +435,6 @@ func forcegc(c *cli.Context) error {
 	if err != nil {
 		return errors.Errorf("partID is not int: %s", partIDString)
 	}
-
 
 	tail := c.Args().Tail()
 
@@ -539,7 +535,7 @@ func main() {
 			Flags: []cli.Flag{
 				&cli.StringFlag{Name: "sm-urls", Value: "127.0.0.1:3401"},
 				&cli.StringFlag{Name: "etcd-urls", Value: "127.0.0.1:2379"},
-				&cli.StringFlag{Name: "replication", Value:"2+1"},
+				&cli.StringFlag{Name: "replication", Value: "2+1"},
 			},
 			Action: bootstrap,
 		},
@@ -758,7 +754,7 @@ func format(c *cli.Context) error {
 	config.SmURLs = smURLs
 	config.EtcdURLs = etcdURLs
 	config.ListenURL = listenURL
-	
+
 	if len(output) == 0 {
 		fmt.Printf("display config \n")
 		fmt.Printf("%+v\n", config)
@@ -785,7 +781,7 @@ func wbench(c *cli.Context) error {
 	return benchmark(etcdUrls, WRITE_T, threadNum, duration, size)
 }
 
-func printSummary(elapsed time.Duration, totalCount uint64, totalSize uint64, threadNum int, size int, hist * utils.HistogramStatus) {
+func printSummary(elapsed time.Duration, totalCount uint64, totalSize uint64, threadNum int, size int, hist *utils.HistogramStatus) {
 	if elapsed.Seconds() < 1e-9 {
 		return
 	}
