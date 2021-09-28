@@ -15,6 +15,7 @@ require (
 	github.com/klauspost/reedsolomon v1.9.13
 	github.com/pkg/errors v0.9.1
 	github.com/pkg/xattr v0.4.3
+	github.com/robfig/cron/v3 v3.0.0 // indirect
 	github.com/satori/go.uuid v1.2.0
 	github.com/stretchr/testify v1.7.0
 	github.com/urfave/cli/v2 v2.3.0

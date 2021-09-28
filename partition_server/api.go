@@ -7,7 +7,6 @@ import (
 
 	"github.com/pkg/errors"
 
-	"github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/range_partition"
 	"github.com/journeymidnight/autumn/wire_errors"
@@ -117,6 +116,7 @@ func (ps *PartitionServer) Range(ctx context.Context, req *pspb.RangeRequest) (*
 }
 
 
+
 func (ps *PartitionServer) Maintenance(ctx context.Context, req *pspb.MaintenanceRequest) (*pspb.MaintenanceResponse, error) {
 	ps.RLock()
 	rp := ps.rangePartitions[req.Partid]
@@ -126,20 +126,25 @@ func (ps *PartitionServer) Maintenance(ctx context.Context, req *pspb.Maintenanc
 		return nil, errors.New("no such partid")
 	}
 
-	if req.Gc && req.MajorCompact {
-		return nil, errors.New("gc and major compact can not be both true")
-	}
 
-	var err error
 	
-	if req.Gc {
-		err = rp.SubmitGC()
-	} else if req.MajorCompact {
+	var err error
+	switch t := req.OP.(type) {
+	case *pspb.MaintenanceRequest_Compact:
 		err = rp.SubmitCompaction()
+	case *pspb.MaintenanceRequest_Autogc:
+		err = rp.SubmitGC(range_partition.GcTask{})
+	case *pspb.MaintenanceRequest_Forcegc:
+		err = rp.SubmitGC(range_partition.GcTask{
+			ForceGC: true,
+			ExIDs: t.Forcegc.ExIDs,
+		})
+	default:
+		err = errors.New("unknown op")
 	}
-
 	return &pspb.MaintenanceResponse{}, err
 }
+
 
 func (ps *PartitionServer) SplitPart(ctx context.Context, req *pspb.SplitPartRequest) (*pspb.SplitPartResponse, error) {
 	ps.RLock()
@@ -178,6 +183,8 @@ func (ps *PartitionServer) SplitPart(ctx context.Context, req *pspb.SplitPartReq
 	midKey := rp.GetSplitPoint()
 	
 
+	//如果submitGC/submitCompact在Close之前, Close等待完成
+	//如果submitGC/submitCompact在Close之后, 由于Close设置了writeBlock, submitGC/submitCompact直接返回
 	rp.Close()
 
 	fmt.Printf("rp %d is closed", rp.PartID)
@@ -194,18 +201,14 @@ func (ps *PartitionServer) SplitPart(ctx context.Context, req *pspb.SplitPartReq
 		err := ps.smClient.MultiModifySplit(ctx, req.Partid, midKey, mutex.Key(), mutex.Header().Revision, 
 		ends.LogEnd, ends.RowEnd, ends.MetaEnd)
 
-		xlog.Logger.Infof("range partionion %d split: resut is %v", err)
+		xlog.Logger.Infof("range partionion %d split: result is %v", err)
 		if err == nil {
 			break
-		} else if err == smclient.ErrTimeOut || err == wire_errors.NotLeader{
+		} else {
+			xlog.Logger.Errorf("range partionion %d split: result is %v, retry...", err)
 			time.Sleep(backOffTime)
 			backOffTime *= 2
 			continue
-		} else {
-			//I have to reopen rp
-			//send warning to sm service
-			defer panic("I have to reopen rp, panic myself to reopen all range partitions")
-			return nil, err
 		}
 	}
 

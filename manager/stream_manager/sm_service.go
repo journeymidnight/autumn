@@ -305,7 +305,112 @@ func (sm *StreamManager) CheckCommitLength(ctx context.Context, req *pb.CheckCom
 	},nil
 }
 
+//doPunchHole will return latest StreamInfo and error
+func (sm *StreamManager) doPunchHoles(streamID uint64, extentIDs []uint64, ownerKey string, revision int64) (*pb.StreamInfo, error) {
+		//WARNING: streamclient should alway lock stream in PunchHoles, Truncate and AllocExtent
 
+		streamInfo, ok := sm.cloneStreamInfo(streamID)
+		if !ok {
+			return nil, errors.Errorf("stream %d do not exist", streamID)
+		}
+		if len(streamInfo.ExtentIDs) == 0 {
+			return nil, errors.Errorf("stream %d do not have any extent", streamID)
+		}
+	
+		lastExID := streamInfo.ExtentIDs[len(streamInfo.ExtentIDs) - 1]
+	
+		//build index for req.ExtentIDs, exclude lastExID
+		index := make(map[uint64]bool)
+		for _, extentID := range extentIDs {
+			if extentID != lastExID {
+				index[extentID] = true
+			}
+		}
+	
+		punchedExtents := make([]uint64, 0)
+	
+		for i := len(streamInfo.ExtentIDs) - 1; i >= 0; i-- {
+			if _, ok := index[streamInfo.ExtentIDs[i]]; ok {
+				punchedExtents = append(punchedExtents, streamInfo.ExtentIDs[i])
+				streamInfo.ExtentIDs = append(streamInfo.ExtentIDs[:i], streamInfo.ExtentIDs[i+1:]...)
+			}
+		}
+	
+		if len(extentIDs) != len(punchedExtents) {
+			xlog.Logger.Warn("punch holes: some extentIDs are not in streamInfo.ExtentIDs")
+		}
+	
+	
+		//update streamInfo
+		ops := []clientv3.Op{clientv3.OpPut(formatStreamKey(streamID), string(utils.MustMarshal(streamInfo)))}
+	
+	
+	
+		//ignore  lock and cloneExtentInfo errors
+		for i := range punchedExtents {
+			if err := sm.lockExtent(punchedExtents[i]) ; err != nil {
+				for j := 0 ; j < i ; j++ {
+					sm.unlockExtent(punchedExtents[j])
+				}
+				return nil, err
+			}
+		}
+		defer func(){
+			for i := range punchedExtents {
+				sm.unlockExtent(punchedExtents[i])
+			}
+		}()
+	
+		//delete extentIDs if ref == 1
+		exToBeDeleted := make([]*pb.ExtentInfo, 0)
+		exToBeUpdated := make([]*pb.ExtentInfo, 0)
+		for i := range punchedExtents {
+			punchExInfo, ok := sm.cloneExtentInfo(punchedExtents[i])
+			if !ok {
+				return nil, errors.Errorf("punch holes: extent %d do not exist", punchedExtents[i])
+			}
+			if punchExInfo.Avali == 0 {
+				return nil, errors.Errorf("punch holes: extent %d should be sealed", punchExInfo.ExtentID)
+			}
+			if punchExInfo.Refs == 1 {
+				exToBeDeleted = append(exToBeDeleted, punchExInfo)
+			} else {
+				punchExInfo.Refs --
+				punchExInfo.Eversion ++
+				exToBeUpdated = append(exToBeUpdated, punchExInfo)
+			}
+		}
+	
+		//delete extentIDs
+		for _, exInfo := range exToBeDeleted {
+			ops = append(ops, clientv3.OpDelete(formatExtentKey(exInfo.ExtentID)))
+		}
+		for _, exInfo := range exToBeUpdated {
+			ops = append(ops, clientv3.OpPut(formatExtentKey(exInfo.ExtentID), string(utils.MustMarshal(exInfo))))
+		}
+	
+		err := etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
+			clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
+			clientv3.Compare(clientv3.CreateRevision(ownerKey), "=", revision),
+		}, ops)
+	
+	
+		if err != nil {
+			return nil, err
+		}
+	
+		//change memory
+		for _, exInfo := range exToBeUpdated {
+			sm.extents.Set(exInfo.ExtentID, exInfo)
+		}
+		for _, exInfo := range exToBeDeleted {
+			sm.extents.Del(exInfo.ExtentID)
+			sm.extentsLocks.Delete(exInfo.ExtentID)
+		}
+		sm.streams.Set(streamID, streamInfo)
+		return streamInfo, nil
+	
+}
 
 func (sm *StreamManager) StreamPunchHoles(ctx context.Context, req *pb.PunchHolesRequest) (*pb.PunchHolesResponse, error) {
 	errDone := func(err error) (*pb.PunchHolesResponse, error){
@@ -320,98 +425,11 @@ func (sm *StreamManager) StreamPunchHoles(ctx context.Context, req *pb.PunchHole
 		return errDone(wire_errors.NotLeader)
 	}
 
-	var err error
 
-	//WARNING: streamclient should alway lock stream in PunchHoles, Truncate and AllocExtent
-
-	streamInfo, ok := sm.cloneStreamInfo(req.StreamID)
-	if !ok {
-		return errDone(errors.Errorf("stream %d do not exist", req.StreamID))
-	}
-	if len(streamInfo.ExtentIDs) == 0 {
-		return errDone(errors.Errorf("stream %d do not have any extent", req.StreamID))
-	}
-
-	lastExID := streamInfo.ExtentIDs[len(streamInfo.ExtentIDs) - 1]
-
-	//build index for req.ExtentIDs, exclude lastExID
-	index := make(map[uint64]bool)
-	for _, extentID := range req.ExtentIDs {
-		if extentID != lastExID {
-			index[extentID] = true
-		}
-	}
-
-	punchedExtents := make([]uint64, 0)
-
-	for i := len(streamInfo.ExtentIDs) - 1; i >= 0; i-- {
-		if _, ok := index[streamInfo.ExtentIDs[i]]; ok {
-			punchedExtents = append(punchedExtents, streamInfo.ExtentIDs[i])
-			streamInfo.ExtentIDs = append(streamInfo.ExtentIDs[:i], streamInfo.ExtentIDs[i+1:]...)
-		}
-	}
-
-	if len(req.ExtentIDs) != len(punchedExtents) {
-		xlog.Logger.Warn("punch holes: some extentIDs are not in streamInfo.ExtentIDs")
-	}
-
-
-	//update streamInfo
-	ops := []clientv3.Op{clientv3.OpPut(formatStreamKey(req.StreamID), string(utils.MustMarshal(streamInfo)))}
-
-	//delete extentIDs if ref == 1
-	exToBeDeleted := make([]*pb.ExtentInfo, 0)
-	exToBeUpdated := make([]*pb.ExtentInfo, 0)
-	//ignore  lock and cloneExtentInfo errors
-	for i := range punchedExtents {
-		if err := sm.lockExtent(punchedExtents[i]) ; err != nil {
-			for j := 0 ; j < i ; j++ {
-				sm.unlockExtent(punchedExtents[j])
-			}
-			return errDone(err)
-		}
-	}
-	defer func(){
-		for i := range punchedExtents {
-			sm.unlockExtent(punchedExtents[i])
-		}
-	}()
-	for i := range punchedExtents {
-		punchExInfo, ok := sm.cloneExtentInfo(punchedExtents[i])
-		if !ok {
-			return errDone(errors.Errorf("not found"))
-		}
-		if punchExInfo.Avali == 0 {
-			return errDone(errors.Errorf("punch holes: extent %d should be sealed", punchExInfo.ExtentID))
-		}
-		if punchExInfo.Refs == 1 {
-			exToBeDeleted = append(exToBeDeleted, punchExInfo)
-		} else {
-			punchExInfo.Refs --
-			punchExInfo.Eversion ++
-			exToBeUpdated = append(exToBeUpdated, punchExInfo)
-		}
-	}
-
-	//delete extentIDs
-	for _, exInfo := range exToBeDeleted {
-		ops = append(ops, clientv3.OpDelete(formatExtentKey(exInfo.ExtentID)))
-	}
-	for _, exInfo := range exToBeUpdated {
-		ops = append(ops, clientv3.OpPut(formatExtentKey(exInfo.ExtentID), string(utils.MustMarshal(exInfo))))
-	}
-
-	err = etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
-		clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
-		clientv3.Compare(clientv3.CreateRevision(req.OwnerKey), "=", req.Revision),
-	}, ops)
-
-
+	streamInfo, err := sm.doPunchHoles(req.StreamID, req.ExtentIDs, req.OwnerKey, req.Revision)
 	if err != nil {
 		return errDone(err)
 	}
-
-	sm.streams.Set(req.StreamID, streamInfo)
 
 	return &pb.PunchHolesResponse{
 		Code: pb.Code_OK,
@@ -919,82 +937,18 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 		return errDone(errors.Errorf("do not have to truncate"))
 	}
 
-
-	//delete extents
-	newExtentIDs := streamInfo.ExtentIDs[i:]
 	oldExtentIDs := streamInfo.ExtentIDs[:i]
 
-	streamKey := formatStreamKey(req.StreamID)
-	newStreamInfo := pb.StreamInfo{
-		StreamID:  req.StreamID,
-		ExtentIDs: newExtentIDs,
-	}
-
-	//update current stream
-	sdata, err := newStreamInfo.Marshal()
-	utils.Check(err)
-	ops := []clientv3.Op{
-		clientv3.OpPut(streamKey, string(sdata)),
-	}
-
-	//delete extents whose ref == 1
-	var exToBeDeleted []*pb.ExtentInfo
-	var exToBeUpdated  []*pb.ExtentInfo
-	for i := range oldExtentIDs {
-		if err := sm.lockExtent(oldExtentIDs[i]) ; err != nil {
-			for j := 0 ; j < i ; j++ {
-				sm.unlockExtent(oldExtentIDs[j])
-			}
-			return errDone(err)
-		}
-	}
-
-	defer func(){
-		for i := range oldExtentIDs {
-			sm.unlockExtent(oldExtentIDs[i])
-		}
-	}()
-
-	for i := range oldExtentIDs {
-		oldExInfo, ok := sm.cloneExtentInfo(oldExtentIDs[i])
-		if !ok {
-			return errDone(errors.Errorf("not found extent %d", oldExtentIDs[i]))
-		}
-		if oldExInfo.Refs == 1 {
-			exToBeDeleted = append(exToBeDeleted, oldExInfo)
-		} else {
-			oldExInfo.Refs --
-			oldExInfo.Eversion ++
-			exToBeUpdated = append(exToBeUpdated, oldExInfo)
-		}
-	}
-
-
-	
-	for _, exInfo := range exToBeDeleted {
-		ops = append(ops, clientv3.OpDelete(formatExtentKey(exInfo.ExtentID)))
-	}
-	for _, exInfo := range exToBeUpdated {
-		ops = append(ops, clientv3.OpPut(formatExtentKey(exInfo.ExtentID), string(utils.MustMarshal(exInfo))))
-	}
-
-	
-
-	err = etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
-		clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
-		clientv3.Compare(clientv3.CreateRevision(req.OwnerKey), "=", req.Revision),
-	}, ops)
+	newStreamInfo, err := sm.doPunchHoles(req.StreamID, oldExtentIDs, req.OwnerKey, req.Revision)
 
 
 	if err != nil {
 		return errDone(err)
 	}
 
-	sm.streams.Set(req.StreamID, &newStreamInfo)
-
 	return &pb.TruncateResponse{
 		Code: pb.Code_OK,
-		UpdatedStreamInfo: &newStreamInfo,
+		UpdatedStreamInfo: newStreamInfo,
 	}, nil
 
 }

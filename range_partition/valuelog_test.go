@@ -317,7 +317,7 @@ func TestSubmitGC(t *testing.T) {
 	//fmt.Println(rp.logStream.StreamInfo().GetExtentIDs())
 	require.Equal(t, 4, len(rp.logStream.StreamInfo().GetExtentIDs()))
 
-	require.Nil(t, rp.SubmitGC())
+	require.Nil(t, rp.SubmitGC(GcTask{}))
 
 	time.Sleep(1 * time.Second)
 

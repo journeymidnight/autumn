@@ -120,7 +120,7 @@ func (p DefaultPickupPolicy) PickupTables(tbls []*table.Table) ([]*table.Table, 
 	throttle := uint64(math.Round(p.compactRatio*float64(p.opt.MaxSkipList)))
 
 	for i := 0; i < len(tbls); i++ {
-		for tbls[i].EstimatedSize < throttle && i < len(tbls) && len(compactTbls) < p.n {
+		for i < len(tbls) && tbls[i].EstimatedSize < throttle && len(compactTbls) < p.n {
 			//merge to older and larger SSTables
 			if i > 0 && len(compactTbls) == 0 {
 				compactTbls = append(compactTbls, tbls[i-1])
@@ -158,7 +158,10 @@ func (rp *RangePartition) compact() {
 		select {
 		case <- rp.majorCompactChan:
 			allTables := rp.getTables()
-			if len(allTables) < 2 {
+			if len(allTables) == 0 {
+				continue
+			}
+			if len(allTables) < 2 && atomic.LoadUint32(&rp.hasOverlap) == 0 {
 				continue
 			}
 			eID := allTables[len(allTables)- 1].Loc.ExtentID
@@ -198,7 +201,7 @@ func (rp *RangePartition) compact() {
 
 func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 
-	if len(tbls) < 2 {
+	if len(tbls) < 1 {
 		return
 	}
 
@@ -319,7 +322,6 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 		atomic.StoreUint32(&rp.hasOverlap, 0)
 	}
 }
-
 
 
 func validDiscard(discards map[uint64]int64, extentIDs []uint64) map[uint64]int64 {

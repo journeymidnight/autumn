@@ -562,28 +562,6 @@ func (en *ExtentNode) AllocExtent(ctx context.Context, req *pb.AllocExtentReques
 	}, nil
 }
 
-/*
-func (en *ExtentNode) Seal(ctx context.Context, req *pb.SealRequest) (*pb.SealResponse, error) {
-	ex := en.getExtent(req.ExtentID)
-	if ex == nil {
-		return nil, errors.Errorf("do not have extent %d, can not alloc new", req.ExtentID)
-	}
-	ex.Lock()
-	defer ex.Unlock()
-
-	if ex.HasLock(req.Revision) == false {
-		return nil, errors.Errorf("lock by others")
-	}
-	
-	err := ex.Seal(req.CommitLength)
-	if err != nil {
-		xlog.Logger.Warnf(err.Error())
-		return nil, err
-	}
-	return &pb.SealResponse{Code: pb.Code_OK}, nil
-
-}
-*/
 
 
 

@@ -249,7 +249,7 @@ func bootstrap(c *cli.Context) error {
 	}
 	fmt.Printf("row stream %d created, replication is [%d+%d]\n", row.StreamID, r, s)
 
-	meta, _, err := smc.CreateStream(context.Background(), uint32(r),1)
+	meta, _, err := smc.CreateStream(context.Background(), uint32(r),  0)
 	if err != nil {
 		fmt.Printf("can not create meta stream\n")
 		return err
@@ -396,9 +396,45 @@ func gc(c *cli.Context) error {
 	if err != nil {
 		return errors.Errorf("partID is not int: %s", partIDString)
 	}
-	return client.Maintenance(context.Background(), partID, true, false)
+	return client.Maintenance(context.Background(), partID, autumn_clientv1.AutoGCTask{})
 }
 
+
+func forcegc(c *cli.Context) error {
+	client, err := connectToAutumn(c)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	partIDString := c.Args().First()
+
+	if len(partIDString) == 0 {
+		return errors.New("partID is nil")
+
+	}
+	partID, err := strconv.ParseUint(partIDString, 10, 64)
+	if err != nil {
+		return errors.Errorf("partID is not int: %s", partIDString)
+	}
+
+
+	tail := c.Args().Tail()
+
+	if len(tail) == 0 {
+		return errors.New("must have at least one extent id")
+	}
+	intTails := make([]uint64, 0, len(tail))
+	var exID uint64
+	for _, t := range tail {
+		exID, err = strconv.ParseUint(t, 10, 64)
+		if err != nil {
+			return errors.Errorf("exID is not int: %s", t)
+		}
+		intTails = append(intTails, exID)
+	}
+
+	return client.Maintenance(context.Background(), partID, autumn_clientv1.ForceGCTask{ExIDs: intTails})
+}
 
 func compact(c *cli.Context) error {
 	client, err := connectToAutumn(c)
@@ -416,7 +452,7 @@ func compact(c *cli.Context) error {
 	if err != nil {
 		return errors.Errorf("partID is not int: %s", partIDString)
 	}
-	return client.Maintenance(context.Background(), partID, false, true)
+	return client.Maintenance(context.Background(), partID, autumn_clientv1.CompactTask{})
 }
 
 func splitPartition(c *cli.Context) error {
@@ -525,6 +561,14 @@ func main() {
 				&cli.StringFlag{Name: "etcdUrls", Value: "127.0.0.1:2379"},
 			},
 			Action: gc,
+		},
+		{
+			Name:  "forcegc",
+			Usage: "gc --etcdUrls <addrs> <PARTID> <ID>...<ID>",
+			Flags: []cli.Flag{
+				&cli.StringFlag{Name: "etcdUrls", Value: "127.0.0.1:2379"},
+			},
+			Action: forcegc,
 		},
 		{
 			Name:  "compact",

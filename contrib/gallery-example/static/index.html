@@ -19,6 +19,7 @@ Show Zone
 
 <!--list button send xhr /list to backend -->
 <button id="list">List</button>
+<button id="delete">Delete</button>
 </p>
 
 <p>
@@ -128,6 +129,23 @@ function previewImage(url){
 
 }
 
+var _delete = document.getElementById('delete');
+_delete.addEventListener('click', function(e){
+    e.preventDefault();
+    var xhr = new XMLHttpRequest();
+    var inputText = document.getElementById('num').value;
+    xhr.open("DELETE", `/del/${inputText}`, true);
+    xhr.onload = function(e) {
+        if (xhr.status == 200) {
+            alert('Deleted');
+        } else { 
+            alert(xhr.statusText);
+        }
+    };
+    xhr.send();
+});
+
+
 var list = document.getElementById('list');
 list.addEventListener('click', function(e) {
     e.preventDefault();
@@ -178,6 +196,8 @@ uploadform.addEventListener("submit", function(e){
             if (fileNum != "") {
                 previewImage(`/get/${fileNum}`)
             }
+            var num = document.getElementById('num');
+            num.value = `${fileNum}`;
         } else if (this.readyState == 4) {
             alert("upload failed" + this.responseText);
         }
