@@ -69,6 +69,7 @@ message PartitionMeta {
 	uint64 rowStream = 3;
 	Range  rg = 7;
 	uint64 PartID = 8;
+	uint64 metaStream = 9;
 }
 
  message PSDetail {
@@ -83,6 +84,7 @@ message BlockMeta {
     uint64  vpExtentID = 4;
     uint32  vpOffset = 5;
     uint64  seqNum = 6;
+	map<uint64, int64> discards = 7;
 }
 
 message BlockOffset {
@@ -173,12 +175,28 @@ message RangeResponse {
 
 
 message SplitPartRequest {
-	uint64 PartID = 1;
+	uint64 partid = 1;
 }
 
 message SplitPartResponse {
 }
 
+message CompactOp {}
+message AutoGCOp {}
+message ForceGCOp {
+	repeated uint64 exIDs = 1;
+}
+message MaintenanceRequest {
+	uint64 partid = 1;
+	oneof OP {
+		CompactOp compact = 2;
+		AutoGCOp  autogc = 3;
+		ForceGCOp forcegc = 4;
+	}
+}
+
+message MaintenanceResponse {
+}
 
 message HeadRequest {
 	bytes key = 1;
@@ -196,12 +214,6 @@ message HeadInfo {
 }
 
 service PartitionKV {
-	/*
-	option (google.api.http) = {
-        post: "/v3/kv/txn"
-        body: "*"
-    };
-	*/
 	rpc Batch(BatchRequest) returns (BatchResponse) {}
 	rpc Put(PutRequest) returns (PutResponse) {}
 	rpc Head(HeadRequest) returns (HeadResponse) {}
@@ -212,4 +224,5 @@ service PartitionKV {
 	//ps management API
 	//system performace
 	rpc SplitPart(SplitPartRequest) returns (SplitPartResponse) {}
+	rpc Maintenance(MaintenanceRequest) returns (MaintenanceResponse) {}
 }

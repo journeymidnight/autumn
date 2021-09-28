@@ -130,10 +130,17 @@ func (en *ExtentNode) extentInfoUpdatedfunc(eventType string, cur *pb.ExtentInfo
 		//FIXME, TODO
 		ex := en.getExtent(prev.ExtentID)
 		if ex != nil {
-			fmt.Printf("you should delete extent %d...", prev.ExtentID)
+			fmt.Printf("you should delete extent %d...\n", prev.ExtentID)
+			en.RemoveExtent(ex)
 		}
 	}
 	
+}
+
+func (en *ExtentNode) RemoveExtent(eod *ExtentOnDisk) error {
+	en.extentMap.Delete(eod.ID)
+	eod.Close()
+	return en.diskFSs[eod.diskID].RemoveExtent(eod.ID)
 }
 
 func (en *ExtentNode) SyncFs() {

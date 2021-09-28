@@ -100,6 +100,22 @@ class AutumnLib:
         return stub.Put(pspb.PutRequest(key=key,value=value,partid=sortedRegion[idx].PartID))
 
 
+    def Delete(self, key):
+        if len(key) == 0:
+            return
+        sortedRegion = self._getRegions()
+        if len(sortedRegion) == 0:
+            return
+
+
+        idx = _binary_search(sortedRegion, lambda x: 
+            len(x.rg.endKey) == 0 or x.rg.endKey > key
+        )
+        conn = self._getConn(self._getPSAddr(sortedRegion[idx].PSID))
+        stub = pspb_grpc.PartitionKVStub(conn)
+        return stub.Delete(pspb.DeleteRequest(key=key,partid=sortedRegion[idx].PartID))
+
+
     def List(self, start, prefix, limit):
         sortedRegion = self._getRegions()
         if len(sortedRegion) == 0:

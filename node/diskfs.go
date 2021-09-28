@@ -105,6 +105,12 @@ func (s *diskFS) pathName(extentID uint64, suffix string) string {
 	return filepath.Join(fpath...)
 }
 
+
+func (s *diskFS) RemoveExtent(extentID uint64) error {
+	fileName := s.pathName(extentID, "ext")
+	return os.Remove(fileName)
+}
+
 func (s *diskFS) AllocCopyExtent(extentID uint64, ReplaceNodeID uint64) (string, error) {
 	utils.AssertTrue(s!=nil)
 	fpath := s.pathName(extentID, fmt.Sprintf("%d.copy", ReplaceNodeID))

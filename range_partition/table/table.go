@@ -3,9 +3,7 @@ package table
 import (
 	"context"
 	"fmt"
-	"sync/atomic"
 
-	"github.com/dgraph-io/ristretto"
 	"github.com/dgraph-io/ristretto/z"
 	"github.com/gogo/protobuf/proto"
 	"github.com/journeymidnight/autumn/proto/pspb"
@@ -27,35 +25,22 @@ type Table struct {
 	utils.SafeMutex
 	blockReader streamclient.BlockReader //only to read
 	blockIndex []*pspb.BlockOffset
-	ref        int32 // For file garbage collection. Atomic.
 
 	// The following are initialized once and const.
 	smallest, biggest []byte // Smallest and largest keys (with timestamps).
 
-	// Stores the total size of key-values stored in this table (including the size on vlog).
+	// Stores the total size of key-values stored in this table (exclude the size on vlog).
 	EstimatedSize uint64
 	bf            *z.Bloom
-	Cache         *ristretto.Cache
-	BfCache       *ristretto.Cache
+	//cache ??
 
-	Loc        pspb.Location
+	Loc        pspb.Location //saved address in rowStream
 	LastSeq    uint64
+	 //all data before [vpExtentID, vpOffset] is in rowStream. log replay starts from [vpExtentID, vpOffset]
 	VpExtentID uint64
-	VpOffset   uint32
-}
-
-// IncrRef increments the refcount (having to do with whether the file should be deleted)
-func (t *Table) IncrRef() {
-	atomic.AddInt32(&t.ref, 1)
-}
-
-// DecrRef decrements the refcount and possibly deletes the table
-func (t *Table) DecrRef() error {
-	ref := atomic.AddInt32(&t.ref, ^int32(0))
-	if ref == 0 {
-		//TODO: remove table
-	}
-	return nil
+	VpOffset   uint32  
+	//extentID => discard count
+	Discards   map[uint64]int64   
 }
 
 func OpenTable(blockReader streamclient.BlockReader,
@@ -105,7 +90,7 @@ func OpenTable(blockReader streamclient.BlockReader,
 		LastSeq:    meta.SeqNum,
 		VpExtentID: meta.VpExtentID,
 		VpOffset:   meta.VpOffset,
-		ref:        1,
+		Discards:   meta.Discards,
 	}
 
 	//read bloom filter
@@ -199,7 +184,6 @@ func (t *Table) initBiggestAndSmallest() error {
 
 // NewIterator returns a new iterator of the Table
 func (t *Table) NewIterator(reversed bool) *Iterator {
-	t.IncrRef() // Important.
 	ti := &Iterator{t: t, reversed: reversed}
 	ti.next()
 	return ti
@@ -207,4 +191,8 @@ func (t *Table) NewIterator(reversed bool) *Iterator {
 
 func (t *Table) DoesNotHave(hash uint64) bool {
 	return !t.bf.Has(hash)
+}
+
+func (t *Table) FirstOccurrence() uint64 {
+	return t.blockIndex[0].ExtentID
 }

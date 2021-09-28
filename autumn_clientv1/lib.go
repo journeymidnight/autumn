@@ -259,6 +259,7 @@ func (lib *AutumnLib) Get(ctx context.Context, key []byte) ([]byte, error) {
 
 }
 
+
 func (lib *AutumnLib) Range(ctx context.Context, prefix []byte, start []byte, limit uint32) ([][]byte, bool, error) {
 	sortedRegions := lib.getRegions()
 	if len(sortedRegions) == 0 {
@@ -319,9 +320,68 @@ func (lib *AutumnLib) SplitPart(ctx context.Context, partID uint64) error {
 	conn := lib.getConn(lib.getPSAddr(sortedRegions[foundRegion].PSID))
 	client := pspb.NewPartitionKVClient(conn)
 	_, err := client.SplitPart(ctx, &pspb.SplitPartRequest{
-		PartID: partID,
+		Partid: partID,
 	})
 
+	return err
+}
+
+
+type MaintenanceTask interface{
+	Name() string
+}
+
+type CompactTask struct {}
+func (CompactTask) Name() string{
+	return "CompactTask"
+}
+
+type ForceGCTask struct {ExIDs []uint64}
+func (ForceGCTask) Name() string {
+	return "ForceGCTask"
+}
+
+
+type AutoGCTask struct {}
+func (AutoGCTask) Name() string {
+	return "AutoGCTask"
+}
+
+func (lib *AutumnLib) Maintenance(ctx context.Context, partID uint64, task MaintenanceTask) error {
+	sortedRegions := lib.getRegions()
+	foundRegion := -1
+	for i := 0; i < len(sortedRegions); i++ {
+		if sortedRegions[i].PartID == partID {
+			foundRegion = i
+		}
+	}
+	if foundRegion == -1 {
+		return errors.New("partition not found")
+	}
+
+	var req pspb.MaintenanceRequest
+	req.Partid = partID
+	switch t := task.(type) {
+		case CompactTask:
+			req.OP = &pspb.MaintenanceRequest_Compact{
+				Compact: &pspb.CompactOp{},
+			}
+		case ForceGCTask:
+			req.OP = &pspb.MaintenanceRequest_Forcegc{
+				Forcegc: &pspb.ForceGCOp{
+					ExIDs: t.ExIDs,
+				},
+			}
+		case AutoGCTask:
+			req.OP = &pspb.MaintenanceRequest_Autogc{
+				Autogc: &pspb.AutoGCOp{},
+			}
+		default:
+			panic("unknown task")
+	}
+	conn := lib.getConn(lib.getPSAddr(sortedRegions[foundRegion].PSID))
+	client  := pspb.NewPartitionKVClient(conn)
+	_, err := client.Maintenance(ctx, &req)
 	return err
 }
 

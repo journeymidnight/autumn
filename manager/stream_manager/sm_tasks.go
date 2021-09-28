@@ -208,7 +208,9 @@ func (sm *StreamManager) saveRecoveryTask(task *pb.RecoveryTask) error{
 	return nil
 }
 
-//FIXME: delete Extent
+
+
+
 
 //lockExtent returns error to indicate extent has been deleted
 func (sm *StreamManager) lockExtent(extentID uint64) error {

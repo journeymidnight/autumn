@@ -8,7 +8,6 @@ import (
 
 var (
 	EndOfExtent = errors.New("EndOfExtent")
-	EndOfStream = errors.New("EndOfStream")
 	VersionLow = errors.New("extent version too low")
 	NotLeader = errors.New("not a leader")
 	LockedByOther = errors.New("LockedByOther")

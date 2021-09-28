@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"strings"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -13,128 +12,82 @@ import (
 
 	"github.com/journeymidnight/autumn/etcd_utils"
 	"github.com/journeymidnight/autumn/manager/smclient"
-	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/range_partition"
 	"github.com/journeymidnight/autumn/streamclient"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
+	"github.com/robfig/cron/v3"
 	"google.golang.org/grpc"
 )
 
-
-type PartitionServerConfig struct {
-	advertiseURL       string
-	ListenURL          string
-	SmURLs        []string
-	EtcdURLs      []string
-	MustSync      bool
+type Config struct {
+	PSID                 uint64
+	AdvertiseURL         string
+	ListenURL            string
+	SmURLs               []string
+	EtcdURLs             []string
+	MustSync             bool
+	CronTimeGC           string
+	CronTimeMajorCompact string
+	MaxExtentSize        uint32
+	MaxMetaExtentSize    uint32
 }
 
 type PartitionServer struct {
-	utils.SafeMutex //protect rangePartitions
-	rangePartitions map[uint64]*range_partition.RangePartition
+	utils.SafeMutex     //protect rangePartitions
+	rangePartitions     map[uint64]*range_partition.RangePartition
 	rangePartitionLocks map[uint64]*concurrency.Mutex
-	PSID            uint64
-	smClient        *smclient.SMClient
-	etcdClient      *clientv3.Client     
-	config         PartitionServerConfig
-	extentManager *smclient.ExtentManager
-	blockReader   *streamclient.AutumnBlockReader
-	grcpServer    *grpc.Server
-	session       *concurrency.Session
-	watchCh       *clientv3.WatchChan
-	closeWatchCh  func()
+	PSID                uint64
+	smClient            *smclient.SMClient
+	etcdClient          *clientv3.Client
+	config              Config
+	extentManager       *smclient.ExtentManager
+	blockReader         *streamclient.AutumnBlockReader
+	grcpServer          *grpc.Server
+	session             *concurrency.Session
+	watchCh             *clientv3.WatchChan
+	closeWatchCh        func()
+	cron                *cron.Cron
 }
 
-func NewPartitionServer(smURLs []string, etcdURLs []string, PSID uint64, advertiseURL string, listenURL string, mustSync bool) *PartitionServer {
+func NewPartitionServer(config Config) *PartitionServer {
 	return &PartitionServer{
-		rangePartitions: make(map[uint64]*range_partition.RangePartition),
+		rangePartitions:     make(map[uint64]*range_partition.RangePartition),
 		rangePartitionLocks: make(map[uint64]*concurrency.Mutex),
-		smClient:        smclient.NewSMClient(smURLs),
-		PSID:            PSID,
-		config: 		PartitionServerConfig{
-			advertiseURL:       advertiseURL,
-			ListenURL:          listenURL,
-			SmURLs:             smURLs,
-			EtcdURLs:           etcdURLs,
-			MustSync:           mustSync,
-		},
+		smClient:            smclient.NewSMClient(config.SmURLs),
+		PSID:                config.PSID,
+		config:              config,
+		cron:                cron.New(cron.WithLogger(xlog.CronLogger{})),
 	}
 }
-
 
 func formatPartLock(partID uint64) string {
 	return fmt.Sprintf("partLock/%d", partID)
 }
 
-
-//FIXME: discard implement
-//
-func (ps *PartitionServer) getPartitionMeta(partID uint64) (int64, *pspb.PartitionMeta, []*pspb.Location, []uint64, error) {
+func (ps *PartitionServer) getPartitionMeta(partID uint64) (int64, *pspb.PartitionMeta, error) {
 	/*
-	PART/{PartID} => {id, id <startKey, endKEY>} //immutable
-
-    PARTSTATS/{PartID}/tables => [(extentID,offset),...,(extentID,offset)]
-    PARTSTATS/{PartID}/blobStreams => [id,...,id]
-    PARTSTATS/{PartID}/discard => <DATA>
-    */
+		PART/{PartID} => {id, id <startKey, endKEY>} //immutable
+	*/
 
 	var rev int64
 	data, newRev, err := etcd_utils.EtcdGetKV(ps.etcdClient, fmt.Sprintf("PART/%d", partID))
 	if err != nil {
-		return 0, nil, nil, nil, err
+		return 0, nil, err
 	}
 	rev = utils.Max64(newRev, rev)
 	var meta pspb.PartitionMeta
 	if err = meta.Unmarshal(data); err != nil {
-		return 0, nil, nil, nil, err
-	}
-	
-	kvs, newRev, err := etcd_utils.EtcdRange(ps.etcdClient, fmt.Sprintf("PARTSTATS/%d", partID))
-	if err != nil {
-		return 0, nil, nil, nil, err
-	}
-	rev = utils.Max64(newRev, rev)
-
-	var rlocs pspb.TableLocations
-	var locs []*pspb.Location
-
-	var rblob pb.BlobStreams
-	var blob []uint64
-
-
-	for _, kv := range kvs {
-		if strings.HasSuffix(string(kv.Key), "tables") {
-			if err = rlocs.Unmarshal(kv.Value) ; err != nil {
-				xlog.Logger.Warnf("parse %s error", kv.Key)
-				continue
-			}
-			locs = rlocs.Locs
-		} else if strings.HasSuffix(string(kv.Key), "blobStreams") {
-			if err = rblob.Unmarshal(kv.Value); err != nil {
-				xlog.Logger.Warnf("parse %s error", kv.Key)
-				continue
-			}
-			blob = make([]uint64, 0, len(rblob.Blobs))
-			for k := range rblob.Blobs {
-				blob = append(blob, k)
-			}
-		} else if strings.HasSuffix(string(kv.Key), "discard") {
-			//TODO
-		} else {
-			xlog.Logger.Warnf("unkown key %s", kv.Key)
-		}
+		return 0, nil, err
 	}
 
-	return rev, &meta, locs, blob, nil
+	return rev, &meta, nil
 }
 
-func (ps *PartitionServer) parseRegionAndStart(regions *pspb.Regions) int64{
+func (ps *PartitionServer) parseRegionAndStart(regions *pspb.Regions) int64 {
 	var rev int64
 	var meta *pspb.PartitionMeta
-	var blobs []uint64
-	var locs []*pspb.Location
 	var err error
 	fmt.Printf("current region: %+v\n", regions.Regions)
 
@@ -145,12 +98,11 @@ func (ps *PartitionServer) parseRegionAndStart(regions *pspb.Regions) int64{
 		_, ok = ps.rangePartitions[region.PartID]
 		ps.RUnlock()
 
-		
 		utils.AssertTrue(region.PartID != 0)
-		
-		if region.PSID != ps.PSID{
+
+		if region.PSID != ps.PSID {
 			if ok {
-				//如果merge或者split存在, 会先close range_partion, 然后再修改regions. 
+				//如果merge或者split存在, 会先close range_partion, 然后再修改regions.
 				//但是允许close range_partition超时或者失败
 				ps.Lock()
 				ps.rangePartitions[region.PartID].Close()
@@ -165,8 +117,7 @@ func (ps *PartitionServer) parseRegionAndStart(regions *pspb.Regions) int64{
 		if ok {
 			continue
 		}
-		
-		
+
 		//if PART did not activate, lock and activate
 		fmt.Printf("locking part %d\n", region.PartID)
 		var mutex *concurrency.Mutex
@@ -183,7 +134,7 @@ func (ps *PartitionServer) parseRegionAndStart(regions *pspb.Regions) int64{
 		}
 
 		fmt.Printf("getPartionMeta %d\n", region.PartID)
-		if rev, meta, locs ,blobs, err = ps.getPartitionMeta(region.PartID) ; err != nil {
+		if rev, meta, err = ps.getPartitionMeta(region.PartID); err != nil {
 			xlog.Logger.Errorf(err.Error())
 			mutex.Unlock(context.Background())
 			continue
@@ -191,7 +142,7 @@ func (ps *PartitionServer) parseRegionAndStart(regions *pspb.Regions) int64{
 
 		xlog.Logger.Infof("range partition %d starting, meta: %v", meta.PartID, meta)
 		fmt.Printf("range partition %d starting, meta: %v", meta.PartID, meta)
-		rp, err := ps.startRangePartition(meta, locs, blobs, mutex)
+		rp, err := ps.startRangePartition(meta, mutex)
 		if err != nil {
 			xlog.Logger.Errorf(err.Error())
 			mutex.Unlock(context.Background())
@@ -214,7 +165,6 @@ func (ps *PartitionServer) Init() {
 
 	//
 
-
 	ps.extentManager = smclient.NewExtentManager(ps.smClient, ps.config.EtcdURLs, nil)
 	ps.blockReader = streamclient.NewAutumnBlockReader(ps.extentManager, ps.smClient)
 
@@ -222,17 +172,16 @@ func (ps *PartitionServer) Init() {
 		xlog.Logger.Fatalf(err.Error())
 	}
 
-	
 	//share the connection with extentManager
 	ps.etcdClient = ps.extentManager.EtcdClient()
-	
-	session , err := concurrency.NewSession(ps.etcdClient, concurrency.WithTTL(60))
+
+	session, err := concurrency.NewSession(ps.etcdClient, concurrency.WithTTL(60))
 	utils.Check(err)
 
 	ps.session = session
-	
+
 	//if session is Done, quit
-	go func(){
+	go func() {
 		for {
 			select {
 			case <-session.Done():
@@ -245,8 +194,8 @@ func (ps *PartitionServer) Init() {
 
 	//session create PSSERVER/{PSID} => {PSDETAIL}
 	var detail = pspb.PSDetail{
-		Address: ps.config.advertiseURL,
-		PSID: ps.PSID,
+		Address: ps.config.AdvertiseURL,
+		PSID:    ps.PSID,
 	}
 
 	keyName := fmt.Sprintf("PSSERVER/%d", ps.PSID)
@@ -263,14 +212,12 @@ func (ps *PartitionServer) Init() {
 		time.Sleep(time.Second)
 	}
 
-
-
 	//read regions/config
 	data, rev, err := etcd_utils.EtcdGetKV(ps.etcdClient, "regions/config")
 	if err != nil {
 		xlog.Logger.Fatalf(err.Error())
 	}
-	
+
 	var config pspb.Regions
 	utils.MustUnMarshal(data, &config)
 
@@ -287,7 +234,7 @@ func (ps *PartitionServer) Init() {
 			//skip to the last, only cares about latest config
 			e := res.Events[len(res.Events)-1]
 			var regions pspb.Regions
-			if err = regions.Unmarshal(e.Kv.Value) ; err != nil {
+			if err = regions.Unmarshal(e.Kv.Value); err != nil {
 				xlog.Logger.Errorf(err.Error())
 				continue
 			}
@@ -297,13 +244,46 @@ func (ps *PartitionServer) Init() {
 	ps.watchCh = &watchConfigCh
 	ps.closeWatchCh = closeWatchCh
 
+	//start cron task:
+
+	ps.cron.AddFunc(ps.config.CronTimeGC, ps.CronTaskGC)
+
+	ps.cron.AddFunc(ps.config.CronTimeMajorCompact, ps.CronTaskCompact)
 }
 
-func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, locs []*pspb.Location, blobs []uint64, mutex *concurrency.Mutex) (*range_partition.RangePartition, error) {
+func (ps *PartitionServer) CronTaskGC() {
+	//copy range partitions
+	ps.RLock()
+	rangePartitions := make([]*range_partition.RangePartition, len(ps.rangePartitions))
+	for _, rp := range ps.rangePartitions {
+		rangePartitions = append(rangePartitions, rp)
+	}
+	ps.RUnlock()
+	for i := 0; i < len(rangePartitions); i++ {
+		fmt.Printf("submit auto gc on range partion %d\n", rangePartitions[i].PartID)
+		rangePartitions[i].SubmitGC(range_partition.GcTask{}) //auto task
+	}
+}
+
+func (ps *PartitionServer) CronTaskCompact() {
+	//copy range partitions
+	ps.RLock()
+	rangePartitions := make([]*range_partition.RangePartition, len(ps.rangePartitions))
+	for _, rp := range ps.rangePartitions {
+		rangePartitions = append(rangePartitions, rp)
+	}
+	ps.RUnlock()
+	for i := 0; i < len(rangePartitions); i++ {
+		fmt.Printf("submit major compaction on range partion %d\n", rangePartitions[i].PartID)
+		rangePartitions[i].SubmitCompaction()
+	}
+}
+
+func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, mutex *concurrency.Mutex) (*range_partition.RangePartition, error) {
 	//1. pmclient get info
 	//2. streamclient connect
 	//3. open RangePartition
-	var row, log *streamclient.AutumnStreamClient
+	var row, log, metaLog *streamclient.AutumnStreamClient
 
 	cleanup := func() {
 		if row != nil {
@@ -312,51 +292,37 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, locs []
 		if log != nil {
 			log.Close()
 		}
+		if metaLog != nil {
+			metaLog.Close()
+		}
 	}
 
-	row = streamclient.NewStreamClient(ps.smClient, ps.extentManager, meta.RowStream, streamclient.MutexToLock(mutex))
+	row = streamclient.NewStreamClient(ps.smClient, ps.extentManager, ps.config.MaxExtentSize, meta.RowStream, streamclient.MutexToLock(mutex))
 	if err := row.Connect(); err != nil {
 		return nil, err
 	}
 
-	log = streamclient.NewStreamClient(ps.smClient, ps.extentManager, meta.LogStream, streamclient.MutexToLock(mutex))
-
+	log = streamclient.NewStreamClient(ps.smClient, ps.extentManager, ps.config.MaxExtentSize, meta.LogStream, streamclient.MutexToLock(mutex))
 	if err := log.Connect(); err != nil {
 		cleanup()
 		return nil, err
 	}
 
-	openStream := func(si pb.StreamInfo) streamclient.StreamClient {
-		return streamclient.NewStreamClient(ps.smClient, ps.extentManager, si.StreamID, streamclient.MutexToLock(mutex))
+	metaLog = streamclient.NewStreamClient(ps.smClient, ps.extentManager, ps.config.MaxMetaExtentSize, meta.MetaStream, streamclient.MutexToLock(mutex))
+	if err := metaLog.Connect(); err != nil {
+		cleanup()
+		return nil, err
 	}
-
-	setRowStreamTables :=  func(id uint64, tables []*pspb.Location) error {
-		utils.AssertTrue(id == meta.PartID)
-
-		var locations pspb.TableLocations
-		locations.Locs = tables
-		data := utils.MustMarshal(&locations)
-		//make sure lock
-	
-		return etcd_utils.EtcdSetKVS(ps.etcdClient, 
-			[]clientv3.Cmp{clientv3.Compare(clientv3.CreateRevision(mutex.Key()), "=", mutex.Header().Revision)},
-		    []clientv3.Op{clientv3.OpPut(fmt.Sprintf("PARTSTATS/%d/tables", meta.PartID), string(data)),
-		})
-	}
-
-
 
 	utils.AssertTrue(meta.Rg != nil)
 	utils.AssertTrue(meta.PartID != 0)
 
-
-	rp, err := range_partition.OpenRangePartition(meta.PartID, row, log, ps.blockReader, meta.Rg.StartKey, meta.Rg.EndKey, locs,
-		blobs, setRowStreamTables, openStream, 
-		range_partition.DefaultOption(), 
+	rp, err := range_partition.OpenRangePartition(meta.PartID, metaLog, row, log, ps.blockReader, meta.Rg.StartKey, meta.Rg.EndKey,
+		range_partition.DefaultOption(),
 		range_partition.WithMaxSkipList(16<<20),
 		range_partition.WithSync(ps.config.MustSync),
 	)
-	
+
 	xlog.Logger.Infof("open range partition %d, StartKey:[%s], EndKey:[%s]: err is %v", meta.PartID, meta.Rg.StartKey, meta.Rg.EndKey, err)
 	return rp, err
 }
@@ -386,6 +352,9 @@ func (ps *PartitionServer) Shutdown() {
 	if ps.grcpServer != nil {
 		ps.grcpServer.GracefulStop()
 	}
+
+	//1.5 close all crontab tasks
+	ps.cron.Stop()
 
 	//2. close all range partition
 	ps.Lock()
