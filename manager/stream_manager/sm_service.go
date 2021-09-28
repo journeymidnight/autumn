@@ -74,7 +74,6 @@ func (sm *StreamManager) CreateStream(ctx context.Context, req *pb.CreateStreamR
 	streamInfo := pb.StreamInfo{
 		StreamID:  streamID,
 		ExtentIDs: []uint64{extentID},
-		Sversion: 1,
 	}
 
 	sdata, err := streamInfo.Marshal()
@@ -139,14 +138,13 @@ func (sm *StreamManager) addExtent(streamID uint64, exInfo *pb.ExtentInfo) {
 	s, ok := sm.cloneStreamInfo(streamID)
 	if ok {
 		s.ExtentIDs = append(s.ExtentIDs, exInfo.ExtentID)
-		s.Sversion ++
 		sm.streams.Set(streamID, s)
 	} else {
 		sm.streams.Set(streamID, &pb.StreamInfo{
 			StreamID:  streamID,
 			ExtentIDs: []uint64{exInfo.ExtentID},
-			Sversion: 1,
 		})
+		//sm.streamsLocks.Store(streamID, new(sync.Mutex))
 	}
 	sm.extents.Set(exInfo.ExtentID, exInfo)
 	sm.extentsLocks.Store(exInfo.ExtentID, new(sync.Mutex))
@@ -183,6 +181,7 @@ func (sm *StreamManager) cloneDiskInfo(diskID uint64) (*pb.DiskInfo, bool) {
 	return &ret, true
 }
 
+
 func (sm *StreamManager) cloneStreamInfo(streamID uint64) (*pb.StreamInfo, bool) {
 	d, ok := sm.streams.Get(streamID)
 	if !ok {
@@ -205,12 +204,12 @@ func (sm *StreamManager) CheckCommitLength(ctx context.Context, req *pb.CheckCom
 		return errDone(wire_errors.NotLeader)
 	}
 
-	s, ok := sm.cloneStreamInfo(req.StreamID)
+	stream, ok := sm.cloneStreamInfo(req.StreamID)
 	if !ok {
 		return errDone(errors.Errorf("no such stream %d", req.StreamID))
 	}
 
-	tailExtentID := s.ExtentIDs[len(s.ExtentIDs) - 1]
+	tailExtentID := stream.ExtentIDs[len(stream.ExtentIDs) - 1]
 	lastExtentInfo, ok := sm.cloneExtentInfo(tailExtentID)
 	if !ok {
 		return errDone(errors.Errorf("internal errors, no such extent %d", tailExtentID))
@@ -219,7 +218,7 @@ func (sm *StreamManager) CheckCommitLength(ctx context.Context, req *pb.CheckCom
 	if lastExtentInfo.Avali > 0 {
 		return &pb.CheckCommitLengthResponse{
 			Code: pb.Code_OK,
-			StreamInfo: s,
+			StreamInfo: stream,
 			End: uint32(lastExtentInfo.SealedLength),
 			LastExInfo: lastExtentInfo,
 		},nil
@@ -256,7 +255,7 @@ func (sm *StreamManager) CheckCommitLength(ctx context.Context, req *pb.CheckCom
 	if !haveToSealLastExtent {
 		return &pb.CheckCommitLengthResponse{
 			Code: pb.Code_OK,
-			StreamInfo: s,
+			StreamInfo: stream,
 			End: uint32(sizes[0]),
 			LastExInfo: lastExtentInfo,
 		},nil
@@ -300,10 +299,143 @@ func (sm *StreamManager) CheckCommitLength(ctx context.Context, req *pb.CheckCom
 	
 	return &pb.CheckCommitLengthResponse{
 		Code: pb.Code_OK,
-		StreamInfo: s,
+		StreamInfo: stream,
 		End: uint32(minimalLength),
 		LastExInfo: lastExtentInfo,
 	},nil
+}
+
+//doPunchHole will return latest StreamInfo and error
+func (sm *StreamManager) doPunchHoles(streamID uint64, extentIDs []uint64, ownerKey string, revision int64) (*pb.StreamInfo, error) {
+		//WARNING: streamclient should alway lock stream in PunchHoles, Truncate and AllocExtent
+
+		streamInfo, ok := sm.cloneStreamInfo(streamID)
+		if !ok {
+			return nil, errors.Errorf("stream %d do not exist", streamID)
+		}
+		if len(streamInfo.ExtentIDs) == 0 {
+			return nil, errors.Errorf("stream %d do not have any extent", streamID)
+		}
+	
+		lastExID := streamInfo.ExtentIDs[len(streamInfo.ExtentIDs) - 1]
+	
+		//build index for req.ExtentIDs, exclude lastExID
+		index := make(map[uint64]bool)
+		for _, extentID := range extentIDs {
+			if extentID != lastExID {
+				index[extentID] = true
+			}
+		}
+	
+		punchedExtents := make([]uint64, 0)
+	
+		for i := len(streamInfo.ExtentIDs) - 1; i >= 0; i-- {
+			if _, ok := index[streamInfo.ExtentIDs[i]]; ok {
+				punchedExtents = append(punchedExtents, streamInfo.ExtentIDs[i])
+				streamInfo.ExtentIDs = append(streamInfo.ExtentIDs[:i], streamInfo.ExtentIDs[i+1:]...)
+			}
+		}
+	
+		if len(extentIDs) != len(punchedExtents) {
+			xlog.Logger.Warn("punch holes: some extentIDs are not in streamInfo.ExtentIDs")
+		}
+	
+	
+		//update streamInfo
+		ops := []clientv3.Op{clientv3.OpPut(formatStreamKey(streamID), string(utils.MustMarshal(streamInfo)))}
+	
+	
+	
+		//ignore  lock and cloneExtentInfo errors
+		for i := range punchedExtents {
+			if err := sm.lockExtent(punchedExtents[i]) ; err != nil {
+				for j := 0 ; j < i ; j++ {
+					sm.unlockExtent(punchedExtents[j])
+				}
+				return nil, err
+			}
+		}
+		defer func(){
+			for i := range punchedExtents {
+				sm.unlockExtent(punchedExtents[i])
+			}
+		}()
+	
+		//delete extentIDs if ref == 1
+		exToBeDeleted := make([]*pb.ExtentInfo, 0)
+		exToBeUpdated := make([]*pb.ExtentInfo, 0)
+		for i := range punchedExtents {
+			punchExInfo, ok := sm.cloneExtentInfo(punchedExtents[i])
+			if !ok {
+				return nil, errors.Errorf("punch holes: extent %d do not exist", punchedExtents[i])
+			}
+			if punchExInfo.Avali == 0 {
+				return nil, errors.Errorf("punch holes: extent %d should be sealed", punchExInfo.ExtentID)
+			}
+			if punchExInfo.Refs == 1 {
+				exToBeDeleted = append(exToBeDeleted, punchExInfo)
+			} else {
+				punchExInfo.Refs --
+				punchExInfo.Eversion ++
+				exToBeUpdated = append(exToBeUpdated, punchExInfo)
+			}
+		}
+	
+		//delete extentIDs
+		for _, exInfo := range exToBeDeleted {
+			ops = append(ops, clientv3.OpDelete(formatExtentKey(exInfo.ExtentID)))
+		}
+		for _, exInfo := range exToBeUpdated {
+			ops = append(ops, clientv3.OpPut(formatExtentKey(exInfo.ExtentID), string(utils.MustMarshal(exInfo))))
+		}
+	
+		err := etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
+			clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
+			clientv3.Compare(clientv3.CreateRevision(ownerKey), "=", revision),
+		}, ops)
+	
+	
+		if err != nil {
+			return nil, err
+		}
+	
+		//change memory
+		for _, exInfo := range exToBeUpdated {
+			sm.extents.Set(exInfo.ExtentID, exInfo)
+		}
+		for _, exInfo := range exToBeDeleted {
+			sm.extents.Del(exInfo.ExtentID)
+			sm.extentsLocks.Delete(exInfo.ExtentID)
+		}
+		sm.streams.Set(streamID, streamInfo)
+		return streamInfo, nil
+	
+}
+
+func (sm *StreamManager) StreamPunchHoles(ctx context.Context, req *pb.PunchHolesRequest) (*pb.PunchHolesResponse, error) {
+	errDone := func(err error) (*pb.PunchHolesResponse, error){
+		code, desCode := wire_errors.ConvertToPBCode(err)
+		return &pb.PunchHolesResponse{
+			Code: code,
+			CodeDes: desCode,
+		}, nil
+	}
+
+	if !sm.AmLeader() {
+		return errDone(wire_errors.NotLeader)
+	}
+
+
+	streamInfo, err := sm.doPunchHoles(req.StreamID, req.ExtentIDs, req.OwnerKey, req.Revision)
+	if err != nil {
+		return errDone(err)
+	}
+
+	return &pb.PunchHolesResponse{
+		Code: pb.Code_OK,
+		Stream: streamInfo,
+	}, nil
+
 }
 
 func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAllocExtentRequest) (*pb.StreamAllocExtentResponse, error) {
@@ -320,31 +452,24 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		return errDone(wire_errors.NotLeader)
 	}
 
-	s, ok := sm.cloneStreamInfo(req.StreamID)
+	//WARNING: streamclient should alway lock stream in PunchHoles, Truncate and AllocExtent
+
+	
+	streamInfo, ok := sm.cloneStreamInfo(req.StreamID)
 	if !ok {
 		return errDone(errors.Errorf("no such stream %d", req.StreamID))
 	}
 
-	if req.Sversion > int64(s.Sversion) {
-		return errDone(wire_errors.ClientStreamVersionTooHigh)
+	if !ok {
+		return errDone(errors.Errorf("no discards for %d", req.StreamID))
 	}
 
-	tailExtentID := s.ExtentIDs[len(s.ExtentIDs) - 1]
+	tailExtentID := streamInfo.ExtentIDs[len(streamInfo.ExtentIDs) - 1]
 	lastExInfo, ok := sm.cloneExtentInfo(tailExtentID)
 	if !ok {
 		return errDone(errors.Errorf("internal errors, no such extent %d", tailExtentID))
 	}
 
-	//duplicated request?
-	if req.Sversion < int64(s.Sversion) {
-		fmt.Printf("req.Sversion:%d < s.Sversion:%d\n", req.Sversion, s.Sversion)
-		
-		return &pb.StreamAllocExtentResponse{
-			Code: pb.Code_OK,
-			StreamInfo: s,
-			LastExInfo: lastExInfo,
-		}, nil
-	}
 	
 	//version match: req.Sversion == s.Sversion
 	sm.lockExtent(lastExInfo.ExtentID)
@@ -434,7 +559,6 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	utils.AssertTrue(ok)
 
 	stream.ExtentIDs = append(stream.ExtentIDs, extentID)
-	stream.Sversion ++
 	//add extentID to stream
 	streamKey := formatStreamKey(req.StreamID)
 	sdata, err := stream.Marshal()
@@ -469,7 +593,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	}, ops)
 
 	if err != nil {
-		return errDone(errors.New("update etcd failed"))
+		return errDone(err)
 	}
 
 	//update memory
@@ -735,6 +859,7 @@ func (sm *StreamManager) ExtentInfo(ctx context.Context, req *pb.ExtentInfoReque
 
 }
 
+
 func (sm *StreamManager) StreamInfo(ctx context.Context, req *pb.StreamInfoRequest) (*pb.StreamInfoResponse, error) {
 	
 	errDone := func(err error) (*pb.StreamInfoResponse, error){
@@ -792,33 +917,13 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 	}
 
 
+	//WARNING: streamclient should alway lock stream in PunchHoles, Truncate and AllocExtent
+
 	streamInfo, ok := sm.cloneStreamInfo(req.StreamID)
 	if !ok {
 		return errDone(errors.Errorf("stream do not have extent %d", req.ExtentID))
 	}
 
-	if streamInfo.Sversion < uint64(req.Sversion) {
-		return errDone(wire_errors.ClientStreamVersionTooHigh)
-	}
-	
-	var blobs pb.BlobStreams
-	if len(req.GabageKey) > 0  {
-		data, _, err := etcd_utils.EtcdGetKV(sm.client, req.GabageKey)
-		if err != nil {
-			return errDone(err)
-		}
-		if len(data) > 0 {
-			utils.MustUnMarshal(data, &blobs)
-		}
-	}
-
-	//duplicated truncated
-	if streamInfo.Sversion > uint64(req.Sversion) {
-		return &pb.TruncateResponse{
-			Code: pb.Code_OK,
-			Blobs: &blobs,
-		}, nil
-	}
 
 	//streamInfo.Sversion  == req.Sversion
 	var i int
@@ -832,105 +937,19 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 		return errDone(errors.Errorf("do not have to truncate"))
 	}
 
-
-	//delete extents
-	newExtentIDs := streamInfo.ExtentIDs[i:]
 	oldExtentIDs := streamInfo.ExtentIDs[:i]
 
-	streamKey := formatStreamKey(req.StreamID)
-	newStreamInfo := pb.StreamInfo{
-		StreamID:  req.StreamID,
-		ExtentIDs: newExtentIDs,
-		Sversion: streamInfo.Sversion+1,
-	}
-
-	//update current stream
-	sdata, err := newStreamInfo.Marshal()
-	utils.Check(err)
-	ops := []clientv3.Op{
-		clientv3.OpPut(streamKey, string(sdata)),
-	}
-
-
-	if len(req.GabageKey) == 0 {
-		//delete extents whose ref == 1
-		var exToBeDeleted []*pb.ExtentInfo
-		var exToBeUpdated  []*pb.ExtentInfo
-		for i := range oldExtentIDs {
-			if err := sm.lockExtent(oldExtentIDs[i]) ; err != nil {
-				for j := 0 ; j < i ; j++ {
-					sm.unlockExtent(oldExtentIDs[j])
-				}
-				return errDone(err)
-			}
-			oldExInfo, ok := sm.cloneExtentInfo(oldExtentIDs[i])
-			if !ok {
-				for j := 0 ; j < i ; j++ {
-					sm.unlockExtent(oldExtentIDs[j])
-				}
-				return errDone(errors.Errorf("not found"))
-			}
-			if oldExInfo.Refs == 1 {
-				exToBeDeleted = append(exToBeDeleted, oldExInfo)
-			} else {
-				oldExInfo.Refs --
-				oldExInfo.Eversion ++
-				exToBeUpdated = append(exToBeUpdated, oldExInfo)
-			}
-		}
-
-		defer func(){
-			for i := range oldExtentIDs {
-				sm.unlockExtent(oldExtentIDs[i])
-			}
-		}()
-		
-		for _, exInfo := range exToBeDeleted {
-			ops = append(ops, clientv3.OpDelete(formatExtentKey(exInfo.ExtentID)))
-		}
-		for _, exInfo := range exToBeUpdated {
-			ops = append(ops, clientv3.OpPut(formatExtentKey(exInfo.ExtentID), string(utils.MustMarshal(exInfo))))
-		}
-
-	} else {
-		//create a new stream, and add it to req.GabageKey, it will run gc in the future.
-		var newGabageStreamID uint64
-		if newGabageStreamID, _, err = sm.allocUniqID(1) ; err != nil {
-			return errDone(err)
-		}
-
-		blobs.Blobs[newGabageStreamID] = newGabageStreamID
-
-		sdata := utils.MustMarshal(
-			&pb.StreamInfo{
-				StreamID:  newGabageStreamID,
-				ExtentIDs: oldExtentIDs,
-				Sversion: 1,
-			},
-		)
-		//transfer old extent to new stream
-		//add add stream to gabages
-		ops = append(ops, clientv3.OpPut(formatStreamKey(newGabageStreamID), string(sdata)))
-		ops = append(ops, clientv3.OpPut(req.GabageKey, string(utils.MustMarshal(&blobs))))
-	}
-	
-
-	err = etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
-		clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
-		clientv3.Compare(clientv3.CreateRevision(req.OwnerKey), "=", req.Revision),
-	}, ops)
+	newStreamInfo, err := sm.doPunchHoles(req.StreamID, oldExtentIDs, req.OwnerKey, req.Revision)
 
 
 	if err != nil {
 		return errDone(err)
 	}
 
-	sm.streams.Set(req.StreamID, &newStreamInfo)
-
 	return &pb.TruncateResponse{
 		Code: pb.Code_OK,
-		Blobs: &blobs,
-		}, nil
+		UpdatedStreamInfo: newStreamInfo,
+	}, nil
 
 }
 
@@ -1045,3 +1064,23 @@ func parseKey(s string, prefix string) (uint64, error) {
 	}
 	return strconv.ParseUint(parts[1], 10, 64)
 }
+
+
+//streamclient should lock before call punchholes/truncate/mustAllocwrite
+/*
+func (sm *StreamManager) lockStream(streamID uint64) error {
+	v, ok := sm.streamsLocks.Load(streamID)
+	if !ok {
+		return errors.Errorf("lock failed: stream %d not found", streamID)
+	}
+	v.(*sync.Mutex).Lock()
+	return nil
+}
+
+func (sm *StreamManager) unlockStream(streamID uint64){
+	v, ok := sm.streamsLocks.Load(streamID)
+	if ok {
+		v.(*sync.Mutex).Unlock()
+	}		
+}
+*/

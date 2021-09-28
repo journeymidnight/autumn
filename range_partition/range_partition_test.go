@@ -84,14 +84,13 @@ func runRPTest(t *testing.T, test func(t *testing.T, rp *RangePartition)) {
 	br := streamclient.NewMockBlockReader()
 	logStream := streamclient.NewMockStreamClient("log", br)
 	rowStream := streamclient.NewMockStreamClient("sst", br)
+	metaStream := streamclient.NewMockStreamClient("meta", br)
 
 	defer logStream.Close()
 	defer rowStream.Close()
-	var server streamclient.MockEtcd
-	rp,_ := OpenRangePartition(3, rowStream, logStream, br,
-		[]byte(""), []byte(""), nil, nil, server.SetRowStreamTables, func(si pb.StreamInfo) streamclient.StreamClient {
-			return streamclient.OpenMockStreamClient(si, br)
-		}, TestOption())
+	defer metaStream.Close()
+	rp,_ := OpenRangePartition(3, metaStream, rowStream, logStream, br,
+		[]byte(""), []byte(""), TestOption())
 	defer func() {
 		require.NoError(t, rp.Close())
 	}()
@@ -111,7 +110,7 @@ func TestWriteRead(t *testing.T) {
 		wg.Wait()
 
 		for i := 0; i < 100; i++ {
-			v, _, err := rp.Get([]byte(fmt.Sprintf("key%d", i)), 300)
+			v, err := rp.Get([]byte(fmt.Sprintf("key%d", i)))
 			require.NoError(t, err)
 			require.Equal(t, []byte(fmt.Sprintf("val%d", i)), v)
 		}
@@ -130,7 +129,7 @@ func TestUpdateRead(t *testing.T) {
 		}
 		wg.Wait()
 
-		value, _, err := rp.Get([]byte("key"), 0)
+		value, err := rp.Get([]byte("key"))
 		require.NoError(t, err)
 		require.Equal(t, []byte(fmt.Sprintf("val%d", 99)), value)
 
@@ -141,10 +140,10 @@ func TestGetBig(t *testing.T) {
 	runRPTest(t, func(t *testing.T, rp *RangePartition) {
 		//txnSet(t, db, []byte("key1"), []byte("val1"), 0x08)
 		bigValue := []byte(fmt.Sprintf("%01048576d", 10))
-		_, err := rp.Write([]byte("key1"), bigValue)
+		err := rp.Write([]byte("key1"), bigValue)
 		require.NoError(t, err)
 
-		v, _,  err := rp.Get([]byte("key1"), 0)
+		v, err := rp.Get([]byte("key1"))
 
 		require.NoError(t, err)
 		require.Equal(t, len(bigValue), len(v))
@@ -158,15 +157,14 @@ func TestReopenRangePartition(t *testing.T) {
 	br := streamclient.NewMockBlockReader()
 	logStream := streamclient.NewMockStreamClient("log",br)
 	rowStream := streamclient.NewMockStreamClient("sst",br)
+	metaStream := streamclient.NewMockStreamClient("meta",br)
 
 	defer logStream.Close()
 	defer rowStream.Close()
-	var server streamclient.MockEtcd
+	defer metaStream.Close()
 
-	rp, _ := OpenRangePartition(3, rowStream, logStream, br,
-		[]byte(""), []byte(""), nil, nil, server.SetRowStreamTables, func(si pb.StreamInfo) streamclient.StreamClient {
-			return streamclient.OpenMockStreamClient(si, br)
-		}, TestOption())
+	rp, _ := OpenRangePartition(3, metaStream, rowStream, logStream, br,
+		[]byte(""), []byte(""), TestOption())
 
 	var wg sync.WaitGroup
 	for i := 10; i < 100; i++ {
@@ -179,13 +177,11 @@ func TestReopenRangePartition(t *testing.T) {
 	rp.Close()
 
 	//reopen with tables
-	rp , _ = OpenRangePartition(3, rowStream, logStream, br,
-		[]byte(""), []byte(""), server.Tables, nil, server.SetRowStreamTables, func(si pb.StreamInfo) streamclient.StreamClient {
-			return streamclient.OpenMockStreamClient(si, br)
-		}, TestOption())
+	rp , _ = OpenRangePartition(3, metaStream, rowStream, logStream, br,
+		[]byte(""), []byte(""), TestOption())
 
 	for i := 10; i < 100; i++ {
-		v, _, err := rp.Get([]byte(fmt.Sprintf("key%d", i)), 300)
+		v, err := rp.Get([]byte(fmt.Sprintf("key%d", i)))
 		if err == errNotFound {
 			fmt.Printf("key%d failed\n", i)
 			continue
@@ -201,15 +197,14 @@ func TestReopenRangePartitionWithBig(t *testing.T) {
 	br := streamclient.NewMockBlockReader()
 	logStream := streamclient.NewMockStreamClient("log", br)
 	rowStream := streamclient.NewMockStreamClient("sst", br)
+	metaStream := streamclient.NewMockStreamClient("meta", br)
 
 	defer logStream.Close()
 	defer rowStream.Close()
-	var server streamclient.MockEtcd
+	defer metaStream.Close()
 
-	rp, _ := OpenRangePartition(3, rowStream, logStream, br,
-		[]byte(""), []byte(""), nil, nil, server.SetRowStreamTables, func(si pb.StreamInfo) streamclient.StreamClient {
-			return streamclient.OpenMockStreamClient(si, br)
-		}, TestOption())
+	rp, _ := OpenRangePartition(3, metaStream, rowStream, logStream, br,
+		[]byte(""), []byte(""), TestOption())
 
 	var expectedValue [][]byte
 	var wg sync.WaitGroup
@@ -228,13 +223,11 @@ func TestReopenRangePartitionWithBig(t *testing.T) {
 
 
 	//reopen with tables
-	rp, _ = OpenRangePartition(3, rowStream, logStream, br,
-		[]byte(""), []byte(""), server.Tables, nil, server.SetRowStreamTables, func(si pb.StreamInfo) streamclient.StreamClient {
-			return streamclient.OpenMockStreamClient(si, br)
-		}, TestOption())
+	rp, _ = OpenRangePartition(3, metaStream, rowStream, logStream, br,
+		[]byte(""), []byte(""), TestOption())
 
 	for i := 10; i < 100; i++ {
-		v, _, err := rp.Get([]byte(fmt.Sprintf("key%d", i)), 300)
+		v, err := rp.Get([]byte(fmt.Sprintf("key%d", i)))
 		if err == errNotFound {
 			fmt.Printf("key%d failed\n", i)
 			continue

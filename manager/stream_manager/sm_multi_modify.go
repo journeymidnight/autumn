@@ -23,7 +23,6 @@ func (sm *StreamManager) duplicateStream(ops *[]clientv3.Op, srcStreamID uint64,
 	}
 	newStreamInfo := pb.StreamInfo{
 		StreamID: destStreamID,
-		Sversion: 1,
 	}
 
 	unlockExtents := func () {
@@ -89,7 +88,6 @@ func (sm *StreamManager) duplicateStream(ops *[]clientv3.Op, srcStreamID uint64,
 
 func (sm *StreamManager) MultiModifySplit(ctx context.Context, req *pb.MultiModifySplitRequest) (*pb.MultiModifySplitResponse, error) {
 
-	
 	errDone := func(err error) (*pb.MultiModifySplitResponse, error){
 		code, desCode := wire_errors.ConvertToPBCode(err)
 		return &pb.MultiModifySplitResponse{
@@ -120,24 +118,8 @@ func (sm *StreamManager) MultiModifySplit(ctx context.Context, req *pb.MultiModi
 		//return errDone(errors.Errorf("midkey is %s, not in [%s, %s)", req.MidKey, meta.Rg.StartKey, meta.Rg.EndKey))
 	}
 
-	//copy rowStream, logStream, GabageStreams	
-	data, _, err = etcd_utils.EtcdGetKV(sm.client, fmt.Sprintf("PARTSTATS/%d/gabageStreams", req.PartID))
-	if err != nil {
-		return errDone(err)
-	}
-
-	
-	tableLocsData , _, err := etcd_utils.EtcdGetKV(sm.client, fmt.Sprintf("PARTSTATS/%d/tables", req.PartID))
-	if err != nil {
-		return errDone(err)
-	}
-
-	
-
-	var garbageStreams pb.BlobStreams
-	garbageStreams.Unmarshal(data)
-
-	n := 1 + 2 + len(garbageStreams.Blobs) // 1 == new partID, 2 == rowStream + logStream
+	//copy rowStream, logStream	and metaStream
+	n := 1 + 3 // 1 == new partID, 2 == rowStream + logStream + metaStream
 	
 	var ops []clientv3.Op
 	start, end, err := sm.allocUniqID(uint64(n))
@@ -146,11 +128,10 @@ func (sm *StreamManager) MultiModifySplit(ctx context.Context, req *pb.MultiModi
 		return errDone(err)
 	}
 
-	//seal meta.LogStream first
-
 	var successOps []func()
 	var failedOps []func()
 
+	//WARNING: can not change orders : log, row,meta
 	f, s, err := sm.duplicateStream(&ops,  meta.LogStream, start, req.LogStreamSealedLength)
 	if err != nil {
 		return errDone(err)
@@ -159,7 +140,6 @@ func (sm *StreamManager) MultiModifySplit(ctx context.Context, req *pb.MultiModi
 	failedOps = append(failedOps, f)
 	
 
-	//seal meta.RowStream first
 	f, s, err = sm.duplicateStream(&ops, meta.RowStream, start +1, req.RowStreamSealedLength)
 	if err != nil {
 		return errDone(err)
@@ -167,47 +147,29 @@ func (sm *StreamManager) MultiModifySplit(ctx context.Context, req *pb.MultiModi
 	successOps = append(successOps, s)
 	failedOps = append(failedOps, f)
 	
-
-
-	i := start + 2
-	for gabageStreamID := range garbageStreams.Blobs {
-		f, s, err = sm.duplicateStream(&ops, gabageStreamID, i, 0) 
-		if err != nil {
-			return errDone(err)
-		}
-		successOps = append(successOps, s)
-		failedOps = append(failedOps, f)
-		i ++
-	} 
-	utils.AssertTrue(i == end -1)
+	f, s, err = sm.duplicateStream(&ops, meta.MetaStream, start +2, req.MetaStreamSealedLength)
+	if err != nil {
+		return errDone(err)
+	}
+	successOps = append(successOps, s)
+	failedOps = append(failedOps, f)
 
 	
 	newPartID := end - 1
 	newMeta := pspb.PartitionMeta{
 		LogStream: start,
 		RowStream: start+1,
+		MetaStream: start+2,
 		Rg:&pspb.Range{StartKey: req.MidKey, EndKey: meta.Rg.EndKey},
 		PartID: newPartID,
 	}
-	var newBlobStreams pb.BlobStreams
-	newBlobStreams.Blobs = make(map[uint64]uint64)
-	for i := start + 2; i < end -1 ; i ++ {
-		newBlobStreams.Blobs[i] = i
-	}
+	
 	ops = append(ops, clientv3.OpPut(fmt.Sprintf("PART/%d", newPartID), string(utils.MustMarshal(&newMeta))))
 	
 	//update original meta's EndKey to midKEY
 	meta.Rg.EndKey = req.MidKey
 	ops = append(ops, clientv3.OpPut(fmt.Sprintf("PART/%d", req.PartID), string(utils.MustMarshal(&meta))))
 
-
-	if len(newBlobStreams.Blobs) > 0 {
-		ops = append(ops, clientv3.OpPut(fmt.Sprintf("PARTSTATS/%d/blobStreams", newPartID), string(utils.MustMarshal(&newBlobStreams))))
-	}
-
-	if len(tableLocsData) > 0 {
-		ops = append(ops, clientv3.OpPut(fmt.Sprintf("PARTSTATS/%d/tables", newPartID), string(tableLocsData)))
-	}
 	
 
 	err = etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{

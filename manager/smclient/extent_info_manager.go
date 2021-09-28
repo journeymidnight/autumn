@@ -21,9 +21,11 @@ import (
 type ExtentManager struct {
 
 	smClient     *SMClient
+	//TODO: make it lockless?
 	extentLock   *utils.SafeMutex
 	extentInfo map[uint64]*pb.ExtentInfo
-
+	
+	//TODO: make it lockless?
 	nodesInfo  map[uint64]*pb.NodeInfo
 	nodesLock    *utils.SafeMutex
 

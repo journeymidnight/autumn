@@ -94,8 +94,8 @@ func (ns *NodeStatus) IsHealthy() bool {
 
 
 type StreamManager struct {
-	//streams    map[uint64]*pb.StreamInfo
 	streams   *hashmap.HashMap//id => *pb.StreamInfo, read only
+	//streamsLocks *sync.Map //client has mutex lock, so we don't need it any more
 
 
 	//extents     map[uint64]*pb.ExtentInfo
@@ -169,13 +169,14 @@ func (sm *StreamManager) runAsLeader() {
 	startLoading := time.Now()
 
 	//load streams
-	kvs, _, err := etcd_utils.EtcdRange(sm.client, "streams")
+	kvs, _, err := etcd_utils.EtcdRange(sm.client, "streams/")
 	if err != nil {
 		xlog.Logger.Warnf(err.Error())
 		return
 	}
-	//sm.streams = make(map[uint64]*pb.StreamInfo)
+
 	sm.streams = &hashmap.HashMap{}
+	//sm.streamsLocks = new(sync.Map)
 
 	for _, kv := range kvs {
 		streamID, err := parseKey(string(kv.Key), "streams")
@@ -188,26 +189,15 @@ func (sm *StreamManager) runAsLeader() {
 			xlog.Logger.Warnf(err.Error())
 			return
 		}
-
-		//FIXME:
-		if kv.Version != int64(streamInfo.Sversion) {
-			panic(fmt.Sprintf("%s 's Version %d is not equal to %d", kv.Key, kv.Version, streamInfo.Sversion))
-		}
-
-		/*
-		Fix if kv.Version != streamInfo.Sversion
-		if kv.Version != int64(streamInfo.Sversion) {
-			streamInfo.Sversion = uint64(kv.Version)
-			etcd_utils.EtcdSetKV(sm.client, formatStreamKey(streamID), utils.MustMarshal(&streamInfo))
-		}
-		*/
 		
 		
 		sm.streams.Set(streamID, &streamInfo)
+		//sm.streamsLocks.Store(streamID, new(sync.Mutex))
 	}
 
+	
 	//load extents
-	kvs, _, err = etcd_utils.EtcdRange(sm.client, "extents")
+	kvs, _, err = etcd_utils.EtcdRange(sm.client, "extents/")
 	if err != nil {
 		xlog.Logger.Warnf(err.Error())
 		return
@@ -228,11 +218,11 @@ func (sm *StreamManager) runAsLeader() {
 		}
 		
 		
-		/*
+		
 		if kv.Version != int64(extentInfo.Eversion) {
 			panic(fmt.Sprintf("%s 's Version %d is not equal to %d", kv.Key, kv.Version, extentInfo.Eversion))
 		}
-		*/
+		
 		
 		sm.extents.Set(extentID, &extentInfo)
 		sm.extentsLocks.Store(extentID, new(sync.Mutex))
@@ -242,7 +232,7 @@ func (sm *StreamManager) runAsLeader() {
 
 	sm.nodes = &hashmap.HashMap{}
 
-	kvs, _, err = etcd_utils.EtcdRange(sm.client, "nodes")
+	kvs, _, err = etcd_utils.EtcdRange(sm.client, "nodes/")
 	if err != nil {
 		xlog.Logger.Errorf(err.Error())
 		return
@@ -263,8 +253,9 @@ func (sm *StreamManager) runAsLeader() {
 		})
 	}
 
+	//load recovery tasks
 	sm.taskPool = NewTaskPool()
-	kvs, _, err = etcd_utils.EtcdRange(sm.client, "recoveryTasks")
+	kvs, _, err = etcd_utils.EtcdRange(sm.client, "recoveryTasks/")
 	if err != nil {
 		xlog.Logger.Errorf(err.Error())
 		return
@@ -363,7 +354,6 @@ func (sm *StreamManager) RegisterGRPC(grpcServer *grpc.Server) {
 }
 
 func (sm *StreamManager) Close() {
-	if sm.isLeader > 0 {
-		sm.stopper.Stop()
-	}
+	sm.client.Close()
+	sm.grcpServer.Stop()
 }

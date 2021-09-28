@@ -7,7 +7,6 @@ import (
 
 	"github.com/pkg/errors"
 
-	"github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/range_partition"
 	"github.com/journeymidnight/autumn/wire_errors"
@@ -38,9 +37,7 @@ func (ps *PartitionServer) Put(ctx context.Context, req *pspb.PutRequest) (*pspb
 	if rp == nil {
 		return nil, errors.New("no such partid")
 	}
-	var version uint64
-	var err error
-	if version, err = rp.Write(req.Key, req.Value); err != nil {
+	if err := rp.Write(req.Key, req.Value); err != nil {
 		if err == wire_errors.LockedByOther {
 			partID := req.Partid
 			defer func(){
@@ -52,13 +49,12 @@ func (ps *PartitionServer) Put(ctx context.Context, req *pspb.PutRequest) (*pspb
 				delete(ps.rangePartitionLocks, partID)
 			}()
 		}
-
+	
+		
 		return nil, err
 	}
-	return &pspb.PutResponse{
-		Key: req.Key,
-		Version: version,
-	}, nil
+	return &pspb.PutResponse{Key: req.Key}, nil
+
 }
 
 func (ps *PartitionServer) Head(ctx context.Context, req *pspb.HeadRequest) (*pspb.HeadResponse, error) {
@@ -66,7 +62,7 @@ func (ps *PartitionServer) Head(ctx context.Context, req *pspb.HeadRequest) (*ps
 	if rp == nil {
 		return nil, errors.New("no such partid")
 	}
-	info, err := rp.Head(req.Key, 0)
+	info, err := rp.Head(req.Key)
 	if err != nil {
 		return nil, err
 	}
@@ -82,18 +78,14 @@ func (ps *PartitionServer) Get(ctx context.Context, req *pspb.GetRequest) (*pspb
 	if rp == nil {
 		return nil, errors.New("no such partid")
 	}
-	//version可有三种
-	//0, 取当前seqnumber
-	//math.MaxUint64, 取最新的
-	//其他, 取指定的version
-	d, v, err := rp.Get(req.Key, 0)
+
+	v, err := rp.Get(req.Key)
 	if err != nil {
 		return nil, err
 	}
 	return &pspb.GetResponse{
 		Key:   req.Key,
-		Value: d,
-		Version: v,
+		Value: v,
 	}, nil
 
 }
@@ -124,7 +116,6 @@ func (ps *PartitionServer) Range(ctx context.Context, req *pspb.RangeRequest) (*
 	
 	out := rp.Range(req.Prefix, req.Start, req.Limit)
 
-	fmt.Printf("range result is %d\n", len(out))
 	var truncated bool
 	if len(out) == int(req.Limit) {
 		truncated = true
@@ -137,12 +128,43 @@ func (ps *PartitionServer) Range(ctx context.Context, req *pspb.RangeRequest) (*
 	}, nil
 }
 
-func (ps *PartitionServer) SplitPart(ctx context.Context, req *pspb.SplitPartRequest) (*pspb.SplitPartResponse, error) {
+
+
+func (ps *PartitionServer) Maintenance(ctx context.Context, req *pspb.MaintenanceRequest) (*pspb.MaintenanceResponse, error) {
 	ps.RLock()
-	rp := ps.rangePartitions[req.PartID]
+	rp := ps.rangePartitions[req.Partid]
 	ps.RUnlock()
 	if rp == nil {
-		fmt.Printf("no such rp %d\n", req.PartID)
+		fmt.Printf("no such rp %d\n", req.Partid)
+		return nil, errors.New("no such partid")
+	}
+
+
+	
+	var err error
+	switch t := req.OP.(type) {
+	case *pspb.MaintenanceRequest_Compact:
+		err = rp.SubmitCompaction()
+	case *pspb.MaintenanceRequest_Autogc:
+		err = rp.SubmitGC(range_partition.GcTask{})
+	case *pspb.MaintenanceRequest_Forcegc:
+		err = rp.SubmitGC(range_partition.GcTask{
+			ForceGC: true,
+			ExIDs: t.Forcegc.ExIDs,
+		})
+	default:
+		err = errors.New("unknown op")
+	}
+	return &pspb.MaintenanceResponse{}, err
+}
+
+
+func (ps *PartitionServer) SplitPart(ctx context.Context, req *pspb.SplitPartRequest) (*pspb.SplitPartResponse, error) {
+	ps.RLock()
+	rp := ps.rangePartitions[req.Partid]
+	ps.RUnlock()
+	if rp == nil {
+		fmt.Printf("no such rp %d\n", req.Partid)
 		return nil, errors.New("no such partid")
 	}
 	
@@ -155,25 +177,22 @@ func (ps *PartitionServer) SplitPart(ctx context.Context, req *pspb.SplitPartReq
 	if !ok {
 		return nil, errors.New("ps has no lock on partID")
 	}
-	defer func() {
-		ps.Lock()
-		delete(ps.rangePartitionLocks, rp.PartID)
-		ps.Unlock()
-		mutex.Unlock(context.Background())
-	}()
+
 
 
 	//stop incoming requests and make sure only one is calling "rp.Close, rp.Split"
 	ps.Lock()
-	if _, ok := ps.rangePartitions[req.PartID] ; !ok {
+	if _, ok := ps.rangePartitions[req.Partid] ; !ok {
 		ps.Unlock()
 		return nil, errors.New("no such partid")
 	}
-	delete(ps.rangePartitions, req.PartID)
+	delete(ps.rangePartitions, req.Partid)
 	ps.Unlock()
 
 
-	
+
+
+
 	midKey := rp.GetSplitPoint()
 
 	if len(midKey) == 0 {
@@ -181,33 +200,43 @@ func (ps *PartitionServer) SplitPart(ctx context.Context, req *pspb.SplitPartReq
 	}
 	
 
+	//如果submitGC/submitCompact在Close之前, Close等待完成
+	//如果submitGC/submitCompact在Close之后, 由于Close设置了writeBlock, submitGC/submitCompact直接返回
 	rp.Close()
 
 	fmt.Printf("rp %d is closed", rp.PartID)
 	xlog.Logger.Infof("rp %d is closed", rp.PartID)
 	
 	
-	//LogRowStreamEnd MUST called before rp.Close()
+	//LogRowStreamEnd MUST be called after rp.Close()
 	//sm service use logEnd and rowEnd to seal log stream and row stream
-	logEnd, rowEnd := rp.LogRowStreamEnd()
+	ends := rp.LogRowMetaStreamEnd()
+	rp = nil
 
 	backOffTime := time.Second
 	for {
-		err := ps.smClient.MultiModifySplit(ctx, rp.PartID, midKey, mutex.Key(), mutex.Header().Revision, logEnd, rowEnd)
-		xlog.Logger.Infof("range partionion %d split: resut is %v", err)
+		err := ps.smClient.MultiModifySplit(ctx, req.Partid, midKey, mutex.Key(), mutex.Header().Revision, 
+		ends.LogEnd, ends.RowEnd, ends.MetaEnd)
+
+		xlog.Logger.Infof("range partionion %d split: result is %v", err)
 		if err == nil {
 			break
-		} else if err == smclient.ErrTimeOut || err == wire_errors.NotLeader{
+		} else {
+			xlog.Logger.Errorf("range partionion %d split: result is %v, retry...", err)
 			time.Sleep(backOffTime)
 			backOffTime *= 2
 			continue
-		} else {
-			//I have to reopen rp
-			//send warning to sm service
-			defer panic("I have to reopen rp, panic myself to reopen all range partitions")
-			return nil, err
 		}
 	}
+
+	defer func() {
+		//release distributed lock
+		ps.Lock()
+		delete(ps.rangePartitionLocks, req.Partid)
+		ps.Unlock()
+		mutex.Unlock(context.Background())
+	}()
+
 	return &pspb.SplitPartResponse{
 	},nil
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/journeymidnight/autumn/manager/stream_manager"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/streamclient"
+	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/stretchr/testify/suite"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -95,7 +96,7 @@ func setupStreamManager(suite *ExtentNodeTestSuite, dir string) {
 	suite.smServer = grpcServer
 	suite.etcd = etcd
 	suite.client = client
-	time.Sleep(17 * time.Second) //wait to be leader
+	time.Sleep(3 * time.Second) //wait to be leader
 }
 
 func (suite *ExtentNodeTestSuite) SetupSuite() {
@@ -175,7 +176,9 @@ func (suite *ExtentNodeTestSuite) TearDownSuite() {
 	os.RemoveAll(suite.tmpdir)
 
 }
-
+const (
+	testExtentSize = (1 << 20)
+)
 func (suite *ExtentNodeTestSuite) TestAppendReadValue() {
 	sm := smclient.NewSMClient([]string{"127.0.0.1:3401"})
 	err := sm.Connect()
@@ -191,14 +194,14 @@ func (suite *ExtentNodeTestSuite) TestAppendReadValue() {
 
 	suite.mutex.Lock(context.Background())
 	defer suite.mutex.Unlock(context.Background())
-	sc := streamclient.NewStreamClient(sm, em, si.StreamID, streamclient.MutexToLock(suite.mutex))
+	sc := streamclient.NewStreamClient(sm, em, testExtentSize, si.StreamID, streamclient.MutexToLock(suite.mutex))
 	err = sc.Connect()
 	suite.Require().Nil(err)
 	extentID, offsets, end, err := sc.Append(context.Background(),
 		[]*pb.Block{
 			{Data:[]byte("hello")},
 			{Data:[]byte("world")},
-		}, true)
+		}, false)
 	suite.Require().Nil(err)
 	suite.Require().True(len(offsets) > 0)
 	//fmt.Printf("%d=>%d, on extent %d\n", offsets[0], end, extentID)
@@ -228,7 +231,7 @@ func (suite *ExtentNodeTestSuite) TestNodeRecoveryDataFromOtherNode() {
 	suite.mutex.Lock(context.Background())
 	defer suite.mutex.Unlock(context.Background())
 
-	sc := streamclient.NewStreamClient(sm, em, si.StreamID, streamclient.MutexToLock(suite.mutex))
+	sc := streamclient.NewStreamClient(sm, em, testExtentSize, si.StreamID, streamclient.MutexToLock(suite.mutex))
 	err = sc.Connect()
 	suite.Require().Nil(err)
 	extentID, offsets, _, err := sc.Append(context.Background(),
@@ -261,6 +264,156 @@ func (suite *ExtentNodeTestSuite) TestNodeRecoveryDataFromOtherNode() {
 	eod := suite.ens[0].getExtent(extentID)//恢复后的extent
 	suite.NotNil(eod)
 	
+}
+
+
+//test truncte stream
+func (suite *ExtentNodeTestSuite) TestTruncateStream() {
+	sm := smclient.NewSMClient([]string{"127.0.0.1:3401"})
+	err := sm.Connect()
+	suite.Require().Nil(err)
+
+	si, _, err := sm.CreateStream(context.Background(), 2, 1)
+	suite.Require().Nil(err)
+
+	em := smclient.NewExtentManager(sm, []string{"127.0.0.1:2379"}, func(eventType string, cur *pb.ExtentInfo, prev *pb.ExtentInfo) {
+		//fmt.Printf("%s: %+v from %+v", eventType, cur, prev)
+	})
+
+	suite.mutex.Lock(context.Background())
+	defer suite.mutex.Unlock(context.Background())
+
+	sc := streamclient.NewStreamClient(sm, em, testExtentSize, si.StreamID, streamclient.MutexToLock(suite.mutex))
+	err = sc.Connect()
+	suite.Require().Nil(err)
+
+	a, _ , _, err := sc.Append(context.Background(),
+	[]*pb.Block{
+		{Data:[]byte("hello")},
+		{Data:[]byte("world")},
+	}, true)
+	suite.Require().Nil(err)
+
+	err = sc.MustAllocNewExtent()
+	suite.Nil(err)
+	suite.Equal(2, len(sc.StreamInfo().ExtentIDs))
+
+
+	b, _, _, err := sc.Append(context.Background(),
+	[]*pb.Block{
+		{Data:[]byte("foo")},
+		{Data:[]byte("bar")},
+	}, true)
+	
+	suite.NotEqual(a, b)
+
+	sc.Truncate(context.Background(), b)
+
+	suite.Equal(1, len(sc.StreamInfo().ExtentIDs))
+}
+
+func (suite *ExtentNodeTestSuite) TestPunchHole() {
+	sm := smclient.NewSMClient([]string{"127.0.0.1:3401"})
+	err := sm.Connect()
+	suite.Require().Nil(err)
+	defer sm.Close()
+
+	si, _, err := sm.CreateStream(context.Background(), 2, 1)
+	suite.Require().Nil(err)
+
+	em := smclient.NewExtentManager(sm, []string{"127.0.0.1:2379"}, func(eventType string, cur *pb.ExtentInfo, prev *pb.ExtentInfo) {
+		//fmt.Printf("%s: %+v from %+v", eventType, cur, prev)
+	})
+
+	suite.mutex.Lock(context.Background())
+	defer suite.mutex.Unlock(context.Background())
+
+	sc := streamclient.NewStreamClient(sm, em, testExtentSize, si.StreamID, streamclient.MutexToLock(suite.mutex))
+	err = sc.Connect()
+	suite.Require().Nil(err)
+
+
+	eID, _ , _, err := sc.Append(context.Background(),
+	[]*pb.Block{
+		{Data:[]byte("hello")},
+		{Data:[]byte("world")},
+	}, false)
+
+	suite.Nil(sc.MustAllocNewExtent())
+
+	fmt.Printf("%+v\n", sc.StreamInfo())
+	suite.Equal(2, len(sc.StreamInfo().ExtentIDs))
+	_, _ , _, err = sc.Append(context.Background(),
+	[]*pb.Block{
+		{Data:[]byte("hello")},
+		{Data:[]byte("world")},
+	}, false)
+
+	suite.Nil(sc.MustAllocNewExtent())
+
+	suite.Equal(3, len(sc.StreamInfo().ExtentIDs))
+
+	//punch hole in the middle.
+	err = sc.PunchHoles(context.Background(), []uint64{eID})
+	suite.Nil(err)
+	suite.Equal(2, len(sc.StreamInfo().ExtentIDs))
+
+}
+
+
+func (suite *ExtentNodeTestSuite) TestReadLastBlock() {
+	sm := smclient.NewSMClient([]string{"127.0.0.1:3401"})
+	err := sm.Connect()
+	suite.Require().Nil(err)
+
+	si, _, err := sm.CreateStream(context.Background(), 2, 1)
+	suite.Require().Nil(err)
+
+	em := smclient.NewExtentManager(sm, []string{"127.0.0.1:2379"}, func(eventType string, cur *pb.ExtentInfo, prev *pb.ExtentInfo) {
+		//fmt.Printf("%s: %+v from %+v", eventType, cur, prev)
+	})
+
+	suite.mutex.Lock(context.Background())
+	defer suite.mutex.Unlock(context.Background())
+
+	sc := streamclient.NewStreamClient(sm, em, testExtentSize, si.StreamID, streamclient.MutexToLock(suite.mutex))
+	err = sc.Connect()
+	suite.Require().Nil(err)
+
+	//empty stream
+	b, err := sc.ReadLastBlock(context.Background())
+	suite.Equal(wire_errors.NotFound, err)
+
+	_, _ , _, err = sc.Append(context.Background(),
+	[]*pb.Block{
+		{Data:[]byte("hello")},
+		{Data:[]byte("world")},
+	}, false)
+
+	suite.Require().Nil(err)
+
+
+	b, err = sc.ReadLastBlock(context.Background())
+	suite.Require().Nil(err)
+	suite.Require().Equal([]byte("world"), b.Data)
+
+	sc.MustAllocNewExtent()
+	sc.MustAllocNewExtent()
+
+
+	b, err = sc.ReadLastBlock(context.Background())
+	suite.Require().Nil(err)
+	suite.Require().Equal([]byte("world"), b.Data)
+
+
+	sc.Append(context.Background(), []*pb.Block{
+		{Data:[]byte("DATA")},
+		{Data:[]byte("DATA2")},
+	}, false)
+
+	b, err = sc.ReadLastBlock(context.Background())
+	suite.Require().Nil(err)
+	suite.Require().Equal([]byte("DATA2"), b.Data)
 }
 
 func TestNode(t *testing.T) {

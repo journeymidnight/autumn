@@ -3,6 +3,7 @@ package streamclient
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"testing"
 	"time"
@@ -59,7 +60,7 @@ func TestAppendReadEntries(t *testing.T) {
 	
 
 	//GC read
-	iter := client.NewLogEntryIter(WithReadFromStart())
+	iter := client.NewLogEntryIter(WithReadFromStart(1))
 
 	//小value在GC时,一个block只返回自己的大小, 上面的entry全部可以GC
 	n := 0
@@ -77,7 +78,7 @@ func TestAppendReadEntries(t *testing.T) {
 	require.Equal(t,2, n)
 
 	//iter = client.NewLogEntryIter(ReadOption{}.WithReadFromStart().WithReplay())
-	iter = client.NewLogEntryIter(WithReadFromStart(), WithReplay())
+	iter = client.NewLogEntryIter(WithReadFromStart(1), WithReplay())
 
 	expectedKeys := [][]byte{
 		[]byte("a"),
@@ -100,7 +101,7 @@ func TestAppendReadEntries(t *testing.T) {
 	_, _, err = client.AppendEntries(context.Background(), cases, true)
 	require.NoError(t, err)
 
-	iter = client.NewLogEntryIter(WithReadFrom(eID, tail), WithReplay())
+	iter = client.NewLogEntryIter(WithReadFrom(eID, tail, 1), WithReplay())
 	for {
 		ok, err := iter.HasNext()
 		require.NoError(t, err)
@@ -134,7 +135,7 @@ func TestAppendReadBigBlocks(t *testing.T) {
 
 	require.NoError(t, err)
 
-	iter := client.NewLogEntryIter(WithReadFromStart(), WithReplay())
+	iter := client.NewLogEntryIter(WithReadFromStart(1), WithReplay())
 	var ans []int //value大小
 	for i :=0 ; i < len(cases) ; i ++ {
 		ok, err := iter.HasNext()
@@ -154,8 +155,7 @@ func TestAppendReadBigBlocks(t *testing.T) {
 	require.Equal(t, []int{2,0}, ans) 
 }
 
-/*
-func TestSplitExtent(t *testing.T) {
+func TestTruncate(t *testing.T) {
 	cases := []*pb.EntryInfo{
 		{
 			Log: &pb.Entry{
@@ -181,33 +181,83 @@ func TestSplitExtent(t *testing.T) {
 	client := NewMockStreamClient("log", br).(*MockStreamClient)
 	defer client.Close()
 
-	_, _, err := client.AppendEntries(context.Background(), cases)
-	_, _, err = client.AppendEntries(context.Background(), cases)
+	_, _, err := client.AppendEntries(context.Background(), cases, false)
 	require.NoError(t, err)
 
-	l := len(client.stream)
+
+	_, _, err = client.AppendEntries(context.Background(), cases, false)
+	require.NoError(t, err)
+
 
 	p := client.stream[1]
-	frontStream, _, err := client.Truncate(context.Background(), p)
+	err = client.Truncate(context.Background(), p)
 	require.NoError(t, err)
 
-	truncStream := OpenMockStreamClient(frontStream, br)
-	defer truncStream.Close()
 
-	//fmt.Printf("len[%d] split to %d vs %d\n", l, len(newStream.ExtentIDs), len(client.exs))
-	require.Equal(t, l, len(frontStream.ExtentIDs)+len(client.stream))
-
-	iter := client.NewLogEntryIter(WithReadFromStart(), WithReplay())
+	iter := client.NewLogEntryIter(WithReadFromStart(math.MaxUint32), WithReplay())
+	result := make([]string, 0)
 	for {
 		ok, err := iter.HasNext()
 		require.NoError(t, err)
 		if !ok {
 			break
 		}
-		iter.Next()
-		//ei := iter.Next()
-		//fmt.Printf("%s\n", ei.Log.Key)
+		ei := iter.Next()
+		result = append(result, string(ei.Log.Key))
 	}
+	require.Equal(t, []string{"a", "b", "c"}, result)
 
 }
-*/
+
+func TestPunchHoles(t *testing.T) {
+	cases := []*pb.EntryInfo{
+		{
+			Log: &pb.Entry{
+				Key:   []byte("a"),
+				Value: []byte("xx"),
+			},
+		},
+		{
+			Log: &pb.Entry{
+				Key:   []byte("b"),
+				Value: []byte(fmt.Sprintf("%01048576d", 10)), //1MB
+			},
+		},
+		{
+			Log: &pb.Entry{
+				Key:   []byte("c"),
+				Value: []byte("xx"),
+			},
+		},
+	}
+
+	br := NewMockBlockReader()
+	client := NewMockStreamClient("log", br).(*MockStreamClient)
+	defer client.Close()
+
+	_, _, err := client.AppendEntries(context.Background(), cases, false)
+	require.NoError(t, err)
+
+
+	_, _, err = client.AppendEntries(context.Background(), cases, false)
+	require.NoError(t, err)
+
+
+	err = client.PunchHoles(context.Background(), []uint64{client.stream[0], client.stream[1]})
+	require.NoError(t, err)
+
+	iter := client.NewLogEntryIter(WithReadFromStart(math.MaxUint32), WithReplay())
+	result := make([]string, 0)
+	for {
+		ok, err := iter.HasNext()
+		require.NoError(t, err)
+		if !ok {
+			break
+		}
+		ei := iter.Next()
+		result = append(result, string(ei.Log.Key))
+	}
+	require.Equal(t, []string{}, result)
+
+}
+

@@ -1,9 +1,23 @@
+/*
+* Licensed under the Apache License, Version 2.0 (the "License");
+* you may not use this file except in compliance with the License.
+* You may obtain a copy of the License at
+*
+*     http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing, software
+* distributed under the License is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+* See the License for the specific language governing permissions and
+* limitations under the License.
+ */
 package range_partition
 
 import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -18,6 +32,7 @@ import (
 	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/journeymidnight/autumn/streamclient"
 	"github.com/journeymidnight/autumn/utils"
+	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
 )
@@ -25,6 +40,7 @@ import (
 const (
 	KB = 1024
 	MB = KB * 1024
+	GB = MB * 1024
 )
 
 var (
@@ -34,31 +50,26 @@ var (
 )
 
 type OpenStreamFunc func(si pb.StreamInfo) streamclient.StreamClient
-type SetRowStreamTableFunc func(id uint64, tables []*pspb.Location) error
 
 type RangePartition struct {
-	discard *discardManager
-	//metaStream *streamclient.StreamClient //设定metadata结构
-	logStream streamclient.StreamClient
-	//从ValueStruct中得到的地址, 用blockReader读出来, 因为它可能在[logStream, []blobStreams]里面
-	//我们不需要读每个stream
+	logStream  streamclient.StreamClient
+	rowStream  streamclient.StreamClient
+	metaStream streamclient.StreamClient
+
 	blockReader streamclient.BlockReader
 
-	rowStream       streamclient.StreamClient
-	logRotates      int32
 	writeCh         chan *request
-	blockWrites     int32
+	blockWrites     int32 //indicate if rp is alive.
 	mt              *skiplist.Skiplist
 	imm             []*skiplist.Skiplist
 	utils.SafeMutex //protect mt,imm when swapping mt, imm
 
-	flushStopper   *utils.Stopper
-	flushChan      chan flushTask
-	writeStopper   *utils.Stopper
-	compactStopper *utils.Stopper
-	tableLock      utils.SafeMutex //protect tables
-	tables         []*table.Table
-	seqNumber      uint64
+	flushStopper *utils.Stopper
+	flushChan    chan flushTask
+	writeStopper *utils.Stopper
+	tableLock    utils.SafeMutex //protect tables
+	tables       []*table.Table
+	seqNumber    uint64
 
 	PartID   uint64
 	StartKey []byte
@@ -69,21 +80,25 @@ type RangePartition struct {
 
 	opt *Option
 
-	//functions
-	openStream OpenStreamFunc //doGC的时候,
-	setLocs    SetRowStreamTableFunc
+	//compaction pickup table policy
+	pickupTablePolicy PickupTables
 
 	hasOverlap uint32 //atomic
+
+	majorCompactChan chan struct{}
+	compactStopper   *utils.Stopper
+
+	gcRunChan chan GcTask
+	gcStopper *utils.Stopper
 }
 
 //TODO
 //interface KV save some values
 
-func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
+func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStream streamclient.StreamClient,
 	logStream streamclient.StreamClient, blockReader streamclient.BlockReader,
-	startKey []byte, endKey []byte, tableLocs []*pspb.Location, blobStreams []uint64,
-	setlocs SetRowStreamTableFunc,
-	openStream OpenStreamFunc, opts ...OptionFunc,
+	startKey []byte, endKey []byte,
+	opts ...OptionFunc,
 ) (*RangePartition, error) {
 
 	utils.AssertTrue(len(opts) > 0)
@@ -96,28 +111,41 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	rp := &RangePartition{
 		rowStream:   rowStream,
 		logStream:   logStream,
+		metaStream:  metaStream,
 		blockReader: blockReader,
-		logRotates:  0,
 		mt:          skiplist.NewSkiplist(int64(opt.MaxSkipList)),
 		imm:         nil,
 		blockWrites: 0,
 		StartKey:    startKey,
 		EndKey:      endKey,
 		PartID:      id,
-		openStream:  openStream,
-		setLocs:     setlocs,
 		opt:         opt,
 	}
 	rp.startMemoryFlush()
 
-	fmt.Printf("log end is %d\n", logStream.End())
-	fmt.Printf("row end is %d\n", rowStream.End())
-	fmt.Printf("table locs is %v\n", tableLocs)
+	/*
+		fmt.Printf("log end is %d\n", logStream.CommitEnd())
+		fmt.Printf("row end is %d\n", rowStream.CommitEnd())
+		fmt.Printf("meta end is %d\n", metaStream.CommitEnd())
+	*/
+
+	var tableLocs pspb.TableLocations
+
+	block, err := metaStream.ReadLastBlock(context.Background())
+	if err == wire_errors.NotFound {
+		tableLocs.Locs = nil
+	} else if err != nil {
+		return nil, err
+	} else {
+		utils.MustUnMarshal(block.Data, &tableLocs)
+	}
+
+	fmt.Printf("table locs is %v\n", tableLocs.Locs)
 
 	//replay log
 	//open tables
 	//tableLocs的顺序就是在logStream里面的顺序
-	for _, tLoc := range tableLocs {
+	for _, tLoc := range tableLocs.Locs {
 	retry:
 		tbl, err := table.OpenTable(rp.blockReader, tLoc.ExtentID, tLoc.Offset)
 		if err != nil {
@@ -129,7 +157,6 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 
 		key := y.ParseKey(tbl.Smallest())
 
-
 		if !rp.IsUserKeyInRange(key) {
 			rp.hasOverlap = 1
 		}
@@ -139,24 +166,21 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		}
 	}
 
-	//SORT all tables, by lastSeq
-	//rp.table MUST be ordered
-	/*
-		sort.Slice(rp.tables, func(i, j int) bool {
-			return rp.tables[i].LastSeq < rp.tables[j].LastSeq
-		})
-	*/
-
 	var lastTable *table.Table
 	rp.seqNumber = 0
 	for i := range rp.tables {
-		fmt.Printf("table %d, table lastSeq %d, vp [%d, %d], len of table %d\n", 
-				i, rp.tables[i].LastSeq, rp.tables[i].VpExtentID, rp.tables[i].VpOffset, rp.tables[i].EstimatedSize)
+		/*
+			fmt.Printf("table %d, table lastSeq %d, loc [%d, %d], len of table %d\n",
+					i, rp.tables[i].LastSeq, rp.tables[i].Loc.ExtentID, rp.tables[i].Loc.Offset, rp.tables[i].EstimatedSize)
+		*/
 		if rp.tables[i].LastSeq > rp.seqNumber {
 			rp.seqNumber = rp.tables[i].LastSeq
 			lastTable = rp.tables[i]
 		}
 	}
+
+	//ASSERT
+	rp.CheckTableOrder(rp.tables)
 
 	//FIXME:poor performace: prefetch read will be better
 	replayedLog := 0
@@ -169,7 +193,6 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 		entriesReady := []*pb.EntryInfo{ei}
 
 		userKey := y.ParseKey(ei.Log.Key)
-
 
 		if !rp.IsUserKeyInRange(userKey) {
 			return true, nil
@@ -213,19 +236,15 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 
 	start := time.Now()
 	if lastTable == nil {
-		err := replayLog(rp.logStream, 0, 0, true, replay)
+		err := replayLog(rp.logStream, replay, streamclient.WithReadFromStart(math.MaxUint32), streamclient.WithReplay())
 		if err != nil {
 			return nil, err
 		}
 	} else {
 		//fmt.Printf("replay log from vp extent %d, offset [%d]\n", lastTable.VpExtentID, lastTable.VpOffset)
-		/*
-			rp.vhead = valuePointer{
-				extentID: lastTable.VpExtentID,
-				offset:   lastTable.VpOffset,
-			}
-		*/
-		err := replayLog(rp.logStream, lastTable.VpExtentID, lastTable.VpOffset, true, replay)
+		err := replayLog(rp.logStream, replay,
+			streamclient.WithReadFrom(lastTable.VpExtentID, lastTable.VpOffset, math.MaxUint32), streamclient.WithReplay())
+
 		if err != nil {
 			return nil, err
 		}
@@ -237,37 +256,29 @@ func OpenRangePartition(id uint64, rowStream streamclient.StreamClient,
 	//start real write
 	rp.startWriteLoop()
 
+	rp.pickupTablePolicy = DefaultPickupPolicy{
+		compactRatio: 0.5,
+		headRatio:    0.3,
+		n:            5,
+		opt:          rp.opt,
+	}
+
+	rp.startCompact()
+	rp.startGC()
 	//do compactions:FIXME, doCompactions放到另一个goroutine里面执行
-
-	/*
-		var tbls []*table.Table
-		rp.tableLock.RLock()
-		for _, t := range rp.tables {
-			tbls = append(tbls, t)
-		}
-		rp.tableLock.RUnlock()
-
-
-		if len(tbls) <= 1 {
-			return rp, nil
-		}
-
-		rp.doCompact(tbls, true)
-		rp.deprecateTables(tbls)
-		for _, t := range tbls {
-			t.DecrRef()
-		}
-	*/
 
 	return rp, nil
 }
 
 type flushTask struct {
-	mt        *skiplist.Skiplist
-	vptr      valuePointer
-	seqNum    uint64
-	isCompact bool          //如果是compact任务, 不需要修改rp.mt
-	resultCh  chan struct{} //也可以用wg, 但是防止未来还需要发数据
+	mt     *skiplist.Skiplist
+	vptr   valuePointer
+	seqNum uint64
+
+	isCompact    bool           //如果是compact任务, 不需要修改rp.mt
+	resultCh     chan struct{}  //也可以用wg, 但是防止未来还需要发数据
+	removedTable []*table.Table //一次compact可以新建多个table, 只有最后一个table有removedTable和discard
+	discards     map[uint64]int64
 }
 
 //split相关, 提供相关参数给上层
@@ -298,8 +309,18 @@ func (rp *RangePartition) CanSplit() bool {
 	return atomic.LoadUint32(&rp.hasOverlap) == 0 && len(rp.tables) > 0
 }
 
-func (rp *RangePartition) LogRowStreamEnd() (uint32, uint32) {
-	return rp.logStream.End(), rp.rowStream.End()
+type CommitEnds struct {
+	LogEnd  uint32
+	RowEnd  uint32
+	MetaEnd uint32
+}
+
+func (rp *RangePartition) LogRowMetaStreamEnd() CommitEnds {
+	return CommitEnds{
+		LogEnd:  rp.logStream.CommitEnd(),
+		RowEnd:  rp.rowStream.CommitEnd(),
+		MetaEnd: rp.metaStream.CommitEnd(),
+	}
 }
 
 func (rp *RangePartition) startWriteLoop() {
@@ -309,9 +330,8 @@ func (rp *RangePartition) startWriteLoop() {
 	rp.writeStopper.RunWorker(rp.doWrites)
 }
 
-
 func (rp *RangePartition) IsUserKeyInRange(userKey []byte) bool {
-	return bytes.Compare(rp.StartKey, userKey) <= 0 && (len(rp.EndKey) == 0 || bytes.Compare(userKey, rp.EndKey) < 0) 
+	return bytes.Compare(rp.StartKey, userKey) <= 0 && (len(rp.EndKey) == 0 || bytes.Compare(userKey, rp.EndKey) < 0)
 }
 
 func (rp *RangePartition) startMemoryFlush() {
@@ -324,16 +344,13 @@ func (rp *RangePartition) startMemoryFlush() {
 }
 
 // handleFlushTask must be run serially.
-func (rp *RangePartition) handleFlushTask(ft flushTask) error {
-	// There can be a scenario, when empty memtable is flushed. For example, memtable is empty and
-	// after writing request to value log, rotation count exceeds db.LogRotatesToFlush.
-	if ft.mt.Empty() {
-		return nil
-	}
+func (rp *RangePartition) handleFlushTask(ft flushTask) (*table.Table, error) {
+	//ft.mt can not be empty
+	utils.AssertTruef(ft.mt.Empty() == false, "flush task with empty memtable")
 
 	iter := ft.mt.NewIterator()
 	defer iter.Close()
-	b := table.NewTableBuilder(rp.rowStream, rp.opt.MustSync)
+	b := table.NewTableBuilder(rp.rowStream)
 	defer b.Close()
 
 	//var vp valuePointer
@@ -343,48 +360,28 @@ func (rp *RangePartition) handleFlushTask(ft flushTask) error {
 		if first == nil {
 			first = iter.Key()
 		}
-		/*
-			vs := iter.Value()
-			if vs.Meta&bitValuePointer > 0 {
-				vp.Decode(vs.Value)
-			}
-		*/
 		//fmt.Printf("%s:%s\n", string(iter.Key()), iter.Value().Value)
 		b.Add(iter.Key(), iter.Value())
 		last = iter.Key()
 	}
 
 	b.FinishBlock()
-	id, offset, err := b.FinishAll(ft.vptr.extentID, ft.vptr.offset, ft.seqNum)
+
+	id, offset, err := b.FinishAll(ft.vptr.extentID, ft.vptr.offset, ft.seqNum, ft.discards)
 	if err != nil {
 		xlog.Logger.Errorf("ERROR while build table: %v", err)
-		return err
+		return nil, err
 	}
 
 	tbl, err := table.OpenTable(rp.blockReader, id, offset)
 	if err != nil {
 		xlog.Logger.Errorf("ERROR while opening table: %v", err)
-		return err
+		return nil, err
 	}
-
-	// We own a ref on tbl.
-
-	rp.tableLock.Lock()
-	rp.tables = append(rp.tables, tbl)
-	//run insertsort to make sure rp.tables is sorted by lastSeq
-	/*
-		for j := len(rp.tables) - 1; j > 0 && rp.tables[j].LastSeq < rp.tables[j-1].LastSeq; j-- {
-			//swap [j] and [j-1]
-			tmp := rp.tables[j]
-			rp.tables[j] = rp.tables[j-1]
-			rp.tables[j-1] = tmp
-		}
-	*/
-	rp.tableLock.Unlock()
 
 	xlog.Logger.Debugf("flushed table %s to %s seq[%d], head %d\n", y.ParseKey(first), y.ParseKey(last), tbl.LastSeq, tbl.VpOffset)
 
-	return nil
+	return tbl, nil
 }
 
 func (rp *RangePartition) getMemTables() ([]*skiplist.Skiplist, func()) {
@@ -413,14 +410,19 @@ func (rp *RangePartition) getMemTables() ([]*skiplist.Skiplist, func()) {
 // flushMemtable must keep running until we send it an empty flushTask. If there
 // are errors during handling the flush task, we'll retry indefinitely.
 func (rp *RangePartition) flushMemtable() {
+
+	compactedTbls := make([]*table.Table, 0, 10)
+
 	for ft := range rp.flushChan {
 		if ft.mt == nil {
 			// We close db.flushChan now, instead of sending a nil ft.mt.
 			continue
 		}
 		//save to rowStream
+		var tbl *table.Table
+		var err error
 		for {
-			err := rp.handleFlushTask(ft)
+			tbl, err = rp.handleFlushTask(ft)
 			if err == nil {
 				if !ft.isCompact {
 					// Update s.imm. Need a lock.
@@ -440,36 +442,79 @@ func (rp *RangePartition) flushMemtable() {
 			time.Sleep(time.Second)
 		}
 
-		//save table offset in PM
-		var tableLocs []*pspb.Location
-		rp.tableLock.RLock()
-		for _, t := range rp.tables {
-			tableLocs = append(tableLocs, &t.Loc)
-		}
-		rp.updateTableLocs(tableLocs)
-		rp.tableLock.RUnlock()
+		// update metastream with new tables
 
 		if ft.isCompact {
+			compactedTbls = append(compactedTbls, tbl)
+			//last table was compacted, save it in metaStream
+			if len(ft.removedTable) > 0 {
+				tblsIndex := make(map[string]bool)
+				for _, t := range ft.removedTable {
+					tblsIndex[fmt.Sprintf("%d-%d", t.Loc.ExtentID, t.Loc.Offset)] = true
+				}
+
+				rp.tableLock.Lock()
+				//remove ft.removedTable from rp.tables
+				for i := len(rp.tables) - 1; i >= 0; i-- {
+					if _, ok := tblsIndex[fmt.Sprintf("%d-%d", rp.tables[i].Loc.ExtentID, rp.tables[i].Loc.Offset)]; ok {
+						//fmt.Printf("remove table %v\n", rp.tables[i].Loc)
+						//exclude the table which is to be deprecated
+						rp.tables = append(rp.tables[:i], rp.tables[i+1:]...)
+					}
+				}
+				//add new tables
+				rp.tables = append(rp.tables, compactedTbls...)
+				//fmt.Printf("new tables %+v", compactedTbls)
+				compactedTbls = compactedTbls[:0]
+
+				rp.tableLock.Unlock()
+				//save table
+				rp.saveTableLocs()
+			}
 			ft.resultCh <- struct{}{}
+		} else {
+			//add new table to tables
+			rp.tableLock.Lock()
+			rp.tables = append(rp.tables, tbl)
+			rp.tableLock.Unlock()
+
+			//save tables to metaStream
+			rp.saveTableLocs()
 		}
 
 	}
 }
 
-func (rp *RangePartition) updateTableLocs(tableLocs []*pspb.Location) {
-	if len(tableLocs) == 0 {
-		return
+func (rp *RangePartition) saveTableLocs() {
+	var locations pspb.TableLocations
+
+	//save all table's offset in metaStream
+	rp.tableLock.RLock()
+	for _, t := range rp.tables {
+		locations.Locs = append(locations.Locs, &t.Loc)
 	}
-	fmt.Printf("updating tables %+v\n", tableLocs)
-	backoff := 100 * time.Millisecond
+	rp.tableLock.RUnlock()
+
+	data := utils.MustMarshal(&locations)
+
+	//fmt.Printf("Set table locations %v\n", locations.Locs)
+	backoff := 50 * time.Millisecond
 	for {
-		err := rp.setLocs(rp.PartID, tableLocs)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+		_, _, _, err := rp.metaStream.Append(ctx, []*pb.Block{{Data: data}}, rp.opt.MustSync)
+		cancel()
 		if err != nil {
 			xlog.Logger.Errorf("failed to set tableLocs for %d, retry...", rp.PartID)
-			time.Sleep(2 * backoff)
+			backoff = backoff * 2
+			time.Sleep(backoff)
 			continue
 		}
 		break
+	}
+	//metaStream should not be too large
+	metaStreamInfo := rp.metaStream.StreamInfo()
+	if len(metaStreamInfo.ExtentIDs) > 1 {
+		rp.metaStream.Truncate(context.Background(), metaStreamInfo.ExtentIDs[len(metaStreamInfo.ExtentIDs)-1])
 	}
 }
 
@@ -487,9 +532,10 @@ var requestPool = sync.Pool{
 
 type request struct {
 	// Input values, 这个以后可能有多个Entry..., 比如一个request里面
-	//A = "x", A:time = "y", A:md5 = "asdfasdf"
+	//A = "x", A:time = "20191224", A:md5 = "fbd80028d33edaa2d7bace539f534cb2"
 	entries []*pb.EntryInfo
 
+	isGCRequest bool
 	// Output values and wait group stuff below
 	wg  sync.WaitGroup
 	Err error
@@ -538,6 +584,7 @@ func (req *request) reset() {
 	req.wg = sync.WaitGroup{}
 	req.Err = nil
 	req.ref = 0
+	req.isGCRequest = false
 }
 
 func (req *request) IncrRef() {
@@ -559,21 +606,24 @@ func (req *request) Wait() error {
 	return err
 }
 
-/*
-func (rp *RangePartition) writeLog(reqs []*request) ([]*pb.EntryInfo, valuePointer, error) {
-	if atomic.LoadInt32(&rp.blockWrites) == 1 {
-		return nil, valuePointer{}, ErrBlockedWrites
-	}
-	utils.AssertTrue(len(reqs) != 0)
-
-	return writeValueLog(rp.logStream, reqs)
-}
-*/
-
 // writeRequests is called serially by only one goroutine.
 func (rp *RangePartition) writeRequests(reqs []*request) error {
 	if len(reqs) == 0 {
 		return nil
+	}
+
+	if reqs[0].isGCRequest {
+		utils.AssertTruef(len(reqs) == 1, "GC request should be the only request")
+		gcRequest := reqs[0]
+		for i := len(gcRequest.entries) - 1; i >= 0; i-- {
+			userKey := y.ParseKey(gcRequest.entries[i].Log.Key)
+			vs := rp.getValueStruct(userKey, 0)
+			if vs.Version > y.ParseTs(gcRequest.entries[i].Log.Key) {
+				//exclude this entry
+				gcRequest.entries = append(gcRequest.entries[:i], gcRequest.entries[i+1:]...)
+				continue
+			}
+		}
 	}
 
 	done := func(err error) {
@@ -641,9 +691,9 @@ func (rp *RangePartition) writeToLSM(entries []*pb.EntryInfo) error {
 				})
 		} else {
 			vp := valuePointer{
-				extentID:entry.ExtentID,
-				offset:  entry.Offset,
-				len :    uint32(len(entry.Log.Value)), //save extent, offset, len in LSM
+				entry.ExtentID,
+				entry.Offset,
+				uint32(len(entry.Log.Value)),
 			}
 			rp.mt.Put(entry.Log.Key,
 				y.ValueStruct{
@@ -707,9 +757,22 @@ func (rp *RangePartition) doWrites() {
 		}
 
 		for {
-			reqs = append(reqs, r)
+			if r.isGCRequest {
+				pendingCh <- struct{}{} // blocking.
+				if len(reqs) > 0 {
+					writeRequests(reqs)
+				}
+				reqs = make([]*request, 1)
+				reqs[0] = r
+				goto writeCase
+
+			} else {
+				reqs = append(reqs, r)
+			}
 
 			//FIXME: if (reqs + r) too big, send reqs, and create new reqs including r
+			//if req's entries are gc request, it means reqs is big enough, send it
+			//the last element of reqs is gc request, writeRequests MUST check last element first
 			if rp.isReqsTooBig(reqs) {
 				pendingCh <- struct{}{} // blocking.
 				goto writeCase
@@ -733,12 +796,8 @@ func (rp *RangePartition) doWrites() {
 			select {
 			case r = <-rp.writeCh:
 				reqs = append(reqs, r)
-				/*
-					if isReqsTooBig(reqs) {
-						pendingCh <- struct{}{} // blocking.
-						goto writeCase
-					}
-				*/
+				//因为close时, 一定先停GC, 所以reqs不会有gc request, 我们把所有req
+				//收集到, 然后提交
 			default:
 				pendingCh <- struct{}{} // Push to pending before doing a write.
 				writeRequests(reqs)
@@ -757,7 +816,6 @@ func (rp *RangePartition) ensureRoomForWrite(entries []*pb.EntryInfo, head value
 	rp.Lock()
 	defer rp.Unlock()
 
-	forceFlush := atomic.LoadInt32(&rp.logRotates) >= 1
 	n := int64(0)
 	for i := range entries {
 		n += int64(estimatedSizeInSkl(entries[i].Log))
@@ -765,7 +823,7 @@ func (rp *RangePartition) ensureRoomForWrite(entries []*pb.EntryInfo, head value
 
 	utils.AssertTrue(n <= rp.opt.MaxSkipList)
 
-	if !forceFlush && rp.mt.MemSize()+n < rp.opt.MaxSkipList {
+	if rp.mt.MemSize()+n < rp.opt.MaxSkipList {
 		return nil
 	}
 	utils.AssertTrue(rp.mt != nil)
@@ -776,7 +834,6 @@ func (rp *RangePartition) ensureRoomForWrite(entries []*pb.EntryInfo, head value
 	select {
 	case rp.flushChan <- flushTask{mt: rp.mt, vptr: head, seqNum: seqNum, isCompact: false}:
 		// After every memtable flush, let's reset the counter.
-		atomic.StoreInt32(&rp.logRotates, 0)
 
 		// Ensure value log is synced to disk so this memtable's contents wouldn't be lost.
 
@@ -816,7 +873,15 @@ func (rp *RangePartition) newIterator() y.Iterator {
 	return table.NewMergeIterator(iters, false)
 }
 
-func (rp *RangePartition) getTablesForKey(userKey []byte) ([]*table.Table, func()) {
+func (rp *RangePartition) getTables() []*table.Table {
+	rp.tableLock.RLock()
+	allTables := make([]*table.Table, len(rp.tables), len(rp.tables))
+	copy(allTables, rp.tables)
+	rp.tableLock.RUnlock()
+	return allTables
+}
+
+func (rp *RangePartition) getTablesForKey(userKey []byte) []*table.Table {
 	var out []*table.Table
 
 	rp.tableLock.RLock()
@@ -826,7 +891,6 @@ func (rp *RangePartition) getTablesForKey(userKey []byte) ([]*table.Table, func(
 		end := y.ParseKey(t.Biggest())
 		if bytes.Compare(userKey, start) >= 0 && bytes.Compare(userKey, end) <= 0 {
 			out = append(out, t)
-			t.IncrRef()
 		}
 	}
 	//返回的tables按照SeqNum排序, SeqNum大的在前(新的table在前), 保证如果出现vesion相同
@@ -838,11 +902,7 @@ func (rp *RangePartition) getTablesForKey(userKey []byte) ([]*table.Table, func(
 		})
 	}
 
-	return out, func() {
-		for _, t := range out {
-			t.DecrRef()
-		}
-	}
+	return out
 }
 
 func (rp *RangePartition) Range(prefix []byte, start []byte, limit uint32) [][]byte {
@@ -894,9 +954,8 @@ func (rp *RangePartition) Range(prefix []byte, start []byte, limit uint32) [][]b
 	return out
 }
 
-
-func (rp *RangePartition) Head(userKey []byte, version uint64) (*pspb.HeadInfo, error) {
-	vs := rp.getValueStruct(userKey, version)
+func (rp *RangePartition) Head(userKey []byte) (*pspb.HeadInfo, error) {
+	vs := rp.getValueStruct(userKey, 0)
 
 	if vs.Version == 0 {
 		return nil, errNotFound
@@ -904,65 +963,48 @@ func (rp *RangePartition) Head(userKey []byte, version uint64) (*pspb.HeadInfo, 
 		return nil, errNotFound
 	}
 	dataLen := uint32(0)
-	if vs.Meta & y.BitValuePointer > 0 {
+	if vs.Meta&y.BitValuePointer > 0 {
 		var vp valuePointer
 		vp.Decode(vs.Value)
 		dataLen = vp.len
 	} else {
 		dataLen = uint32(len(vs.Value))
 	}
-	
+
 	return &pspb.HeadInfo{
-		Key: userKey,
-		Len: dataLen,
+		Key:     userKey,
+		Len:     dataLen,
 		Version: vs.Version,
 	}, nil
 
 }
 
-func (rp *RangePartition) Get(userKey []byte, version uint64) ([]byte, uint64, error) {
+func (rp *RangePartition) Get(userKey []byte) ([]byte, error) {
 
-	vs := rp.getValueStruct(userKey, version)
+	vs := rp.getValueStruct(userKey, 0)
 
 	if vs.Version == 0 {
-		return nil, 0,  errNotFound
-	} else if (vs.Meta & y.BitDelete) > 0 {
-		return nil, 0, errNotFound
+		return nil, errNotFound
+	} else if vs.Meta&y.BitDelete > 0 {
+		return nil, errNotFound
 	}
 
-	if vs.Meta & y.BitValuePointer > 0 {
+	if vs.Meta&y.BitValuePointer > 0 {
 
 		var vp valuePointer
 		vp.Decode(vs.Value)
 		//fmt.Printf("%s's location is [%d, %d]\n", userKey, vp.extentID, vp.offset)
 		blocks, _, err := rp.blockReader.Read(context.Background(), vp.extentID, vp.offset, 1, streamclient.HintReadThrough)
 		if err != nil {
-			return nil, 0, err
+			return nil, err
 		}
 
 		entry := y.ExtractLogEntry(blocks[0])
-		return entry.Value, vs.Version, nil
+		return entry.Value, nil
 	}
-
-	return vs.Value, vs.Version, nil
+	return vs.Value, nil
 
 }
-
-/*
-internal APIs/block
-由于userKEY的seq不能保证总是最新的在后面, 所以所有的readkey操作, 需要读所有的memtable和table
-原因:
-1: gc时, seqNum不变, 导致memtale里面的seqNum比之前的小
-2: 如果做双logstream, replaystream时也会导致memtablel里面的seqNum顺序不一致
-3. 如果做多version的情况, 比如最大支持最近20个version, 也需要读所有memtable和table
-
-场景:
-1. 随机读一个key, 读所有memtable和table, 找到seqNum最高的
-2. range一部分key, 读所有memttable和table, 即使是seqNum相同, 但是不关心seqNum和对应的value
-3. 随机读一个key, 如果有2个key有相同的SeqNum, 在相同的seqnum情况下, memtable保证有序, tables也通过lastSeq保证
-有序, 首先应该读到时间更新的KEY
-
-*/
 
 func (rp *RangePartition) getValueStruct(userKey []byte, version uint64) y.ValueStruct {
 
@@ -970,36 +1012,39 @@ func (rp *RangePartition) getValueStruct(userKey []byte, version uint64) y.Value
 	defer decr()
 
 	var internalKey []byte
+
 	if version == 0 {
+		//find the latest version
 		internalKey = y.KeyWithTs(userKey, atomic.LoadUint64(&rp.seqNumber))
 	} else {
 		internalKey = y.KeyWithTs(userKey, version)
-
 	}
-	var maxVs y.ValueStruct
 
 	//search in rp.mt and rp.imm
 	for i := 0; i < len(mtables); i++ {
 		//samekey and the vs is the smallest bigger than req's version
 		vs := mtables[i].Get(internalKey)
 
+		//fmt.Printf("search result of internalKey %s:%d is %+v\n",userKey, y.ParseTs(internalKey),  vs)
 		if vs.Meta == 0 && vs.Value == nil {
 			//not found, userKey not match
 			continue
 		}
+
 		// Found the required version of the key, return immediately.
-		if vs.Version == version {
+		if version > 0 && vs.Version == version {
 			return vs
 		}
-		if maxVs.Version < vs.Version {
-			maxVs = vs
+
+		if version == 0 && vs.Version > 0 {
+			return vs
 		}
 	}
 
-	tables, decr := rp.getTablesForKey(userKey)
-	defer decr()
+	tables := rp.getTablesForKey(userKey)
 	hash := farm.Fingerprint64(userKey)
-	//search each tables to find element which has the max version
+
+	var maxVs y.ValueStruct
 	for _, th := range tables {
 		if th.DoesNotHave(hash) {
 			continue
@@ -1012,9 +1057,16 @@ func (rp *RangePartition) getValueStruct(userKey []byte, version uint64) y.Value
 		}
 
 		if y.SameKey(internalKey, iter.Key()) {
-			if version := y.ParseTs(iter.Key()); version > maxVs.Version {
+			vsVersion := y.ParseTs(iter.Key())
+			if version > 0 && vsVersion == version {
 				maxVs = iter.ValueCopy()
 				maxVs.Version = version
+				break
+			}
+			if version == 0 && vsVersion > 0 {
+				maxVs = iter.ValueCopy()
+				maxVs.Version = vsVersion
+				break
 			}
 		}
 	}
@@ -1033,6 +1085,9 @@ func (rp *RangePartition) close(gracefull bool) error {
 	xlog.Logger.Infof("Closing RangePartion %d", rp.PartID)
 	atomic.StoreInt32(&rp.blockWrites, 1)
 
+	//stop GC first
+	rp.gcStopper.Stop()
+	rp.compactStopper.Stop()
 	rp.writeStopper.Stop()
 	close(rp.writeCh)
 
@@ -1040,7 +1095,7 @@ func (rp *RangePartition) close(gracefull bool) error {
 	//doWrite在返回前,会调用最后一次writeRequest并且等待返回, 所以这里
 	//mt和rp.vhead都是只读的
 	//106是空的skiplist的只有头node的大小
-	if gracefull && rp.mt.MemSize() > 106 {
+	if gracefull && rp.mt.Empty() == false {
 		for {
 			pushedFlushTask := func() bool {
 				rp.Lock()
@@ -1085,7 +1140,7 @@ func (rp *RangePartition) WriteAsync(key, value []byte, f func(error)) {
 		},
 	}
 
-	req, err := rp.sendToWriteCh([]*pb.EntryInfo{e})
+	req, err := rp.sendToWriteCh([]*pb.EntryInfo{e}, false)
 	if err != nil {
 		f(err)
 		return
@@ -1096,6 +1151,31 @@ func (rp *RangePartition) WriteAsync(key, value []byte, f func(error)) {
 		f(err)
 	}()
 
+}
+
+//submit a major compaction task
+func (rp *RangePartition) SubmitCompaction() error {
+	if atomic.LoadInt32(&rp.blockWrites) == 1 {
+		return errors.New("writes are blocked, rp have been closed")
+	}
+	select {
+	case rp.majorCompactChan <- struct{}{}:
+		return nil
+	default:
+		return errors.New("major compaction busy")
+	}
+}
+
+func (rp *RangePartition) SubmitGC(task GcTask) error {
+	if atomic.LoadInt32(&rp.blockWrites) == 1 {
+		return errors.New("writes are blocked, rp have been closed")
+	}
+	select {
+	case rp.gcRunChan <- task:
+		return nil
+	default:
+		return errors.New("gc busy")
+	}
 }
 
 func (rp *RangePartition) Delete(key []byte) error {
@@ -1113,15 +1193,49 @@ func (rp *RangePartition) Delete(key []byte) error {
 		},
 	}
 
-	req, err := rp.sendToWriteCh([]*pb.EntryInfo{e})
+	req, err := rp.sendToWriteCh([]*pb.EntryInfo{e}, false)
 	if err != nil {
 		return err
 	}
 	return req.Wait()
 }
 
+//检查是否所有tables全局有序, 否则panic
+func (rp *RangePartition) CheckTableOrder(out []*table.Table) {
+
+	tbls := make([]*table.Table, 0, len(out))
+	copy(tbls, out)
+	//sort tbls by lastSeq
+	sort.Slice(tbls, func(i, j int) bool {
+		return tbls[i].LastSeq > tbls[j].LastSeq
+	})
+	//
+	index := make(map[string]uint64)
+
+	if len(tbls) < 2 {
+		return
+	}
+
+	for _, tbl := range tbls {
+		it := tbl.NewIterator(false)
+		for ; it.Valid(); it.Next() {
+			userKey := y.ParseKey(it.Key())
+			ts := y.ParseTs(it.Key())
+			if prevTs, ok := index[string(userKey)]; ok {
+				if prevTs < ts {
+					panic(fmt.Sprintf("table order error, key is %s ,prevTs %d, ts %d on table %d",
+						string(userKey), prevTs, ts, tbl.LastSeq))
+				}
+			} else {
+				index[string(userKey)] = ts
+			}
+		}
+	}
+
+}
+
 //req.Wait will free the request
-func (rp *RangePartition) Write(key, value []byte) (uint64, error) {
+func (rp *RangePartition) Write(key, value []byte) error {
 	newSeqNumber := atomic.AddUint64(&rp.seqNumber, 1)
 
 	e := &pb.EntryInfo{
@@ -1130,18 +1244,15 @@ func (rp *RangePartition) Write(key, value []byte) (uint64, error) {
 			Value: value,
 		},
 	}
-	req, err := rp.sendToWriteCh([]*pb.EntryInfo{e})
+	req, err := rp.sendToWriteCh([]*pb.EntryInfo{e}, false)
 	if err != nil {
-		return 0, err
+		return err
 	}
-	if err = req.Wait() ; err != nil {
-		return 0, err
-	}
-	return newSeqNumber, nil
+	return req.Wait()
 }
 
 //block API
-func (rp *RangePartition) sendToWriteCh(entries []*pb.EntryInfo) (*request, error) {
+func (rp *RangePartition) sendToWriteCh(entries []*pb.EntryInfo, isGC bool) (*request, error) {
 	if atomic.LoadInt32(&rp.blockWrites) == 1 {
 		return nil, ErrBlockedWrites
 	}
@@ -1153,6 +1264,7 @@ func (rp *RangePartition) sendToWriteCh(entries []*pb.EntryInfo) (*request, erro
 
 	req.wg.Add(1)
 	req.IncrRef()
+	req.isGCRequest = isGC
 	rp.writeCh <- req
 	return req, nil
 }
@@ -1162,7 +1274,7 @@ const vptrSize = unsafe.Sizeof(valuePointer{})
 type valuePointer struct {
 	extentID uint64
 	offset   uint32
-	len      uint32 //only used when saving big object
+	len      uint32
 }
 
 // Encode encodes Pointer into byte buffer.

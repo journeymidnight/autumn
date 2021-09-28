@@ -55,9 +55,9 @@ func main() {
 				Required:    true,
 			},
 			&cli.BoolFlag{
-				Name:      "nosync",
+				Name:        "nosync",
 				Destination: &noSync,
-				Value:    false,
+				Value:       false,
 			},
 		},
 	}
@@ -75,8 +75,20 @@ func main() {
 	fmt.Printf("smURL is %v\n", utils.SplitAndTrim(smURLs, ","))
 	fmt.Printf("etcdURL is %v\n", utils.SplitAndTrim(etcdURLs, ","))
 
-	ps := partition_server.NewPartitionServer(utils.SplitAndTrim(smURLs, ","), 
-	                 utils.SplitAndTrim(etcdURLs, ","), id, advertiseListen, listen, !noSync)
+	config := partition_server.Config{
+		PSID:                 id,
+		AdvertiseURL:         advertiseListen,
+		ListenURL:            listen,
+		SmURLs:               utils.SplitAndTrim(smURLs, ","),
+		EtcdURLs:             utils.SplitAndTrim(etcdURLs, ","),
+		MustSync:             !noSync,
+		CronTimeGC:           "0 0 * * 1",
+		CronTimeMajorCompact: "0 3 * * 2",
+		MaxExtentSize:        16 << 20, //TEST OPTION
+		MaxMetaExtentSize:    1 << 20,
+	}
+
+	ps := partition_server.NewPartitionServer(config)
 
 	ps.Init()
 

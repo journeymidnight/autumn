@@ -19,8 +19,8 @@ package table
 import (
 	"context"
 	"encoding/binary"
-	"fmt"
 	"math"
+	"time"
 	"unsafe"
 
 	"github.com/dgraph-io/ristretto/z"
@@ -79,11 +79,10 @@ type Builder struct {
 	stream       streamclient.StreamClient
 	writeCh      chan writeBlock
 	stopper      *utils.Stopper
-	mustSync     bool
 }
 
 // NewTableBuilder makes a new TableBuilder.
-func NewTableBuilder(stream streamclient.StreamClient, mustSync bool) *Builder {
+func NewTableBuilder(stream streamclient.StreamClient) *Builder {
 	b := &Builder{
 		tableIndex:   &pspb.TableIndex{},
 		keyHashes:    make([]uint64, 0, 1024), // Avoid some malloc calls.
@@ -91,7 +90,6 @@ func NewTableBuilder(stream streamclient.StreamClient, mustSync bool) *Builder {
 		writeCh:      make(chan writeBlock, 16),
 		stopper:      utils.NewStopper(),
 		currentBlock: &pb.Block{Data: make([]byte, 64*KB)},
-		mustSync :   mustSync,
 	}
 
 	b.stopper.RunWorker(func() {
@@ -128,8 +126,18 @@ func NewTableBuilder(stream streamclient.StreamClient, mustSync bool) *Builder {
 					return
 				}
 
-				extentID, offsets, _, err := b.stream.Append(context.Background(), blocks, b.mustSync)
-				utils.Check(err)
+				var extentID uint64
+				var offsets []uint32
+				var err error
+				for {
+					extentID, offsets, _, err = b.stream.Append(context.Background(), blocks, false)
+					if err != nil {
+						xlog.Logger.Error("Append error is %s", err.Error())
+						time.Sleep(time.Second)
+						continue
+					}
+					break
+				}
 
 				for i, offset := range offsets {
 					//在写入block之后, 把block的sz, baseKey, offset写入metablock
@@ -339,7 +347,7 @@ The table structure looks like
 //return metablock position(extentID, offset, error)
 //tailExtentID和tailOffset表示当前commitLog对应的结尾, 在打开commitlog后, 从(tailExtentID, tailOffset)开始的
 //block读数据, 生成mt
-func (b *Builder) FinishAll(headExtentID uint64, headOffset uint32, seqNum uint64) (uint64, uint32, error) {
+func (b *Builder) FinishAll(headExtentID uint64, headOffset uint32, seqNum uint64, discards map[uint64]int64) (uint64, uint32, error) {
 
 	close(b.writeCh)
 	b.stopper.Wait()
@@ -358,6 +366,7 @@ func (b *Builder) FinishAll(headExtentID uint64, headOffset uint32, seqNum uint6
 		VpOffset:         headOffset,
 		SeqNum:           seqNum,
 		TableIndex:       b.tableIndex,
+		Discards:  		  discards,
 	}
 
 
@@ -377,7 +386,7 @@ func (b *Builder) FinishAll(headExtentID uint64, headOffset uint32, seqNum uint6
 	if err != nil {
 		return 0, 0, err
 	}
-	fmt.Printf("build table on %d:%d , vp [%d,%d]\n", extentID, offsets[0], headExtentID, headOffset)
+	//fmt.Printf("build table on %d:%d , vp [%d,%d]\n", extentID, offsets[0], headExtentID, headOffset)
 
 	return extentID, offsets[0], nil
 }

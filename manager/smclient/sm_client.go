@@ -234,7 +234,7 @@ func (client *SMClient) CheckCommitLength(ctx context.Context, streamID uint64, 
 	return stream, lastEx, end, err
 }
 
-func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64, Sversion int64,
+func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64,
 	ownerKey string, revision int64, end uint32) (*pb.StreamInfo , *pb.ExtentInfo, error) {
 
 	err := ErrTimeOut
@@ -247,7 +247,6 @@ func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64, 
 			StreamID: streamID,
 			OwnerKey: ownerKey,
 			Revision: revision,
-			Sversion: Sversion,
 			End: end,
 		})
 		if err == context.Canceled || err == context.DeadlineExceeded {
@@ -371,10 +370,47 @@ func (client *SMClient) StreamInfo(ctx context.Context, streamIDs []uint64) (map
 	return streamInfos, extentInfos, err	
 }
 
-func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, extentID uint64, ownerKey string, revision int64, sversion int64, gabageKey string) (*pb.BlobStreams ,error) {
-	err := ErrTimeOut
+func (client *SMClient) PunchHoles(ctx context.Context, streamID uint64, holes []uint64, ownerKey string, revision int64) (updatedStream *pb.StreamInfo, err error) {
+	err = ErrTimeOut
+	var res *pb.PunchHolesResponse
+	client.try(func(conn *grpc.ClientConn) bool {
+		c := pb.NewStreamManagerServiceClient(conn)
+		res, err = c.StreamPunchHoles(ctx, &pb.PunchHolesRequest{
+			StreamID: streamID,
+			ExtentIDs: holes,
+			Revision: revision,
+			OwnerKey: ownerKey,
+		})
+
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			return false
+		}
+		if err != nil {
+			xlog.Logger.Warnf(err.Error())
+			return true
+		}
+
+		if res.Code != pb.Code_OK {
+			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
+			//if remote is not a leader, retry
+			if err == wire_errors.NotLeader {
+				return true
+			}
+			return false
+		}
+
+		updatedStream = res.Stream
+		return false
+
+	}, 500*time.Millisecond)
+	
+	return
+}
+
+
+func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, extentID uint64, ownerKey string, revision int64) (updatedStream *pb.StreamInfo , err error) {
+	err = ErrTimeOut
 	var res *pb.TruncateResponse
-	var gabageStreams *pb.BlobStreams
 	client.try(func(conn *grpc.ClientConn) bool {
 		c := pb.NewStreamManagerServiceClient(conn)
 		res, err = c.Truncate(ctx, &pb.TruncateRequest{
@@ -382,8 +418,6 @@ func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, ext
 			ExtentID: extentID,
 			OwnerKey: ownerKey,
 			Revision: revision,
-			Sversion: sversion,
-			GabageKey: gabageKey,
 		})
 		
 		if err == context.Canceled || err == context.DeadlineExceeded {
@@ -401,16 +435,16 @@ func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, ext
 			}
 			return false
 		}
-		gabageStreams = res.Blobs
+		updatedStream = res.UpdatedStreamInfo
 		return false
 	}, 500*time.Millisecond)
 
-	return gabageStreams, err	
+	return 
 }
 	
 
 func (client *SMClient) MultiModifySplit(ctx context.Context, partID uint64, midKey []byte, 
-	ownerKey string, revision int64, logEnd, rowEnd uint32) error {
+	ownerKey string, revision int64, logEnd, rowEnd, metaEnd uint32) error {
 	err := ErrTimeOut
 	var res *pb.MultiModifySplitResponse
 	client.try(func(conn *grpc.ClientConn) bool {
@@ -422,6 +456,7 @@ func (client *SMClient) MultiModifySplit(ctx context.Context, partID uint64, mid
 			Revision: revision,
 			LogStreamSealedLength: logEnd,
 			RowStreamSealedLength: rowEnd,
+			MetaStreamSealedLength: metaEnd,
 		})
 		
 		if err == context.Canceled || err == context.DeadlineExceeded {
@@ -444,41 +479,3 @@ func (client *SMClient) MultiModifySplit(ctx context.Context, partID uint64, mid
 
 	return err	
 }
-
-
-/*
-func (client *SMClient) SubmitRecoveryTask(ctx context.Context, extentID uint64, replaceID uint64) error {
-	
-	err := errors.New("can not find connection to stream manager")
-	var res *pb.SubmitRecoveryTaskResponse
-	client.try(func(conn *grpc.ClientConn) bool {
-		c := pb.NewStreamManagerServiceClient(conn)
-		res, err = c.SubmitRecoveryTask(ctx, &pb.SubmitRecoveryTaskRequest{
-			Task : &pb.RecoveryTask{
-				ExtentID: extentID,
-				ReplaceID: replaceID,
-			},
-		})
-		if err == context.Canceled || err == context.DeadlineExceeded {
-			return false
-		}
-		if err != nil {
-			xlog.Logger.Warnf(err.Error())
-			return true
-		}
-		if res.Code != pb.Code_OK {
-			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
-			//if remote is not a leader, retry
-			if err == wire_errors.NotLeader {
-				return true
-			}
-			return false
-		}
-
-		return false
-	}, 500*time.Millisecond)
-
-	return err
-
-}
-*/

@@ -163,7 +163,7 @@ func receiveData(client *clientv3.Client) []KV {
 				Value: jsonEncode(&x),
 			}
 			data = append(data, d)
-		} else if strings.HasPrefix(string(kv.Key), "nodes") {
+		} else if strings.HasPrefix(string(kv.Key), "nodes/") {
 			var x pb.NodeInfo
 			if err := x.Unmarshal(kv.Value); err != nil {
 				panic(err)
@@ -174,7 +174,7 @@ func receiveData(client *clientv3.Client) []KV {
 			}
 			data = append(data, d)
 
-		} else if strings.HasPrefix(string(kv.Key), "streams") {
+		} else if strings.HasPrefix(string(kv.Key), "streams/") {
 			var x pb.StreamInfo
 			if err := x.Unmarshal(kv.Value); err != nil {
 				panic(err)
@@ -184,7 +184,7 @@ func receiveData(client *clientv3.Client) []KV {
 				Value: jsonEncode(&x),
 			}
 			data = append(data, d)
-		} else if strings.HasPrefix(string(kv.Key), "disks") {
+		} else if strings.HasPrefix(string(kv.Key), "disks/") {
 			var x pb.DiskInfo
 			utils.MustUnMarshal(kv.Value, &x)
 			d := KV{

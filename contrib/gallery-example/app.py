@@ -12,7 +12,27 @@ from multiprocessing.dummy import Pool as ThreadPool
 app = Flask(__name__, static_url_path='')
 
 
-#support [mimetypes, range bytes, streamread]
+@app.route('/del/<name>', methods=['DELETE'])
+def delete(name):
+    meta_file_name = "b:" + name
+    ret = lib.Get(bytes(meta_file_name, 'utf-8'))
+    if ret is None:
+        return "File not found", 404
+    if len(ret.value) == 4:
+        size = struct.unpack("!I", ret.value[0:4])[0]
+        n = int(size / chunk_size)
+        if size % chunk_size > 0:
+            n += 1
+        names = ["a:" + name + ":" + str(int(i)) for i in range(n)]
+        for name in names:
+            lib.Delete(bytes(name, 'utf-8'))
+        lib.Delete(bytes(meta_file_name, 'utf-8'))
+        return "OK", 200
+    else:
+        lib.Delete(bytes(meta_file_name, 'utf-8'))
+        return "OK", 200
+
+#GET API support [mimetypes, range bytes, streamread]
 @app.route("/get/<name>", methods=['GET'])
 def get(name):
     type, encoding = mimetypes.guess_type(name)
