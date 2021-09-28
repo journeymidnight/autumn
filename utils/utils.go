@@ -28,14 +28,12 @@ var (
 )
 */
 
-
 func Max64(a, b int64) int64 {
 	if a < b {
 		return b
 	}
 	return a
 }
-
 
 func Max(a, b int) int {
 	if a < b {
@@ -63,7 +61,6 @@ func AssertTruef(b bool, format string, a ...interface{}) {
 		panic(fmt.Sprintf(format, a...))
 	}
 }
-
 
 func EqualUint32(a, b []uint32) bool {
 	if len(a) != len(b) {
@@ -103,7 +100,7 @@ func HumanReadableSize(t uint64) string {
 		return "0B"
 	}
 	power := int(math.Log10(float64(t)) / 3)
-	if power >= len(units) || power < 0{
+	if power >= len(units) || power < 0 {
 		return ""
 	}
 
@@ -135,14 +132,14 @@ func SplitAndTrim(s string, sep string) []string {
 }
 
 func Ceil(size uint32, align uint32) uint32 {
-	AssertTrue(align&(align-1)==0)
+	AssertTrue(align&(align-1) == 0)
 	//fallback to? return (size + align - 1) / align * align
 	mask := align - 1
 	return (size + mask) & ^mask
 }
 
 func Floor(size uint32, align uint32) uint32 {
-	AssertTrue(align&(align-1)==0)
+	AssertTrue(align&(align-1) == 0)
 	mask := align - 1
 	//fallback to? return size / align * align?
 	return size & (^mask)
@@ -178,7 +175,6 @@ type RandomTicker struct {
 	min   int64
 	max   int64
 }
-
 
 func init() {
 	rand.Seed(time.Now().UnixNano()) //set global rand seed
@@ -232,7 +228,6 @@ func (rt *RandomTicker) nextInterval() time.Duration {
 	return time.Duration(interval) * time.Nanosecond
 }
 
-
 //thread-safe rand
 type LockedSource struct {
 	lk  sync.Mutex
@@ -266,7 +261,6 @@ func (c CRC) Update(b []byte) CRC {
 func (c CRC) Value() uint32 {
 	return uint32(c>>15|c<<17) + 0xa282ead8
 }
-
 
 func SizeOfBlocks(blocks []*pb.Block) uint32 {
 	ret := uint32(0)
@@ -329,7 +323,6 @@ func (f *memory) Write(p []byte) (n int, err error) {
 	return n, nil
 }
 
-
 func ParseReplicationString(replication string) (int, int, error) {
 	re := regexp.MustCompile(`\d+`)
 	parts := re.FindAllString(replication, -1)
@@ -337,29 +330,29 @@ func ParseReplicationString(replication string) (int, int, error) {
 	var err error
 
 	switch len(parts) {
-		case 1:
-			//replication
-			r, err = strconv.Atoi(parts[0])
-			if err != nil {
-				return -1, -1, err
-			}
-			if r > 3 {
-				return -1, -1, errors.Errorf("replicat %s is too big", r)
-			}
-		case 2:
-			//erasure code
-			if r, err = strconv.Atoi(parts[0]) ; err != nil {
-				return -1, -1, err
-			}
-		
-			if s, err = strconv.Atoi(parts[1]) ; err != nil {
-				return -1, -1, err
-			}
-			if r == 1 {
-				return -1, -1, errors.Errorf("EC datashard can not be 1")
-			}
-		default:
-			return -1, -1, errors.Errorf("can not parse %s for replication", replication)
+	case 1:
+		//replication
+		r, err = strconv.Atoi(parts[0])
+		if err != nil {
+			return -1, -1, err
+		}
+		if r > 3 {
+			return -1, -1, errors.Errorf("replicat %d is too big", r)
+		}
+	case 2:
+		//erasure code
+		if r, err = strconv.Atoi(parts[0]); err != nil {
+			return -1, -1, err
+		}
+
+		if s, err = strconv.Atoi(parts[1]); err != nil {
+			return -1, -1, err
+		}
+		if r == 1 {
+			return -1, -1, errors.Errorf("EC datashard can not be 1")
+		}
+	default:
+		return -1, -1, errors.Errorf("can not parse %s for replication", replication)
 	}
 	return r, s, nil
 }

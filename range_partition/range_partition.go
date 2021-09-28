@@ -972,9 +972,8 @@ func (rp *RangePartition) Head(userKey []byte) (*pspb.HeadInfo, error) {
 	}
 
 	return &pspb.HeadInfo{
-		Key:     userKey,
-		Len:     dataLen,
-		Version: vs.Version,
+		Key: userKey,
+		Len: dataLen,
 	}, nil
 
 }

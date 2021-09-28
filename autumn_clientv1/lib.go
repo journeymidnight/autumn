@@ -37,7 +37,6 @@ func NewAutumnLib(etcdAddr []string) *AutumnLib {
 	}
 }
 
-
 func (lib *AutumnLib) Close() {
 	lib.etcdClient.Close()
 	for i := range lib.conns {
@@ -49,7 +48,7 @@ func (lib *AutumnLib) saveRegion(regions *pspb.Regions) {
 
 	newRegions := make([]*pspb.RegionInfo, 0, len(regions.Regions))
 	for _, region := range regions.Regions {
-		newRegions = append(newRegions, region)		
+		newRegions = append(newRegions, region)
 	}
 
 	sort.Slice(newRegions, func(i, j int) bool {
@@ -59,7 +58,7 @@ func (lib *AutumnLib) saveRegion(regions *pspb.Regions) {
 	//assert to make sure the regions are sorted
 	//if so, do not update region
 	for i := 0; i < len(newRegions); i++ {
-		if i < len(newRegions) - 1 && bytes.Compare(newRegions[i].Rg.EndKey, newRegions[i+1].Rg.StartKey) != 0 {
+		if i < len(newRegions)-1 && bytes.Compare(newRegions[i].Rg.EndKey, newRegions[i+1].Rg.StartKey) != 0 {
 			return
 			//panic(fmt.Sprintf("region %d end key is not equal to start key of region %d", newRegions[i].PartID, newRegions[i+1].PartID))
 		}
@@ -74,7 +73,7 @@ func (lib *AutumnLib) Connect() error {
 		Endpoints:   lib.etcdAddr,
 		DialTimeout: time.Second,
 	})
-	
+
 	if err != nil {
 		return err
 	}
@@ -91,7 +90,6 @@ func (lib *AutumnLib) Connect() error {
 	utils.MustUnMarshal(data, &regions)
 	//sort and save regions
 	lib.saveRegion(&regions)
-	
 
 	maxRev = utils.Max64(maxRev, rev)
 
@@ -259,7 +257,6 @@ func (lib *AutumnLib) Get(ctx context.Context, key []byte) ([]byte, error) {
 
 }
 
-
 func (lib *AutumnLib) Range(ctx context.Context, prefix []byte, start []byte, limit uint32) ([][]byte, bool, error) {
 	sortedRegions := lib.getRegions()
 	if len(sortedRegions) == 0 {
@@ -326,23 +323,24 @@ func (lib *AutumnLib) SplitPart(ctx context.Context, partID uint64) error {
 	return err
 }
 
-
-type MaintenanceTask interface{
+type MaintenanceTask interface {
 	Name() string
 }
 
-type CompactTask struct {}
-func (CompactTask) Name() string{
+type CompactTask struct{}
+
+func (CompactTask) Name() string {
 	return "CompactTask"
 }
 
-type ForceGCTask struct {ExIDs []uint64}
+type ForceGCTask struct{ ExIDs []uint64 }
+
 func (ForceGCTask) Name() string {
 	return "ForceGCTask"
 }
 
+type AutoGCTask struct{}
 
-type AutoGCTask struct {}
 func (AutoGCTask) Name() string {
 	return "AutoGCTask"
 }
@@ -362,29 +360,28 @@ func (lib *AutumnLib) Maintenance(ctx context.Context, partID uint64, task Maint
 	var req pspb.MaintenanceRequest
 	req.Partid = partID
 	switch t := task.(type) {
-		case CompactTask:
-			req.OP = &pspb.MaintenanceRequest_Compact{
-				Compact: &pspb.CompactOp{},
-			}
-		case ForceGCTask:
-			req.OP = &pspb.MaintenanceRequest_Forcegc{
-				Forcegc: &pspb.ForceGCOp{
-					ExIDs: t.ExIDs,
-				},
-			}
-		case AutoGCTask:
-			req.OP = &pspb.MaintenanceRequest_Autogc{
-				Autogc: &pspb.AutoGCOp{},
-			}
-		default:
-			panic("unknown task")
+	case CompactTask:
+		req.OP = &pspb.MaintenanceRequest_Compact{
+			Compact: &pspb.CompactOp{},
+		}
+	case ForceGCTask:
+		req.OP = &pspb.MaintenanceRequest_Forcegc{
+			Forcegc: &pspb.ForceGCOp{
+				ExIDs: t.ExIDs,
+			},
+		}
+	case AutoGCTask:
+		req.OP = &pspb.MaintenanceRequest_Autogc{
+			Autogc: &pspb.AutoGCOp{},
+		}
+	default:
+		panic("unknown task")
 	}
 	conn := lib.getConn(lib.getPSAddr(sortedRegions[foundRegion].PSID))
-	client  := pspb.NewPartitionKVClient(conn)
+	client := pspb.NewPartitionKVClient(conn)
 	_, err := client.Maintenance(ctx, &req)
 	return err
 }
-
 
 func (lib *AutumnLib) Delete(ctx context.Context, key []byte) error {
 	var err error
@@ -412,10 +409,10 @@ func (lib *AutumnLib) Delete(ctx context.Context, key []byte) error {
 }
 
 //Head return key []byte, version uint64, len uint32
-func (lib *AutumnLib) Head(ctx context.Context, key []byte) ([]byte, uint64, uint32, error) {
+func (lib *AutumnLib) Head(ctx context.Context, key []byte) ([]byte, uint32, error) {
 	sortedRegions := lib.getRegions()
 	if len(sortedRegions) == 0 {
-		return nil,0,0, errors.New("no regions to write")
+		return nil, 0, errors.New("no regions to write")
 	}
 	//idx
 	idx := sort.Search(len(sortedRegions), func(i int) bool {
@@ -428,10 +425,10 @@ func (lib *AutumnLib) Head(ctx context.Context, key []byte) ([]byte, uint64, uin
 	conn := lib.getConn(lib.getPSAddr((sortedRegions[idx].PSID)))
 	client := pspb.NewPartitionKVClient(conn)
 	res, err := client.Head(ctx, &pspb.HeadRequest{
-		Key: key,
+		Key:    key,
 		Partid: sortedRegions[idx].PartID})
 	if err != nil {
-		return nil,0,0, err
+		return nil, 0, err
 	}
-	return res.Info.Key, res.Info.Version, res.Info.Len, err
+	return res.Info.Key, res.Info.Len, err
 }

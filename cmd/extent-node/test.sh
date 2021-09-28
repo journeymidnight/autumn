@@ -1,2 +1,0 @@
-go build
-goreman start

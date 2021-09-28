@@ -111,7 +111,6 @@ message PutRequest {
 
 message PutResponse {
 	bytes key = 1;
-	uint64 version = 2;
 }
 
 
@@ -133,7 +132,6 @@ message GetRequest {
 message GetResponse {
 	bytes key = 1;
 	bytes value = 2;
-	uint64 version = 3;
 }
 
 message RequestOp {
@@ -209,7 +207,6 @@ message HeadResponse {
 
 message HeadInfo {
 	bytes key = 1;
-	uint64 version = 2;
 	uint32 len = 3;
 }
 
