@@ -30,8 +30,9 @@ type Config struct {
 	MustSync             bool
 	CronTimeGC           string
 	CronTimeMajorCompact string
-	MaxExtentSize        uint32
-	MaxMetaExtentSize    uint32
+	MaxExtentSize        uint32 //in the unit of Bytes
+	MaxMetaExtentSize    uint32 //in the unit of Bytes
+	SkipListSize         uint32 //in the unit of Bytes
 }
 
 type PartitionServer struct {
@@ -319,7 +320,7 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, mutex *
 
 	rp, err := range_partition.OpenRangePartition(meta.PartID, metaLog, row, log, ps.blockReader, meta.Rg.StartKey, meta.Rg.EndKey,
 		range_partition.DefaultOption(),
-		range_partition.WithMaxSkipList(16<<20),
+		range_partition.WithMaxSkipList(int64(ps.config.SkipListSize)),
 		range_partition.WithSync(ps.config.MustSync),
 	)
 

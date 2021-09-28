@@ -1,3 +1,16 @@
+/*
+* Licensed under the Apache License, Version 2.0 (the "License");
+* you may not use this file except in compliance with the License.
+* You may obtain a copy of the License at
+*
+*     http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing, software
+* distributed under the License is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+* See the License for the specific language governing permissions and
+* limitations under the License.
+ */
 package main
 
 import (
@@ -38,32 +51,59 @@ import (
 )
 
 type Result struct {
-	Key       string
-	StartTime float64 //time.Now().Second
-	Elapsed   float64
+	Key       string  `json:"Key"`
+	StartTime float64 `json:"StartTime"`
+	Elapsed   float64 `json:"Elapsed"`
 }
 
-type BenchType string
+type BenchType interface {
+}
 
-const (
-	READ_T  BenchType = "read"
-	WRITE_T           = "write"
-)
+type WBench struct {
+	Size int
+}
 
-func benchmark(etcdUrls []string, op BenchType, threadNum int, duration int, size int) error {
+type RBench struct {
+	Keys []string
+}
+
+func benchmark(etcdUrls []string, op BenchType, threadNum int, duration int) error {
 
 	client := autumn_clientv1.NewAutumnLib(etcdUrls)
-	//defer client.Close()
 
 	if err := client.Connect(); err != nil {
 		return err
 	}
+	defer client.Close()
 
 	stopper := utils.NewStopper()
 
-	//prepare data
-	data := make([]byte, size)
-	utils.SetRandStringBytes(data)
+	var size int
+	var isWriteBench bool
+	var data []byte
+	var keys [][]string
+	switch t := op.(type) {
+	case WBench:
+		isWriteBench = true
+		size = t.Size
+		//prepare write data
+		data = make([]byte, size)
+		utils.SetRandStringBytes(data)
+	case RBench:
+		chunkSize := len(t.Keys) / threadNum
+		keys = make([][]string, threadNum)
+		for i := 0; i < threadNum; i++ {
+			var hi int
+			if chunkSize*(i+1) > len(t.Keys) {
+				hi = len(t.Keys)
+			} else {
+				hi = chunkSize * (i + 1)
+			}
+			keys[i] = t.Keys[chunkSize*i : hi]
+		}
+	default:
+		return errors.New("unknown bench type")
+	}
 
 	var lock sync.Mutex //protect results
 	var results []Result
@@ -103,11 +143,10 @@ func benchmark(etcdUrls []string, op BenchType, threadNum int, duration int, siz
 			loop := 0 //sample to record lantency
 			t := i
 			stopper.RunWorker(func() {
-				j := 0
+				j := 0 //for wbench
 				var ctx context.Context
 				var cancel context.CancelFunc
 				for {
-
 					select {
 					case <-stopper.ShouldStop():
 						if cancel != nil {
@@ -115,7 +154,7 @@ func benchmark(etcdUrls []string, op BenchType, threadNum int, duration int, siz
 						}
 						return
 					default:
-						write := func(t int) {
+						write := func(t int) int {
 							key := fmt.Sprintf("test%d_%d_%d", n, t, j)
 							ctx, cancel = context.WithCancel(context.Background())
 							start := time.Now()
@@ -125,9 +164,9 @@ func benchmark(etcdUrls []string, op BenchType, threadNum int, duration int, siz
 							j++
 							if err != nil {
 								fmt.Printf("%v\n", err)
-								return
+								return -1
 							}
-							if loop%3 == 0 {
+							if (loop % 5) == 0 {
 								lock.Lock()
 								results = append(results, Result{
 									Key:       key,
@@ -136,22 +175,51 @@ func benchmark(etcdUrls []string, op BenchType, threadNum int, duration int, siz
 								})
 								lock.Unlock()
 							}
-							hist.Record(int64(time.Since(start).Milliseconds()))
+							hist.Record(end.Sub(start).Milliseconds())
+
 							atomic.AddUint64(&totalSize, uint64(size))
 							atomic.AddUint64(&count, 1)
 							loop++
-						}
-						read := func(t int) {}
-						switch op {
-						case "read":
-							read(t)
-						case "write":
-							write(t)
-						default:
-							fmt.Println("bench type is wrong")
-							return
+							return 0
 						}
 
+						read := func(t int) int {
+							if len(keys[t]) == 0 {
+								return -1
+							}
+							start := time.Now()
+							data, err := client.Get(context.Background(), []byte(keys[t][0]))
+							end := time.Now()
+							if err != nil {
+								fmt.Printf("%v\n", err)
+								return -1
+							}
+							if (loop % 5) == 0 {
+								lock.Lock()
+								results = append(results, Result{
+									Key:       keys[t][0],
+									StartTime: start.Sub(benchStartTime).Seconds(),
+									Elapsed:   end.Sub(start).Seconds(),
+								})
+								lock.Unlock()
+							}
+							keys[t] = keys[t][1:] //shift to next
+							hist.Record(end.Sub(start).Milliseconds())
+							atomic.AddUint64(&totalSize, uint64(len(data)))
+							atomic.AddUint64(&count, 1)
+							loop++
+							return 0
+						}
+
+						if isWriteBench {
+							if write(t) == -1 {
+								return
+							}
+						} else {
+							if read(t) == -1 {
+								return
+							}
+						}
 					}
 
 				}
@@ -182,13 +250,10 @@ func benchmark(etcdUrls []string, op BenchType, threadNum int, duration int, siz
 	})
 
 	var fileName string
-	switch op {
-	case READ_T:
-		fileName = "rresult.json"
-	case WRITE_T:
-		fileName = "result.json"
-	default:
-		return errors.Errorf("benchtype error")
+	if isWriteBench {
+		fileName = "write_result.json"
+	} else {
+		fileName = "read_result.json"
 	}
 
 	f, err := os.OpenFile(fileName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
@@ -604,7 +669,16 @@ func main() {
 			},
 			Action: compact,
 		},
-
+		{
+			Name:  "rbench",
+			Usage: "rbench --etcd-urls <addrs> --thread <num> --duration <duration> <json>",
+			Flags: []cli.Flag{
+				&cli.StringFlag{Name: "etcd-urls", Value: "127.0.0.1:2379"},
+				&cli.IntFlag{Name: "thread", Value: 40, Aliases: []string{"t"}},
+				&cli.IntFlag{Name: "duration", Value: 10, Aliases: []string{"d"}},
+			},
+			Action: rbench,
+		},
 		{
 			Name:  "wbench",
 			Usage: "wbench --etcd-urls <addrs> --thread <num> --duration <duration>",
@@ -773,12 +847,36 @@ func format(c *cli.Context) error {
 	return nil
 }
 
+func rbench(c *cli.Context) error {
+	threadNum := c.Int("thread")
+	duration := c.Int("duration")
+	etcdUrls := utils.SplitAndTrim(c.String("etcd-urls"), ",")
+	if c.Args().Len() == 0 {
+		return errors.New("json file can not be empty")
+	}
+	f, err := os.Open(c.Args().First())
+	if err != nil {
+		return err
+	}
+	var results []Result
+	decoder := json.NewDecoder(f)
+	decoder.Decode(&results)
+	if len(results) == 0 {
+		return errors.New("json file is empty")
+	}
+	keys := make([]string, len(results))
+	for i := range keys {
+		keys[i] = results[i].Key
+	}
+	return benchmark(etcdUrls, RBench{Keys: keys}, threadNum, duration)
+}
+
 func wbench(c *cli.Context) error {
 	threadNum := c.Int("thread")
 	duration := c.Int("duration")
 	size := c.Int("size")
 	etcdUrls := utils.SplitAndTrim(c.String("etcd-urls"), ",")
-	return benchmark(etcdUrls, WRITE_T, threadNum, duration, size)
+	return benchmark(etcdUrls, WBench{Size: size}, threadNum, duration)
 }
 
 func printSummary(elapsed time.Duration, totalCount uint64, totalSize uint64, threadNum int, size int, hist *utils.HistogramStatus) {
@@ -788,10 +886,10 @@ func printSummary(elapsed time.Duration, totalCount uint64, totalSize uint64, th
 	t := float64(totalSize) / elapsed.Seconds()
 	fmt.Printf("\nSummary\n")
 	fmt.Printf("Threads :%d\n", threadNum)
-	fmt.Printf("Size    :%d\n", size)
+	fmt.Printf("Write size :%d\n", size)
 	fmt.Printf("Time taken for tests :%v seconds\n", elapsed.Seconds())
 	fmt.Printf("Complete requests :%d\n", totalCount)
-	fmt.Printf("Total transferred :%d bytes\n", totalSize)
+	fmt.Printf("Total transferred :%s\n", utils.HumanReadableSize(totalSize))
 	fmt.Printf("Requests per second :%.2f [#/sec]\n", float64(totalCount)/elapsed.Seconds())
 	fmt.Printf("Throughput per second :%s\n", utils.HumanReadableThroughput(t))
 	fmt.Printf("Latency in millisecond p50, p95, p99: %v\n", hist.Histgram([]float64{50, 95, 99}, nil))

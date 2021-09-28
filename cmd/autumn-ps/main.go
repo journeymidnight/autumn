@@ -1,3 +1,17 @@
+/*
+* Licensed under the Apache License, Version 2.0 (the "License");
+* you may not use this file except in compliance with the License.
+* You may obtain a copy of the License at
+*
+*     http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing, software
+* distributed under the License is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+* See the License for the specific language governing permissions and
+* limitations under the License.
+ */
+
 package main
 
 import (
@@ -23,6 +37,7 @@ func main() {
 	var listen string
 	var noSync bool
 	var maxExtentMBString string //in the unit of MB
+	var skiplistMBString string  //in the unit of MB
 
 	app := &cli.App{
 		HelpName: "",
@@ -66,6 +81,12 @@ func main() {
 				Required:    true,
 				Usage:       "max extent size in MB",
 			},
+			&cli.StringFlag{
+				Name:        "skiplist-size",
+				Destination: &skiplistMBString,
+				Required:    true,
+				Usage:       "skiplist size in MB",
+			},
 		},
 	}
 
@@ -91,6 +112,14 @@ func main() {
 		panic(fmt.Sprint("max-extent-size must be greater than zero"))
 	}
 
+	skiplistSizeMB, err := strconv.Atoi(skiplistMBString)
+	if err != nil {
+		panic(fmt.Sprint("skiplist-sizeis not a integer"))
+	}
+	if skiplistSizeMB <= 0 || skiplistSizeMB > 120 { //120MB is the hard limit
+		panic(fmt.Sprint("skiplist-size must be greater than zero and less than 120MB"))
+	}
+
 	config := partition_server.Config{
 		PSID:                 id,
 		AdvertiseURL:         advertiseListen,
@@ -102,6 +131,7 @@ func main() {
 		CronTimeMajorCompact: "0 3 * * 2",
 		MaxExtentSize:        uint32((maxExtentMB << 20)),
 		MaxMetaExtentSize:    (4 << 20),
+		SkipListSize:         uint32((skiplistSizeMB << 20)),
 	}
 
 	ps := partition_server.NewPartitionServer(config)

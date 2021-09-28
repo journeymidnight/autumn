@@ -14,6 +14,7 @@ services:
         --sm-urls stream-manager:3401 
         --etcd-urls stream-manager:2379
         --max-extent-size 64
+        --skiplist-size 16
      ports:
        - "9955:9955" 
   stream-manager:
