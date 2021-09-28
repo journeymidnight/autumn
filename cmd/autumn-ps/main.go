@@ -22,6 +22,7 @@ func main() {
 	var etcdURLs string
 	var listen string
 	var noSync bool
+	var maxExtentMBString string //in the unit of MB
 
 	app := &cli.App{
 		HelpName: "",
@@ -59,6 +60,12 @@ func main() {
 				Destination: &noSync,
 				Value:       false,
 			},
+			&cli.StringFlag{
+				Name:        "max-extent-size",
+				Destination: &maxExtentMBString,
+				Required:    true,
+				Usage:       "max extent size in MB",
+			},
 		},
 	}
 
@@ -67,6 +74,7 @@ func main() {
 	}
 
 	xlog.InitLog([]string{fmt.Sprintf("ps.log")}, zap.DebugLevel)
+
 	id, err := strconv.ParseUint(psID, 10, 64)
 	if err != nil || id == 0 {
 		panic(fmt.Sprint("psid can not be zero"))
@@ -74,6 +82,14 @@ func main() {
 
 	fmt.Printf("smURL is %v\n", utils.SplitAndTrim(smURLs, ","))
 	fmt.Printf("etcdURL is %v\n", utils.SplitAndTrim(etcdURLs, ","))
+
+	maxExtentMB, err := strconv.Atoi(maxExtentMBString)
+	if err != nil {
+		panic(fmt.Sprint("max-extent-size is not a integer"))
+	}
+	if maxExtentMB <= 0 || maxExtentMB > 3072 { //3GB is the hard limit
+		panic(fmt.Sprint("max-extent-size must be greater than zero"))
+	}
 
 	config := partition_server.Config{
 		PSID:                 id,
@@ -84,8 +100,8 @@ func main() {
 		MustSync:             !noSync,
 		CronTimeGC:           "0 0 * * 1",
 		CronTimeMajorCompact: "0 3 * * 2",
-		MaxExtentSize:        16 << 20, //TEST OPTION
-		MaxMetaExtentSize:    1 << 20,
+		MaxExtentSize:        uint32((maxExtentMB << 20)),
+		MaxMetaExtentSize:    (4 << 20),
 	}
 
 	ps := partition_server.NewPartitionServer(config)
