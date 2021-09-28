@@ -896,6 +896,7 @@ func (rp *RangePartition) getTablesForKey(userKey []byte) []*table.Table {
 	//返回的tables按照SeqNum排序, SeqNum大的在前(新的table在前), 保证如果出现vesion相同
 	//的key的情况下, 总是找到新的key(为什么会出现version相同的key? 从valuelog gc而来
 
+	//TODO:cache this
 	if len(out) > 1 {
 		sort.Slice(out, func(i, j int) bool {
 			return out[i].LastSeq > out[j].LastSeq
