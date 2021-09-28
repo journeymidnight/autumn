@@ -17,17 +17,22 @@ import (
 	"github.com/journeymidnight/autumn/streamclient"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
+	"github.com/robfig/cron/v3"
 	"google.golang.org/grpc"
 )
 
 
-type PartitionServerConfig struct {
-	advertiseURL       string
+type Config struct {
+	PSID  uint64
+	AdvertiseURL       string
 	ListenURL          string
 	SmURLs        []string
 	EtcdURLs      []string
 	MustSync      bool
+	CronTimeGC    string
+	CronTimeMajorCompact string
 }
+
 
 type PartitionServer struct {
 	utils.SafeMutex //protect rangePartitions
@@ -36,28 +41,25 @@ type PartitionServer struct {
 	PSID            uint64
 	smClient        *smclient.SMClient
 	etcdClient      *clientv3.Client     
-	config         PartitionServerConfig
+	config         Config
 	extentManager *smclient.ExtentManager
 	blockReader   *streamclient.AutumnBlockReader
 	grcpServer    *grpc.Server
 	session       *concurrency.Session
 	watchCh       *clientv3.WatchChan
 	closeWatchCh  func()
+	cron          *cron.Cron
+
 }
 
-func NewPartitionServer(smURLs []string, etcdURLs []string, PSID uint64, advertiseURL string, listenURL string, mustSync bool) *PartitionServer {
+func NewPartitionServer(config Config) *PartitionServer {
 	return &PartitionServer{
 		rangePartitions: make(map[uint64]*range_partition.RangePartition),
 		rangePartitionLocks: make(map[uint64]*concurrency.Mutex),
-		smClient:        smclient.NewSMClient(smURLs),
-		PSID:            PSID,
-		config: 		PartitionServerConfig{
-			advertiseURL:       advertiseURL,
-			ListenURL:          listenURL,
-			SmURLs:             smURLs,
-			EtcdURLs:           etcdURLs,
-			MustSync:           mustSync,
-		},
+		smClient:        smclient.NewSMClient(config.SmURLs),
+		PSID:            config.PSID,
+		config: 	     config,
+		cron: 		 cron.New(cron.WithLogger(xlog.CronLogger{})),
 	}
 }
 
@@ -67,8 +69,7 @@ func formatPartLock(partID uint64) string {
 }
 
 
-//FIXME: discard implement
-//
+
 func (ps *PartitionServer) getPartitionMeta(partID uint64) (int64, *pspb.PartitionMeta, error) {
 	/*
 	PART/{PartID} => {id, id <startKey, endKEY>} //immutable
@@ -201,7 +202,7 @@ func (ps *PartitionServer) Init() {
 
 	//session create PSSERVER/{PSID} => {PSDETAIL}
 	var detail = pspb.PSDetail{
-		Address: ps.config.advertiseURL,
+		Address: ps.config.AdvertiseURL,
 		PSID: ps.PSID,
 	}
 
@@ -253,7 +254,42 @@ func (ps *PartitionServer) Init() {
 	ps.watchCh = &watchConfigCh
 	ps.closeWatchCh = closeWatchCh
 
+	//start cron task:
+
+
+	ps.cron.AddFunc(ps.config.CronTimeGC, ps.CronTaskGC)
+
+	ps.cron.AddFunc(ps.config.CronTimeMajorCompact, ps.CronTaskCompact)
 }
+
+func (ps *PartitionServer) CronTaskGC() {
+	//copy range partitions
+	ps.RLock()
+	rangePartitions := make([]*range_partition.RangePartition, len(ps.rangePartitions))
+	for _, rp := range ps.rangePartitions {
+		rangePartitions = append(rangePartitions, rp)
+	}
+	ps.RUnlock()
+	for i := 0 ;i < len(rangePartitions) ; i++ {
+		fmt.Printf("submit auto gc on range partion %d\n", rangePartitions[i].PartID)
+		rangePartitions[i].SubmitGC(range_partition.GcTask{})//auto task
+	}
+}
+
+func (ps *PartitionServer) CronTaskCompact() {
+	//copy range partitions
+	ps.RLock()
+	rangePartitions := make([]*range_partition.RangePartition, len(ps.rangePartitions))
+	for _, rp := range ps.rangePartitions {
+		rangePartitions = append(rangePartitions, rp)
+	}
+	ps.RUnlock()
+	for i := 0 ;i < len(rangePartitions) ; i++ {
+		fmt.Printf("submit major compaction on range partion %d\n", rangePartitions[i].PartID)
+		rangePartitions[i].SubmitCompaction()
+	}
+}
+
 
 func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, mutex *concurrency.Mutex) (*range_partition.RangePartition, error) {
 	//1. pmclient get info
@@ -331,6 +367,9 @@ func (ps *PartitionServer) Shutdown() {
 	if ps.grcpServer != nil {
 		ps.grcpServer.GracefulStop()
 	}
+
+	//1.5 close all crontab tasks
+	ps.cron.Stop()
 
 	//2. close all range partition
 	ps.Lock()

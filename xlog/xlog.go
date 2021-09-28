@@ -27,3 +27,16 @@ func InitLog(outputPath []string, level zapcore.Level) {
 	}
 	Logger = ZapLogger.Sugar()
 }
+
+
+//cron log
+type CronLogger struct {}
+
+func (logger CronLogger) Info (msg string, keysAndValues ...interface{}) {
+	Logger.Info(msg)
+}
+func (logger CronLogger) Error(err error, msg string, keysAndValues ...interface{}) {
+	Logger.Error(err.Error(), msg)
+}
+
+//etcd log

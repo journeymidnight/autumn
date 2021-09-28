@@ -59,7 +59,7 @@ type RangePartition struct {
 	blockReader streamclient.BlockReader
 
 	writeCh         chan *request
-	blockWrites     int32
+	blockWrites     int32 //indicate if rp is alive.
 	mt              *skiplist.Skiplist
 	imm             []*skiplist.Skiplist
 	utils.SafeMutex //protect mt,imm when swapping mt, imm
@@ -88,7 +88,7 @@ type RangePartition struct {
 	majorCompactChan chan struct{}
 	compactStopper *utils.Stopper
 
-	gcRunChan 	     chan struct{}
+	gcRunChan 	     chan GcTask
 	gcStopper  	*utils.Stopper
 }
 
@@ -447,18 +447,20 @@ func (rp *RangePartition) flushMemtable() {
 			time.Sleep(time.Second)
 		}
 
+		
 		// update metastream with new tables
+
 		if ft.isCompact {
-			//last table was compated, save it in metaStream
 			compactedTbls = append(compactedTbls, tbl)
+			//last table was compacted, save it in metaStream
 			if len(ft.removedTable) > 0 {
 				tblsIndex := make(map[string]bool)
 				for _, t := range ft.removedTable {
 					tblsIndex[fmt.Sprintf("%d-%d", t.Loc.ExtentID, t.Loc.Offset)] = true
 				}
-				rp.tableLock.Lock()
 
-				//remove table
+				rp.tableLock.Lock()
+				//remove ft.removedTable from rp.tables
 				for i := len(rp.tables) - 1; i >= 0; i-- {
 					if _, ok := tblsIndex[fmt.Sprintf("%d-%d", rp.tables[i].Loc.ExtentID, rp.tables[i].Loc.Offset)]; ok {
 						//fmt.Printf("remove table %v\n", rp.tables[i].Loc)
@@ -466,7 +468,7 @@ func (rp *RangePartition) flushMemtable() {
 						rp.tables = append(rp.tables[:i], rp.tables[i+1:]...)
 					}
 				}
-				//add table
+				//add new tables
 				rp.tables = append(rp.tables, compactedTbls...)
 				//fmt.Printf("new tables %+v", compactedTbls)
 				compactedTbls = compactedTbls[:0]
@@ -517,7 +519,7 @@ func (rp *RangePartition) saveTableLocs() {
 	}
 	//metaStream should not be too large
 	metaStreamInfo := rp.metaStream.StreamInfo()
-	if len(metaStreamInfo.ExtentIDs) > 2 {
+	if len(metaStreamInfo.ExtentIDs) > 1 {
 		rp.metaStream.Truncate(context.Background(), metaStreamInfo.ExtentIDs[len(metaStreamInfo.ExtentIDs)-1])
 	}
 }
@@ -1137,6 +1139,9 @@ func (rp *RangePartition) WriteAsync(key, value []byte, f func(error)) {
 
 //submit a major compaction task 
 func (rp *RangePartition) SubmitCompaction() error{
+	if atomic.LoadInt32(&rp.blockWrites) == 1 {
+		return errors.New("writes are blocked, rp have been closed")
+	}
 	select {
 	case rp.majorCompactChan <- struct{}{}:
 		return nil
@@ -1145,9 +1150,12 @@ func (rp *RangePartition) SubmitCompaction() error{
 	}
 }
 
-func (rp *RangePartition) SubmitGC() error {
+func (rp *RangePartition) SubmitGC(task GcTask) error {
+	if atomic.LoadInt32(&rp.blockWrites) == 1 {
+		return errors.New("writes are blocked, rp have been closed")
+	}
 	select {
-	case rp.gcRunChan <- struct{}{}:
+	case rp.gcRunChan <- task:
 		return nil
 	default:
 		return errors.New("gc busy")

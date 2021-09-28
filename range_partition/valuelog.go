@@ -54,13 +54,6 @@ func replayLog(stream streamclient.StreamClient, replayFunc func(*pb.EntryInfo) 
 	return nil
 }
 
-//policy
-//FIXME	
-/*
-func (rp *RangePartition) pickLog(discardRatio float64) *pb.StreamInfo {
-
-}
-*/
 
 func discardEntry(ei *pb.EntryInfo, vs y.ValueStruct) bool {
 	if vs.Version != y.ParseTs(ei.Log.Key) {
@@ -73,56 +66,89 @@ func discardEntry(ei *pb.EntryInfo, vs y.ValueStruct) bool {
 	return false
 }
 
+type GcTask struct {
+	ForceGC bool
+	ExIDs []uint64 //if not forceGC, pickup will choose automatically
+}
+
+const (
+	MAX_GC_ONCE = 3
+)
 
 func (rp *RangePartition) startGC() {
 	rp.gcStopper = utils.NewStopper()
-	rp.gcRunChan = make(chan struct{}, 1)
+	rp.gcRunChan = make(chan GcTask, 1)
 	//only one compact goroutine
 	rp.gcStopper.RunWorker(func() {
 		for {
 			select {
 				case <- rp.gcStopper.ShouldStop():
 					return
-				case <- rp.gcRunChan:
+				case task := <- rp.gcRunChan:
 					//chose an extent to compact
 				
 					logStreamInfo := rp.logStream.StreamInfo()
 					if len(logStreamInfo.ExtentIDs) < 2 {
+						fmt.Printf("only one extent, no extent to delete\n")
 						continue
 					}
-					tbls := rp.getTables()
+					holes :=make([]uint64, 0, 3)
+					if task.ForceGC {
+						fmt.Printf("task to gc on %+v\n", task.ExIDs)
+						//valide task.ExIDs
+						idx := make(map[uint64]bool, len(logStreamInfo.ExtentIDs))
+						for _, exID := range logStreamInfo.ExtentIDs {
+							idx[exID] = true
+						}
+						for i := 0 ; i < len(task.ExIDs)  && i < MAX_GC_ONCE; i++ {
+							if _, ok := idx[task.ExIDs[i]] ; ok{
+								holes = append(holes, task.ExIDs[i])
+							}
+						}
 
-					discards := getDiscards(tbls)
-					validDiscard(discards, logStreamInfo.ExtentIDs[:len(logStreamInfo.ExtentIDs)-1])
-					//sort discards by its value
-					canndidates := make([]uint64, 0, len(discards))
-					for k, _ := range discards {
-						canndidates = append(canndidates, k)
+					} else {
+						tbls := rp.getTables()
+
+						discards := getDiscards(tbls)
+						//exlucde the last extent, last extent is usually a non-sealed extent
+						validDiscard(discards, logStreamInfo.ExtentIDs[:len(logStreamInfo.ExtentIDs)-1])
+						//sort discard
+						canndidates := make([]uint64, 0, 3)
+
+						for k := range discards {
+							canndidates = append(canndidates, k)
+						}
+						sort.Slice(canndidates, func(i, j int) bool {
+							return discards[canndidates[i]] > discards[canndidates[j]]
+						})
+						for i := 0 ; i < len(canndidates) && i < MAX_GC_ONCE; i++ {
+							exID := canndidates[i]
+							size, err := rp.blockReader.SealedLength(exID)
+							if err != nil {
+								xlog.Logger.Errorf("get sealed length error: %v in runGC", err)
+								continue
+							}
+							if size == 0 {
+								continue
+							}
+							radio := float64(discards[exID]) / float64(size)
+							if radio > 0.4 {
+								holes = append(holes, exID)
+							}
+						}
 					}
-					sort.Slice(canndidates, func(i, j int) bool {
-						return discards[canndidates[i]] > discards[canndidates[j]]
-					})
 
-					holes := make([]uint64, 0, 3)
-					for i := 0 ; i < len(canndidates) && i < 3; i++ {
-						exID := canndidates[i]
-						size, err := rp.blockReader.SealedLength(exID)
-						if err != nil {
-							xlog.Logger.Errorf("get sealed length error: %v in runGC", err)
-							continue
-						}
-						if size == 0 {
-							continue
-						}
-						radio := float64(discards[exID]) / float64(size)
-						if radio > 0.4 {
-							rp.runGC(exID)
-							holes = append(holes, exID)
-						}
+					if len(holes) == 0 {
+						fmt.Printf("no extent to delete\n")
+						continue
+					}
+
+					for i := range holes {
+						rp.runGC(holes[i])
 					}
 					//TODO: retry if failed
 					//delete extent for stream
-					fmt.Printf("delete extent [%v], for stream %d\n", holes, logStreamInfo.StreamID)
+					fmt.Printf("deleted extent [%v], for stream %d\n", holes, logStreamInfo.StreamID)
 					//delete extent for block
 					if err := rp.logStream.PunchHoles(context.Background(), holes); err != nil {
 						xlog.Logger.Errorf("punch holes error: %v in runGC", err)
