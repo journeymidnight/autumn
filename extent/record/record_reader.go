@@ -150,7 +150,7 @@ type Reader struct {
 func NewReader(r io.Reader) *Reader {
 	seeker, _ := r.(io.Seeker)
 	return &Reader{
-		r: r,
+		r:      r,
 		seeker: seeker,
 	}
 }

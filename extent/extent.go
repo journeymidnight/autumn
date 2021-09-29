@@ -53,7 +53,7 @@ type Extent struct {
 	fileName     string
 	file         *os.File
 	//FIXME: add SSD Chanel
-	writer *record.LogWriter
+	writer       *record.LogWriter
 	lastRevision int64
 }
 
@@ -159,7 +159,7 @@ func OpenExtent(fileName string) (*Extent, error) {
 			return nil, errors.Errorf("check extent file, the extent file is too big")
 		}
 		//check extent header
-		
+
 		eh, err := readExtentHeader(file)
 		if err != nil {
 			return nil, err
@@ -198,7 +198,7 @@ func OpenExtent(fileName string) (*Extent, error) {
 	var rev = int64(0)
 	hex, _ := xattr.FGet(f, XATTRREV)
 	rev, _ = strconv.ParseInt(string(hex), 10, 64)
-	
+
 	ex := &Extent{
 		isSeal:       0,
 		commitLength: currentSize,
@@ -257,15 +257,18 @@ func (ex *Extent) Seal(commit uint32) error {
 		ex.writer.Close()
 		ex.writer = nil
 	}
-	
+	var err error
+
 	currentLength := atomic.LoadUint32(&ex.commitLength)
 	if currentLength < commit {
 		ex.resetWriter()
 		return errors.New("commit is less than current commit length")
 	}
 	ex.commitLength = commit
-	ex.file.Truncate(int64(commit))
-	if err := xattr.FSet(ex.file, XATTRSEAL, []byte("true")); err != nil {
+	if err = ex.file.Truncate(int64(commit)); err != nil {
+		return err
+	}
+	if err = xattr.FSet(ex.file, XATTRSEAL, []byte("true")); err != nil {
 		return err
 	}
 
@@ -285,7 +288,8 @@ func (ex *Extent) GetReader() *extentReader {
 	}
 
 }
-type rawWriter struct{
+
+type rawWriter struct {
 	io.WriteSeeker
 	extent *Extent
 }
@@ -302,19 +306,21 @@ func (fw *rawWriter) Seek(offset int64, whence int) (int64, error) {
 	return 0, nil
 }
 
-
 //fixWriter is used to fill gaps between
-func (ex *Extent) GetRawWriter() *rawWriter{
+func (ex *Extent) GetRawWriter() (*rawWriter, error) {
 	ex.AssertLock()
 
 	if ex.writer != nil {
 		utils.Check(ex.writer.Close())
 		ex.writer = nil
 	}
-	ex.file.Seek(int64(ex.commitLength), io.SeekStart)
+	if _, err := ex.file.Seek(int64(ex.commitLength), io.SeekStart); err != nil {
+		return nil, err
+	}
+
 	return &rawWriter{
 		extent: ex,
-	}
+	}, nil
 }
 
 //Close requeset LOCK
@@ -327,13 +333,15 @@ func (ex *Extent) Close() {
 	ex.file.Close()
 }
 
-
 func (ex *Extent) Truncate(length uint32) error {
 	ex.AssertLock()
 
 	ex.commitLength = length
-	ex.file.Truncate(int64(length))
-	return ex.resetWriter()
+	if err := ex.file.Truncate(int64(length)); err != nil {
+		return err
+	}
+	ex.resetWriter()
+	return nil
 }
 
 func (ex *Extent) HasLock(revision int64) bool {
@@ -347,12 +355,12 @@ func (ex *Extent) HasLock(revision int64) bool {
 	return false
 }
 
-func (ex *Extent) resetWriter() error {
+func (ex *Extent) resetWriter() {
 	if ex.writer != nil {
 		ex.writer.Close()
 	}
 	if atomic.LoadInt32(&ex.isSeal) == 1 {
-		return nil
+		return
 	}
 
 	utils.AssertTrue(ex.IsSeal() == false)
@@ -367,11 +375,11 @@ func (ex *Extent) resetWriter() error {
 	offset := currentLength % record.BlockSize
 	newWriter := record.NewLogWriter(ex.file, int64(bn), int32(offset))
 	ex.writer = newWriter
-	return nil
+	return
 }
 
-func (ex *Extent) ResetWriter() error {
-	return ex.resetWriter()
+func (ex *Extent) ResetWriter() {
+	ex.resetWriter()
 }
 
 func (ex *Extent) RecoveryData(start uint32, rev int64, blocks []*pb.Block) error {
@@ -385,7 +393,6 @@ func (ex *Extent) RecoveryData(start uint32, rev int64, blocks []*pb.Block) erro
 
 	expectedEnd := start
 
-
 	for _, block := range blocks {
 		expectedEnd = record.ComputeEnd(expectedEnd, uint32(len(block.Data)))
 	}
@@ -395,7 +402,10 @@ func (ex *Extent) RecoveryData(start uint32, rev int64, blocks []*pb.Block) erro
 	if expectedEnd <= currentLength {
 		return nil
 	}
-	ex.file.Seek(int64(start), os.SEEK_SET)
+	_, err := ex.file.Seek(int64(start), os.SEEK_SET)
+	if err != nil {
+		return err
+	}
 
 	xlog.Logger.Debugf("fixing %d blocks from %d\n", len(blocks), start)
 	//fix current extent
@@ -417,8 +427,8 @@ func (ex *Extent) RecoveryData(start uint32, rev int64, blocks []*pb.Block) erro
 	return nil
 }
 
-func (ex *Extent) Sync() {
-	ex.writer.Sync()
+func (ex *Extent) Sync() error {
+	return ex.writer.Sync()
 }
 
 func (ex *Extent) AppendBlocks(blocks []*pb.Block, doSync bool) ([]uint32, uint32, error) {
@@ -465,7 +475,6 @@ func (ex *Extent) AppendBlocks(blocks []*pb.Block, doSync bool) ([]uint32, uint3
 	atomic.StoreUint32(&ex.commitLength, uint32(end))
 	return offsets, uint32(end), nil
 }
-
 
 //ValidAllBlocks表示从start,就存在一个合法的数据block(不是64KB BLOCK)
 func (ex *Extent) ValidAllBlocks(start int64) (uint32, error) {
@@ -528,11 +537,9 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 			return nil, nil, 0, err
 		}
 
-
-
 		data, err := ioutil.ReadAll(reader)
 
-		if rr.End() - int64(offset) > int64(maxTotalSize) && len(ret) > 0 {
+		if rr.End()-int64(offset) > int64(maxTotalSize) && len(ret) > 0 {
 			end = uint32(start)
 			break
 		}
@@ -557,8 +564,8 @@ func (ex *Extent) ReadLastBlock() ([]*pb.Block, []uint32, uint32, error) {
 	var err error
 	var end uint32
 	var start uint32
-	LOOP:
-	for ; offset >= 0; offset -= record.BlockSize{
+LOOP:
+	for ; offset >= 0; offset -= record.BlockSize {
 		rr := record.NewReader(wrapReader)
 		rr.SeekRecord(offset)
 		for {
@@ -573,7 +580,7 @@ func (ex *Extent) ReadLastBlock() ([]*pb.Block, []uint32, uint32, error) {
 				//block crc is bad:
 				break
 			}
-			
+
 			start = uint32(rr.Offset())
 			data, err = ioutil.ReadAll(reader)
 			if err != nil {
@@ -598,7 +605,6 @@ func (ex *Extent) CommitLength() uint32 {
 //node_service will never call this function, this function is only for test
 func (ex *Extent) ReadEntries(offset uint32, maxTotalSize uint32, replay bool) ([]*pb.EntryInfo, uint32, error) {
 
-	
 	blocks, offsets, end, err := ex.ReadBlocks(offset, 10, maxTotalSize)
 	if err != nil && err != wire_errors.EndOfExtent {
 		return nil, 0, err
@@ -611,7 +617,7 @@ func (ex *Extent) ReadEntries(offset uint32, maxTotalSize uint32, replay bool) (
 			continue
 		}
 		//fill end field in EntryInfo
-		if i == len(blocks) -1 {
+		if i == len(blocks)-1 {
 			e.End = end
 		} else {
 			e.End = offsets[i+1]
@@ -623,7 +629,6 @@ func (ex *Extent) ReadEntries(offset uint32, maxTotalSize uint32, replay bool) (
 	return ret, end, err
 
 }
-
 
 func ExtractEntryInfo(b *pb.Block, extentID uint64, offset uint32, replay bool) (*pb.EntryInfo, error) {
 	entry := new(pb.Entry)

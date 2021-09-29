@@ -629,7 +629,6 @@ func TestRecoverLastCompleteBlock(t *testing.T) {
 	}
 }
 
-
 func BenchmarkNormalWrite(b *testing.B) {
 	for _, size := range []int{8, 16, 32, 64, 128, 1 << 20} {
 		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {

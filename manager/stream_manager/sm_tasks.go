@@ -18,21 +18,35 @@ import (
 )
 
 //extent is copied from replaceID to newNodeID
-func (sm *StreamManager) copyDone(task *pb.RecoveryTask) {
+func (sm *StreamManager) copyDone(task *pb.RecoveryTaskStatus) {
 
-	sm.lockExtent(task.ExtentID)
-	defer sm.unlockExtent(task.ExtentID)
+	if err := sm.lockExtent(task.Task.ExtentID); err != nil {
+		xlog.Logger.Warnf("extent %d has been deleted, remove recovery task", task.Task.ExtentID)
+		//extent has been deleted, remove Copy task	from etcd
+		taskKey := FormatRecoveryTaskName(task.Task.ExtentID)
+		cmps := []clientv3.Cmp{clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue)}
+		ops := []clientv3.Op{
+			clientv3.OpDelete(taskKey),
+		}
 
-	exInfo, ok := sm.cloneExtentInfo(task.ExtentID)
+		if err := etcd_utils.EtcdSetKVS(sm.client, cmps, ops); err != nil {
+			xlog.Logger.Warnf("setting etcd failed [%s]", err)
+			return
+		}
+		return
+	}
+	defer sm.unlockExtent(task.Task.ExtentID)
+
+	exInfo, ok := sm.cloneExtentInfo(task.Task.ExtentID)
 	if !ok {
 		return
 	}
-	newNodeID := task.NodeID
+	newNodeID := task.Task.NodeID
 
-	slot := FindNodeIndex(exInfo, task.ReplaceID)
+	slot := FindNodeIndex(exInfo, task.Task.ReplaceID)
 	if slot == -1 {
 		xlog.Logger.Errorf("copyDone invalid task %v", task)
-		return 
+		return
 	}
 
 	//replace ID
@@ -40,12 +54,10 @@ func (sm *StreamManager) copyDone(task *pb.RecoveryTask) {
 		exInfo.Replicates[slot] = newNodeID
 		exInfo.ReplicateDisks[slot] = task.ReadyDiskID
 	} else {
-		exInfo.Parity[slot - len(exInfo.Replicates)] = newNodeID
-		exInfo.ParityDisk[slot - len(exInfo.Replicates)] = task.ReadyDiskID
+		exInfo.Parity[slot-len(exInfo.Replicates)] = newNodeID
+		exInfo.ParityDisk[slot-len(exInfo.Replicates)] = task.ReadyDiskID
 	}
-	exInfo.Eversion ++
-
-
+	exInfo.Eversion++
 
 	extentKey := formatExtentKey(exInfo.ExtentID)
 	data := utils.MustMarshal(exInfo)
@@ -66,14 +78,13 @@ func (sm *StreamManager) copyDone(task *pb.RecoveryTask) {
 	//remove from taskPool in local memory
 	sm.taskPool.Remove(exInfo.ExtentID)
 	//return successfull
-	xlog.Logger.Infof("extent %d, replaceID %d is restored on node %d", task.ExtentID, task.ReplaceID, newNodeID)
+	xlog.Logger.Infof("extent %d, replaceID %d is restored on node %d", task.Task.ExtentID, task.Task.ReplaceID, newNodeID)
 }
-
 
 //go routine
 func (sm *StreamManager) routineUpdateDF() {
 
-	ticker := utils.NewRandomTicker(10 * time.Second, 20 * time.Second)
+	ticker := utils.NewRandomTicker(10*time.Second, 20*time.Second)
 
 	var ctx context.Context
 	var cancel context.CancelFunc
@@ -82,17 +93,16 @@ func (sm *StreamManager) routineUpdateDF() {
 		xlog.Logger.Infof("routineUpdateDF quit")
 	}()
 
-
-	df := func(node *NodeStatus){
-		defer func(){
-			if time.Now().Sub(node.LastEcho()) > 4 * time.Minute {
+	df := func(node *NodeStatus) {
+		defer func() {
+			if time.Now().Sub(node.LastEcho()) > 4*time.Minute {
 				fmt.Printf("node %d set dead", node.NodeInfo.NodeID)
 				//node.SetDead()
 			}
 		}()
-		
+
 		conn := node.GetConn()
-		pctx, pCancel := context.WithTimeout(ctx, 5 * time.Second)
+		pctx, pCancel := context.WithTimeout(ctx, 5*time.Second)
 		client := pb.NewExtentServiceClient(conn)
 		res, err := client.Df(pctx, &pb.DfRequest{
 			Tasks: sm.taskPool.GetFromNode(node.NodeID),
@@ -115,43 +125,41 @@ func (sm *StreamManager) routineUpdateDF() {
 
 		node.SetFree(sumFree)
 		node.SetTotal(sumTotal)
-		
+
 		for i := range res.DoneTask {
 			sm.copyDone(res.DoneTask[i])
 		}
 	}
 
-
-
 	xlog.Logger.Infof("routineUpdateDF started")
+	fmt.Println("routineUpdateDF")
 	for {
 		select {
-			case <- sm.stopper.ShouldStop():
-				if cancel != nil{
-					cancel()
-				}
-				return
-			case <- ticker.C:
-				ctx, cancel = context.WithCancel(context.Background())
-				nodes := sm.getAllNodeStatus(false)
-				for i := range nodes {
-					node := nodes[i]
-					go df(node)
-				}	
+		case <-sm.stopper.ShouldStop():
+			if cancel != nil {
+				cancel()
+			}
+			return
+		case <-ticker.C:
+			ctx, cancel = context.WithCancel(context.Background())
+			nodes := sm.getAllNodeStatus(false)
+			for i := range nodes {
+				node := nodes[i]
+				go df(node)
+			}
 		}
 	}
 }
 
 type RecoveryTask struct {
-	task *pb.RecoveryTask //immutable
+	task        *pb.RecoveryTask //immutable
 	runningNode uint64
-	start int64 //
+	start       int64 //
 }
-
 
 func (rt *RecoveryTask) StartTime() time.Time {
 	val := atomic.LoadInt64(&rt.start)
-	return time.Unix(val,0)
+	return time.Unix(val, 0)
 }
 
 func (rt *RecoveryTask) SetStartTime() {
@@ -165,7 +173,6 @@ func (rt *RecoveryTask) RunningNode() uint64 {
 func (rt *RecoveryTask) SetRunningNode(x uint64) {
 	atomic.StoreUint64(&rt.runningNode, x)
 }
-
 
 func FormatRecoveryTaskName(extentID uint64) string {
 	return fmt.Sprintf("recoveryTasks/%d", extentID)
@@ -187,30 +194,25 @@ func isReplaceIDinInfo(extentInfo *pb.ExtentInfo, replaceID uint64) bool {
 }
 
 //non-block
-func (sm *StreamManager) saveRecoveryTask(task *pb.RecoveryTask) error{
-		key := FormatRecoveryTaskName(task.ExtentID)
+func (sm *StreamManager) saveRecoveryTask(task *pb.RecoveryTask) error {
+	key := FormatRecoveryTaskName(task.ExtentID)
 
-		//set etcd if isLeader && not exist, submit the task
-		data := utils.MustMarshal(task)
+	//set etcd if isLeader && not exist, submit the task
+	data := utils.MustMarshal(task)
 
-		cmps := []clientv3.Cmp{clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
-							  clientv3.Compare(clientv3.CreateRevision(key), "=", 0)}
-		ops := []clientv3.Op{
-			clientv3.OpPut(key, string(data)),
-		}
-		err := etcd_utils.EtcdSetKVS(sm.client, cmps, ops)
-		if err != nil {
-			xlog.Logger.Warnf("can not submit recoverytask for %s", key)
-			return err
-		}
+	cmps := []clientv3.Cmp{clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
+		clientv3.Compare(clientv3.CreateRevision(key), "=", 0)}
+	ops := []clientv3.Op{
+		clientv3.OpPut(key, string(data)),
+	}
+	err := etcd_utils.EtcdSetKVS(sm.client, cmps, ops)
+	if err != nil {
+		xlog.Logger.Warnf("can not submit recoverytask for %s", key)
+		return err
+	}
 
-		
 	return nil
 }
-
-
-
-
 
 //lockExtent returns error to indicate extent has been deleted
 func (sm *StreamManager) lockExtent(extentID uint64) error {
@@ -229,16 +231,15 @@ func (sm *StreamManager) unlockExtent(extentID uint64) {
 	}
 }
 
-
 func (sm *StreamManager) reAvali(exInfo *pb.ExtentInfo, nodeID uint64) {
 
 	ns := sm.getNodeStatus(nodeID)
 	pool := conn.GetPools().Connect(ns.Address)
 	if pool == nil {
-		return 
+		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3 * time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	c := pb.NewExtentServiceClient(pool.Get())
 	res, err := c.ReAvali(ctx, &pb.ReAvaliRequest{
 		ExtentID: exInfo.ExtentID,
@@ -247,7 +248,7 @@ func (sm *StreamManager) reAvali(exInfo *pb.ExtentInfo, nodeID uint64) {
 	cancel()
 	if err != nil {
 		xlog.Logger.Error(err.Error())
-		return 
+		return
 	}
 	if res.Code != pb.Code_OK {
 		xlog.Logger.Error(res.CodeDes)
@@ -262,7 +263,7 @@ func (sm *StreamManager) reAvali(exInfo *pb.ExtentInfo, nodeID uint64) {
 		return
 	}
 	//update exInfo
-	exInfo.Eversion ++
+	exInfo.Eversion++
 	exInfo.Avali |= (1 << slot)
 
 	//update etcd
@@ -292,7 +293,7 @@ func (sm *StreamManager) dispatchRecoveryTask(exInfo *pb.ExtentInfo, replaceID u
 		t := sm.taskPool.GetFromExtent(exInfo.ExtentID)
 		ns := sm.getNodeStatus(t.NodeID)
 		pool := conn.GetPools().Connect(ns.Address)
-		if pool != nil &&  pool.IsHealthy() {
+		if pool != nil && pool.IsHealthy() {
 			return errors.Errorf("duplicate task")
 		}
 	}
@@ -304,15 +305,15 @@ func (sm *StreamManager) dispatchRecoveryTask(exInfo *pb.ExtentInfo, replaceID u
 	}
 
 	/*
-	if exInfo.ExtentID == 17 {
-		chosenNode = &NodeStatus{NodeInfo:pb.NodeInfo{
-			NodeID: 4,
-			Address:"127.0.0.1:4002",
-		}}
-	} else {
-		fmt.Printf("ignore")
-		return nil
-	}*/
+		if exInfo.ExtentID == 17 {
+			chosenNode = &NodeStatus{NodeInfo:pb.NodeInfo{
+				NodeID: 4,
+				Address:"127.0.0.1:4002",
+			}}
+		} else {
+			fmt.Printf("ignore")
+			return nil
+		}*/
 
 	//simple policy
 	var chosenNode *NodeStatus
@@ -343,29 +344,28 @@ func (sm *StreamManager) dispatchRecoveryTask(exInfo *pb.ExtentInfo, replaceID u
 		chosenNode = nodes[i]
 		break
 	}
-	
+
 	if chosenNode == nil {
 		return errors.New("can not find remote node to copy")
 	}
 
-
 	pool := conn.GetPools().Connect(chosenNode.Address)
-	if pool == nil || pool.IsHealthy() == false {
+	if pool == nil || !pool.IsHealthy() {
 		xlog.Logger.Warnf("can not connect %v", chosenNode)
 		return errors.Errorf("can not connect %v", chosenNode)
 	}
 
 	task := &pb.RecoveryTask{
-		ExtentID: exInfo.ExtentID, //extentID to be recovered
-		ReplaceID: replaceID,      //nodeID in replicas or parity fields, origin location
-		NodeID: chosenNode.NodeID, //nodeID of newlocation
+		ExtentID:  exInfo.ExtentID,   //extentID to be recovered
+		ReplaceID: replaceID,         //nodeID in replicas or parity fields, origin location
+		NodeID:    chosenNode.NodeID, //nodeID of newlocation
 	}
 	fmt.Printf("dispatch task %+v to node %+v\n", task, chosenNode)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	c := pb.NewExtentServiceClient(pool.Get())
 
 	res, err := c.RequireRecovery(ctx, &pb.RequireRecoveryRequest{
-			Task: task})
+		Task: task})
 	cancel()
 	//network error
 	if err != nil {
@@ -386,13 +386,13 @@ func (sm *StreamManager) dispatchRecoveryTask(exInfo *pb.ExtentInfo, replaceID u
 		return err
 	}
 	sm.taskPool.Insert(task)
-	
+
 	return nil
 }
 
 func (sm *StreamManager) routineDispatchTask() {
 	//loop over task pool, assign a task to a living node
-	ticker := utils.NewRandomTicker(5* time.Second, 10 * time.Second)
+	ticker := utils.NewRandomTicker(5*time.Second, 10*time.Second)
 	defer func() {
 		ticker.Stop()
 		xlog.Logger.Infof("routineDispatchTask quit")
@@ -401,74 +401,75 @@ func (sm *StreamManager) routineDispatchTask() {
 	xlog.Logger.Infof("routineDispatchTask started")
 	for {
 		select {
-			case <- sm.stopper.ShouldStop():
-				return
-			case <- ticker.C:
-				OUTER:
-				for kv := range sm.extents.Iter() {
-					exInfo := kv.Value.(*pb.ExtentInfo) //extent is read only
+		case <-sm.stopper.ShouldStop():
+			return
+		case <-ticker.C:
+		OUTER:
+			for kv := range sm.extents.Iter() {
+				exInfo := kv.Value.(*pb.ExtentInfo) //extent is read only
 
-					//only check sealed extent
-					if exInfo.Avali == 0 {
-						continue 
-					}
-					
-					sm.lockExtent(exInfo.ExtentID)
-
-					allCopies := append(exInfo.Replicates, exInfo.Parity...)
-					
-					for i, nodeID := range allCopies {
-
-						//check node is avali					
-						if (exInfo.Avali & uint32(1 << i)) == 0 {
-							fmt.Printf("check Avali for extent %d on node %d, avali is %d\n", 
-							exInfo.ExtentID, nodeID, exInfo.Avali)
-							go func(extent *pb.ExtentInfo, nodeID uint64){
-								sm.reAvali(extent, nodeID)
-								sm.unlockExtent(extent.ExtentID)
-							}(exInfo, nodeID)
-							continue OUTER
-						}
-						
-						//check disk health
-						var diskID uint64
-						if i >= len(exInfo.Replicates) {
-							diskID = exInfo.ParityDisk[i - len(exInfo.Replicates)]
-						} else {
-							diskID = exInfo.ReplicateDisks[i]
-						}
-						
-						diskInfo, ok := sm.cloneDiskInfo(diskID)
-						if !ok || diskInfo.Online == false {
-							go func(exInfo *pb.ExtentInfo, nodeID uint64) {
-								err := sm.dispatchRecoveryTask(exInfo, nodeID)
-								fmt.Printf("extent %d on disk %d is offline, dispatch result is %v\n", exInfo.ExtentID, diskInfo.DiskID, err)
-								sm.unlockExtent(exInfo.ExtentID)
-							}(exInfo, nodeID)
-							continue OUTER
-						}
-						
-
-						//check node health
-						ns := sm.getNodeStatus(nodeID)
-						if (ns == nil || ns.Dead()) && exInfo.Avali > 0{
-							fmt.Printf("node %d is dead, recovery for %d\n", nodeID, exInfo.ExtentID) 
-							go func(extent *pb.ExtentInfo, nodeID uint64) {
-								sm.dispatchRecoveryTask(extent, nodeID)
-								sm.unlockExtent(extent.ExtentID)
-							}(exInfo, nodeID)
-							continue OUTER
-						}
-
-
-
-					}
-					sm.unlockExtent(exInfo.ExtentID)
+				//only check sealed extent
+				if exInfo.Avali == 0 {
+					continue
 				}
+
+				if err := sm.lockExtent(exInfo.ExtentID); err != nil {
+					xlog.Logger.Warnf("lock extent failed [%s]", err)
+					continue
+				}
+
+				allCopies := append(exInfo.Replicates, exInfo.Parity...)
+
+				for i, nodeID := range allCopies {
+
+					//check node is avali
+					if (exInfo.Avali & uint32(1<<i)) == 0 {
+						fmt.Printf("check Avali for extent %d on node %d, avali is %d\n",
+							exInfo.ExtentID, nodeID, exInfo.Avali)
+						go func(extent *pb.ExtentInfo, nodeID uint64) {
+							sm.reAvali(extent, nodeID)
+							sm.unlockExtent(extent.ExtentID)
+						}(exInfo, nodeID)
+						continue OUTER
+					}
+
+					//check disk health
+					var diskID uint64
+					if i >= len(exInfo.Replicates) {
+						diskID = exInfo.ParityDisk[i-len(exInfo.Replicates)]
+					} else {
+						diskID = exInfo.ReplicateDisks[i]
+					}
+
+					diskInfo, ok := sm.cloneDiskInfo(diskID)
+					if !ok || diskInfo.Online == false {
+						go func(exInfo *pb.ExtentInfo, nodeID uint64) {
+							err := sm.dispatchRecoveryTask(exInfo, nodeID)
+							fmt.Printf("extent %d on disk %d is offline, dispatch result is %v\n", exInfo.ExtentID, diskInfo.DiskID, err)
+							sm.unlockExtent(exInfo.ExtentID)
+						}(exInfo, nodeID)
+						continue OUTER
+					}
+
+					//check node health
+					ns := sm.getNodeStatus(nodeID)
+					if (ns == nil || ns.Dead()) && exInfo.Avali > 0 {
+						fmt.Printf("node %d is dead, recovery for %d\n", nodeID, exInfo.ExtentID)
+						go func(extent *pb.ExtentInfo, nodeID uint64) {
+							if err := sm.dispatchRecoveryTask(extent, nodeID); err != nil {
+								xlog.Logger.Warnf("dispatchRecoveryTask failed [%s]", err)
+							}
+							sm.unlockExtent(extent.ExtentID)
+						}(exInfo, nodeID)
+						continue OUTER
+					}
+
+				}
+				sm.unlockExtent(exInfo.ExtentID)
 			}
+		}
 	}
 }
-
 
 func FindNodeIndex(extentInfo *pb.ExtentInfo, nodeID uint64) int {
 	slot := -1
@@ -489,5 +490,5 @@ func FindNodeIndex(extentInfo *pb.ExtentInfo, nodeID uint64) int {
 		}
 	}
 
-	return slot 
+	return slot
 }

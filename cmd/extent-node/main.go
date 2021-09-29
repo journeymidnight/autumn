@@ -8,7 +8,7 @@ import (
 
 	"github.com/journeymidnight/autumn/node"
 	"github.com/journeymidnight/autumn/utils"
-	"github.com/journeymidnight/autumn/xlog"	
+	"github.com/journeymidnight/autumn/xlog"
 
 	"go.uber.org/zap"
 )

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/journeymidnight/autumn/xlog"
@@ -30,22 +31,22 @@ func (suite *EtcdUtilTestSuite) SetupSuite() {
 	config.Name = "etcd"
 	config.Dir = "etcd.db"
 
-		config.LCUrls = mustParseURL("http://127.0.0.1:2379")
-		config.LPUrls = mustParseURL("http://127.0.0.1:2380")
-		config.ACUrls = mustParseURL("http://127.0.0.1:2379")
-		config.APUrls = mustParseURL("http://127.0.0.1:2380")
-		config.InitialCluster = "etcd=http://127.0.0.1:2380"
-		config.ClusterState = "new"
-		config.InitialClusterToken ="cluster"
-	
+	config.LCUrls = mustParseURL("http://127.0.0.1:2379")
+	config.LPUrls = mustParseURL("http://127.0.0.1:2380")
+	config.ACUrls = mustParseURL("http://127.0.0.1:2379")
+	config.APUrls = mustParseURL("http://127.0.0.1:2380")
+	config.InitialCluster = "etcd=http://127.0.0.1:2380"
+	config.ClusterState = "new"
+	config.InitialClusterToken = "cluster"
+	config.LogLevel = "fatal"
 	etcd, client, err := ServeETCD(config)
-	fmt.Println(err)
 	suite.Nil(err)
 	suite.etcd = etcd
 	suite.client = client
 }
 
 func (suite *EtcdUtilTestSuite) TearDownSuite() {
+	suite.client.Close()
 	suite.etcd.Close()
 	os.RemoveAll("etcd.db")
 	os.Remove("etcd.log")
@@ -61,34 +62,39 @@ func (suite *EtcdUtilTestSuite) TestSetGetKV() {
 	data, _, err := EtcdGetKV(suite.client, "key_50")
 	suite.Nil(err)
 	suite.Equal("val50", string(data))
-	
+
 }
 
 func (suite *EtcdUtilTestSuite) TestWatch() {
-	go func(){
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
 		for i := 0; i < 100; i++ {
 			key := fmt.Sprintf("key/%d", i)
 			val := fmt.Sprintf("val%d", i)
 			EtcdSetKV(suite.client, key, []byte(val))
 		}
-		data,_, err := EtcdGetKV(suite.client, "key/50")
+
+		data, _, err := EtcdGetKV(suite.client, "key/50")
 		suite.Nil(err)
 		suite.Equal("val50", string(data))
+		wg.Done()
+
 	}()
 
 	ch, closeWatch := EtcdWatchEvents(suite.client, "key", "key0", 1)
-	j := 0 
+	j := 0
 	for e := range ch {
 		for i := range e.Events {
 			suite.Equal(fmt.Sprintf("key/%d", j), string(e.Events[i].Kv.Key))
-			j ++
+			j++
 		}
 		if j == 99 {
 			break
 		}
 	}
 	closeWatch()
-
+	wg.Wait()
 }
 
 func TestEtcdUtil(t *testing.T) {

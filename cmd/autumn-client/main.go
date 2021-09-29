@@ -127,8 +127,8 @@ func benchmark(etcdUrls []string, op BenchType, threadNum int, duration int) err
 				//https://stackoverflow.com/questions/56103775/how-to-print-formatted-string-to-the-same-line-in-stdout-with-go
 				//how to print in one line
 				fmt.Print("\033[u\033[K")
-				ops := atomic.LoadUint64(&count) / uint64(time.Now().Sub(start).Seconds())
-				throughput := float64(atomic.LoadUint64(&totalSize)) / time.Now().Sub(start).Seconds()
+				ops := atomic.LoadUint64(&count) / uint64(time.Since(start).Seconds())
+				throughput := float64(atomic.LoadUint64(&totalSize)) / time.Since(start).Seconds()
 				fmt.Printf("ops:%d/s  throughput:%s", ops, utils.HumanReadableThroughput(throughput))
 			}
 		}

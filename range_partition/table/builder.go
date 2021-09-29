@@ -175,10 +175,6 @@ func (b *Builder) keyDiff(newKey []byte) []byte {
 	return newKey[i:]
 }
 
-type blockWriteReq struct {
-	b pb.Block
-}
-
 /*
 func blockGrow(block *pb.Block, n uint32) {
 	newSize := utils.Ceil(uint32(len(block.Data))+n, 4 * KB)
@@ -366,9 +362,8 @@ func (b *Builder) FinishAll(headExtentID uint64, headOffset uint32, seqNum uint6
 		VpOffset:         headOffset,
 		SeqNum:           seqNum,
 		TableIndex:       b.tableIndex,
-		Discards:  		  discards,
+		Discards:         discards,
 	}
-
 
 	metaBlock := &pb.Block{
 		Data: make([]byte, meta.Size()+4),

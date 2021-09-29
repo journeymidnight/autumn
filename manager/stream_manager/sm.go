@@ -27,16 +27,16 @@ const (
 
 type NodeStatus struct {
 	pb.NodeInfo
-	//atomic 
-	total    uint64
-	free     uint64
-	dead     uint32
+	//atomic
+	total uint64
+	free  uint64
+	dead  uint32
 }
 
 type DiskStatus struct {
 	pb.DiskInfo
-	total    uint64
-	free     uint64
+	total uint64
+	free  uint64
 	//avg lantency
 }
 
@@ -53,16 +53,16 @@ func (ds *DiskStatus) Free() uint64 {
 func (ns *NodeStatus) Dead() bool {
 	return atomic.LoadUint32(&ns.dead) > 0
 }
-func (ns *NodeStatus) SetDead(){
+func (ns *NodeStatus) SetDead() {
 	atomic.StoreUint32(&ns.dead, 1)
 }
-func (ns *NodeStatus) Total() uint64{
+func (ns *NodeStatus) Total() uint64 {
 	return atomic.LoadUint64(&ns.total)
 }
 func (ns *NodeStatus) SetTotal(t uint64) {
 	atomic.StoreUint64(&ns.total, t)
-} 
-func (ns *NodeStatus) Free() uint64{
+}
+func (ns *NodeStatus) Free() uint64 {
 	return atomic.LoadUint64(&ns.free)
 }
 func (ns *NodeStatus) SetFree(f uint64) {
@@ -92,22 +92,19 @@ func (ns *NodeStatus) IsHealthy() bool {
 	return pool.IsHealthy()
 }
 
-
 type StreamManager struct {
-	streams   *hashmap.HashMap//id => *pb.StreamInfo, read only
+	streams *hashmap.HashMap //id => *pb.StreamInfo, read only
 	//streamsLocks *sync.Map //client has mutex lock, so we don't need it any more
-
 
 	//extents     map[uint64]*pb.ExtentInfo
 	//locks is used only for sealed extents when updating avali field and replicates/parities
-	extents   *hashmap.HashMap//id => *pb.ExtentInfo, read only
+	extents      *hashmap.HashMap //id => *pb.ExtentInfo, read only
 	extentsLocks *sync.Map
-	
-	
+
 	//nodeLock utils.SafeMutex
 	//nodes    map[uint64]*NodeStatus
-	nodes     *hashmap.HashMap //id => *NodeStatus
-	disks     *hashmap.HashMap  //id => *DiskStatus
+	nodes *hashmap.HashMap //id => *NodeStatus
+	disks *hashmap.HashMap //id => *DiskStatus
 
 	etcd       *embed.Etcd
 	client     *clientv3.Client
@@ -122,23 +119,22 @@ type StreamManager struct {
 	//leadeKey is to store Election key
 	leaderKey string
 
-	policy AllocExtentPolicy
+	policy  AllocExtentPolicy
 	stopper *utils.Stopper //leader tasks
 
-	taskPoolLock  *utils.SafeMutex
-	taskPool      *TaskPool
+	taskPoolLock *utils.SafeMutex
+	taskPool     *TaskPool
 }
 
 func NewStreamManager(etcd *embed.Etcd, client *clientv3.Client, config *manager.Config) *StreamManager {
 	sm := &StreamManager{
-		etcd:   etcd,
-		client: client,
-		config: config,
-		ID:     uint64(etcd.Server.ID()),
-		policy: new(SimplePolicy),
+		etcd:    etcd,
+		client:  client,
+		config:  config,
+		ID:      uint64(etcd.Server.ID()),
+		policy:  new(SimplePolicy),
 		stopper: utils.NewStopper(),
 	}
-	
 
 	v := pb.MemberValue{
 		ID:      sm.ID,
@@ -189,13 +185,11 @@ func (sm *StreamManager) runAsLeader() {
 			xlog.Logger.Warnf(err.Error())
 			return
 		}
-		
-		
+
 		sm.streams.Set(streamID, &streamInfo)
 		//sm.streamsLocks.Store(streamID, new(sync.Mutex))
 	}
 
-	
 	//load extents
 	kvs, _, err = etcd_utils.EtcdRange(sm.client, "extents/")
 	if err != nil {
@@ -216,14 +210,11 @@ func (sm *StreamManager) runAsLeader() {
 			xlog.Logger.Errorf(err.Error())
 			return
 		}
-		
-		
-		
+
 		if kv.Version != int64(extentInfo.Eversion) {
 			panic(fmt.Sprintf("%s 's Version %d is not equal to %d", kv.Key, kv.Version, extentInfo.Eversion))
 		}
-		
-		
+
 		sm.extents.Set(extentID, &extentInfo)
 		sm.extentsLocks.Store(extentID, new(sync.Mutex))
 	}
@@ -269,7 +260,7 @@ func (sm *StreamManager) runAsLeader() {
 		fmt.Printf("%+v\n", task)
 
 		sm.taskPool.Insert(&task)
-		fmt.Printf("????%v\n" ,sm.taskPool.GetFromNode(task.NodeID))
+		fmt.Printf("????%v\n", sm.taskPool.GetFromNode(task.NodeID))
 	}
 
 	sm.disks = &hashmap.HashMap{}
@@ -294,17 +285,13 @@ func (sm *StreamManager) runAsLeader() {
 		})
 	}
 
-
 	//start leader tasks
 	sm.stopper.RunWorker(sm.routineUpdateDF)
 	sm.stopper.RunWorker(sm.routineDispatchTask)
 
 	atomic.StoreInt32(&sm.isLeader, 1)
-	fmt.Printf("Start loading data from etcd, cost %v\n", time.Now().Sub(startLoading))
+	fmt.Printf("Start loading data from etcd, cost %v\n", time.Since(startLoading))
 }
-
-
-
 
 func (sm *StreamManager) LeaderLoop() {
 	for {

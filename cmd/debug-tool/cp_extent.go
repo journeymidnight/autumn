@@ -17,7 +17,7 @@ func main() {
 	src := os.Args[1]
 	dest := os.Args[2]
 	//parse offset to int64 from argv[3]
-	offset, err :=  strconv.Atoi(os.Args[3])
+	offset, err := strconv.Atoi(os.Args[3])
 	if err != nil {
 		panic(err)
 	}
@@ -27,18 +27,21 @@ func main() {
 	}
 
 	ex.Lock()
-	w := ex.GetRawWriter()
-	
-	srcFile , err := os.Open(src)
+	w, err := ex.GetRawWriter()
+	if err != nil {
+		panic(err)
+	}
+
+	srcFile, err := os.Open(src)
 	if err != nil {
 		panic(err)
 	}
 	defer srcFile.Close()
 
 	x := utils.Floor(uint32(offset), 64<<10)
-	
+
 	padding := uint32(offset) - x
-	
+
 	fmt.Printf("start padding is %d\n", padding)
 
 	srcFile.Seek(int64(x), 0)
@@ -49,5 +52,5 @@ func main() {
 		panic(err)
 	}
 	ex.Close()
-	
+
 }

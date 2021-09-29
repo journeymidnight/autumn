@@ -38,8 +38,7 @@ var (
 	_ = fmt.Printf
 )
 
-
-type ExtentOnDisk struct{
+type ExtentOnDisk struct {
 	*extent.Extent
 	diskID uint64
 }
@@ -52,9 +51,9 @@ type ExtentNode struct {
 	wal        *wal.Wal
 	extentMap  *sync.Map //extentID => ExtentOnDisk
 
-	smClient *smclient.SMClient
-	em       *smclient.ExtentManager
-	recoveryTaskNum  int32
+	smClient        *smclient.SMClient
+	em              *smclient.ExtentManager
+	recoveryTaskNum int32
 }
 
 func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl string, smURLs []string, etcdURLs []string) *ExtentNode {
@@ -65,14 +64,13 @@ func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl st
 		listenUrl: listenUrl,
 		smClient:  smclient.NewSMClient(smURLs),
 		nodeID:    nodeID,
-		diskFSs: make(map[uint64]*diskFS),
-		
+		diskFSs:   make(map[uint64]*diskFS),
 	}
 	if err := en.smClient.Connect(); err != nil {
 		xlog.Logger.Fatal(err)
 		return nil
 	}
-	
+
 	en.em = smclient.NewExtentManager(en.smClient, etcdURLs, en.extentInfoUpdatedfunc)
 
 	utils.AssertTrue(en.em != nil)
@@ -83,7 +81,6 @@ func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl st
 	if err != nil {
 		xlog.Logger.Fatalf("remote ETCD is not valid [%v]", err)
 	}
-	
 
 	fmt.Printf("connected to ETCD server\n")
 	//load disk
@@ -108,7 +105,6 @@ func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl st
 	return en
 }
 
-
 func (en *ExtentNode) extentInfoUpdatedfunc(eventType string, cur *pb.ExtentInfo, prev *pb.ExtentInfo) {
 	switch eventType {
 	case "PUT":
@@ -118,7 +114,7 @@ func (en *ExtentNode) extentInfoUpdatedfunc(eventType string, cur *pb.ExtentInfo
 			if ex != nil && ex.IsSeal() == false {
 				xlog.Logger.Infof("SEAL extent %d", cur.ExtentID)
 				ex.Lock()
-				if err := ex.Seal(uint32(cur.SealedLength)) ;err != nil {
+				if err := ex.Seal(uint32(cur.SealedLength)); err != nil {
 					//if error happend, wait for manager send a ReAvali msg to recovery data
 					xlog.Logger.Errorf(err.Error())
 				}
@@ -134,7 +130,7 @@ func (en *ExtentNode) extentInfoUpdatedfunc(eventType string, cur *pb.ExtentInfo
 			en.RemoveExtent(ex)
 		}
 	}
-	
+
 }
 
 func (en *ExtentNode) RemoveExtent(eod *ExtentOnDisk) error {
@@ -165,7 +161,6 @@ func (en *ExtentNode) setExtent(ID uint64, eod *ExtentOnDisk) {
 	en.extentMap.Store(ID, eod)
 }
 
-
 func (en *ExtentNode) LoadExtents() error {
 
 	//register each extent to node
@@ -193,22 +188,22 @@ func (en *ExtentNode) LoadExtents() error {
 			return
 		}
 		//restore task from filename
-		extentID , err := strconv.ParseUint(parts[0], 10, 64)
+		extentID, err := strconv.ParseUint(parts[0], 10, 64)
 		if err != nil {
 			xlog.Logger.Error(err)
 			return
 		}
 
-		replaceID , err := strconv.ParseUint(parts[1], 10, 64)
+		replaceID, err := strconv.ParseUint(parts[1], 10, 64)
 		if err != nil {
 			xlog.Logger.Error(err)
 			return
 		}
 
 		task := pb.RecoveryTask{
-			ExtentID: extentID,
+			ExtentID:  extentID,
 			ReplaceID: replaceID,
-			NodeID: en.nodeID,
+			NodeID:    en.nodeID,
 		}
 
 		//if extent's version is updated. remove RecoveryTask
@@ -235,7 +230,10 @@ func (en *ExtentNode) LoadExtents() error {
 			xlog.Logger.Warnf("extentID %d not exist", ID)
 			return
 		}
-		ex.RecoveryData(start,rev, data)
+		err := ex.RecoveryData(start, rev, data)
+		if err != nil {
+			xlog.Logger.Errorf("replay extent %d failed: %v, disk failure?", ID, err)
+		}
 		//ex.CommitLength()
 	}
 
@@ -246,9 +244,7 @@ func (en *ExtentNode) LoadExtents() error {
 
 	en.extentMap.Range(func(k, v interface{}) bool {
 		ex := v.(*ExtentOnDisk)
-		if err := ex.ResetWriter(); err != nil {
-			xlog.Logger.Warnf("reset writer %s", err.Error())
-		}
+		ex.ResetWriter()
 		return true
 	})
 

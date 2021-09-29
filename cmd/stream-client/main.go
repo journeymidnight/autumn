@@ -201,7 +201,7 @@ func benchmark(etcdAddr []string, smAddr []string, op BenchType, duration int, s
 	})
 	defer em.Close()
 
-	session , err := concurrency.NewSession(em.EtcdClient(), concurrency.WithTTL(30))
+	session, err := concurrency.NewSession(em.EtcdClient(), concurrency.WithTTL(30))
 	if err != nil {
 		panic(err.Error())
 	}
@@ -394,7 +394,7 @@ func main() {
 				&cli.IntFlag{Name: "thread", Value: 1, Aliases: []string{"t"}},
 				&cli.IntFlag{Name: "duration", Value: 10, Aliases: []string{"d"}},
 				&cli.IntFlag{Name: "size", Value: 8192, Aliases: []string{"s"}},
-				&cli.StringFlag{Name: "replication", Value:"2+1", Required: true},
+				&cli.StringFlag{Name: "replication", Value: "2+1", Required: true},
 			},
 			Action: wbench,
 		},

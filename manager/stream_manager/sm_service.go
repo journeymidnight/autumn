@@ -22,13 +22,12 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
-
 func (sm *StreamManager) CreateStream(ctx context.Context, req *pb.CreateStreamRequest) (*pb.CreateStreamResponse, error) {
 
-	errDone := func(err error) (*pb.CreateStreamResponse, error){
+	errDone := func(err error) (*pb.CreateStreamResponse, error) {
 		code, desCode := wire_errors.ConvertToPBCode(err)
 		return &pb.CreateStreamResponse{
-			Code: code,
+			Code:    code,
 			CodeDes: desCode,
 		}, nil
 	}
@@ -50,15 +49,14 @@ func (sm *StreamManager) CreateStream(ctx context.Context, req *pb.CreateStreamR
 	if req.DataShard == 0 {
 		return errDone(errors.New("req.DataShard can not be 0"))
 	}
-	
+
 	if req.ParityShard > 0 && req.DataShard < 2 {
 		return errDone(errors.New("DataShard can not be less than 2 when EC is used"))
 	}
-	
 
 	nodes := sm.getAllNodeStatus(true)
 
-	nodes, err = sm.policy.AllocExtent(nodes, int(req.DataShard + req.ParityShard), nil)
+	nodes, err = sm.policy.AllocExtent(nodes, int(req.DataShard+req.ParityShard), nil)
 	if err != nil {
 		return errDone(err)
 	}
@@ -79,20 +77,19 @@ func (sm *StreamManager) CreateStream(ctx context.Context, req *pb.CreateStreamR
 	sdata, err := streamInfo.Marshal()
 	utils.Check(err)
 
-	
 	nodeIDs := extractNodeId(nodes)
 
-	utils.AssertTrue(len(nodeIDs)==int(req.DataShard) + int(req.ParityShard))
+	utils.AssertTrue(len(nodeIDs) == int(req.DataShard)+int(req.ParityShard))
 	//new extents
 	extentKey := formatExtentKey(extentID)
 	extentInfo := pb.ExtentInfo{
-		ExtentID:   extentID,
-		Replicates: nodeIDs[:req.DataShard],
-		Parity: nodeIDs[req.DataShard:],
-		Eversion: 1,
+		ExtentID:       extentID,
+		Replicates:     nodeIDs[:req.DataShard],
+		Parity:         nodeIDs[req.DataShard:],
+		Eversion:       1,
 		ReplicateDisks: diskIDs[:req.DataShard],
-		ParityDisk: diskIDs[req.DataShard:],
-		Refs: 1,
+		ParityDisk:     diskIDs[req.DataShard:],
+		Refs:           1,
 	}
 
 	edata, err := extentInfo.Marshal()
@@ -121,7 +118,6 @@ func (sm *StreamManager) CreateStream(ctx context.Context, req *pb.CreateStreamR
 	}, nil
 }
 
-
 func (sm *StreamManager) addDisk(info pb.DiskInfo) {
 	sm.disks.Set(info.DiskID, &DiskStatus{
 		DiskInfo: info,
@@ -129,7 +125,7 @@ func (sm *StreamManager) addDisk(info pb.DiskInfo) {
 }
 
 func (sm *StreamManager) addNode(info pb.NodeInfo) {
-	sm.nodes.Set(info.NodeID ,&NodeStatus{
+	sm.nodes.Set(info.NodeID, &NodeStatus{
 		NodeInfo: info,
 	})
 }
@@ -153,13 +149,13 @@ func (sm *StreamManager) addExtent(streamID uint64, exInfo *pb.ExtentInfo) {
 
 func (sm *StreamManager) hasDuplicateAddr(addr string) bool {
 	/*
-	sm.nodeLock.RLock()
-	defer sm.nodeLock.RUnlock()
-	for _, n := range sm.nodes {
-		if n.Address == addr {
-			return true
+		sm.nodeLock.RLock()
+		defer sm.nodeLock.RUnlock()
+		for _, n := range sm.nodes {
+			if n.Address == addr {
+				return true
+			}
 		}
-	}
 	*/
 
 	for kv := range sm.nodes.Iter() {
@@ -181,7 +177,6 @@ func (sm *StreamManager) cloneDiskInfo(diskID uint64) (*pb.DiskInfo, bool) {
 	return &ret, true
 }
 
-
 func (sm *StreamManager) cloneStreamInfo(streamID uint64) (*pb.StreamInfo, bool) {
 	d, ok := sm.streams.Get(streamID)
 	if !ok {
@@ -192,10 +187,10 @@ func (sm *StreamManager) cloneStreamInfo(streamID uint64) (*pb.StreamInfo, bool)
 }
 
 func (sm *StreamManager) CheckCommitLength(ctx context.Context, req *pb.CheckCommitLengthRequest) (*pb.CheckCommitLengthResponse, error) {
-	errDone := func(err error) (*pb.CheckCommitLengthResponse, error){
+	errDone := func(err error) (*pb.CheckCommitLengthResponse, error) {
 		code, desCode := wire_errors.ConvertToPBCode(err)
 		return &pb.CheckCommitLengthResponse{
-			Code: code,
+			Code:    code,
 			CodeDes: desCode,
 		}, nil
 	}
@@ -209,7 +204,7 @@ func (sm *StreamManager) CheckCommitLength(ctx context.Context, req *pb.CheckCom
 		return errDone(errors.Errorf("no such stream %d", req.StreamID))
 	}
 
-	tailExtentID := stream.ExtentIDs[len(stream.ExtentIDs) - 1]
+	tailExtentID := stream.ExtentIDs[len(stream.ExtentIDs)-1]
 	lastExtentInfo, ok := sm.cloneExtentInfo(tailExtentID)
 	if !ok {
 		return errDone(errors.Errorf("internal errors, no such extent %d", tailExtentID))
@@ -217,17 +212,17 @@ func (sm *StreamManager) CheckCommitLength(ctx context.Context, req *pb.CheckCom
 
 	if lastExtentInfo.Avali > 0 {
 		return &pb.CheckCommitLengthResponse{
-			Code: pb.Code_OK,
+			Code:       pb.Code_OK,
 			StreamInfo: stream,
-			End: uint32(lastExtentInfo.SealedLength),
+			End:        uint32(lastExtentInfo.SealedLength),
 			LastExInfo: lastExtentInfo,
-		},nil
+		}, nil
 	}
 
-		
-	sm.lockExtent(lastExtentInfo.ExtentID)
+	if err := sm.lockExtent(lastExtentInfo.ExtentID); err != nil {
+		return errDone(err)
+	}
 	defer sm.unlockExtent(lastExtentInfo.ExtentID)
-
 
 	nodes := sm.getNodes(lastExtentInfo)
 	if nodes == nil {
@@ -235,10 +230,9 @@ func (sm *StreamManager) CheckCommitLength(ctx context.Context, req *pb.CheckCom
 	}
 
 	haveToSealLastExtent := false
-	//PS invoke 'CheckCommit' which will invoke receiveCommitlength, 
+	//PS invoke 'CheckCommit' which will invoke receiveCommitlength,
 	//update req.Revision to the current PS's revision.
 	sizes := sm.receiveCommitlength(ctx, nodes, tailExtentID, req.Revision)
-
 
 	//examples to haveToSealLastExtent
 	//[-1, 10, 10]
@@ -254,16 +248,15 @@ func (sm *StreamManager) CheckCommitLength(ctx context.Context, req *pb.CheckCom
 	//all nodes are alive and have the same commit length
 	if !haveToSealLastExtent {
 		return &pb.CheckCommitLengthResponse{
-			Code: pb.Code_OK,
+			Code:       pb.Code_OK,
 			StreamInfo: stream,
-			End: uint32(sizes[0]),
+			End:        uint32(sizes[0]),
 			LastExInfo: lastExtentInfo,
-		},nil
+		}, nil
 	}
 
-
 	var minSize int
-	if len(lastExtentInfo.Parity) > 0  {
+	if len(lastExtentInfo.Parity) > 0 {
 		minSize = len(lastExtentInfo.Replicates)
 	} else {
 		minSize = 1
@@ -276,7 +269,7 @@ func (sm *StreamManager) CheckCommitLength(ctx context.Context, req *pb.CheckCom
 			avali |= (1 << i)
 			if minimalLength > sizes[i] {
 				minimalLength = sizes[i]
-			}					
+			}
 		}
 	}
 	if bits.OnesCount32(avali) < minSize {
@@ -284,9 +277,8 @@ func (sm *StreamManager) CheckCommitLength(ctx context.Context, req *pb.CheckCom
 		return errDone(errors.Errorf("avali nodes is %d , less than minSize %d", avali, minSize))
 	}
 
-
 	lastExtentInfo.SealedLength = uint64(minimalLength)
-	lastExtentInfo.Eversion ++
+	lastExtentInfo.Eversion++
 	lastExtentInfo.Avali = avali
 	ops := []clientv3.Op{clientv3.OpPut(formatExtentKey(lastExtentInfo.ExtentID), string(utils.MustMarshal(lastExtentInfo)))}
 	err := etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
@@ -296,127 +288,123 @@ func (sm *StreamManager) CheckCommitLength(ctx context.Context, req *pb.CheckCom
 	if err != nil {
 		return errDone(err)
 	}
-	
+
 	return &pb.CheckCommitLengthResponse{
-		Code: pb.Code_OK,
+		Code:       pb.Code_OK,
 		StreamInfo: stream,
-		End: uint32(minimalLength),
+		End:        uint32(minimalLength),
 		LastExInfo: lastExtentInfo,
-	},nil
+	}, nil
 }
 
 //doPunchHole will return latest StreamInfo and error
 func (sm *StreamManager) doPunchHoles(streamID uint64, extentIDs []uint64, ownerKey string, revision int64) (*pb.StreamInfo, error) {
-		//WARNING: streamclient should alway lock stream in PunchHoles, Truncate and AllocExtent
+	//WARNING: streamclient should alway lock stream in PunchHoles, Truncate and AllocExtent
 
-		streamInfo, ok := sm.cloneStreamInfo(streamID)
-		if !ok {
-			return nil, errors.Errorf("stream %d do not exist", streamID)
+	streamInfo, ok := sm.cloneStreamInfo(streamID)
+	if !ok {
+		return nil, errors.Errorf("stream %d do not exist", streamID)
+	}
+	if len(streamInfo.ExtentIDs) == 0 {
+		return nil, errors.Errorf("stream %d do not have any extent", streamID)
+	}
+
+	lastExID := streamInfo.ExtentIDs[len(streamInfo.ExtentIDs)-1]
+
+	//build index for req.ExtentIDs, exclude lastExID
+	index := make(map[uint64]bool)
+	for _, extentID := range extentIDs {
+		if extentID != lastExID {
+			index[extentID] = true
 		}
-		if len(streamInfo.ExtentIDs) == 0 {
-			return nil, errors.Errorf("stream %d do not have any extent", streamID)
+	}
+
+	punchedExtents := make([]uint64, 0)
+
+	for i := len(streamInfo.ExtentIDs) - 1; i >= 0; i-- {
+		if _, ok := index[streamInfo.ExtentIDs[i]]; ok {
+			punchedExtents = append(punchedExtents, streamInfo.ExtentIDs[i])
+			streamInfo.ExtentIDs = append(streamInfo.ExtentIDs[:i], streamInfo.ExtentIDs[i+1:]...)
 		}
-	
-		lastExID := streamInfo.ExtentIDs[len(streamInfo.ExtentIDs) - 1]
-	
-		//build index for req.ExtentIDs, exclude lastExID
-		index := make(map[uint64]bool)
-		for _, extentID := range extentIDs {
-			if extentID != lastExID {
-				index[extentID] = true
+	}
+
+	if len(extentIDs) != len(punchedExtents) {
+		xlog.Logger.Warn("punch holes: some extentIDs are not in streamInfo.ExtentIDs")
+	}
+
+	//update streamInfo
+	ops := []clientv3.Op{clientv3.OpPut(formatStreamKey(streamID), string(utils.MustMarshal(streamInfo)))}
+
+	//ignore  lock and cloneExtentInfo errors
+	for i := range punchedExtents {
+		if err := sm.lockExtent(punchedExtents[i]); err != nil {
+			for j := 0; j < i; j++ {
+				sm.unlockExtent(punchedExtents[j])
 			}
-		}
-	
-		punchedExtents := make([]uint64, 0)
-	
-		for i := len(streamInfo.ExtentIDs) - 1; i >= 0; i-- {
-			if _, ok := index[streamInfo.ExtentIDs[i]]; ok {
-				punchedExtents = append(punchedExtents, streamInfo.ExtentIDs[i])
-				streamInfo.ExtentIDs = append(streamInfo.ExtentIDs[:i], streamInfo.ExtentIDs[i+1:]...)
-			}
-		}
-	
-		if len(extentIDs) != len(punchedExtents) {
-			xlog.Logger.Warn("punch holes: some extentIDs are not in streamInfo.ExtentIDs")
-		}
-	
-	
-		//update streamInfo
-		ops := []clientv3.Op{clientv3.OpPut(formatStreamKey(streamID), string(utils.MustMarshal(streamInfo)))}
-	
-	
-	
-		//ignore  lock and cloneExtentInfo errors
-		for i := range punchedExtents {
-			if err := sm.lockExtent(punchedExtents[i]) ; err != nil {
-				for j := 0 ; j < i ; j++ {
-					sm.unlockExtent(punchedExtents[j])
-				}
-				return nil, err
-			}
-		}
-		defer func(){
-			for i := range punchedExtents {
-				sm.unlockExtent(punchedExtents[i])
-			}
-		}()
-	
-		//delete extentIDs if ref == 1
-		exToBeDeleted := make([]*pb.ExtentInfo, 0)
-		exToBeUpdated := make([]*pb.ExtentInfo, 0)
-		for i := range punchedExtents {
-			punchExInfo, ok := sm.cloneExtentInfo(punchedExtents[i])
-			if !ok {
-				return nil, errors.Errorf("punch holes: extent %d do not exist", punchedExtents[i])
-			}
-			if punchExInfo.Avali == 0 {
-				return nil, errors.Errorf("punch holes: extent %d should be sealed", punchExInfo.ExtentID)
-			}
-			if punchExInfo.Refs == 1 {
-				exToBeDeleted = append(exToBeDeleted, punchExInfo)
-			} else {
-				punchExInfo.Refs --
-				punchExInfo.Eversion ++
-				exToBeUpdated = append(exToBeUpdated, punchExInfo)
-			}
-		}
-	
-		//delete extentIDs
-		for _, exInfo := range exToBeDeleted {
-			ops = append(ops, clientv3.OpDelete(formatExtentKey(exInfo.ExtentID)))
-		}
-		for _, exInfo := range exToBeUpdated {
-			ops = append(ops, clientv3.OpPut(formatExtentKey(exInfo.ExtentID), string(utils.MustMarshal(exInfo))))
-		}
-	
-		err := etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
-			clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
-			clientv3.Compare(clientv3.CreateRevision(ownerKey), "=", revision),
-		}, ops)
-	
-	
-		if err != nil {
 			return nil, err
 		}
-	
-		//change memory
-		for _, exInfo := range exToBeUpdated {
-			sm.extents.Set(exInfo.ExtentID, exInfo)
+	}
+	defer func() {
+		for i := range punchedExtents {
+			sm.unlockExtent(punchedExtents[i])
 		}
-		for _, exInfo := range exToBeDeleted {
-			sm.extents.Del(exInfo.ExtentID)
-			sm.extentsLocks.Delete(exInfo.ExtentID)
+	}()
+
+	//delete extentIDs if ref == 1
+	exToBeDeleted := make([]*pb.ExtentInfo, 0)
+	exToBeUpdated := make([]*pb.ExtentInfo, 0)
+	for i := range punchedExtents {
+		punchExInfo, ok := sm.cloneExtentInfo(punchedExtents[i])
+		if !ok {
+			return nil, errors.Errorf("punch holes: extent %d do not exist", punchedExtents[i])
 		}
-		sm.streams.Set(streamID, streamInfo)
-		return streamInfo, nil
-	
+		if punchExInfo.Avali == 0 {
+			return nil, errors.Errorf("punch holes: extent %d should be sealed", punchExInfo.ExtentID)
+		}
+		if punchExInfo.Refs == 1 {
+			exToBeDeleted = append(exToBeDeleted, punchExInfo)
+		} else {
+			punchExInfo.Refs--
+			punchExInfo.Eversion++
+			exToBeUpdated = append(exToBeUpdated, punchExInfo)
+		}
+	}
+
+	//delete extentIDs
+	for _, exInfo := range exToBeDeleted {
+		ops = append(ops, clientv3.OpDelete(formatExtentKey(exInfo.ExtentID)))
+	}
+	for _, exInfo := range exToBeUpdated {
+		ops = append(ops, clientv3.OpPut(formatExtentKey(exInfo.ExtentID), string(utils.MustMarshal(exInfo))))
+	}
+
+	err := etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
+		clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
+		clientv3.Compare(clientv3.CreateRevision(ownerKey), "=", revision),
+	}, ops)
+
+	if err != nil {
+		return nil, err
+	}
+
+	//change memory
+	for _, exInfo := range exToBeUpdated {
+		sm.extents.Set(exInfo.ExtentID, exInfo)
+	}
+	for _, exInfo := range exToBeDeleted {
+		sm.extents.Del(exInfo.ExtentID)
+		sm.extentsLocks.Delete(exInfo.ExtentID)
+	}
+	sm.streams.Set(streamID, streamInfo)
+	return streamInfo, nil
+
 }
 
 func (sm *StreamManager) StreamPunchHoles(ctx context.Context, req *pb.PunchHolesRequest) (*pb.PunchHolesResponse, error) {
-	errDone := func(err error) (*pb.PunchHolesResponse, error){
+	errDone := func(err error) (*pb.PunchHolesResponse, error) {
 		code, desCode := wire_errors.ConvertToPBCode(err)
 		return &pb.PunchHolesResponse{
-			Code: code,
+			Code:    code,
 			CodeDes: desCode,
 		}, nil
 	}
@@ -425,14 +413,13 @@ func (sm *StreamManager) StreamPunchHoles(ctx context.Context, req *pb.PunchHole
 		return errDone(wire_errors.NotLeader)
 	}
 
-
 	streamInfo, err := sm.doPunchHoles(req.StreamID, req.ExtentIDs, req.OwnerKey, req.Revision)
 	if err != nil {
 		return errDone(err)
 	}
 
 	return &pb.PunchHolesResponse{
-		Code: pb.Code_OK,
+		Code:   pb.Code_OK,
 		Stream: streamInfo,
 	}, nil
 
@@ -440,10 +427,10 @@ func (sm *StreamManager) StreamPunchHoles(ctx context.Context, req *pb.PunchHole
 
 func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAllocExtentRequest) (*pb.StreamAllocExtentResponse, error) {
 
-	errDone := func(err error) (*pb.StreamAllocExtentResponse, error){
+	errDone := func(err error) (*pb.StreamAllocExtentResponse, error) {
 		code, desCode := wire_errors.ConvertToPBCode(err)
 		return &pb.StreamAllocExtentResponse{
-			Code: code,
+			Code:    code,
 			CodeDes: desCode,
 		}, nil
 	}
@@ -454,7 +441,6 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 
 	//WARNING: streamclient should alway lock stream in PunchHoles, Truncate and AllocExtent
 
-	
 	streamInfo, ok := sm.cloneStreamInfo(req.StreamID)
 	if !ok {
 		return errDone(errors.Errorf("no such stream %d", req.StreamID))
@@ -464,23 +450,22 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		return errDone(errors.Errorf("no discards for %d", req.StreamID))
 	}
 
-	tailExtentID := streamInfo.ExtentIDs[len(streamInfo.ExtentIDs) - 1]
+	tailExtentID := streamInfo.ExtentIDs[len(streamInfo.ExtentIDs)-1]
 	lastExInfo, ok := sm.cloneExtentInfo(tailExtentID)
 	if !ok {
 		return errDone(errors.Errorf("internal errors, no such extent %d", tailExtentID))
 	}
 
-	
 	//version match: req.Sversion == s.Sversion
-	sm.lockExtent(lastExInfo.ExtentID)
+	if err := sm.lockExtent(lastExInfo.ExtentID); err != nil {
+		return errDone(err)
+	}
 	defer sm.unlockExtent(lastExInfo.ExtentID)
-	
 
 	nodes := sm.getNodes(lastExInfo)
 	if nodes == nil {
 		return errDone(errors.Errorf("request errors, internal error can not get nodesStatus from extentInfo %d", lastExInfo.ExtentID))
 	}
-
 
 	dataShards := len(lastExInfo.Replicates)
 	parityShards := len(lastExInfo.Parity)
@@ -497,20 +482,20 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		//if EC, we have to get datashards results to decide the minimal length
 		//if replicated, only one returns can work, but if we want the system more stable
 		//use 2 insdead of 1
-		if len(lastExInfo.Parity) > 0  {
+		if len(lastExInfo.Parity) > 0 {
 			minSize = len(lastExInfo.Replicates)
 		} else {
 			minSize = 1
 		}
-		
+
 		sizes = sm.receiveCommitlength(ctx, nodes, lastExInfo.ExtentID, req.Revision)
-		
+
 		for i := range sizes {
 			if sizes[i] != -1 {
 				avali |= (1 << i)
 				if minimalLength > sizes[i] {
 					minimalLength = sizes[i]
-				}					
+				}
 			}
 		}
 		if bits.OnesCount32(avali) < minSize {
@@ -520,20 +505,19 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	} else {
 		//all nodes were avali
 		minimalLength = int64(req.End)
-		avali = (1 << (dataShards+ parityShards)) - 1
+		avali = (1 << (dataShards + parityShards)) - 1
 	}
-		
+
 	//set extent
 	lastExInfo.SealedLength = uint64(minimalLength)
-	lastExInfo.Eversion ++
+	lastExInfo.Eversion++
 	lastExInfo.Avali = avali
 
 	data := utils.MustMarshal(lastExInfo)
-	
-	ops = append(ops, 
+
+	ops = append(ops,
 		clientv3.OpPut(formatExtentKey(lastExInfo.ExtentID), string(data)),
 	)
-	
 
 	//alloc new extent
 	extentID, _, err := sm.allocUniqID(1)
@@ -549,7 +533,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 		return errDone(err)
 	}
 
-	diskIDs, err := sm.sendAllocToNodes(ctx, nodes, extentID); 
+	diskIDs, err := sm.sendAllocToNodes(ctx, nodes, extentID)
 	if err != nil {
 		return errDone(err)
 	}
@@ -568,13 +552,13 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	//new extents
 	extentKey := formatExtentKey(extentID)
 	newExInfo := pb.ExtentInfo{
-		ExtentID:   extentID,
-		Replicates: nodeIDs[:dataShards],
-		Parity: nodeIDs[dataShards:],
-		Eversion: 1,
+		ExtentID:       extentID,
+		Replicates:     nodeIDs[:dataShards],
+		Parity:         nodeIDs[dataShards:],
+		Eversion:       1,
 		ReplicateDisks: diskIDs[:dataShards],
-		ParityDisk: diskIDs[dataShards:],
-		Refs: 1,
+		ParityDisk:     diskIDs[dataShards:],
+		Refs:           1,
 	}
 
 	//set old
@@ -582,7 +566,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	edata, err := newExInfo.Marshal()
 	utils.Check(err)
 
-	ops = append(ops, 
+	ops = append(ops,
 		clientv3.OpPut(streamKey, string(sdata)),
 		clientv3.OpPut(extentKey, string(edata)),
 	)
@@ -603,7 +587,7 @@ func (sm *StreamManager) StreamAllocExtent(ctx context.Context, req *pb.StreamAl
 	sm.addExtent(req.StreamID, &newExInfo)
 
 	return &pb.StreamAllocExtentResponse{
-		Code: pb.Code_OK,
+		Code:       pb.Code_OK,
 		StreamInfo: stream,
 		LastExInfo: &newExInfo,
 	}, nil
@@ -641,7 +625,7 @@ func (sm *StreamManager) sealExtents(ctx context.Context, nodes []*NodeStatus, e
 
 //receiveCommitlength returns minimal commitlength and all node who give us response and who did not
 //-1 if no response
-func (sm *StreamManager) receiveCommitlength(ctx context.Context, nodes []*NodeStatus, extentID uint64, revision int64) ([]int64) {
+func (sm *StreamManager) receiveCommitlength(ctx context.Context, nodes []*NodeStatus, extentID uint64, revision int64) []int64 {
 
 	pctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
@@ -663,7 +647,7 @@ func (sm *StreamManager) receiveCommitlength(ctx context.Context, nodes []*NodeS
 			conn := pool.Get()
 
 			c := pb.NewExtentServiceClient(conn)
-			
+
 			res, err := c.CommitLength(pctx, &pb.CommitLengthRequest{
 				ExtentID: extentID,
 				Revision: revision,
@@ -674,7 +658,7 @@ func (sm *StreamManager) receiveCommitlength(ctx context.Context, nodes []*NodeS
 				result[j] = -1
 				return
 			}
-			result[j] = int64(res.Length)			
+			result[j] = int64(res.Length)
 		})
 	}
 	stopper.Wait()
@@ -684,7 +668,7 @@ func (sm *StreamManager) receiveCommitlength(ctx context.Context, nodes []*NodeS
 	return result
 }
 
-func (sm *StreamManager) sendAllocToNodes(ctx context.Context, nodes []*NodeStatus, extentID uint64) ([]uint64 , error) {
+func (sm *StreamManager) sendAllocToNodes(ctx context.Context, nodes []*NodeStatus, extentID uint64) ([]uint64, error) {
 	pctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
 
@@ -720,11 +704,11 @@ func (sm *StreamManager) sendAllocToNodes(ctx context.Context, nodes []*NodeStat
 }
 
 func (sm *StreamManager) RegisterNode(ctx context.Context, req *pb.RegisterNodeRequest) (*pb.RegisterNodeResponse, error) {
-	
-	errDone := func(err error) (*pb.RegisterNodeResponse, error){
+
+	errDone := func(err error) (*pb.RegisterNodeResponse, error) {
 		code, desCode := wire_errors.ConvertToPBCode(err)
 		return &pb.RegisterNodeResponse{
-			Code: code,
+			Code:    code,
 			CodeDes: desCode,
 		}, nil
 	}
@@ -739,24 +723,22 @@ func (sm *StreamManager) RegisterNode(ctx context.Context, req *pb.RegisterNodeR
 
 	//TODO: duplicated disk UUID?
 
-	id, _, err := sm.allocUniqID(uint64(1+len(req.DiskUUIDs)))
+	id, _, err := sm.allocUniqID(uint64(1 + len(req.DiskUUIDs)))
 	if err != nil {
 		return errDone(errors.New("failed to alloc uniq id"))
 	}
 
-
-
 	//modify etcd
 	//add node and disks
-	disks := make([]pb.DiskInfo,len(req.DiskUUIDs))
+	disks := make([]pb.DiskInfo, len(req.DiskUUIDs))
 	for i := range req.DiskUUIDs {
 		disks[i] = pb.DiskInfo{
-			DiskID: id+uint64(i)+1,
+			DiskID: id + uint64(i) + 1,
 			Online: true,
-			Uuid: req.DiskUUIDs[i],
+			Uuid:   req.DiskUUIDs[i],
 		}
 	}
-	
+
 	seq := func(start uint64, count int) []uint64 {
 		a := make([]uint64, count)
 		for i := range a {
@@ -768,7 +750,7 @@ func (sm *StreamManager) RegisterNode(ctx context.Context, req *pb.RegisterNodeR
 	nodeInfo := &pb.NodeInfo{
 		NodeID:  id,
 		Address: req.Addr,
-		Disks: seq(id+1, len(req.DiskUUIDs)),
+		Disks:   seq(id+1, len(req.DiskUUIDs)),
 	}
 
 	data, err := nodeInfo.Marshal()
@@ -788,8 +770,6 @@ func (sm *StreamManager) RegisterNode(ctx context.Context, req *pb.RegisterNodeR
 		))
 	}
 
-
-
 	err = etcd_utils.EtcdSetKVS(sm.client, []clientv3.Cmp{
 		clientv3.Compare(clientv3.Value(sm.leaderKey), "=", sm.memberValue),
 	}, ops)
@@ -802,14 +782,14 @@ func (sm *StreamManager) RegisterNode(ctx context.Context, req *pb.RegisterNodeR
 		sm.addDisk(disks[i])
 	}
 	sm.addNode(*nodeInfo)
-	
+
 	uuidToDiskID := make(map[string]uint64)
 	for _, disk := range disks {
 		uuidToDiskID[disk.Uuid] = disk.DiskID
 	}
 	return &pb.RegisterNodeResponse{
-		Code:   pb.Code_OK,
-		NodeId: id,
+		Code:      pb.Code_OK,
+		NodeId:    id,
 		DiskUUIDs: uuidToDiskID,
 	}, nil
 }
@@ -830,13 +810,12 @@ func (sm *StreamManager) Status(ctx context.Context, req *pb.StatusRequest) (*pb
 	}, nil
 }
 
-
 func (sm *StreamManager) ExtentInfo(ctx context.Context, req *pb.ExtentInfoRequest) (*pb.ExtentInfoResponse, error) {
-	
-	errDone := func(err error) (*pb.ExtentInfoResponse, error){
+
+	errDone := func(err error) (*pb.ExtentInfoResponse, error) {
 		code, desCode := wire_errors.ConvertToPBCode(err)
 		return &pb.ExtentInfoResponse{
-			Code: code,
+			Code:    code,
 			CodeDes: desCode,
 		}, nil
 	}
@@ -845,27 +824,24 @@ func (sm *StreamManager) ExtentInfo(ctx context.Context, req *pb.ExtentInfoReque
 		return errDone(wire_errors.NotLeader)
 	}
 
-
 	exInfo, ok := sm.cloneExtentInfo(req.ExtentID)
 
 	if !ok {
 		return errDone(wire_errors.NotFound)
 	}
 	return &pb.ExtentInfoResponse{
-		Code: pb.Code_OK,
+		Code:   pb.Code_OK,
 		ExInfo: exInfo,
 	}, nil
 
-
 }
 
-
 func (sm *StreamManager) StreamInfo(ctx context.Context, req *pb.StreamInfoRequest) (*pb.StreamInfoResponse, error) {
-	
-	errDone := func(err error) (*pb.StreamInfoResponse, error){
+
+	errDone := func(err error) (*pb.StreamInfoResponse, error) {
 		code, desCode := wire_errors.ConvertToPBCode(err)
 		return &pb.StreamInfoResponse{
-			Code: code,
+			Code:    code,
 			CodeDes: desCode,
 		}, nil
 	}
@@ -903,11 +879,11 @@ func (sm *StreamManager) StreamInfo(ctx context.Context, req *pb.StreamInfoReque
 }
 
 func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) (*pb.TruncateResponse, error) {
-	
-	errDone := func(err error) (*pb.TruncateResponse, error){
+
+	errDone := func(err error) (*pb.TruncateResponse, error) {
 		code, desCode := wire_errors.ConvertToPBCode(err)
 		return &pb.TruncateResponse{
-			Code: code,
+			Code:    code,
 			CodeDes: desCode,
 		}, nil
 	}
@@ -916,14 +892,12 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 		return errDone(wire_errors.NotLeader)
 	}
 
-
 	//WARNING: streamclient should alway lock stream in PunchHoles, Truncate and AllocExtent
 
 	streamInfo, ok := sm.cloneStreamInfo(req.StreamID)
 	if !ok {
 		return errDone(errors.Errorf("stream do not have extent %d", req.ExtentID))
 	}
-
 
 	//streamInfo.Sversion  == req.Sversion
 	var i int
@@ -941,18 +915,16 @@ func (sm *StreamManager) Truncate(ctx context.Context, req *pb.TruncateRequest) 
 
 	newStreamInfo, err := sm.doPunchHoles(req.StreamID, oldExtentIDs, req.OwnerKey, req.Revision)
 
-
 	if err != nil {
 		return errDone(err)
 	}
 
 	return &pb.TruncateResponse{
-		Code: pb.Code_OK,
+		Code:              pb.Code_OK,
 		UpdatedStreamInfo: newStreamInfo,
 	}, nil
 
 }
-
 
 func (sm *StreamManager) cloneExtentInfo(extentID uint64) (*pb.ExtentInfo, bool) {
 	d, ok := sm.extents.Get(extentID)
@@ -962,7 +934,6 @@ func (sm *StreamManager) cloneExtentInfo(extentID uint64) (*pb.ExtentInfo, bool)
 	v := d.(*pb.ExtentInfo)
 	return proto.Clone(v).(*pb.ExtentInfo), true
 }
-
 
 func (sm *StreamManager) getNodes(exInfo *pb.ExtentInfo) []*NodeStatus {
 	var ret []*NodeStatus
@@ -987,9 +958,8 @@ func (sm *StreamManager) getNodes(exInfo *pb.ExtentInfo) []*NodeStatus {
 
 }
 
-
 func (sm *StreamManager) getDiskStatus(diskID uint64) *DiskStatus {
-	v, ok  := sm.disks.Get(diskID)
+	v, ok := sm.disks.Get(diskID)
 	if !ok {
 		return nil
 	}
@@ -997,7 +967,7 @@ func (sm *StreamManager) getDiskStatus(diskID uint64) *DiskStatus {
 }
 
 func (sm *StreamManager) getNodeStatus(nodeID uint64) *NodeStatus {
-	v, ok  := sm.nodes.Get(nodeID)
+	v, ok := sm.nodes.Get(nodeID)
 	if !ok {
 		return nil
 	}
@@ -1027,7 +997,6 @@ func (sm *StreamManager) cloneNodesInfo() map[uint64]*pb.NodeInfo {
 	}
 	return ret
 }
-
 
 func extractNodeId(nodes []*NodeStatus) []uint64 {
 	var ret []uint64
@@ -1065,7 +1034,6 @@ func parseKey(s string, prefix string) (uint64, error) {
 	return strconv.ParseUint(parts[1], 10, 64)
 }
 
-
 //streamclient should lock before call punchholes/truncate/mustAllocwrite
 /*
 func (sm *StreamManager) lockStream(streamID uint64) error {
@@ -1081,6 +1049,6 @@ func (sm *StreamManager) unlockStream(streamID uint64){
 	v, ok := sm.streamsLocks.Load(streamID)
 	if ok {
 		v.(*sync.Mutex).Unlock()
-	}		
+	}
 }
 */
