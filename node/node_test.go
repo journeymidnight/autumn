@@ -176,9 +176,11 @@ func (suite *ExtentNodeTestSuite) TearDownSuite() {
 	os.RemoveAll(suite.tmpdir)
 
 }
+
 const (
 	testExtentSize = (1 << 20)
 )
+
 func (suite *ExtentNodeTestSuite) TestAppendReadValue() {
 	sm := smclient.NewSMClient([]string{"127.0.0.1:3401"})
 	err := sm.Connect()
@@ -199,8 +201,8 @@ func (suite *ExtentNodeTestSuite) TestAppendReadValue() {
 	suite.Require().Nil(err)
 	extentID, offsets, end, err := sc.Append(context.Background(),
 		[]*pb.Block{
-			{Data:[]byte("hello")},
-			{Data:[]byte("world")},
+			{Data: []byte("hello")},
+			{Data: []byte("world")},
 		}, false)
 	suite.Require().Nil(err)
 	suite.Require().True(len(offsets) > 0)
@@ -236,8 +238,8 @@ func (suite *ExtentNodeTestSuite) TestNodeRecoveryDataFromOtherNode() {
 	suite.Require().Nil(err)
 	extentID, offsets, _, err := sc.Append(context.Background(),
 		[]*pb.Block{
-			{Data:[]byte("hello")},
-			{Data:[]byte("world")},
+			{Data: []byte("hello")},
+			{Data: []byte("world")},
 		}, true)
 	suite.Require().Nil(err)
 	suite.Require().True(len(offsets) > 0)
@@ -245,8 +247,9 @@ func (suite *ExtentNodeTestSuite) TestNodeRecoveryDataFromOtherNode() {
 	err = sc.MustAllocNewExtent()
 	suite.Nil(err)
 
-	em.WaitVersion(extentID, 2)//wait for version 2
-	
+	em.WaitVersion(extentID, 2) //wait for version 2
+
+	fmt.Printf("extent info is %+v\n", em.GetExtentInfo(extentID))
 
 	//原来是(7,5,3), 改成(1,5,3)
 	suite.Require().Equal(uint64(1), suite.ens[0].nodeID)
@@ -255,17 +258,15 @@ func (suite *ExtentNodeTestSuite) TestNodeRecoveryDataFromOtherNode() {
 		Task: &pb.RecoveryTask{
 			ExtentID:  extentID,
 			ReplaceID: 7,
-			NodeID: 1,
+			NodeID:    1,
 		},
 	})
 	fmt.Printf("%+v\n", res)
 	time.Sleep(3 * time.Second)
 
-	eod := suite.ens[0].getExtent(extentID)//恢复后的extent
+	eod := suite.ens[0].getExtent(extentID) //恢复后的extent
 	suite.NotNil(eod)
-	
 }
-
 
 //test truncte stream
 func (suite *ExtentNodeTestSuite) TestTruncateStream() {
@@ -287,24 +288,23 @@ func (suite *ExtentNodeTestSuite) TestTruncateStream() {
 	err = sc.Connect()
 	suite.Require().Nil(err)
 
-	a, _ , _, err := sc.Append(context.Background(),
-	[]*pb.Block{
-		{Data:[]byte("hello")},
-		{Data:[]byte("world")},
-	}, true)
+	a, _, _, err := sc.Append(context.Background(),
+		[]*pb.Block{
+			{Data: []byte("hello")},
+			{Data: []byte("world")},
+		}, true)
 	suite.Require().Nil(err)
 
 	err = sc.MustAllocNewExtent()
 	suite.Nil(err)
 	suite.Equal(2, len(sc.StreamInfo().ExtentIDs))
 
-
 	b, _, _, err := sc.Append(context.Background(),
-	[]*pb.Block{
-		{Data:[]byte("foo")},
-		{Data:[]byte("bar")},
-	}, true)
-	
+		[]*pb.Block{
+			{Data: []byte("foo")},
+			{Data: []byte("bar")},
+		}, true)
+
 	suite.NotEqual(a, b)
 
 	sc.Truncate(context.Background(), b)
@@ -332,22 +332,21 @@ func (suite *ExtentNodeTestSuite) TestPunchHole() {
 	err = sc.Connect()
 	suite.Require().Nil(err)
 
-
-	eID, _ , _, err := sc.Append(context.Background(),
-	[]*pb.Block{
-		{Data:[]byte("hello")},
-		{Data:[]byte("world")},
-	}, false)
+	eID, _, _, err := sc.Append(context.Background(),
+		[]*pb.Block{
+			{Data: []byte("hello")},
+			{Data: []byte("world")},
+		}, false)
 
 	suite.Nil(sc.MustAllocNewExtent())
 
 	fmt.Printf("%+v\n", sc.StreamInfo())
 	suite.Equal(2, len(sc.StreamInfo().ExtentIDs))
-	_, _ , _, err = sc.Append(context.Background(),
-	[]*pb.Block{
-		{Data:[]byte("hello")},
-		{Data:[]byte("world")},
-	}, false)
+	_, _, _, err = sc.Append(context.Background(),
+		[]*pb.Block{
+			{Data: []byte("hello")},
+			{Data: []byte("world")},
+		}, false)
 
 	suite.Nil(sc.MustAllocNewExtent())
 
@@ -359,7 +358,6 @@ func (suite *ExtentNodeTestSuite) TestPunchHole() {
 	suite.Equal(2, len(sc.StreamInfo().ExtentIDs))
 
 }
-
 
 func (suite *ExtentNodeTestSuite) TestReadLastBlock() {
 	sm := smclient.NewSMClient([]string{"127.0.0.1:3401"})
@@ -384,14 +382,13 @@ func (suite *ExtentNodeTestSuite) TestReadLastBlock() {
 	b, err := sc.ReadLastBlock(context.Background())
 	suite.Equal(wire_errors.NotFound, err)
 
-	_, _ , _, err = sc.Append(context.Background(),
-	[]*pb.Block{
-		{Data:[]byte("hello")},
-		{Data:[]byte("world")},
-	}, false)
+	_, _, _, err = sc.Append(context.Background(),
+		[]*pb.Block{
+			{Data: []byte("hello")},
+			{Data: []byte("world")},
+		}, false)
 
 	suite.Require().Nil(err)
-
 
 	b, err = sc.ReadLastBlock(context.Background())
 	suite.Require().Nil(err)
@@ -400,15 +397,13 @@ func (suite *ExtentNodeTestSuite) TestReadLastBlock() {
 	sc.MustAllocNewExtent()
 	sc.MustAllocNewExtent()
 
-
 	b, err = sc.ReadLastBlock(context.Background())
 	suite.Require().Nil(err)
 	suite.Require().Equal([]byte("world"), b.Data)
-
 
 	sc.Append(context.Background(), []*pb.Block{
-		{Data:[]byte("DATA")},
-		{Data:[]byte("DATA2")},
+		{Data: []byte("DATA")},
+		{Data: []byte("DATA2")},
 	}, false)
 
 	b, err = sc.ReadLastBlock(context.Background())

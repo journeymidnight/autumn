@@ -26,8 +26,8 @@ type PickupTables interface {
 type DefaultPickupPolicy struct {
 	compactRatio float64
 	headRatio    float64
-	n int //at most n tables to be merged
-	opt *Option
+	n            int //at most n tables to be merged
+	opt          *Option
 }
 
 //In size-tiered compaction, newer and smaller SSTables are successively merged into older and larger SSTables
@@ -38,12 +38,12 @@ func (p DefaultPickupPolicy) PickupTables(tbls []*table.Table) ([]*table.Table, 
 	if len(tbls) < 2 {
 		return nil, 0
 	}
-	
+
 	/*
-	rule1:
-	if tables are on multiple extents, and the table size on the first extent is less then headRatio * all table size
-	pickup all tables on the first extent, and compact them and truncate.
-	for invariance: all tables must are sorted, we can only compact neighbor tables
+		rule1:
+		if tables are on multiple extents, and the table size on the first extent is less then headRatio * all table size
+		pickup all tables on the first extent, and compact them and truncate.
+		for invariance: all tables must are sorted, we can only compact neighbor tables
 	*/
 
 	totalSize := uint64(0)
@@ -61,7 +61,7 @@ func (p DefaultPickupPolicy) PickupTables(tbls []*table.Table) ([]*table.Table, 
 		chosenExtentID := extents[0]
 		var truncateID uint64
 		//find all tables on chosenExtentID
-		for i := 0; i < len(tbls) && i < p.n ; i++ {
+		for i := 0; i < len(tbls) && i < p.n; i++ {
 			if extents[i] == chosenExtentID {
 				chosenTbls = append(chosenTbls, tbls[i])
 			} else if extents[i] != chosenExtentID {
@@ -71,7 +71,7 @@ func (p DefaultPickupPolicy) PickupTables(tbls []*table.Table) ([]*table.Table, 
 		}
 
 		//sort both chosenTbls and tbls by LastSeq
-		sort.Slice(tbls, func(i,j int)bool {
+		sort.Slice(tbls, func(i, j int) bool {
 			return tbls[i].LastSeq < tbls[j].LastSeq
 		})
 		sort.Slice(chosenTbls, func(i, j int) bool {
@@ -81,18 +81,18 @@ func (p DefaultPickupPolicy) PickupTables(tbls []*table.Table) ([]*table.Table, 
 		i := sort.Search(len(tbls), func(i int) bool {
 			return tbls[i].LastSeq == chosenTbls[0].LastSeq
 		})
-		j := 0 
-		utils.AssertTruef(i >=0 , "search should always succeed")
+		j := 0
+		utils.AssertTruef(i >= 0, "search should always succeed")
 
-		for i < len(tbls) && j < len(chosenTbls) && len(compactTbls) < p.n{
+		for i < len(tbls) && j < len(chosenTbls) && len(compactTbls) < p.n {
 			if tbls[i].LastSeq < chosenTbls[j].LastSeq {
-				compactTbls = append(compactTbls, tbls[i])//fix holes in chosenTbls
-				i ++
+				compactTbls = append(compactTbls, tbls[i]) //fix holes in chosenTbls
+				i++
 			} else if tbls[i].LastSeq == chosenTbls[j].LastSeq {
 				compactTbls = append(compactTbls, tbls[i])
-				i ++
-				j ++
-			} else {//tbls[i].LastSeq > chosenTbls[j].LastSeq
+				i++
+				j++
+			} else { //tbls[i].LastSeq > chosenTbls[j].LastSeq
 				utils.AssertTruef(false, "chosenTbls is subset of tbls, should never happen")
 			}
 		}
@@ -106,18 +106,18 @@ func (p DefaultPickupPolicy) PickupTables(tbls []*table.Table) ([]*table.Table, 
 	}
 
 	/*
-	rule2:
-	choose a table whose size is less than compactRatio * totalSize, start from this table's previous table if any,
-	to the next table whose size is less than compactRatio * totalSize
-	merge newer and smaller SSTables into older and larger SSTables
+		rule2:
+		choose a table whose size is less than compactRatio * totalSize, start from this table's previous table if any,
+		to the next table whose size is less than compactRatio * totalSize
+		merge newer and smaller SSTables into older and larger SSTables
 	*/
 
 	//sort tables by lastSeq.
-	sort.Slice(tbls, func(i,j int)bool {
+	sort.Slice(tbls, func(i, j int) bool {
 		return tbls[i].LastSeq < tbls[j].LastSeq
 	})
-	
-	throttle := uint64(math.Round(p.compactRatio*float64(p.opt.MaxSkipList)))
+
+	throttle := uint64(math.Round(p.compactRatio * float64(p.opt.MaxSkipList)))
 
 	for i := 0; i < len(tbls); i++ {
 		for i < len(tbls) && tbls[i].EstimatedSize < throttle && len(compactTbls) < p.n {
@@ -126,7 +126,7 @@ func (p DefaultPickupPolicy) PickupTables(tbls []*table.Table) ([]*table.Table, 
 				compactTbls = append(compactTbls, tbls[i-1])
 			}
 			compactTbls = append(compactTbls, tbls[i])
-			i ++
+			i++
 		}
 		if len(compactTbls) > 0 {
 			//corner case : 1, 100, 100, 100
@@ -142,21 +142,17 @@ func (p DefaultPickupPolicy) PickupTables(tbls []*table.Table) ([]*table.Table, 
 	return nil, 0
 }
 
-
-
 func (rp *RangePartition) startCompact() {
 	rp.compactStopper = utils.NewStopper()
-	rp.majorCompactChan = make(chan struct{},1)
+	rp.majorCompactChan = make(chan struct{}, 1)
 	rp.compactStopper.RunWorker(rp.compact)
 }
-
-
 
 func (rp *RangePartition) compact() {
 	randTicker := utils.NewRandomTicker(10*time.Second, 20*time.Second)
 	for {
 		select {
-		case <- rp.majorCompactChan:
+		case <-rp.majorCompactChan:
 			allTables := rp.getTables()
 			if len(allTables) == 0 {
 				continue
@@ -164,7 +160,7 @@ func (rp *RangePartition) compact() {
 			if len(allTables) < 2 && atomic.LoadUint32(&rp.hasOverlap) == 0 {
 				continue
 			}
-			eID := allTables[len(allTables)- 1].Loc.ExtentID
+			eID := allTables[len(allTables)-1].Loc.ExtentID
 			fmt.Printf("do major compaction tasks for tables %+v\n", allTables)
 			rp.doCompact(allTables, true)
 			if eID != 0 {
@@ -175,7 +171,7 @@ func (rp *RangePartition) compact() {
 				}
 			}
 			fmt.Printf("fininshed major compaction tasks for tables %+v\n", allTables)
-		case <- randTicker.C:
+		case <-randTicker.C:
 			allTables := rp.getTables()
 			compactTables, eID := rp.pickupTablePolicy.PickupTables(allTables)
 			if len(compactTables) < 2 {
@@ -212,7 +208,7 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 	})
 
 	discards := getDiscards(tbls)
-	
+
 	var iters []y.Iterator
 	var maxSeq uint64
 	var head valuePointer
@@ -221,11 +217,10 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 		offset:   tbls[0].VpOffset,
 	}
 
-
 	for _, table := range tbls {
 		iters = append(iters, table.NewIterator(false))
 	}
-	
+
 	updateStats := func(vs y.ValueStruct) {
 		if (vs.Meta & y.BitValuePointer) > 0 { //big Value
 			var vp valuePointer
@@ -277,7 +272,7 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 				continue
 			}
 
-			if memStore.MemSize() + int64(estimatedVS(it.Key(), it.Value())) > capacity {
+			if memStore.MemSize()+int64(estimatedVS(it.Key(), it.Value())) > capacity {
 				break
 			}
 			numKeys++
@@ -287,21 +282,20 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 		xlog.Logger.Debugf("LOG Compact %d tables Added %d keys. Skipped %d keys. Iteration took: %v, ", len(tbls),
 			numKeys, numSkips, time.Since(timeStart))
 
-		
 		if memStore.Empty() {
 			return
 		}
 
 		task := flushTask{
-			mt: memStore, 
-			vptr: head, 
-			seqNum: maxSeq, 
-			isCompact: true, 
-			resultCh: resultCh,
+			mt:        memStore,
+			vptr:      head,
+			seqNum:    maxSeq,
+			isCompact: true,
+			resultCh:  resultCh,
 		}
 		if !it.Valid() {
-			//if this the last table, attach removedTables and discards 
-			
+			//if this the last table, attach removedTables and discards
+
 			validDiscard(discards, rp.logStream.StreamInfo().ExtentIDs)
 			task.removedTable = tbls
 			task.discards = discards
@@ -315,14 +309,13 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 	for i := 0; i < numBuilds; i++ {
 		<-resultCh
 	}
-	
+
 	//在这个时间, 虽然有可能memstore还没有完全刷下去, 但是rp.Close调用会等待flushTask全部执行完成.
 	//另外, 在分裂时选择midKey后, 会有一个assert确保midKey在startKey和endKey之间
 	if major {
 		atomic.StoreUint32(&rp.hasOverlap, 0)
 	}
 }
-
 
 func validDiscard(discards map[uint64]int64, extentIDs []uint64) map[uint64]int64 {
 	extentIdx := make(map[uint64]bool)

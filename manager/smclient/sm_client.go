@@ -19,7 +19,7 @@ import (
 //err表示网络错误
 
 var (
-	ErrTimeOut   = errors.New("can not find connection to stream manager, timeout")
+	ErrTimeOut = errors.New("can not find connection to stream manager, timeout")
 )
 
 type SMClient struct {
@@ -40,7 +40,7 @@ func (client *SMClient) Status() error {
 	if len(client.conns) == 0 {
 		return errors.New("not connection to stream server")
 	}
-	for i := range client.conns{
+	for i := range client.conns {
 		c := pb.NewStreamManagerServiceClient(client.conns[i])
 		_, err := c.Status(context.Background(), &pb.StatusRequest{})
 		if err != nil {
@@ -95,7 +95,6 @@ func (client *SMClient) Alive() bool {
 	return len(client.conns) > 0
 }
 
-
 func (client *SMClient) try(f func(conn *grpc.ClientConn) bool, x time.Duration) {
 	client.RLock()
 	connLen := len(client.conns)
@@ -103,12 +102,12 @@ func (client *SMClient) try(f func(conn *grpc.ClientConn) bool, x time.Duration)
 	client.RUnlock()
 
 	current := atomic.LoadInt32(&client.lastLeader)
-	for loop := 0; loop < connLen * 4; loop++ {
+	for loop := 0; loop < connLen*4; loop++ {
 		client.RLock()
 		if client.conns != nil && client.conns[current] != nil {
 			//if f() return true, sleep and continue
 			//if f() return false, return
-			if f(client.conns[current]) == true {
+			if f(client.conns[current]) {
 				current = (current + 1) % int32(connLen)
 				client.RUnlock()
 				time.Sleep(x)
@@ -119,7 +118,7 @@ func (client *SMClient) try(f func(conn *grpc.ClientConn) bool, x time.Duration)
 				return
 			}
 		}
-		
+
 	}
 }
 
@@ -131,7 +130,7 @@ func (client *SMClient) RegisterNode(ctx context.Context, uuids []string, addr s
 	client.try(func(conn *grpc.ClientConn) bool {
 		c := pb.NewStreamManagerServiceClient(conn)
 		res, err = c.RegisterNode(ctx, &pb.RegisterNodeRequest{
-			Addr: addr,
+			Addr:      addr,
 			DiskUUIDs: uuids,
 		})
 		if err == context.Canceled || err == context.DeadlineExceeded {
@@ -144,10 +143,7 @@ func (client *SMClient) RegisterNode(ctx context.Context, uuids []string, addr s
 		if res.Code != pb.Code_OK {
 			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
 			//if remote is not a leader, retry
-			if err == wire_errors.NotLeader {
-				return true
-			}
-			return false
+			return err == wire_errors.NotLeader
 		}
 
 		nodeID = res.NodeId
@@ -155,21 +151,20 @@ func (client *SMClient) RegisterNode(ctx context.Context, uuids []string, addr s
 		return false
 	}, 500*time.Millisecond)
 
-	return nodeID, uuidToDiskID,  err
+	return nodeID, uuidToDiskID, err
 }
 
-
 //FIXME: stream layer need Code to tell logic error or network error
-func (client *SMClient) CreateStream(ctx context.Context, dataShard uint32, parityShard uint32) (*pb.StreamInfo, *pb.ExtentInfo, error) {	
+func (client *SMClient) CreateStream(ctx context.Context, dataShard uint32, parityShard uint32) (*pb.StreamInfo, *pb.ExtentInfo, error) {
 	err := ErrTimeOut
-	
+
 	var res *pb.CreateStreamResponse
 	var ei *pb.ExtentInfo
 	var si *pb.StreamInfo
 	client.try(func(conn *grpc.ClientConn) bool {
 		c := pb.NewStreamManagerServiceClient(conn)
 		res, err = c.CreateStream(ctx, &pb.CreateStreamRequest{
-			DataShard: dataShard,
+			DataShard:   dataShard,
 			ParityShard: parityShard,
 		})
 
@@ -196,8 +191,7 @@ func (client *SMClient) CreateStream(ctx context.Context, dataShard uint32, pari
 	return si, ei, err
 }
 
-
-func (client *SMClient) CheckCommitLength(ctx context.Context, streamID uint64, ownerKey string, revision int64) (*pb.StreamInfo , *pb.ExtentInfo, uint32, error){
+func (client *SMClient) CheckCommitLength(ctx context.Context, streamID uint64, ownerKey string, revision int64) (*pb.StreamInfo, *pb.ExtentInfo, uint32, error) {
 	err := ErrTimeOut
 	var res *pb.CheckCommitLengthResponse
 	var stream *pb.StreamInfo
@@ -220,10 +214,7 @@ func (client *SMClient) CheckCommitLength(ctx context.Context, streamID uint64, 
 		if res.Code != pb.Code_OK {
 			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
 			//if remote is not a leader, retry
-			if err == wire_errors.NotLeader {
-				return true
-			}
-			return false
+			return err == wire_errors.NotLeader
 		}
 		stream = res.StreamInfo
 		lastEx = res.LastExInfo
@@ -235,7 +226,7 @@ func (client *SMClient) CheckCommitLength(ctx context.Context, streamID uint64, 
 }
 
 func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64,
-	ownerKey string, revision int64, end uint32) (*pb.StreamInfo , *pb.ExtentInfo, error) {
+	ownerKey string, revision int64, end uint32) (*pb.StreamInfo, *pb.ExtentInfo, error) {
 
 	err := ErrTimeOut
 	var res *pb.StreamAllocExtentResponse
@@ -247,7 +238,7 @@ func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64,
 			StreamID: streamID,
 			OwnerKey: ownerKey,
 			Revision: revision,
-			End: end,
+			End:      end,
 		})
 		if err == context.Canceled || err == context.DeadlineExceeded {
 			return false
@@ -259,10 +250,7 @@ func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64,
 		if res.Code != pb.Code_OK {
 			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
 			//if remote is not a leader, retry
-			if err == wire_errors.NotLeader {
-				return true
-			}
-			return false
+			return err == wire_errors.NotLeader
 		}
 		stream = res.StreamInfo
 		lastEx = res.LastExInfo
@@ -272,9 +260,8 @@ func (client *SMClient) StreamAllocExtent(ctx context.Context, streamID uint64,
 	return stream, lastEx, err
 }
 
-
 func (client *SMClient) NodesInfo(ctx context.Context) (map[uint64]*pb.NodeInfo, error) {
-	
+
 	err := ErrTimeOut
 	var res *pb.NodesInfoResponse
 	var nodeInfos map[uint64]*pb.NodeInfo
@@ -291,10 +278,7 @@ func (client *SMClient) NodesInfo(ctx context.Context) (map[uint64]*pb.NodeInfo,
 		if res.Code != pb.Code_OK {
 			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
 			//if remote is not a leader, retry
-			if err == wire_errors.NotLeader {
-				return true
-			}
-			return false
+			return err == wire_errors.NotLeader
 		}
 		nodeInfos = res.Nodes
 		return false
@@ -303,9 +287,8 @@ func (client *SMClient) NodesInfo(ctx context.Context) (map[uint64]*pb.NodeInfo,
 	return nodeInfos, err
 }
 
-
 func (client *SMClient) ExtentInfo(ctx context.Context, extentID uint64) (*pb.ExtentInfo, error) {
-	
+
 	err := ErrTimeOut
 	var res *pb.ExtentInfoResponse
 	var exInfo *pb.ExtentInfo
@@ -322,10 +305,7 @@ func (client *SMClient) ExtentInfo(ctx context.Context, extentID uint64) (*pb.Ex
 		if res.Code != pb.Code_OK {
 			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
 			//if remote is not a leader, retry
-			if err == wire_errors.NotLeader {
-				return true
-			}
-			return false
+			return err == wire_errors.NotLeader
 		}
 		exInfo = res.ExInfo
 		return false
@@ -334,11 +314,8 @@ func (client *SMClient) ExtentInfo(ctx context.Context, extentID uint64) (*pb.Ex
 	return exInfo, err
 }
 
-
-
-
 func (client *SMClient) StreamInfo(ctx context.Context, streamIDs []uint64) (map[uint64]*pb.StreamInfo, map[uint64]*pb.ExtentInfo, error) {
-	
+
 	err := ErrTimeOut
 	var res *pb.StreamInfoResponse
 	var extentInfos map[uint64]*pb.ExtentInfo
@@ -357,17 +334,14 @@ func (client *SMClient) StreamInfo(ctx context.Context, streamIDs []uint64) (map
 		if res.Code != pb.Code_OK {
 			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
 			//if remote is not a leader, retry
-			if err == wire_errors.NotLeader {
-				return true
-			}
-			return false
+			return err == wire_errors.NotLeader
 		}
 		extentInfos = res.Extents
 		streamInfos = res.Streams
 		return false
 	}, 500*time.Millisecond)
 
-	return streamInfos, extentInfos, err	
+	return streamInfos, extentInfos, err
 }
 
 func (client *SMClient) PunchHoles(ctx context.Context, streamID uint64, holes []uint64, ownerKey string, revision int64) (updatedStream *pb.StreamInfo, err error) {
@@ -376,10 +350,10 @@ func (client *SMClient) PunchHoles(ctx context.Context, streamID uint64, holes [
 	client.try(func(conn *grpc.ClientConn) bool {
 		c := pb.NewStreamManagerServiceClient(conn)
 		res, err = c.StreamPunchHoles(ctx, &pb.PunchHolesRequest{
-			StreamID: streamID,
+			StreamID:  streamID,
 			ExtentIDs: holes,
-			Revision: revision,
-			OwnerKey: ownerKey,
+			Revision:  revision,
+			OwnerKey:  ownerKey,
 		})
 
 		if err == context.Canceled || err == context.DeadlineExceeded {
@@ -393,22 +367,18 @@ func (client *SMClient) PunchHoles(ctx context.Context, streamID uint64, holes [
 		if res.Code != pb.Code_OK {
 			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
 			//if remote is not a leader, retry
-			if err == wire_errors.NotLeader {
-				return true
-			}
-			return false
+			return err == wire_errors.NotLeader
 		}
 
 		updatedStream = res.Stream
 		return false
 
 	}, 500*time.Millisecond)
-	
+
 	return
 }
 
-
-func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, extentID uint64, ownerKey string, revision int64) (updatedStream *pb.StreamInfo , err error) {
+func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, extentID uint64, ownerKey string, revision int64) (updatedStream *pb.StreamInfo, err error) {
 	err = ErrTimeOut
 	var res *pb.TruncateResponse
 	client.try(func(conn *grpc.ClientConn) bool {
@@ -419,7 +389,7 @@ func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, ext
 			OwnerKey: ownerKey,
 			Revision: revision,
 		})
-		
+
 		if err == context.Canceled || err == context.DeadlineExceeded {
 			return false
 		}
@@ -430,35 +400,31 @@ func (client *SMClient) TruncateStream(ctx context.Context, streamID uint64, ext
 		if res.Code != pb.Code_OK {
 			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
 			//if remote is not a leader, retry
-			if err == wire_errors.NotLeader {
-				return true
-			}
-			return false
+			return err == wire_errors.NotLeader
 		}
 		updatedStream = res.UpdatedStreamInfo
 		return false
 	}, 500*time.Millisecond)
 
-	return 
+	return
 }
-	
 
-func (client *SMClient) MultiModifySplit(ctx context.Context, partID uint64, midKey []byte, 
+func (client *SMClient) MultiModifySplit(ctx context.Context, partID uint64, midKey []byte,
 	ownerKey string, revision int64, logEnd, rowEnd, metaEnd uint32) error {
 	err := ErrTimeOut
 	var res *pb.MultiModifySplitResponse
 	client.try(func(conn *grpc.ClientConn) bool {
 		c := pb.NewStreamManagerServiceClient(conn)
 		res, err = c.MultiModifySplit(ctx, &pb.MultiModifySplitRequest{
-			PartID: partID,
-			MidKey: midKey,
-			OwnerKey: ownerKey,
-			Revision: revision,
-			LogStreamSealedLength: logEnd,
-			RowStreamSealedLength: rowEnd,
+			PartID:                 partID,
+			MidKey:                 midKey,
+			OwnerKey:               ownerKey,
+			Revision:               revision,
+			LogStreamSealedLength:  logEnd,
+			RowStreamSealedLength:  rowEnd,
 			MetaStreamSealedLength: metaEnd,
 		})
-		
+
 		if err == context.Canceled || err == context.DeadlineExceeded {
 			return false
 		}
@@ -469,13 +435,10 @@ func (client *SMClient) MultiModifySplit(ctx context.Context, partID uint64, mid
 		if res.Code != pb.Code_OK {
 			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
 			//if remote is not a leader, retry
-			if err == wire_errors.NotLeader {
-				return true
-			}
-			return false
+			return err == wire_errors.NotLeader
 		}
 		return false
 	}, 500*time.Millisecond)
 
-	return err	
+	return err
 }

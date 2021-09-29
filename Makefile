@@ -2,18 +2,17 @@
 BUILD_VERSION  ?= $(shell git describe --always --tags)
 subdirs = extent-node autumn-manager autumn-ps autumn-client
 
+lint: ## run lint
+	if [ ! -e ./bin/golangci-lint ]; then \
+		curl -sfL https://install.goreleaser.com/github.com/golangci/golangci-lint.sh | sh -s $(GOLANGCI_LINT_VERSION); \
+	fi
+	./bin/golangci-lint run --skip-files '\w+_test.go'
 all:
 	@for dir in $(subdirs) debug-tool; do \
 		echo "building $$dir"; \
 		make -C cmd/$$dir/;done
 test:
-	cd extent && go test -race
-	cd extent/record && go test -race
-	cd streamclient && go test -race
-	cd erasure_code && go test -race
-	cd node && go test -race
-	cd range_partition/ && go test -v  -race -coverprofile=coverage.txt -covermode=atomic
-	cd range_partition/table && go test
+	go test -v -race -coverprofile=coverage.out -covermode=atomic `go list ./...|grep -v cmd`
 image:
 	@mkdir -p linux
 	@for dir in $(subdirs); do \

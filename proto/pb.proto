@@ -153,16 +153,20 @@ message DfRequest{
 
 //DfResponse does't need to Code/CodeDes
 message DfResponse{
-	repeated RecoveryTask doneTask = 4;
+	repeated RecoveryTaskStatus doneTask = 4;
 	map<uint64, DF> diskStatus = 5;
 }
 
+message RecoveryTaskStatus {
+	RecoveryTask task = 1;
+	uint64  readyDiskID = 2; //node tells sm manager:extentID is recoveried on disk:readyDiskID
+}
+
 message RecoveryTask {
-	uint64  extentID = 1;
-	uint64  replaceID = 2;
+	uint64  extentID = 1;  //extentID to be recovered
+	uint64  replaceID = 2; //nodeID in replicas or parity fields, origin location
 	uint64  nodeID = 3;
-	int64  startTime = 4;
-	uint64 readyDiskID = 5;
+	int64   startTime = 4;
 }
 
 message RequireRecoveryRequest {

@@ -33,7 +33,7 @@ func (rp *RangePartition) writeValueLog(reqs []*request) ([]*pb.EntryInfo, value
 func replayLog(stream streamclient.StreamClient, replayFunc func(*pb.EntryInfo) (bool, error), opts ...streamclient.ReadOption) error {
 
 	iter := stream.NewLogEntryIter(opts...)
-		
+
 	for {
 		ok, err := iter.HasNext()
 		if err != nil {
@@ -47,13 +47,12 @@ func replayLog(stream streamclient.StreamClient, replayFunc func(*pb.EntryInfo) 
 		if err != nil {
 			return err
 		}
-		if next == false {
+		if !next {
 			break
 		}
 	}
 	return nil
 }
-
 
 func discardEntry(ei *pb.EntryInfo, vs y.ValueStruct) bool {
 	if vs.Version != y.ParseTs(ei.Log.Key) {
@@ -68,7 +67,7 @@ func discardEntry(ei *pb.EntryInfo, vs y.ValueStruct) bool {
 
 type GcTask struct {
 	ForceGC bool
-	ExIDs []uint64 //if not forceGC, pickup will choose automatically
+	ExIDs   []uint64 //if not forceGC, pickup will choose automatically
 }
 
 const (
@@ -82,83 +81,81 @@ func (rp *RangePartition) startGC() {
 	rp.gcStopper.RunWorker(func() {
 		for {
 			select {
-				case <- rp.gcStopper.ShouldStop():
-					return
-				case task := <- rp.gcRunChan:
-					//chose an extent to compact
-				
-					logStreamInfo := rp.logStream.StreamInfo()
-					if len(logStreamInfo.ExtentIDs) < 2 {
-						fmt.Printf("only one extent, no extent to delete\n")
-						continue
+			case <-rp.gcStopper.ShouldStop():
+				return
+			case task := <-rp.gcRunChan:
+				//chose an extent to compact
+
+				logStreamInfo := rp.logStream.StreamInfo()
+				if len(logStreamInfo.ExtentIDs) < 2 {
+					fmt.Printf("only one extent, no extent to delete\n")
+					continue
+				}
+				holes := make([]uint64, 0, 3)
+				if task.ForceGC {
+					fmt.Printf("task to gc on %+v\n", task.ExIDs)
+					//valide task.ExIDs
+					idx := make(map[uint64]bool, len(logStreamInfo.ExtentIDs))
+					for _, exID := range logStreamInfo.ExtentIDs {
+						idx[exID] = true
 					}
-					holes :=make([]uint64, 0, 3)
-					if task.ForceGC {
-						fmt.Printf("task to gc on %+v\n", task.ExIDs)
-						//valide task.ExIDs
-						idx := make(map[uint64]bool, len(logStreamInfo.ExtentIDs))
-						for _, exID := range logStreamInfo.ExtentIDs {
-							idx[exID] = true
-						}
-						for i := 0 ; i < len(task.ExIDs)  && i < MAX_GC_ONCE; i++ {
-							if _, ok := idx[task.ExIDs[i]] ; ok{
-								holes = append(holes, task.ExIDs[i])
-							}
-						}
-
-					} else {
-						tbls := rp.getTables()
-
-						discards := getDiscards(tbls)
-						//exlucde the last extent, last extent is usually a non-sealed extent
-						validDiscard(discards, logStreamInfo.ExtentIDs[:len(logStreamInfo.ExtentIDs)-1])
-						//sort discard
-						canndidates := make([]uint64, 0, 3)
-
-						for k := range discards {
-							canndidates = append(canndidates, k)
-						}
-						sort.Slice(canndidates, func(i, j int) bool {
-							return discards[canndidates[i]] > discards[canndidates[j]]
-						})
-						for i := 0 ; i < len(canndidates) && i < MAX_GC_ONCE; i++ {
-							exID := canndidates[i]
-							size, err := rp.blockReader.SealedLength(exID)
-							if err != nil {
-								xlog.Logger.Errorf("get sealed length error: %v in runGC", err)
-								continue
-							}
-							if size == 0 {
-								continue
-							}
-							radio := float64(discards[exID]) / float64(size)
-							if radio > 0.4 {
-								holes = append(holes, exID)
-							}
+					for i := 0; i < len(task.ExIDs) && i < MAX_GC_ONCE; i++ {
+						if _, ok := idx[task.ExIDs[i]]; ok {
+							holes = append(holes, task.ExIDs[i])
 						}
 					}
 
-					if len(holes) == 0 {
-						fmt.Printf("no extent to delete\n")
-						continue
-					}
+				} else {
+					tbls := rp.getTables()
 
-					for i := range holes {
-						rp.runGC(holes[i])
+					discards := getDiscards(tbls)
+					//exlucde the last extent, last extent is usually a non-sealed extent
+					validDiscard(discards, logStreamInfo.ExtentIDs[:len(logStreamInfo.ExtentIDs)-1])
+					//sort discard
+					canndidates := make([]uint64, 0, 3)
+
+					for k := range discards {
+						canndidates = append(canndidates, k)
 					}
-					//TODO: retry if failed
-					//delete extent for stream
-					fmt.Printf("deleted extent [%v], for stream %d\n", holes, logStreamInfo.StreamID)
-					//delete extent for block
-					if err := rp.logStream.PunchHoles(context.Background(), holes); err != nil {
-						xlog.Logger.Errorf("punch holes error: %v in runGC", err)
+					sort.Slice(canndidates, func(i, j int) bool {
+						return discards[canndidates[i]] > discards[canndidates[j]]
+					})
+					for i := 0; i < len(canndidates) && i < MAX_GC_ONCE; i++ {
+						exID := canndidates[i]
+						size, err := rp.blockReader.SealedLength(exID)
+						if err != nil {
+							xlog.Logger.Errorf("get sealed length error: %v in runGC", err)
+							continue
+						}
+						if size == 0 {
+							continue
+						}
+						radio := float64(discards[exID]) / float64(size)
+						if radio > 0.4 {
+							holes = append(holes, exID)
+						}
 					}
+				}
+
+				if len(holes) == 0 {
+					fmt.Printf("no extent to delete\n")
+					continue
+				}
+
+				for i := range holes {
+					rp.runGC(holes[i])
+				}
+				//TODO: retry if failed
+				//delete extent for stream
+				fmt.Printf("deleted extent [%v], for stream %d\n", holes, logStreamInfo.StreamID)
+				//delete extent for block
+				if err := rp.logStream.PunchHoles(context.Background(), holes); err != nil {
+					xlog.Logger.Errorf("punch holes error: %v in runGC", err)
+				}
 			}
 		}
 	})
 }
-
-
 
 func (rp *RangePartition) runGC(extentID uint64) {
 
@@ -181,7 +178,7 @@ func (rp *RangePartition) runGC(extentID uint64) {
 		//fmt.Printf("processing %s\n", userKey)
 		//if small file, ei.Log.Value must be nil
 		//if big file, len(ei.Log.Value) > 0
-		if (ei.Log.Meta & uint32(y.BitValuePointer)) == 0{
+		if (ei.Log.Meta & uint32(y.BitValuePointer)) == 0 {
 			//fmt.Printf("discard small entry, key: %s\n", streamclient.FormatEntry(ei))
 			utils.AssertTrue(ei.Log.Value == nil)
 			return true, nil
@@ -200,9 +197,9 @@ func (rp *RangePartition) runGC(extentID uint64) {
 			return true, nil
 		}
 
-        /*
-		rp.Write(userKey, []byte("TEST"))
-        */
+		/*
+			rp.Write(userKey, []byte("TEST"))
+		*/
 
 		utils.AssertTrue(len(vs.Value) > 0)
 		var vp valuePointer
@@ -256,8 +253,8 @@ func (rp *RangePartition) runGC(extentID uint64) {
 		return
 	}
 
-	fmt.Printf("GC: processed %d entries, %d entries moved, %v freed bytes, %v moved bytes\n", count, moved, 
-	utils.HumanReadableSize(freeSize), utils.HumanReadableSize(moveSize))
+	fmt.Printf("GC: processed %d entries, %d entries moved, %v freed bytes, %v moved bytes\n", count, moved,
+		utils.HumanReadableSize(freeSize), utils.HumanReadableSize(moveSize))
 
 	xlog.Logger.Infof("GC: processed %d entries, %d entries moved, %d freed bytes, %d moved bytes", count, moved, freeSize, moveSize)
 

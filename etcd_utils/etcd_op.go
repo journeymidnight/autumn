@@ -11,8 +11,6 @@ import (
 	"go.etcd.io/etcd/api/v3/mvccpb"
 )
 
-
-
 const etcdTimeout = 2 * time.Second
 
 func EtcdWatchEvents(c *clientv3.Client, start, end string, startRev int64) (clientv3.WatchChan, func()) {
@@ -20,18 +18,18 @@ func EtcdWatchEvents(c *clientv3.Client, start, end string, startRev int64) (cli
 
 	var rch clientv3.WatchChan
 	if len(end) > 0 {
-		rch = watcher.Watch(context.Background(), start, 
-		clientv3.WithRange(end), 
-		clientv3.WithPrevKV(),
-		clientv3.WithRev(startRev))
+		rch = watcher.Watch(context.Background(), start,
+			clientv3.WithRange(end),
+			clientv3.WithPrevKV(),
+			clientv3.WithRev(startRev))
 	} else {
-		rch = watcher.Watch(context.Background(), start, 
-		clientv3.WithPrevKV(),
-		clientv3.WithRev(startRev))
+		rch = watcher.Watch(context.Background(), start,
+			clientv3.WithPrevKV(),
+			clientv3.WithRev(startRev))
 
 	}
 
-	return rch, func(){
+	return rch, func() {
 		watcher.Close()
 	}
 }
@@ -64,13 +62,13 @@ func EtcdGetKV(c *clientv3.Client, key string, opts ...clientv3.OpOption) ([]byt
 	defer cancel()
 	resp, err := clientv3.NewKV(c).Get(ctx, key, opts...)
 	if err != nil {
-		return nil, 0,  err
+		return nil, 0, err
 	}
 	if resp == nil || len(resp.Kvs) == 0 {
 		return nil, 0, nil
 	}
-	
-	return resp.Kvs[0].Value,resp.Header.Revision, nil
+
+	return resp.Kvs[0].Value, resp.Header.Revision, nil
 }
 
 //EtcdRange return (KeyValue, Revision, error)
@@ -84,7 +82,7 @@ func EtcdRange(c *clientv3.Client, prefix string) ([]*mvccpb.KeyValue, int64, er
 	}
 	kv := clientv3.NewKV(c)
 	resp, err := kv.Get(ctx, prefix, opts...)
-	
+
 	if err != nil {
 		return nil, 0, err
 	}

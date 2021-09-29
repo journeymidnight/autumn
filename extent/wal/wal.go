@@ -91,10 +91,9 @@ func OpenWal(dir string, userSync func()) (*Wal, error) {
 	}
 
 	//some filesystem can not guarantee readdir is order
-	sort.Slice(oldWals, func(i,j int) bool {
+	sort.Slice(oldWals, func(i, j int) bool {
 		return strings.Compare(oldWals[i], oldWals[j]) < 0
-	}) 
-
+	})
 
 	//create new wal
 	last++
@@ -135,9 +134,9 @@ func (wal *Wal) cleanPendingWal() {
 //rotate will  non-block
 func (wal *Wal) rotate() {
 	atomic.StoreInt32(&wal.syncing, 1)
-
+	wal.syncWg.Add(1)
 	go func() {
-		wal.syncWg.Add(1)
+
 		wal.userSync()
 
 		//wait user sync end
@@ -193,7 +192,10 @@ func (wal *Wal) doRequest(reqs []*request) error {
 		}
 		wal.walOffset = end
 	}
-	wal.writer.Sync()
+	if err := wal.writer.Sync(); err != nil {
+		done(err)
+		return err
+	}
 	done(nil)
 	return nil
 }
@@ -314,7 +316,7 @@ func (wal *Wal) Replay(callback func(uint64, uint32, int64, []*pb.Block)) error 
 			}
 			req.decode(s)
 			callback(req.extentID, req.start, req.rev, req.data)
-			n ++
+			n++
 		}
 	}
 	wal.cleanPendingWal()

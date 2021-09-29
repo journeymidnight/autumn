@@ -1095,7 +1095,7 @@ func (rp *RangePartition) close(gracefull bool) error {
 	//doWrite在返回前,会调用最后一次writeRequest并且等待返回, 所以这里
 	//mt和rp.vhead都是只读的
 	//106是空的skiplist的只有头node的大小
-	if gracefull && rp.mt.Empty() == false {
+	if gracefull && !rp.mt.Empty() {
 		for {
 			pushedFlushTask := func() bool {
 				rp.Lock()

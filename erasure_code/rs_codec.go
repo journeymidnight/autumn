@@ -13,23 +13,19 @@ import (
 	"github.com/klauspost/reedsolomon"
 )
 
-type ReedSolomon struct{} 
+type ReedSolomon struct{}
 
-func (ReedSolomon) Reconstruct(input []io.Reader, dataShards int, parityShards int, output []io.Writer) error{
+func (ReedSolomon) Reconstruct(input []io.Reader, dataShards int, parityShards int, output []io.Writer) error {
 	enc, err := reedsolomon.NewStream(dataShards, parityShards)
 	if err != nil {
 		return err
-	}	
-	if err = enc.Reconstruct(input, output) ; err != nil {
-			return err
 	}
-		
+	if err = enc.Reconstruct(input, output); err != nil {
+		return err
+	}
+
 	return nil
 }
-
-const (
-	metaSize = 4
-)
 
 func (ReedSolomon) Decode(input [][]byte, dataShards int, parityShards int) ([]byte, error) {
 
@@ -38,14 +34,13 @@ func (ReedSolomon) Decode(input [][]byte, dataShards int, parityShards int) ([]b
 		return nil, err
 	}
 
-
 	// Verify the shards
 	ok, err := enc.Verify(input)
 	if !ok {
 		err = enc.Reconstruct(input)
-			if err != nil {
-				return nil, err
-			}
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	perShards := len(input[0])
@@ -54,7 +49,7 @@ func (ReedSolomon) Decode(input [][]byte, dataShards int, parityShards int) ([]b
 	ret := make([]byte, size)
 	p := ret
 	remaining := size
-	for i := 0 ;i < dataShards && remaining > 0 ; i ++ {
+	for i := 0; i < dataShards && remaining > 0; i++ {
 		n := utils.Min(int(remaining), perShards)
 		copy(p, input[i][:n])
 		p = p[n:]
@@ -69,43 +64,41 @@ func (ReedSolomon) Encode(input []byte, dataShards int, parityShards int) ([][]b
 	if err != nil {
 		return nil, err
 	}
-	
 
 	size := len(input)
 	/*
-	leftSpace和perShard至少是4, 保证存储长度
-	solution1:
-	perShard := (size + dataShards - 1) / dataShards
+		leftSpace和perShard至少是4, 保证存储长度
+		solution1:
+		perShard := (size + dataShards - 1) / dataShards
 
-	//at least 4 bytes to save length
+		//at least 4 bytes to save length
+		if perShard < 4 {
+			perShard = 4
+		}
+
+		leftSpace := perShard * dataShards - size
+
+		if leftSpace < 4 {
+			perShard += (4-leftSpace) / dataShards + 1
+		}
+	*/
+	perShard := (size + dataShards + 4 - 1) / dataShards
 	if perShard < 4 {
 		perShard = 4
 	}
-
-	leftSpace := perShard * dataShards - size
-	
-	if leftSpace < 4 {
-		perShard += (4-leftSpace) / dataShards + 1
-	}
-	*/
-	perShard := (size  + dataShards + 4 - 1)/dataShards
-    if perShard < 4 {
-        perShard = 4
-	}
-	leftSpace := perShard * dataShards - size
+	leftSpace := perShard*dataShards - size
 	utils.AssertTrue(leftSpace >= 4)
-	
-	var padding []byte //include the last shard and all partyShards
 
+	var padding []byte //include the last shard and all partyShards
 
 	shards := dataShards + parityShards
 	// calculate maximum number of full shards in `data` slice
 	fullShards := len(input) / perShard
 	if fullShards == 0 {
 		//copy all data
-		padding = make([]byte, shards * perShard)
+		padding = make([]byte, shards*perShard)
 		copy(padding, input)
-		input= input[:0]
+		input = input[:0]
 	} else {
 		//copy the last shards
 		padding = make([]byte, shards*perShard-perShard*fullShards)
@@ -132,7 +125,6 @@ func (ReedSolomon) Encode(input []byte, dataShards int, parityShards int) ([][]b
 
 }
 
-
 func which(x [][]byte) {
 	for i := 0; i < len(x); i++ {
 		if x[i] == nil {
@@ -141,18 +133,17 @@ func which(x [][]byte) {
 	}
 }
 
-
 //FIXME: add a channel to make ReadBlocks and Reconstruct asynchronized
 func (ReedSolomon) RebuildECExtent(dataShards, parityShards int, sourceExtent []*extent.Extent, start uint32, replacingIndex int, targetExtent *extent.Extent) error {
-	
+
 	targetExtent.AssertLock()
 
 	enc, err := reedsolomon.New(dataShards, parityShards)
-	
+
 	blocks := make([][]*pb.Block, dataShards+parityShards)
 	shards := make([][]byte, dataShards+parityShards)
 
-	if len(sourceExtent) > replacingIndex  && sourceExtent[replacingIndex] != nil {
+	if len(sourceExtent) > replacingIndex && sourceExtent[replacingIndex] != nil {
 		return errors.New("sourceExtent[replacingIndex] must be nil")
 	}
 
@@ -160,17 +151,17 @@ func (ReedSolomon) RebuildECExtent(dataShards, parityShards int, sourceExtent []
 	end := uint32(0)
 	n := 0
 	for !done {
-		for i:= 0 ; i < dataShards + parityShards ; i ++ {
+		for i := 0; i < dataShards+parityShards; i++ {
 			if sourceExtent[i] != nil {
 				blocks[i], _, end, err = sourceExtent[i].ReadBlocks(start, 20000, 40<<20)
 				n = len(blocks[i])
 				if err != nil {
-					if err != wire_errors.EndOfExtent{
+					if err != wire_errors.EndOfExtent {
 						fmt.Printf("source Extent error!!! to i %d\n", i)
 						//来源block也可能损坏, 所以应该持续恢复, 并且返回给上层err内容
 						//return err
 					}
-					done= true
+					done = true
 				}
 			} else {
 				blocks[i] = nil
@@ -181,15 +172,15 @@ func (ReedSolomon) RebuildECExtent(dataShards, parityShards int, sourceExtent []
 		writeBlocks := make([]*pb.Block, n)
 
 		for k := 0; k < n; k++ {
-			for i := 0 ; i < dataShards + parityShards ; i ++ {
+			for i := 0; i < dataShards+parityShards; i++ {
 				if blocks[i] == nil {
 					shards[i] = nil
 				} else {
 					shards[i] = blocks[i][k].Data
 				}
 			}
-			
-			if err = enc.Reconstruct(shards) ; err != nil {
+
+			if err = enc.Reconstruct(shards); err != nil {
 				return err
 			}
 			writeBlocks[k] = &pb.Block{
@@ -197,7 +188,7 @@ func (ReedSolomon) RebuildECExtent(dataShards, parityShards int, sourceExtent []
 			}
 		}
 		var doSync bool
-		if done {//last one
+		if done { //last one
 			doSync = true
 		}
 		if _, _, err = targetExtent.AppendBlocks(writeBlocks, doSync); err != nil {

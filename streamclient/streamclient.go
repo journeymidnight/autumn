@@ -71,9 +71,9 @@ type LogEntryIter interface {
 }
 
 type AutumnBlockReader struct {
-	em *smclient.ExtentManager
-	sm *smclient.SMClient
-	blockCache  *ristretto.Cache
+	em         *smclient.ExtentManager
+	sm         *smclient.SMClient
+	blockCache *ristretto.Cache
 }
 
 func NewAutumnBlockReader(em *smclient.ExtentManager, sm *smclient.SMClient) *AutumnBlockReader {
@@ -86,18 +86,17 @@ func NewAutumnBlockReader(em *smclient.ExtentManager, sm *smclient.SMClient) *Au
 		panic(err)
 	}
 	return &AutumnBlockReader{
-		em: em,
-		sm: sm,
+		em:         em,
+		sm:         sm,
 		blockCache: blockCache,
 	}
 }
 
 //hint
 const (
-	HintReadThrough = 1 << 0
+	HintReadThrough        = 1 << 0
 	HintReadFromCache byte = 1 << 1
 )
-
 
 func blockCacheID(extentID uint64, offset uint32) []byte {
 	buf := make([]byte, 12)
@@ -107,10 +106,9 @@ func blockCacheID(extentID uint64, offset uint32) []byte {
 }
 
 type blockInCache struct {
-	block *pb.Block
+	block   *pb.Block
 	readEnd uint32
 }
-
 
 func (br *AutumnBlockReader) SealedLength(extentID uint64) (uint64, error) {
 	exInfo := br.em.GetExtentInfo(extentID)
@@ -120,11 +118,10 @@ func (br *AutumnBlockReader) SealedLength(extentID uint64) (uint64, error) {
 	return exInfo.SealedLength, nil
 }
 
-
 func (br *AutumnBlockReader) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32, hint byte) ([]*pb.Block, uint32, error) {
 	//only cache metadata
-	if (hint & HintReadFromCache) > 0 && numOfBlocks == 1{
-		data , ok := br.blockCache.Get(blockCacheID(extentID, offset))
+	if (hint&HintReadFromCache) > 0 && numOfBlocks == 1 {
+		data, ok := br.blockCache.Get(blockCacheID(extentID, offset))
 		if ok && data != nil {
 			x := data.(blockInCache)
 			return []*pb.Block{x.block}, x.readEnd, nil
@@ -162,7 +159,7 @@ retry:
 		return nil, 0, err
 	}
 
-	if (hint & HintReadFromCache) > 0 && numOfBlocks == 1 {
+	if (hint&HintReadFromCache) > 0 && numOfBlocks == 1 {
 		br.blockCache.Set(blockCacheID(extentID, offset), blockInCache{block: res.Blocks[0], readEnd: res.End}, 0)
 	}
 	return res.Blocks, res.End, nil
@@ -171,10 +168,10 @@ retry:
 type readOption struct {
 	ReadFromStart bool
 	ExtentID      uint64
-	Offset       uint32
-	Replay       bool
+	Offset        uint32
+	Replay        bool
 	//max extents we can read
-	MaxExtentRead   int
+	MaxExtentRead int
 }
 
 type ReadOption func(*readOption)
@@ -203,7 +200,6 @@ func WithReadFrom(extentID uint64, offset uint32, maxExtents int) ReadOption {
 	}
 }
 
-
 type StreamLock struct {
 	revision int64
 	ownerKey string
@@ -222,13 +218,13 @@ type AutumnStreamClient struct {
 	smClient   *smclient.SMClient
 	streamInfo *pb.StreamInfo
 
-	em         *smclient.ExtentManager
-	streamID   uint64
-	streamLock StreamLock
-	end        uint32
+	em            *smclient.ExtentManager
+	streamID      uint64
+	streamLock    StreamLock
+	end           uint32
 	maxExtentSize uint32
 
-	utils.SafeMutex//protect streamInfo from allocStream, Truncate, PunchHole
+	utils.SafeMutex //protect streamInfo from allocStream, Truncate, PunchHole
 }
 
 func NewStreamClient(sm *smclient.SMClient, em *smclient.ExtentManager, maxExtentSize uint32, streamID uint64, streamLock StreamLock) *AutumnStreamClient {
@@ -236,10 +232,10 @@ func NewStreamClient(sm *smclient.SMClient, em *smclient.ExtentManager, maxExten
 
 	utils.AssertTruef(maxExtentSize < HardMaxExtentSize, "maxExtentSize %d is too large", maxExtentSize)
 	return &AutumnStreamClient{
-		smClient:   sm,
-		em:         em,
-		streamID:   streamID,
-		streamLock: streamLock,
+		smClient:      sm,
+		em:            em,
+		streamID:      streamID,
+		streamLock:    streamLock,
 		maxExtentSize: maxExtentSize,
 	}
 }
@@ -253,9 +249,8 @@ type AutumnEntryIter struct {
 	cache              []*pb.EntryInfo
 	replay             bool
 	conn               *grpc.ClientConn
-	n                  int//number of extents we have read
+	n                  int //number of extents we have read
 }
-
 
 /*
 At the start of a partition load, the partition server
@@ -289,7 +284,6 @@ func (sc *AutumnStreamClient) checkCommitLength() {
 
 }
 
-
 func (sc *AutumnStreamClient) ReadLastBlock(ctx context.Context) (*pb.Block, error) {
 
 	if len(sc.streamInfo.ExtentIDs) == 0 {
@@ -297,7 +291,7 @@ func (sc *AutumnStreamClient) ReadLastBlock(ctx context.Context) (*pb.Block, err
 	}
 
 	findValidLastExtent := func(i int) (*pb.ExtentInfo, int) {
-		for ;i >= 0; i-- {
+		for ; i >= 0; i-- {
 			exID, err := sc.getExtentFromIndex(i)
 			if err != nil {
 				return nil, -1
@@ -312,41 +306,40 @@ func (sc *AutumnStreamClient) ReadLastBlock(ctx context.Context) (*pb.Block, err
 		return nil, -1
 	}
 
-
 	getLastBlock := func(exInfo *pb.ExtentInfo) ([]*pb.Block, error) {
-		retry:
-			exInfo = sc.em.GetExtentInfo(exInfo.ExtentID)
-			if exInfo == nil {
-				return nil, errors.Errorf("no such extent")
-			}
-			conn := sc.em.GetExtentConn(exInfo.ExtentID, smclient.AlivePolicy{})
-			if conn == nil {
-				return nil, errors.Errorf("unable to get extent connection.")
-			}
-			c := pb.NewExtentServiceClient(conn)
-			res, err := c.SmartReadBlocks(ctx, &pb.ReadBlocksRequest{
-				ExtentID:    exInfo.ExtentID,
-				Eversion:    exInfo.Eversion,
-				OnlyLastBlock: true,
-			})
-			if err != nil {
-				return nil, err
-			}
-			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
-			if err == wire_errors.VersionLow {
-				sc.em.WaitVersion(exInfo.ExtentID, exInfo.Eversion+1)
-				goto retry
-			} else if err != nil {
-				return nil, err
-			}
-			return res.Blocks, nil
+	retry:
+		exInfo = sc.em.GetExtentInfo(exInfo.ExtentID)
+		if exInfo == nil {
+			return nil, errors.Errorf("no such extent")
+		}
+		conn := sc.em.GetExtentConn(exInfo.ExtentID, smclient.AlivePolicy{})
+		if conn == nil {
+			return nil, errors.Errorf("unable to get extent connection.")
+		}
+		c := pb.NewExtentServiceClient(conn)
+		res, err := c.SmartReadBlocks(ctx, &pb.ReadBlocksRequest{
+			ExtentID:      exInfo.ExtentID,
+			Eversion:      exInfo.Eversion,
+			OnlyLastBlock: true,
+		})
+		if err != nil {
+			return nil, err
+		}
+		err = wire_errors.FromPBCode(res.Code, res.CodeDes)
+		if err == wire_errors.VersionLow {
+			sc.em.WaitVersion(exInfo.ExtentID, exInfo.Eversion+1)
+			goto retry
+		} else if err != nil {
+			return nil, err
+		}
+		return res.Blocks, nil
 	}
 
-	i := len(sc.streamInfo.ExtentIDs) - 1;
+	i := len(sc.streamInfo.ExtentIDs) - 1
 	for i >= 0 {
 		exInfo, idx := findValidLastExtent(i)
 		if idx == -1 {
-			return nil, wire_errors.NotFound			
+			return nil, wire_errors.NotFound
 		}
 
 		blocks, err := getLastBlock(exInfo)
@@ -357,20 +350,19 @@ func (sc *AutumnStreamClient) ReadLastBlock(ctx context.Context) (*pb.Block, err
 		if err != nil {
 			return nil, err
 		}
-		
+
 		utils.AssertTrue(len(blocks) == 1)
 		return blocks[0], nil
 	}
-	return nil, wire_errors.NotFound	
+	return nil, wire_errors.NotFound
 }
-
 
 func (iter *AutumnEntryIter) HasNext() (bool, error) {
 	if len(iter.cache) == 0 {
 		if iter.noMore {
 			return false, nil
 		}
-		for iter.noMore == false && len(iter.cache) == 0 {
+		for !iter.noMore && len(iter.cache) == 0 {
 			err := iter.receiveEntries()
 			if err != nil {
 				return false, err
@@ -456,7 +448,7 @@ retry:
 		iter.currentOffset = 0
 		iter.currentExtentIndex++
 		iter.conn = nil
-		iter.n ++
+		iter.n++
 		if iter.currentExtentIndex == len(iter.sc.streamInfo.ExtentIDs) || iter.n >= iter.opt.MaxExtentRead {
 			iter.noMore = true
 		}
@@ -478,13 +470,13 @@ func (sc *AutumnStreamClient) NewLogEntryIter(opts ...ReadOption) LogEntryIter {
 	leIter := &AutumnEntryIter{
 		sc:  sc,
 		opt: readOpt,
-		n :  0,
+		n:   0,
 	}
 
 	if readOpt.Replay {
 		leIter.replay = true
 	}
-	
+
 	if readOpt.ReadFromStart {
 		leIter.currentExtentIndex = 0
 		leIter.currentOffset = 0
@@ -495,11 +487,10 @@ func (sc *AutumnStreamClient) NewLogEntryIter(opts ...ReadOption) LogEntryIter {
 	return leIter
 }
 
-
 func (sc *AutumnStreamClient) PunchHoles(ctx context.Context, extentIDs []uint64) error {
 	sc.Lock()
 	defer sc.Unlock()
-	
+
 	updatedStream, err := sc.smClient.PunchHoles(ctx, sc.streamID, extentIDs, sc.streamLock.ownerKey, sc.streamLock.revision)
 	if err != nil {
 		return err
@@ -507,7 +498,6 @@ func (sc *AutumnStreamClient) PunchHoles(ctx context.Context, extentIDs []uint64
 	sc.streamInfo = updatedStream
 	return nil
 }
-
 
 func (sc *AutumnStreamClient) Truncate(ctx context.Context, extentID uint64) error {
 	sc.Lock()
@@ -527,7 +517,7 @@ func (sc *AutumnStreamClient) Truncate(ctx context.Context, extentID uint64) err
 		sc.streamLock.ownerKey, sc.streamLock.revision)
 
 	if err != nil {
-		return  err
+		return err
 	}
 
 	sc.streamInfo = updatedStream
@@ -683,7 +673,7 @@ retry:
 		goto retry
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15 * time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	c := pb.NewExtentServiceClient(conn)
 	res, err := c.Append(ctx, &pb.AppendRequest{
 		ExtentID: extentID,
@@ -697,7 +687,7 @@ retry:
 	if status.Code(err) == codes.DeadlineExceeded || status.Code(err) == codes.Unavailable { //timeout
 		fmt.Printf("append on extent %d; error is %v\n", extentID, err)
 		if loop < 2 {
-			loop ++
+			loop++
 			time.Sleep(100 * time.Millisecond)
 			goto retry
 		}
@@ -728,7 +718,7 @@ retry:
 	//fmt.Printf("extent %d updated end is %d\n", extentID, sc.end)
 	//检查offset结果, 如果已经超过MaxExtentSize, 调用StreamAllocExtent
 	utils.AssertTrue(res.End > 0)
-	
+
 	if res.End > sc.maxExtentSize {
 		if err = sc.MustAllocNewExtent(); err != nil {
 			return 0, nil, 0, err
@@ -758,5 +748,5 @@ func FormatEntry(entry *pb.EntryInfo) string {
 		flag = "norm"
 	}
 	return fmt.Sprintf("%s~%d on extent %d:(%d-%d) [%s]",
-	y.ParseKey(entry.Log.Key), y.ParseTs(entry.Log.Key), entry.ExtentID, entry.Offset, entry.End, flag)
+		y.ParseKey(entry.Log.Key), y.ParseTs(entry.Log.Key), entry.ExtentID, entry.Offset, entry.End, flag)
 }

@@ -25,14 +25,13 @@ type HistogramStatus struct {
 	histogram *hdrhistogram.Histogram
 }
 
-
-func NewLantencyStatus(start int64 , end int64) *HistogramStatus{
+func NewLantencyStatus(start int64, end int64) *HistogramStatus {
 	return &HistogramStatus{
 		histogram: hdrhistogram.New(start, end, 3),
 	}
 }
 
-func (ls *HistogramStatus) Record(n int64) error{
+func (ls *HistogramStatus) Record(n int64) error {
 	return ls.histogram.RecordValue(n)
 }
 
@@ -43,20 +42,22 @@ type Result struct {
 
 func (ls *HistogramStatus) Histgram(percentiles []float64, w io.Writer) []int64 {
 	ret := make([]int64, len(percentiles))
-	for i := range  percentiles {
-		ret[i]  = ls.histogram.ValueAtQuantile(percentiles[i])
+	for i := range percentiles {
+		ret[i] = ls.histogram.ValueAtQuantile(percentiles[i])
 	}
 	if w != nil {
 		brackets := ls.histogram.CumulativeDistribution()
 		results := make([]Result, len(brackets))
 		for i := range brackets {
 			results[i] = Result{
-				Percetage:brackets[i].Quantile,
-				Lantency: float64(brackets[i].ValueAt),
+				Percetage: brackets[i].Quantile,
+				Lantency:  float64(brackets[i].ValueAt),
 			}
 		}
 		data, _ := json.Marshal(results)
-		w.Write(data)
+		if _, err := w.Write(data); err != nil {
+			panic(err)
+		}
 	}
 	return ret
 }
@@ -153,4 +154,3 @@ func (ls *LantencyStatus) Histgram(p []float64, w io.Writer) []float64 {
 	return ret
 }
 */
-

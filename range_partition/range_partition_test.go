@@ -74,10 +74,6 @@ func _writeToLSM(skl *skiplist.Skiplist, entires []*pb.EntryInfo) int64 {
 	return skl.MemSize()
 }
 
-func mockUpdateStream([]pb.StreamInfo) {
-
-}
-
 func runRPTest(t *testing.T, test func(t *testing.T, rp *RangePartition)) {
 
 	br := streamclient.NewMockBlockReader()

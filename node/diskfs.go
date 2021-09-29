@@ -26,10 +26,10 @@ const (
 type diskFS struct {
 	baseDir string
 	baseFd  *os.File
-	diskID uint64
-	online uint32  //atomic value
-	total uint64
-	free uint64
+	diskID  uint64
+	online  uint32 //atomic value
+	total   uint64
+	free    uint64
 }
 
 func OpenDiskFS(dir string, nodeID uint64) (*diskFS, error) {
@@ -46,7 +46,6 @@ func OpenDiskFS(dir string, nodeID uint64) (*diskFS, error) {
 	if err != nil {
 		return nil, errors.Errorf("can not parse file: node_id %v", err)
 	}
-
 
 	id, err := strconv.ParseUint(string(idString), 10, 64)
 	if err != nil {
@@ -69,11 +68,12 @@ func OpenDiskFS(dir string, nodeID uint64) (*diskFS, error) {
 	s.online = 1
 	return s, nil
 }
+
 //Df() return (total, free, error)
-func (s *diskFS) Df() (uint64, uint64 , error){
-	total, free,  err := getDiskInfo(s.baseDir)
+func (s *diskFS) Df() (uint64, uint64, error) {
+	total, free, err := getDiskInfo(s.baseDir)
 	if err != nil {
-		return 0,0, err
+		return 0, 0, err
 	}
 	s.total = total
 	s.free = free
@@ -105,14 +105,13 @@ func (s *diskFS) pathName(extentID uint64, suffix string) string {
 	return filepath.Join(fpath...)
 }
 
-
 func (s *diskFS) RemoveExtent(extentID uint64) error {
 	fileName := s.pathName(extentID, "ext")
 	return os.Remove(fileName)
 }
 
 func (s *diskFS) AllocCopyExtent(extentID uint64, ReplaceNodeID uint64) (string, error) {
-	utils.AssertTrue(s!=nil)
+	utils.AssertTrue(s != nil)
 	fpath := s.pathName(extentID, fmt.Sprintf("%d.copy", ReplaceNodeID))
 	return extent.CreateCopyExtent(fpath, extentID)
 }
@@ -128,7 +127,7 @@ func (s *diskFS) AllocExtent(ID uint64) (*extent.Extent, error) {
 
 func (s *diskFS) LoadExtents(normalExt func(string, uint64), copyExt func(string, uint64)) {
 	//walk all exts files
-	filepath.Walk(s.baseDir, func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(s.baseDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			xlog.Logger.Fatal(err)
 		}
@@ -141,12 +140,14 @@ func (s *diskFS) LoadExtents(normalExt func(string, uint64), copyExt func(string
 		} else if strings.HasSuffix(info.Name(), ".copy") {
 			copyExt(path, s.diskID)
 			return nil
-		} 
+		}
 		return nil
 	})
+	if err != nil {
+		xlog.Logger.Errorf(err.Error())
+	}
 }
 
-//FIXME:以后修改到storage.Default
 func (s *diskFS) Syncfs() {
 	syncfs(s.baseFd.Fd())
 }
