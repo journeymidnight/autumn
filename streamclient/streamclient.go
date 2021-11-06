@@ -581,12 +581,7 @@ func (sc *AutumnStreamClient) MustAllocNewExtent() error {
 			break
 		}
 		xlog.Logger.Errorf(err.Error())
-		if err == smclient.ErrTimeOut {
-			time.Sleep(5 * time.Second)
-			continue
-		}
-		return err
-
+		time.Sleep(100 * time.Millisecond)
 	}
 	sc.streamInfo = updatedStream
 	sc.em.WaitVersion(newExInfo.ExtentID, 1)
@@ -673,9 +668,9 @@ retry:
 		goto retry
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	pctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	c := pb.NewExtentServiceClient(conn)
-	res, err := c.Append(ctx, &pb.AppendRequest{
+	res, err := c.Append(pctx, &pb.AppendRequest{
 		ExtentID: extentID,
 		Blocks:   blocks,
 		Eversion: exInfo.Eversion,

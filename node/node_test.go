@@ -171,10 +171,12 @@ func (suite *ExtentNodeTestSuite) SetupSuite() {
 }
 
 func (suite *ExtentNodeTestSuite) TearDownSuite() {
+	for _, en := range suite.ens {
+		en.Shutdown()
+	}
 	suite.sm.Close()
 	suite.etcd.Close()
 	os.RemoveAll(suite.tmpdir)
-
 }
 
 const (
