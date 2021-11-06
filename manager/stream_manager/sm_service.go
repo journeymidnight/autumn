@@ -60,6 +60,7 @@ func (sm *StreamManager) CreateStream(ctx context.Context, req *pb.CreateStreamR
 	if err != nil {
 		return errDone(err)
 	}
+	fmt.Printf("chosen nodes %v\n", nodes)
 
 	diskIDs, err := sm.sendAllocToNodes(ctx, nodes, extentID)
 	if err != nil {
@@ -698,7 +699,7 @@ func (sm *StreamManager) sendAllocToNodes(ctx context.Context, nodes []*NodeStat
 	}
 	stopper.Wait()
 	if complets != n || !sm.AmLeader() {
-		return nil, errors.Errorf("not to create stream")
+		return nil, errors.Errorf("leader? %v, fail to create stream: complets %d < n %d", sm.AmLeader(), complets, n)
 	}
 	return diskIDs, nil
 }

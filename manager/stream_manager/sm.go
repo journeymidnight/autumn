@@ -341,6 +341,7 @@ func (sm *StreamManager) RegisterGRPC(grpcServer *grpc.Server) {
 }
 
 func (sm *StreamManager) Close() {
-	sm.client.Close()
+	//FIXME: sm should close leader loop first
+	//sm.client.Close()
 	sm.grcpServer.Stop()
 }

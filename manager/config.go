@@ -43,6 +43,7 @@ func (config *Config) GetEmbedConfig() (*embed.Config, error) {
 	embedConfig.ClusterState = config.InitialClusterState
 	embedConfig.InitialClusterToken = config.ClusterToken
 	embedConfig.InitialCluster = config.InitialCluster
+	embedConfig.LogLevel = "error" //ignore etcd warnings and infos
 
 	lcurls, err := parseUrls(config.ClientUrls)
 	if err != nil {
