@@ -49,7 +49,22 @@ var (
 	ErrBlockedWrites = errors.New("Writes are blocked, possibly due to DropAll or Close")
 )
 
-type OpenStreamFunc func(si pb.StreamInfo) streamclient.StreamClient
+type MemTable struct {
+	*skiplist.Skiplist
+	/*
+		this OriginDiscard will be written to SST's discard field
+		when flushed. it means this key-value pair will be discarded
+		when GC happens.
+	*/
+	OriginDiscard map[uint64]int64
+}
+
+func NewMemTable(capacity int64) *MemTable {
+	return &MemTable{
+		Skiplist:      skiplist.NewSkiplist(capacity),
+		OriginDiscard: make(map[uint64]int64),
+	}
+}
 
 type RangePartition struct {
 	logStream  streamclient.StreamClient
@@ -60,8 +75,8 @@ type RangePartition struct {
 
 	writeCh         chan *request
 	blockWrites     int32 //indicate if rp is alive.
-	mt              *skiplist.Skiplist
-	imm             []*skiplist.Skiplist
+	mt              *MemTable
+	imm             []*MemTable
 	utils.SafeMutex //protect mt,imm when swapping mt, imm
 
 	flushStopper *utils.Stopper
@@ -113,7 +128,7 @@ func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStre
 		logStream:   logStream,
 		metaStream:  metaStream,
 		blockReader: blockReader,
-		mt:          skiplist.NewSkiplist(int64(opt.MaxSkipList)),
+		mt:          NewMemTable(opt.MaxSkipList),
 		imm:         nil,
 		blockWrites: 0,
 		StartKey:    startKey,
@@ -271,14 +286,14 @@ func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStre
 }
 
 type flushTask struct {
-	mt     *skiplist.Skiplist
-	vptr   valuePointer
-	seqNum uint64
+	mt       *MemTable
+	vptr     valuePointer
+	seqNum   uint64
+	discards map[uint64]int64 //初始mt有discard, compact任务的最后一个table有discard
 
 	isCompact    bool           //如果是compact任务, 不需要修改rp.mt
 	resultCh     chan struct{}  //也可以用wg, 但是防止未来还需要发数据
 	removedTable []*table.Table //一次compact可以新建多个table, 只有最后一个table有removedTable和discard
-	discards     map[uint64]int64
 }
 
 //split相关, 提供相关参数给上层
@@ -384,11 +399,11 @@ func (rp *RangePartition) handleFlushTask(ft flushTask) (*table.Table, error) {
 	return tbl, nil
 }
 
-func (rp *RangePartition) getMemTables() ([]*skiplist.Skiplist, func()) {
+func (rp *RangePartition) getMemTables() ([]*MemTable, func()) {
 	rp.RLock()
 	defer rp.RUnlock()
 
-	tables := make([]*skiplist.Skiplist, len(rp.imm)+1)
+	tables := make([]*MemTable, len(rp.imm)+1)
 
 	// Get mutable memtable.
 	tables[0] = rp.mt
@@ -689,6 +704,12 @@ func (rp *RangePartition) writeToLSM(entries []*pb.EntryInfo) error {
 					Meta:      getLowerByte(entry.Log.Meta),
 					ExpiresAt: entry.Log.ExpiresAt,
 				})
+			/*
+				this OriginDiscard will be written to SST's discard field
+				when flushed. it means this key-value pair will be discarded
+				when GC happens.
+			*/
+			rp.mt.OriginDiscard[entry.ExtentID] += int64(entry.Log.Size())
 		} else {
 			vp := valuePointer{
 				entry.ExtentID,
@@ -832,7 +853,7 @@ func (rp *RangePartition) ensureRoomForWrite(entries []*pb.EntryInfo, head value
 	seqNum := atomic.AddUint64(&rp.seqNumber, 1)
 	//non-block, block if flushChan is full,
 	select {
-	case rp.flushChan <- flushTask{mt: rp.mt, vptr: head, seqNum: seqNum, isCompact: false}:
+	case rp.flushChan <- flushTask{mt: rp.mt, vptr: head, seqNum: seqNum, isCompact: false, discards: rp.mt.OriginDiscard}:
 		// After every memtable flush, let's reset the counter.
 
 		// Ensure value log is synced to disk so this memtable's contents wouldn't be lost.
@@ -841,7 +862,7 @@ func (rp *RangePartition) ensureRoomForWrite(entries []*pb.EntryInfo, head value
 			rp.mt.MemSize(), len(rp.flushChan))
 		rp.imm = append(rp.imm, rp.mt)
 
-		rp.mt = skiplist.NewSkiplist(rp.opt.MaxSkipList)
+		rp.mt = NewMemTable(rp.opt.MaxSkipList)
 		// New memtable is empty. We certainly have room.
 
 		return nil
@@ -1102,7 +1123,7 @@ func (rp *RangePartition) close(gracefull bool) error {
 				defer rp.Unlock()
 				utils.AssertTrue(rp.mt != nil)
 				select {
-				case rp.flushChan <- flushTask{mt: rp.mt, vptr: rp.vhead, seqNum: rp.seqNumber + 1}:
+				case rp.flushChan <- flushTask{mt: rp.mt, vptr: rp.vhead, seqNum: rp.seqNumber + 1, discards: rp.mt.OriginDiscard}:
 					//fmt.Printf("Gracefull stop: submitted to flushkask vp %+v\n", rp.vhead)
 					rp.imm = append(rp.imm, rp.mt) // Flusher will attempt to remove this from s.imm.
 					rp.mt = nil                    // Will segfault if we try writing!

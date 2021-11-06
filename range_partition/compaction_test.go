@@ -49,13 +49,12 @@ func TestCompaction(t *testing.T) {
 	tbls = rp.getTables()
 	beforeNums := len(tbls)
 
-
 	rp.doCompact(tbls, true)
 
 	tbls = rp.getTables()
 	afterNums := len(tbls)
 
-	require.Less(t, afterNums,beforeNums)
+	require.Less(t, afterNums, beforeNums)
 
 	//no key was lost
 	keys := rp.Range([]byte(""), []byte(""), 5000)
@@ -65,7 +64,7 @@ func TestCompaction(t *testing.T) {
 	}
 
 	//location was written to meta
-	block , err := metaStream.ReadLastBlock(context.Background())
+	block, err := metaStream.ReadLastBlock(context.Background())
 	require.Nil(t, err)
 	var tableLocs pspb.TableLocations
 	utils.MustUnMarshal(block.Data, &tableLocs)
@@ -73,7 +72,6 @@ func TestCompaction(t *testing.T) {
 
 	rp.Close()
 }
-
 
 func TestDicardBigData(t *testing.T) {
 	br := streamclient.NewMockBlockReader()
@@ -86,20 +84,18 @@ func TestDicardBigData(t *testing.T) {
 	defer metaStream.Close()
 
 	rp, err := OpenRangePartition(1, metaStream, rowStream, logStream, br,
-		[]byte(""), []byte(""),  TestOption())
-	
+		[]byte(""), []byte(""), TestOption())
+
 	require.Nil(t, err)
 
 	data1 := []byte(fmt.Sprintf("data1%01048576d", 10)) //1MB
 	data2 := []byte(fmt.Sprintf("data2%01048576d", 10)) //1MB
-	require.Nil(t, rp.Write([]byte("a"),data1)) 
-	require.Nil(t, rp.Write([]byte("b"),data2)) 
+	require.Nil(t, rp.Write([]byte("a"), data1))
+	require.Nil(t, rp.Write([]byte("b"), data2))
 
 	rp.Delete([]byte("a"))
 	rp.Delete([]byte("b"))
 
-
-	
 	var wg sync.WaitGroup
 	for i := 0; i < 2000; i++ {
 		wg.Add(1)
@@ -110,65 +106,54 @@ func TestDicardBigData(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	
-
 
 	rp.Close() //FORCE rp flush table
-
-
 
 	//open again
 	rp, err = OpenRangePartition(1, metaStream, rowStream, logStream, br,
 		[]byte(""), []byte(""), TestOption())
-	
+
 	require.Nil(t, err)
 
-
 	tbls := rp.getTables()
-
 
 	rp.doCompact(tbls, true)
 	tbls = tbls[:0]
 
-
-	rp.Write([]byte("c"),data1)
+	//force to make a new extent
+	rp.Write([]byte("c"), data1)
 	rp.Delete([]byte("c"))
 
 	require.Equal(t, 1, len(rp.tables))
-	require.Equal(t, 2, len(rp.tables[0].Discards))
-	
+
+	numOfExtents := len(rp.logStream.StreamInfo().GetExtentIDs())
+	require.Equal(t, numOfExtents-1, len(rp.tables[0].Discards))
+
 	for _, t := range rp.tables {
-		fmt.Printf("table %v ,size %d discards %v\n", t.Loc, t.EstimatedSize,  t.Discards)
+		fmt.Printf("table %v ,size %d discards %v\n", t.Loc, t.EstimatedSize, t.Discards)
 	}
-	
 
 	rp.Close()
-
 
 	//open rp again again
 	rp, err = OpenRangePartition(1, metaStream, rowStream, logStream, br,
 		[]byte(""), []byte(""), TestOption())
-	
+
 	require.Nil(t, err)
 	defer rp.Close()
 
-
 	tbls = rp.getTables()
-
 
 	rp.doCompact(tbls, true)
 	tbls = tbls[:0]
 
+	numOfExtents = len(rp.logStream.StreamInfo().GetExtentIDs())
+	require.Equal(t, numOfExtents, len(rp.tables[len(rp.tables)-1].Discards))
 
-	require.Equal(t, 3, len(rp.tables[len(rp.tables) - 1].Discards))
-	
 	/*
-	for _, t := range rp.tables {
-		fmt.Printf("table %v ,size %d discards %v\n", t.Loc, t.EstimatedSize,  t.Discards)
-	}
+		for _, t := range rp.tables {
+			fmt.Printf("table %v ,size %d discards %v\n", t.Loc, t.EstimatedSize,  t.Discards)
+		}
 	*/
-
-
-
 
 }

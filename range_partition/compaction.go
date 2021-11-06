@@ -8,7 +8,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/journeymidnight/autumn/range_partition/skiplist"
 	"github.com/journeymidnight/autumn/range_partition/table"
 	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/journeymidnight/autumn/utils"
@@ -155,9 +154,11 @@ func (rp *RangePartition) compact() {
 		case <-rp.majorCompactChan:
 			allTables := rp.getTables()
 			if len(allTables) == 0 {
+				fmt.Printf("len(allTables) == 0; ignore marjorCompaction\n")
 				continue
 			}
 			if len(allTables) < 2 && atomic.LoadUint32(&rp.hasOverlap) == 0 {
+				fmt.Printf("len(allTables) < 2 && overlap == 0;ignore marjorCompaction \n")
 				continue
 			}
 			eID := allTables[len(allTables)-1].Loc.ExtentID
@@ -242,7 +243,7 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 		var skipKey []byte
 		timeStart := time.Now()
 		var numKeys, numSkips uint64
-		memStore := skiplist.NewSkiplist(capacity)
+		memStore := NewMemTable(capacity) //compation memtable size is twice of op.MaxSkipList
 		for ; it.Valid(); it.Next() {
 
 			userKey := y.ParseKey(it.Key())
