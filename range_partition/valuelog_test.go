@@ -63,34 +63,32 @@ func TestRunGCSameObject(t *testing.T) {
 
 	rp, _ := OpenRangePartition(1, metaStream, rowStream, logStream, br,
 		[]byte(""), []byte(""), TestOption())
-	
+
 	data1 := []byte(fmt.Sprintf("data1%01048576d", 10)) //1MB
 	data2 := []byte(fmt.Sprintf("data2%01048576d", 10)) //1MB
-	require.Nil(t, rp.Write([]byte("TEST"),data1)) 
-	require.Nil(t, rp.Write([]byte("TEST"),data2)) 
+	require.Nil(t, rp.Write([]byte("TEST"), data1))
+	require.Nil(t, rp.Write([]byte("TEST"), data2))
 
 	replayLog(logStream, func(ei *pb.EntryInfo) (bool, error) {
 		fmt.Printf("%s\n", streamclient.FormatEntry(ei))
 		return true, nil
 	}, streamclient.WithReadFromStart(math.MaxUint32), streamclient.WithReplay())
-
 
 	rp.runGC(logStream.StreamInfo().ExtentIDs[0])
 
 	//KEY TEST~1 will be gc
 
 	data, err := rp.Get([]byte("TEST"))
-	
+
 	require.Nil(t, err)
 	require.Equal(t, data2, data)
 	require.NotEqual(t, data1, data)
 
-
 	/*
-	replayLog(logStream, func(ei *pb.EntryInfo) (bool, error) {
-		fmt.Printf("%s\n", streamclient.FormatEntry(ei))
-		return true, nil
-	}, streamclient.WithReadFromStart(math.MaxUint32), streamclient.WithReplay())
+		replayLog(logStream, func(ei *pb.EntryInfo) (bool, error) {
+			fmt.Printf("%s\n", streamclient.FormatEntry(ei))
+			return true, nil
+		}, streamclient.WithReadFromStart(math.MaxUint32), streamclient.WithReplay())
 	*/
 
 }
@@ -106,16 +104,15 @@ func TestRunGCMiddle(t *testing.T) {
 	defer rowStream.Close()
 	defer metaStream.Close()
 
-
 	rp, _ := OpenRangePartition(3, metaStream, rowStream, logStream, br,
 		[]byte(""), []byte(""), TestOption())
 
-	for i := 0 ;i < 2 ; i ++ {
+	for i := 0; i < 2; i++ {
 		require.Nil(t, rp.Write([]byte(fmt.Sprintf("a%d", i)), []byte("xx")))
 		require.Nil(t, rp.Write([]byte(fmt.Sprintf("b%d", i)), []byte(fmt.Sprintf("%01048576d", 10)))) //1MB
 		require.Nil(t, rp.Write([]byte(fmt.Sprintf("c%d", i)), []byte("xx")))
 	}
-	
+
 	//a0,b0 on the first
 	//c0,a1,b1 on the second
 	//c1 on the third
@@ -128,21 +125,22 @@ func TestRunGCMiddle(t *testing.T) {
 	fmt.Printf("run GC on second Extent %d\n", secondEx)
 	rp.runGC(secondEx)
 
-	v , err := rp.Get([]byte("c0"))
+	v, err := rp.Get([]byte("c0"))
 	require.Nil(t, err)
 	require.Equal(t, []byte("xx"), v)
 
-	expectedValue := []string{"a0","b0", "c1", "b1"}
+	expectedValue := []string{"a0", "b0", "c1", "b1"}
 	var results []string
 	replayLog(logStream, func(ei *pb.EntryInfo) (bool, error) {
 		fmt.Printf("%s\n", streamclient.FormatEntry(ei))
 		results = append(results, string(y.ParseKey(ei.Log.Key)))
 		return true, nil
 	}, streamclient.WithReadFromStart(math.MaxUint32), streamclient.WithReplay())
-	
+
 	require.Equal(t, expectedValue, results)
-	
+
 }
+
 //WARNING: mockstreamclient.testThreshold MUST BE 1M to run this test.
 func TestRunGCMove(t *testing.T) {
 
@@ -155,36 +153,33 @@ func TestRunGCMove(t *testing.T) {
 	defer rowStream.Close()
 	defer metaStream.Close()
 
-
 	rp, _ := OpenRangePartition(3, metaStream, rowStream, logStream, br,
 		[]byte(""), []byte(""), TestOption())
-	
-	
-	for i := 0 ;i < 2 ; i ++ {
+
+	for i := 0; i < 2; i++ {
 		require.Nil(t, rp.Write([]byte(fmt.Sprintf("a%d", i)), []byte("xx")))
 		require.Nil(t, rp.Write([]byte(fmt.Sprintf("b%d", i)), []byte(fmt.Sprintf("%01048576d", 10)))) //1MB
 		require.Nil(t, rp.Write([]byte(fmt.Sprintf("c%d", i)), []byte("xx")))
 	}
-	
+
 	//a0,b0 on the first
 	//c0,a1,b1 on the second
 	//c1 on the third
 	require.Equal(t, 3, len(logStream.StreamInfo().ExtentIDs))
 
-
 	rp.Delete([]byte("a0"))
-	
+
 	firstEx := logStream.StreamInfo().ExtentIDs[0]
 	fmt.Printf("run GC on second Extent %d\n", firstEx)
 	rp.runGC(firstEx)
 
 	/*
-	c0 on first, flag [0] 
-    a1 on first, flag [0] 
-    b1 on first, flag [2] 
-    c1 on second, flag [0] 
-    a0 on second, flag [1] a0 is delete tag
-    b0 on second, flag [2] 
+			c0 on first, flag [0]
+		    a1 on first, flag [0]
+		    b1 on first, flag [2]
+		    c1 on second, flag [0]
+		    a0 on second, flag [1] a0 is delete tag
+		    b0 on second, flag [2]
 	*/
 	expectedValue := []string{"c0", "a1", "b1", "c1", "a0", "b0"}
 	var result []string
@@ -263,8 +258,6 @@ func TestLogReplay(t *testing.T) {
 
 }
 
-
-
 func TestSubmitGC(t *testing.T) {
 	br := streamclient.NewMockBlockReader()
 	logStream := streamclient.NewMockStreamClient("log", br)
@@ -277,19 +270,17 @@ func TestSubmitGC(t *testing.T) {
 
 	rp, err := OpenRangePartition(1, metaStream, rowStream, logStream, br,
 		[]byte(""), []byte(""), TestOption())
-	
+
 	require.Nil(t, err)
 
 	data1 := []byte(fmt.Sprintf("data1%01048576d", 10)) //1MB
 	data2 := []byte(fmt.Sprintf("data2%01048576d", 10)) //1MB
-	require.Nil(t, rp.Write([]byte("a"),data1)) 
-	require.Nil(t, rp.Write([]byte("b"),data2)) 
+	require.Nil(t, rp.Write([]byte("a"), data1))
+	require.Nil(t, rp.Write([]byte("b"), data2))
 
 	rp.Delete([]byte("a"))
 	rp.Delete([]byte("b"))
 
-
-	
 	var wg sync.WaitGroup
 	for i := 0; i < 2000; i++ {
 		wg.Add(1)
@@ -303,11 +294,10 @@ func TestSubmitGC(t *testing.T) {
 
 	rp.Close()
 
-
 	//open again
 	rp, err = OpenRangePartition(1, metaStream, rowStream, logStream, br,
 		[]byte(""), []byte(""), TestOption())
-	
+
 	require.Nil(t, err)
 
 	require.Nil(t, rp.SubmitCompaction())
@@ -321,10 +311,9 @@ func TestSubmitGC(t *testing.T) {
 
 	time.Sleep(1 * time.Second)
 
-	require.Equal(t, 2, len(rp.logStream.StreamInfo().GetExtentIDs()))
+	require.Equal(t, 1, len(rp.logStream.StreamInfo().GetExtentIDs()))
 	//fmt.Println(rp.logStream.StreamInfo().GetExtentIDs())
 
-	
 	rp.Close()
-	
+
 }

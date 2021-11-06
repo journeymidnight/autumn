@@ -73,23 +73,25 @@ type Builder struct {
 
 	baseKey []byte // Base key for the current block.
 	//baseOffset   uint32   // Offset for the current block.
-	entryOffsets []uint32 // Offsets of entries present in current block.
-	tableIndex   *pspb.TableIndex
-	keyHashes    []uint64 // Used for building the bloomfilter.
-	stream       streamclient.StreamClient
-	writeCh      chan writeBlock
-	stopper      *utils.Stopper
+	entryOffsets  []uint32 // Offsets of entries present in current block.
+	tableIndex    *pspb.TableIndex
+	keyHashes     []uint64 // Used for building the bloomfilter.
+	stream        streamclient.StreamClient
+	writeCh       chan writeBlock
+	stopper       *utils.Stopper
+	originDiscard map[uint64]int64
 }
 
 // NewTableBuilder makes a new TableBuilder.
 func NewTableBuilder(stream streamclient.StreamClient) *Builder {
 	b := &Builder{
-		tableIndex:   &pspb.TableIndex{},
-		keyHashes:    make([]uint64, 0, 1024), // Avoid some malloc calls.
-		stream:       stream,
-		writeCh:      make(chan writeBlock, 16),
-		stopper:      utils.NewStopper(),
-		currentBlock: &pb.Block{Data: make([]byte, 64*KB)},
+		tableIndex:    &pspb.TableIndex{},
+		keyHashes:     make([]uint64, 0, 1024), // Avoid some malloc calls.
+		stream:        stream,
+		writeCh:       make(chan writeBlock, 16),
+		stopper:       utils.NewStopper(),
+		currentBlock:  &pb.Block{Data: make([]byte, 64*KB)},
+		originDiscard: make(map[uint64]int64),
 	}
 
 	b.stopper.RunWorker(func() {
