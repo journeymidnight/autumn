@@ -15,7 +15,6 @@
 package extent
 
 import (
-	"fmt"
 	"io"
 	"io/ioutil"
 	"strconv"
@@ -532,9 +531,9 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 		}
 
 		if err != nil {
-			fmt.Printf("DISK ReadBlocks: err != nil %s\n", err)
 			xlog.Logger.Errorf("extent %d readBlock from %d , err is %s", ex.ID, offset, err)
-			return nil, nil, 0, err
+			return ret, offsets, end, wire_errors.EndOfExtent
+			//return nil, nil, 0, err
 		}
 
 		data, err := ioutil.ReadAll(reader)

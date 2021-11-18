@@ -318,6 +318,7 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 	}
 }
 
+//discards: map[extentID]dicardSize
 func validDiscard(discards map[uint64]int64, extentIDs []uint64) map[uint64]int64 {
 	extentIdx := make(map[uint64]bool)
 	for _, extentID := range extentIDs {

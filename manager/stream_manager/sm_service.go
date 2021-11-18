@@ -689,8 +689,12 @@ func (sm *StreamManager) sendAllocToNodes(ctx context.Context, nodes []*NodeStat
 			res, err := c.AllocExtent(pctx, &pb.AllocExtentRequest{
 				ExtentID: extentID,
 			})
-			if err != nil || res.Code != pb.Code_OK {
+			if err != nil {
 				xlog.Logger.Warnf(err.Error())
+				return
+			}
+			if res.Code != pb.Code_OK {
+				xlog.Logger.Warnf("%v", res)
 				return
 			}
 			diskIDs[j] = res.DiskID
