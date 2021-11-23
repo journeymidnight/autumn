@@ -20,24 +20,23 @@ var (
 )
 
 type MockBlockReader struct {
-	exs             map[uint64]*extent.Extent
 	utils.SafeMutex //protect exs
 }
 
-func (br *MockBlockReader) SealedLength(extentID uint64) (uint64, error) {
-	br.RLock()
-	ex := br.exs[extentID]
-	br.RUnlock()
+func (client *MockStreamClient) SealedLength(extentID uint64) (uint64, error) {
+	client.RLock()
+	ex := client.exs[extentID]
+	client.RUnlock()
 	if ex == nil || !ex.IsSeal() {
 		return 0, errors.New("extentID not good")
 	}
 	return uint64(ex.CommitLength()), nil
 }
 
-func (br *MockBlockReader) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32, hint byte) ([]*pb.Block, uint32, error) {
-	br.RLock()
-	ex := br.exs[extentID]
-	br.RUnlock()
+func (client *MockStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32, hint byte) ([]*pb.Block, uint32, error) {
+	client.RLock()
+	ex := client.exs[extentID]
+	client.RUnlock()
 
 	if ex == nil {
 		fmt.Printf("extentID is %d", extentID)
@@ -60,8 +59,8 @@ type MockStreamClient struct {
 	names  []string
 	ID     uint64
 	suffix string
-	br     *MockBlockReader
 	utils.SafeMutex
+	exs map[uint64]*extent.Extent
 }
 
 var (
@@ -72,24 +71,27 @@ func fileName(id uint64, suffix string) string {
 	return fmt.Sprintf("%s_%d.%s", fileNamePrefix, id, suffix)
 }
 
+/*
 func NewMockBlockReader() *MockBlockReader {
 	return &MockBlockReader{
 		exs: make(map[uint64]*extent.Extent),
 	}
 }
+*/
 
-func NewMockStreamClient(suffix string, br *MockBlockReader) StreamClient {
+func NewMockStreamClient(suffix string) StreamClient {
 	sID := uint64(rand.Uint32())
 	name := fileName(sID, suffix)
 
 	ex, err := extent.CreateExtent(name, sID)
 
-	br.exs[ex.ID] = ex
+	exs := make(map[uint64]*extent.Extent)
+	exs[ex.ID] = ex
 	utils.Check(err)
 	return &MockStreamClient{
 		ID:     sID,
 		suffix: suffix,
-		br:     br,
+		exs:    exs,
 		stream: []uint64{ex.ID},
 	}
 }
@@ -97,15 +99,16 @@ func NewMockStreamClient(suffix string, br *MockBlockReader) StreamClient {
 //only open log file
 func OpenMockStreamClient(si pb.StreamInfo, br *MockBlockReader) StreamClient {
 	sID := si.StreamID
+	exs := make(map[uint64]*extent.Extent)
 	for _, eID := range si.ExtentIDs {
 		name := fileName(eID, "log")
 		ex, err := extent.OpenExtent(name)
 		utils.Check(err)
-		br.exs[ex.ID] = ex
+		exs[ex.ID] = ex
 	}
 
 	return &MockStreamClient{
-		br:     br,
+		exs:    exs,
 		ID:     sID,
 		suffix: "log",
 	}
@@ -114,9 +117,9 @@ func OpenMockStreamClient(si pb.StreamInfo, br *MockBlockReader) StreamClient {
 func (client *MockStreamClient) CommitEnd() uint32 {
 	exIndex := len(client.stream) - 1
 	exID := client.stream[exIndex]
-	client.br.Lock()
-	ex := client.br.exs[exID]
-	client.br.Unlock()
+	client.Lock()
+	ex := client.exs[exID]
+	client.Unlock()
 	return ex.CommitLength()
 
 }
@@ -146,11 +149,9 @@ func (client *MockStreamClient) Truncate(ctx context.Context, extentID uint64) e
 		exID := client.stream[j]
 		name := fileName(exID, client.suffix)
 		//fmt.Printf("delete %s\n", name)
-		client.br.Lock()
-		ex := client.br.exs[exID]
+		ex := client.exs[exID]
 		ex.Close()
-		delete(client.br.exs, exID)
-		client.br.Unlock()
+		delete(client.exs, exID)
 		os.Remove(name)
 	}
 	client.stream = client.stream[i:]
@@ -181,9 +182,9 @@ func (client *MockStreamClient) AppendEntries(ctx context.Context, entries []*pb
 func (client *MockStreamClient) Append(ctx context.Context, blocks []*pb.Block, mustSync bool) (uint64, []uint32, uint32, error) {
 	exIndex := len(client.stream) - 1
 	exID := client.stream[exIndex]
-	client.br.Lock()
-	ex := client.br.exs[exID]
-	client.br.Unlock()
+	client.Lock()
+	ex := client.exs[exID]
+	client.Unlock()
 
 	ex.Lock()
 	defer ex.Unlock()
@@ -191,8 +192,6 @@ func (client *MockStreamClient) Append(ctx context.Context, blocks []*pb.Block, 
 	offsets, end, err := ex.AppendBlocks(blocks, mustSync)
 
 	if ex.CommitLength() > uint32(testThreshold) {
-		client.Lock()
-		defer client.Unlock()
 		//seal
 		ex.Seal(ex.CommitLength())
 		//create new
@@ -201,9 +200,9 @@ func (client *MockStreamClient) Append(ctx context.Context, blocks []*pb.Block, 
 		newEx, err := extent.CreateExtent(name, eID)
 		utils.Check(err)
 
-		client.br.Lock()
-		client.br.exs[newEx.ID] = newEx
-		client.br.Unlock()
+		client.Lock()
+		client.exs[newEx.ID] = newEx
+		client.Unlock()
 
 		client.stream = append(client.stream, newEx.ID)
 	}
@@ -215,11 +214,11 @@ func (client *MockStreamClient) Close() {
 		name := fileName(exID, client.suffix)
 		//fmt.Printf("delete %s\n", name)
 
-		client.br.Lock()
-		ex := client.br.exs[exID]
+		client.Lock()
+		ex := client.exs[exID]
 		ex.Close()
-		delete(client.br.exs, exID)
-		client.br.Unlock()
+		delete(client.exs, exID)
+		client.Unlock()
 		os.Remove(name)
 	}
 }
@@ -242,9 +241,9 @@ func (client *MockStreamClient) StreamInfo() *pb.StreamInfo {
 func (client *MockStreamClient) ReadLastBlock(ctx context.Context) (*pb.Block, error) {
 	exIndex := len(client.stream) - 1
 	exID := client.stream[exIndex]
-	client.br.Lock()
-	ex := client.br.exs[exID]
-	client.br.Unlock()
+	client.Lock()
+	ex := client.exs[exID]
+	client.Unlock()
 
 	ex.Lock()
 	defer ex.Unlock()
@@ -311,9 +310,6 @@ func (client *MockStreamClient) NewLogEntryIter(opts ...ReadOption) LogEntryIter
 		}
 
 	}
-	if readOpt.Replay {
-		x.replay = true
-	}
 
 	return x
 }
@@ -325,7 +321,6 @@ type MockLockEntryIter struct {
 	opt           *readOption
 	noMore        bool
 	cache         []*pb.EntryInfo
-	replay        bool
 	n             int //number of extents we have read
 
 }
@@ -346,11 +341,11 @@ func (iter *MockLockEntryIter) HasNext() (bool, error) {
 func (iter *MockLockEntryIter) receiveEntries() error {
 
 	exID := iter.sc.stream[iter.currentIndex]
-	iter.sc.br.RLock()
-	ex := iter.sc.br.exs[exID]
-	iter.sc.br.RUnlock()
+	iter.sc.RLock()
+	ex := iter.sc.exs[exID]
+	iter.sc.RUnlock()
 
-	res, tail, err := ex.ReadEntries(iter.currentOffset, 16*KB, iter.replay)
+	res, tail, err := ex.ReadEntries(iter.currentOffset, 16*KB)
 
 	if len(res) > 0 {
 		iter.cache = nil

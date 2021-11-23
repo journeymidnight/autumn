@@ -210,8 +210,8 @@ func (suite *ExtentNodeTestSuite) TestAppendReadValue() {
 	suite.Require().True(len(offsets) > 0)
 	//fmt.Printf("%d=>%d, on extent %d\n", offsets[0], end, extentID)
 
-	blockReader := streamclient.NewAutumnBlockReader(em, sm)
-	ret, end, err := blockReader.Read(context.Background(), extentID, offsets[0], 2, streamclient.HintReadFromCache)
+	sc = streamclient.NewStreamClient(sm, em, testExtentSize, si.StreamID, streamclient.MutexToLock(suite.mutex))
+	ret, end, err := sc.Read(context.Background(), extentID, offsets[0], 2, streamclient.HintReadFromCache)
 	suite.Require().Nil(err)
 
 	fmt.Printf("ret:%v, end %d\n", ret, end)

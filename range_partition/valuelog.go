@@ -122,7 +122,7 @@ func (rp *RangePartition) startGC() {
 					})
 					for i := 0; i < len(canndidates) && i < MAX_GC_ONCE; i++ {
 						exID := canndidates[i]
-						size, err := rp.blockReader.SealedLength(exID)
+						size, err := rp.logStream.SealedLength(exID)
 						if err != nil {
 							xlog.Logger.Errorf("get sealed length error: %v in runGC", err)
 							continue
@@ -176,11 +176,9 @@ func (rp *RangePartition) runGC(extentID uint64) {
 		userKey := y.ParseKey(ei.Log.Key)
 
 		//fmt.Printf("processing %s\n", userKey)
-		//if small file, ei.Log.Value must be nil
-		//if big file, len(ei.Log.Value) > 0
+		//if small file
 		if (ei.Log.Meta & uint32(y.BitValuePointer)) == 0 {
 			//fmt.Printf("discard small entry, key: %s\n", streamclient.FormatEntry(ei))
-			utils.AssertTrue(ei.Log.Value == nil)
 			return true, nil
 		}
 

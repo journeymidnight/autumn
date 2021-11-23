@@ -166,7 +166,7 @@ func benchmark(etcdUrls []string, op BenchType, threadNum int, duration int) err
 								fmt.Printf("%v\n", err)
 								return -1
 							}
-							if (loop % 5) == 0 {
+							if (loop % 1) == 0 {
 								lock.Lock()
 								results = append(results, Result{
 									Key:       key,

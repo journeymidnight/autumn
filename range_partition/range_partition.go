@@ -71,7 +71,7 @@ type RangePartition struct {
 	rowStream  streamclient.StreamClient
 	metaStream streamclient.StreamClient
 
-	blockReader streamclient.BlockReader
+	//blockReader streamclient.BlockReader
 
 	writeCh         chan *request
 	blockWrites     int32 //indicate if rp is alive.
@@ -111,7 +111,7 @@ type RangePartition struct {
 //interface KV save some values
 
 func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStream streamclient.StreamClient,
-	logStream streamclient.StreamClient, blockReader streamclient.BlockReader,
+	logStream streamclient.StreamClient,
 	startKey []byte, endKey []byte,
 	opts ...OptionFunc,
 ) (*RangePartition, error) {
@@ -127,7 +127,6 @@ func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStre
 		rowStream:   rowStream,
 		logStream:   logStream,
 		metaStream:  metaStream,
-		blockReader: blockReader,
 		mt:          NewMemTable(opt.MaxSkipList),
 		imm:         nil,
 		blockWrites: 0,
@@ -162,7 +161,7 @@ func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStre
 	//tableLocs的顺序就是在logStream里面的顺序
 	for _, tLoc := range tableLocs.Locs {
 	retry:
-		tbl, err := table.OpenTable(rp.blockReader, tLoc.ExtentID, tLoc.Offset)
+		tbl, err := table.OpenTable(rp.rowStream, tLoc.ExtentID, tLoc.Offset)
 		if err != nil {
 			xlog.Logger.Error(err)
 			time.Sleep(1 * time.Second)
@@ -251,14 +250,14 @@ func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStre
 
 	start := time.Now()
 	if lastTable == nil {
-		err := replayLog(rp.logStream, replay, streamclient.WithReadFromStart(math.MaxUint32), streamclient.WithReplay())
+		err := replayLog(rp.logStream, replay, streamclient.WithReadFromStart(math.MaxUint32))
 		if err != nil {
 			return nil, err
 		}
 	} else {
 		//fmt.Printf("replay log from vp extent %d, offset [%d]\n", lastTable.VpExtentID, lastTable.VpOffset)
 		err := replayLog(rp.logStream, replay,
-			streamclient.WithReadFrom(lastTable.VpExtentID, lastTable.VpOffset, math.MaxUint32), streamclient.WithReplay())
+			streamclient.WithReadFrom(lastTable.VpExtentID, lastTable.VpOffset, math.MaxUint32))
 
 		if err != nil {
 			return nil, err
@@ -388,7 +387,7 @@ func (rp *RangePartition) handleFlushTask(ft flushTask) (*table.Table, error) {
 		return nil, err
 	}
 
-	tbl, err := table.OpenTable(rp.blockReader, id, offset)
+	tbl, err := table.OpenTable(rp.rowStream, id, offset)
 	if err != nil {
 		xlog.Logger.Errorf("ERROR while opening table: %v", err)
 		return nil, err
@@ -1015,7 +1014,7 @@ func (rp *RangePartition) Get(userKey []byte) ([]byte, error) {
 		var vp valuePointer
 		vp.Decode(vs.Value)
 		//fmt.Printf("%s's location is [%d, %d]\n", userKey, vp.extentID, vp.offset)
-		blocks, _, err := rp.blockReader.Read(context.Background(), vp.extentID, vp.offset, 1, streamclient.HintReadThrough)
+		blocks, _, err := rp.logStream.Read(context.Background(), vp.extentID, vp.offset, 1, streamclient.HintReadThrough)
 		if err != nil {
 			return nil, err
 		}

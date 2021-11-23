@@ -52,16 +52,15 @@ func TestRunRepeatRead(t *testing.T) {
 
 //WARNING: mockstreamclient.testThreshold MUST BE 1M to run this test.
 func TestRunGCSameObject(t *testing.T) {
-	br := streamclient.NewMockBlockReader()
-	logStream := streamclient.NewMockStreamClient("log", br)
-	rowStream := streamclient.NewMockStreamClient("sst", br)
-	metaStream := streamclient.NewMockStreamClient("meta", br)
+	logStream := streamclient.NewMockStreamClient("log")
+	rowStream := streamclient.NewMockStreamClient("sst")
+	metaStream := streamclient.NewMockStreamClient("meta")
 
 	defer logStream.Close()
 	defer rowStream.Close()
 	defer metaStream.Close()
 
-	rp, _ := OpenRangePartition(1, metaStream, rowStream, logStream, br,
+	rp, _ := OpenRangePartition(1, metaStream, rowStream, logStream,
 		[]byte(""), []byte(""), TestOption())
 
 	data1 := []byte(fmt.Sprintf("data1%01048576d", 10)) //1MB
@@ -72,7 +71,7 @@ func TestRunGCSameObject(t *testing.T) {
 	replayLog(logStream, func(ei *pb.EntryInfo) (bool, error) {
 		fmt.Printf("%s\n", streamclient.FormatEntry(ei))
 		return true, nil
-	}, streamclient.WithReadFromStart(math.MaxUint32), streamclient.WithReplay())
+	}, streamclient.WithReadFromStart(math.MaxUint32))
 
 	rp.runGC(logStream.StreamInfo().ExtentIDs[0])
 
@@ -95,16 +94,15 @@ func TestRunGCSameObject(t *testing.T) {
 
 //WARNING: mockstreamclient.testThreshold MUST BE 1M to run this test.
 func TestRunGCMiddle(t *testing.T) {
-	br := streamclient.NewMockBlockReader()
-	logStream := streamclient.NewMockStreamClient("log", br)
-	rowStream := streamclient.NewMockStreamClient("sst", br)
-	metaStream := streamclient.NewMockStreamClient("meta", br)
+	logStream := streamclient.NewMockStreamClient("log")
+	rowStream := streamclient.NewMockStreamClient("sst")
+	metaStream := streamclient.NewMockStreamClient("meta")
 
 	defer logStream.Close()
 	defer rowStream.Close()
 	defer metaStream.Close()
 
-	rp, _ := OpenRangePartition(3, metaStream, rowStream, logStream, br,
+	rp, _ := OpenRangePartition(3, metaStream, rowStream, logStream,
 		[]byte(""), []byte(""), TestOption())
 
 	for i := 0; i < 2; i++ {
@@ -135,7 +133,7 @@ func TestRunGCMiddle(t *testing.T) {
 		fmt.Printf("%s\n", streamclient.FormatEntry(ei))
 		results = append(results, string(y.ParseKey(ei.Log.Key)))
 		return true, nil
-	}, streamclient.WithReadFromStart(math.MaxUint32), streamclient.WithReplay())
+	}, streamclient.WithReadFromStart(math.MaxUint32))
 
 	require.Equal(t, expectedValue, results)
 
@@ -143,17 +141,15 @@ func TestRunGCMiddle(t *testing.T) {
 
 //WARNING: mockstreamclient.testThreshold MUST BE 1M to run this test.
 func TestRunGCMove(t *testing.T) {
-
-	br := streamclient.NewMockBlockReader()
-	logStream := streamclient.NewMockStreamClient("log", br)
-	rowStream := streamclient.NewMockStreamClient("sst", br)
-	metaStream := streamclient.NewMockStreamClient("meta", br)
+	logStream := streamclient.NewMockStreamClient("log")
+	rowStream := streamclient.NewMockStreamClient("sst")
+	metaStream := streamclient.NewMockStreamClient("meta")
 
 	defer logStream.Close()
 	defer rowStream.Close()
 	defer metaStream.Close()
 
-	rp, _ := OpenRangePartition(3, metaStream, rowStream, logStream, br,
+	rp, _ := OpenRangePartition(3, metaStream, rowStream, logStream,
 		[]byte(""), []byte(""), TestOption())
 
 	for i := 0; i < 2; i++ {
@@ -186,7 +182,7 @@ func TestRunGCMove(t *testing.T) {
 	replayLog(logStream, func(ei *pb.EntryInfo) (bool, error) {
 		result = append(result, string(y.ParseKey(ei.Log.Key)))
 		return true, nil
-	}, streamclient.WithReadFromStart(math.MaxUint32), streamclient.WithReplay())
+	}, streamclient.WithReadFromStart(math.MaxUint32))
 	require.Equal(t, expectedValue, result)
 }
 func TestLogReplay(t *testing.T) {
@@ -215,7 +211,7 @@ func TestLogReplay(t *testing.T) {
 		},
 	}
 
-	logStream := streamclient.NewMockStreamClient("log", streamclient.NewMockBlockReader())
+	logStream := streamclient.NewMockStreamClient("log")
 	defer logStream.Close()
 
 	extentID, offset, err := logStream.AppendEntries(context.Background(), cases, true)
@@ -259,16 +255,15 @@ func TestLogReplay(t *testing.T) {
 }
 
 func TestSubmitGC(t *testing.T) {
-	br := streamclient.NewMockBlockReader()
-	logStream := streamclient.NewMockStreamClient("log", br)
-	rowStream := streamclient.NewMockStreamClient("sst", br)
-	metaStream := streamclient.NewMockStreamClient("meta", br)
+	logStream := streamclient.NewMockStreamClient("log")
+	rowStream := streamclient.NewMockStreamClient("sst")
+	metaStream := streamclient.NewMockStreamClient("meta")
 
 	defer logStream.Close()
 	defer rowStream.Close()
 	defer metaStream.Close()
 
-	rp, err := OpenRangePartition(1, metaStream, rowStream, logStream, br,
+	rp, err := OpenRangePartition(1, metaStream, rowStream, logStream,
 		[]byte(""), []byte(""), TestOption())
 
 	require.Nil(t, err)
@@ -295,7 +290,7 @@ func TestSubmitGC(t *testing.T) {
 	rp.Close()
 
 	//open again
-	rp, err = OpenRangePartition(1, metaStream, rowStream, logStream, br,
+	rp, err = OpenRangePartition(1, metaStream, rowStream, logStream,
 		[]byte(""), []byte(""), TestOption())
 
 	require.Nil(t, err)

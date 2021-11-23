@@ -34,7 +34,7 @@ func key(prefix string, i int) string {
 	return prefix + fmt.Sprintf("%04d", i)
 }
 
-func buildTestTable(t *testing.T, prefix string, n int) (streamclient.StreamClient, streamclient.BlockReader, uint64, uint32) {
+func buildTestTable(t *testing.T, prefix string, n int) (streamclient.StreamClient, uint64, uint32) {
 	utils.AssertTrue(n <= 10000)
 	keyValues := make([][]string, n)
 	for i := 0; i < n; i++ {
@@ -46,11 +46,10 @@ func buildTestTable(t *testing.T, prefix string, n int) (streamclient.StreamClie
 }
 
 // keyValues is n by 2 where n is number of pairs.
-func buildTable(t *testing.T, keyValues [][]string) (streamclient.StreamClient, streamclient.BlockReader, uint64, uint32) {
+func buildTable(t *testing.T, keyValues [][]string) (streamclient.StreamClient, uint64, uint32) {
 	//open local stream
-	br := streamclient.NewMockBlockReader()
 
-	stream := streamclient.NewMockStreamClient("log", br)
+	stream := streamclient.NewMockStreamClient("log")
 	b := NewTableBuilder(stream)
 	defer b.Close()
 
@@ -61,17 +60,17 @@ func buildTable(t *testing.T, keyValues [][]string) (streamclient.StreamClient, 
 		utils.AssertTrue(len(kv) == 2)
 		b.Add(y.KeyWithTs([]byte(kv[0]), 0), y.ValueStruct{Value: []byte(kv[1]), Meta: 'A'})
 	}
-	b.FinishBlock()                          //finish current block
+	b.FinishBlock()                               //finish current block
 	ex, offset, err := b.FinishAll(0, 0, 10, nil) //finish all table
 	assert.Nil(t, err)
-	return stream, br, ex, offset
+	return stream, ex, offset
 }
 
-func  TestMidKey(t *testing.T) {
-	stream, br, id, offset := buildTestTable(t, "key", 5000)
+func TestMidKey(t *testing.T) {
+	stream, id, offset := buildTestTable(t, "key", 5000)
 	defer stream.Close()
 
-	table, err := OpenTable(br, id, offset)
+	table, err := OpenTable(stream, id, offset)
 
 	require.NoError(t, err)
 
@@ -81,10 +80,10 @@ func TestSeekToFirst(t *testing.T) {
 	for _, n := range []int{101, 199, 200, 250, 9999, 10000} {
 		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
 
-			stream, br, id, offset := buildTestTable(t, "key", n)
+			stream, id, offset := buildTestTable(t, "key", n)
 			defer stream.Close()
 
-			table, err := OpenTable(br, id, offset)
+			table, err := OpenTable(stream, id, offset)
 
 			require.NoError(t, err)
 			it := table.NewIterator(false)
@@ -102,9 +101,9 @@ func TestSeekToLast(t *testing.T) {
 	for _, n := range []int{101, 199, 200, 250, 9999, 10000} {
 		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
 
-			stream, br, id, offset := buildTestTable(t, "key", n)
+			stream, id, offset := buildTestTable(t, "key", n)
 			defer stream.Close()
-			table, err := OpenTable(br, id, offset)
+			table, err := OpenTable(stream, id, offset)
 			require.NoError(t, err)
 			it := table.NewIterator(false)
 			defer it.Close()
@@ -122,13 +121,11 @@ func TestSeekToLast(t *testing.T) {
 	}
 }
 
-
-
 func TestSeek(t *testing.T) {
-	stream,br, id, offset := buildTestTable(t, "k", 10000)
+	stream, id, offset := buildTestTable(t, "k", 10000)
 	defer stream.Close()
 
-	table, err := OpenTable(br, id, offset)
+	table, err := OpenTable(stream, id, offset)
 
 	require.NoError(t, err)
 
@@ -165,10 +162,10 @@ func TestSeek(t *testing.T) {
 }
 
 func TestSeekForPrev(t *testing.T) {
-	stream, br, id, offset := buildTestTable(t, "k", 10000)
+	stream, id, offset := buildTestTable(t, "k", 10000)
 	defer stream.Close()
 
-	table, err := OpenTable(br, id, offset)
+	table, err := OpenTable(stream, id, offset)
 
 	require.NoError(t, err)
 
@@ -206,10 +203,10 @@ func TestIterateFromStart(t *testing.T) {
 	// Vary the number of elements added.
 	for _, n := range []int{101, 199, 200, 250, 9999, 10000} {
 		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
-			stream, br, id, offset := buildTestTable(t, "k", n)
+			stream, id, offset := buildTestTable(t, "k", n)
 			defer stream.Close()
 
-			table, err := OpenTable(br, id, offset)
+			table, err := OpenTable(stream, id, offset)
 
 			require.NoError(t, err)
 			ti := table.NewIterator(false)
@@ -236,13 +233,13 @@ func TestIterateFromEnd(t *testing.T) {
 	// Vary the number of elements added.
 	for _, n := range []int{101, 199, 200, 250, 9999, 10000} {
 		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
-			stream,br, id, offset := buildTestTable(t, "k", n)
+			stream, id, offset := buildTestTable(t, "k", n)
 			defer stream.Close()
 
-			table, err := OpenTable(br, id, offset)
+			table, err := OpenTable(stream, id, offset)
 
 			require.NoError(t, err)
-			
+
 			ti := table.NewIterator(false)
 			defer ti.Close()
 			ti.reset()
@@ -264,10 +261,10 @@ func TestIterateFromEnd(t *testing.T) {
 
 func TestTable(t *testing.T) {
 
-	stream, br, id, offset := buildTestTable(t, "key", 10000)
+	stream, id, offset := buildTestTable(t, "key", 10000)
 	defer stream.Close()
 
-	table, err := OpenTable(br, id, offset)
+	table, err := OpenTable(stream, id, offset)
 
 	require.NoError(t, err)
 	ti := table.NewIterator(false)
@@ -297,13 +294,12 @@ func TestTable(t *testing.T) {
 
 func TestIterateBackAndForth(t *testing.T) {
 
-	stream, br, id, offset := buildTestTable(t, "key", 10000)
+	stream, id, offset := buildTestTable(t, "key", 10000)
 	defer stream.Close()
 
-	table, err := OpenTable(br, id, offset)
+	table, err := OpenTable(stream, id, offset)
 
 	require.NoError(t, err)
-	
 
 	seek := y.KeyWithTs([]byte(key("key", 1010)), 0)
 
@@ -344,13 +340,13 @@ func TestIterateBackAndForth(t *testing.T) {
 }
 
 func TestUniIterator(t *testing.T) {
-	stream, br, id, offset := buildTestTable(t, "key", 10000)
+	stream, id, offset := buildTestTable(t, "key", 10000)
 	defer stream.Close()
 
-	table, err := OpenTable(br, id, offset)
+	table, err := OpenTable(stream, id, offset)
 
 	require.NoError(t, err)
-	
+
 	{
 		it := table.NewIterator(false)
 		defer it.Close()
@@ -379,12 +375,12 @@ func TestUniIterator(t *testing.T) {
 
 // Try having only one table.
 func TestConcatIteratorOneTable(t *testing.T) {
-	stream, br, id, offset := buildTable(t, [][]string{
+	stream, id, offset := buildTable(t, [][]string{
 		{"k1", "a1"},
 		{"k2", "a2"},
 	})
 	defer stream.Close()
-	tbl, err := OpenTable(br, id, offset)
+	tbl, err := OpenTable(stream, id, offset)
 
 	require.NoError(t, err)
 
@@ -400,21 +396,20 @@ func TestConcatIteratorOneTable(t *testing.T) {
 	require.EqualValues(t, 'A', vs.Meta)
 }
 
-
 func TestConcatIterator(t *testing.T) {
-	f, br, id, offset := buildTestTable(t, "keya", 10000)
+	f, id, offset := buildTestTable(t, "keya", 10000)
 	defer f.Close()
-	f2, br2, id2, offset2 := buildTestTable(t, "keyb", 10000)
+	f2, id2, offset2 := buildTestTable(t, "keyb", 10000)
 	defer f2.Close()
 
-	f3, br3, id3, offset3 := buildTestTable(t, "keyc", 10000)
+	f3, id3, offset3 := buildTestTable(t, "keyc", 10000)
 	defer f3.Close()
 
-	tbl, err := OpenTable(br, id, offset)
+	tbl, err := OpenTable(f, id, offset)
 	require.NoError(t, err)
-	tbl2, err := OpenTable(br2, id2, offset2)
+	tbl2, err := OpenTable(f2, id2, offset2)
 	require.NoError(t, err)
-	tbl3, err := OpenTable(br3, id3, offset3)
+	tbl3, err := OpenTable(f3, id3, offset3)
 	require.NoError(t, err)
 
 	{
@@ -484,13 +479,13 @@ func TestConcatIterator(t *testing.T) {
 }
 
 func TestMergingIterator(t *testing.T) {
-	f1, br1, id1, offset1 := buildTable(t, [][]string{
+	f1, id1, offset1 := buildTable(t, [][]string{
 		{"k1", "a1"},
 		{"k4", "a4"},
 		{"k5", "a5"},
 	})
 	defer f1.Close()
-	f2, br2, id2, offset2 := buildTable(t, [][]string{
+	f2, id2, offset2 := buildTable(t, [][]string{
 		{"k2", "b2"},
 		{"k3", "b3"},
 		{"k4", "b4"},
@@ -507,9 +502,9 @@ func TestMergingIterator(t *testing.T) {
 		{"k4", "a4"},
 		{"k5", "a5"},
 	}
-	tbl1, err := OpenTable(br1, id1, offset1)
+	tbl1, err := OpenTable(f1, id1, offset1)
 	require.NoError(t, err)
-	tbl2, err := OpenTable(br2, id2, offset2)
+	tbl2, err := OpenTable(f2, id2, offset2)
 	require.NoError(t, err)
 	it1 := tbl1.NewIterator(false)
 	it2 := NewConcatIterator([]*Table{tbl2}, false)
@@ -530,14 +525,14 @@ func TestMergingIterator(t *testing.T) {
 }
 
 func TestMergingIteratorReversed(t *testing.T) {
-	f1,br1, id1, offset1 := buildTable(t, [][]string{
+	f1, id1, offset1 := buildTable(t, [][]string{
 		{"k1", "a1"},
 		{"k2", "a2"},
 		{"k4", "a4"},
 		{"k5", "a5"},
 	})
 	defer f1.Close()
-	f2, br2, id2, offset2 := buildTable(t, [][]string{
+	f2, id2, offset2 := buildTable(t, [][]string{
 		{"k1", "b2"},
 		{"k3", "b3"},
 		{"k4", "b4"},
@@ -555,9 +550,9 @@ func TestMergingIteratorReversed(t *testing.T) {
 		{"k2", "a2"},
 		{"k1", "a1"},
 	}
-	tbl1, err := OpenTable(br1, id1, offset1)
+	tbl1, err := OpenTable(f1, id1, offset1)
 	require.NoError(t, err)
-	tbl2, err := OpenTable(br2, id2, offset2)
+	tbl2, err := OpenTable(f2, id2, offset2)
 	require.NoError(t, err)
 	it1 := tbl1.NewIterator(true)
 	it2 := NewConcatIterator([]*Table{tbl2}, true)
@@ -580,17 +575,17 @@ func TestMergingIteratorReversed(t *testing.T) {
 
 // Take only the first iterator.
 func TestMergingIteratorTakeOne(t *testing.T) {
-	f1, br1, id1, offset1 := buildTable(t, [][]string{
+	f1, id1, offset1 := buildTable(t, [][]string{
 		{"k1", "a1"},
 		{"k2", "a2"},
 	})
 	defer f1.Close()
 
-	f2, br2, id2, offset2 := buildTable(t, [][]string{{"l1", "b1"}})
+	f2, id2, offset2 := buildTable(t, [][]string{{"l1", "b1"}})
 	defer f2.Close()
-	t1, err := OpenTable(br1, id1, offset1)
+	t1, err := OpenTable(f1, id1, offset1)
 	require.NoError(t, err)
-	t2, err := OpenTable(br2, id2, offset2)
+	t2, err := OpenTable(f2, id2, offset2)
 	require.NoError(t, err)
 
 	it1 := NewConcatIterator([]*Table{t1}, false)
@@ -627,17 +622,17 @@ func TestMergingIteratorTakeOne(t *testing.T) {
 
 // Take only the second iterator.
 func TestMergingIteratorTakeTwo(t *testing.T) {
-	f1, br1, id1, offset1 := buildTable(t, [][]string{{"l1", "b1"}})
+	f1, id1, offset1 := buildTable(t, [][]string{{"l1", "b1"}})
 	defer f1.Close()
-	f2, br2, id2, offset2 := buildTable(t, [][]string{
+	f2, id2, offset2 := buildTable(t, [][]string{
 		{"k1", "a1"},
 		{"k2", "a2"},
 	})
 	defer f2.Close()
 
-	t1, err := OpenTable(br1, id1, offset1)
+	t1, err := OpenTable(f1, id1, offset1)
 	require.NoError(t, err)
-	t2, err := OpenTable(br2, id2, offset2)
+	t2, err := OpenTable(f2, id2, offset2)
 	require.NoError(t, err)
 
 	it1 := NewConcatIterator([]*Table{t1}, false)
@@ -678,9 +673,7 @@ func TestTableBigValues(t *testing.T) {
 		return []byte(fmt.Sprintf("%01048576d", i)) // Return 1MB value which is > math.MaxUint16.
 	}
 
-	br := streamclient.NewMockBlockReader()
-
-	stream := streamclient.NewMockStreamClient("log", br)
+	stream := streamclient.NewMockStreamClient("log")
 	defer stream.Close()
 
 	n := 100 // Insert 100 keys.
@@ -692,14 +685,13 @@ func TestTableBigValues(t *testing.T) {
 		builder.Add(key, vs)
 	}
 	builder.FinishBlock()
-	id, offset, err := builder.FinishAll(0, 0, 0, map[uint64]int64{10:10})
+	id, offset, err := builder.FinishAll(0, 0, 0, map[uint64]int64{10: 10})
 	require.NoError(t, err)
 
-	tbl, err := OpenTable(br, id, offset)
+	tbl, err := OpenTable(stream, id, offset)
 	require.NoError(t, err, "unable to open table")
-	require.Equal(t, map[uint64]int64{10:10}, tbl.Discards)
+	require.Equal(t, map[uint64]int64{10: 10}, tbl.Discards)
 
-	
 	itr := tbl.NewIterator(false)
 	require.True(t, itr.Valid())
 

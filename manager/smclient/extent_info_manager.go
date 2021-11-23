@@ -14,42 +14,37 @@ import (
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/journeymidnight/autumn/xlog"
+	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 )
 
-
 type ExtentManager struct {
-
-	smClient     *SMClient
+	smClient *SMClient
 	//TODO: make it lockless?
-	extentLock   *utils.SafeMutex
+	extentLock *utils.SafeMutex
 	extentInfo map[uint64]*pb.ExtentInfo
-	
-	//TODO: make it lockless?
-	nodesInfo  map[uint64]*pb.NodeInfo
-	nodesLock    *utils.SafeMutex
 
-	client       *clientv3.Client
-	closeEtcdResource   func()
-	stoper      *utils.Stopper  
+	//TODO: make it lockless?
+	nodesInfo map[uint64]*pb.NodeInfo
+	nodesLock *utils.SafeMutex
+
+	client            *clientv3.Client
+	closeEtcdResource func()
+	stoper            *utils.Stopper
 
 	//condition lock to notify WaitVersion
-	cond   *sync.Cond
+	cond                  *sync.Cond
 	extentUpdatedCallback extentInfoUpdatedFunc
-
 }
-
 
 type extentInfoUpdatedFunc func(eventType string, cur *pb.ExtentInfo, prev *pb.ExtentInfo)
 type nodesInfoUpdatedFunc func(event *clientv3.Event)
-
-
 
 //NewExtentManager will block forever until connected to etcd
 func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate extentInfoUpdatedFunc) *ExtentManager {
 
 	client, err := clientv3.New(clientv3.Config{
-		Endpoints:   etcdAddr,
+		Endpoints: etcdAddr,
 		DialOptions: []grpc.DialOption{
 			grpc.WithBlock(),
 		},
@@ -60,21 +55,21 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 	}
 
 	/*
-	ETCD FORMATE:
-	nodes/{id}   => pb.NodeInfo
-	extents/{id} => pb.ExtentInfo
+		ETCD FORMATE:
+		nodes/{id}   => pb.NodeInfo
+		extents/{id} => pb.ExtentInfo
 	*/
 	em := &ExtentManager{
-		extentInfo: make(map[uint64]*pb.ExtentInfo),
-		nodesInfo: make(map[uint64]*pb.NodeInfo),
-		extentLock: &utils.SafeMutex{},
-		nodesLock: &utils.SafeMutex{},
-		client: client,
-		smClient : smclient,
-		cond: sync.NewCond(new(sync.Mutex)),
+		extentInfo:            make(map[uint64]*pb.ExtentInfo),
+		nodesInfo:             make(map[uint64]*pb.NodeInfo),
+		extentLock:            &utils.SafeMutex{},
+		nodesLock:             &utils.SafeMutex{},
+		client:                client,
+		smClient:              smclient,
+		cond:                  sync.NewCond(new(sync.Mutex)),
 		extentUpdatedCallback: extentsUpdate,
 	}
-	
+
 	//load latest data
 	kvs, _, err := etcd_utils.EtcdRange(client, "nodes/")
 	if err != nil {
@@ -82,7 +77,7 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 	} else {
 		for _, kv := range kvs {
 			var info pb.NodeInfo
-			if err = info.Unmarshal(kv.Value) ; err != nil{
+			if err = info.Unmarshal(kv.Value); err != nil {
 				xlog.Logger.Errorf("reflect: can not get pb.NodeInfo")
 				continue
 			}
@@ -96,7 +91,7 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 	} else {
 		for _, kv := range kvs {
 			var info pb.ExtentInfo
-			if err = info.Unmarshal(kv.Value) ; err != nil{
+			if err = info.Unmarshal(kv.Value); err != nil {
 				xlog.Logger.Errorf("reflect: can not get pb.extentInfo")
 				continue
 			}
@@ -104,23 +99,21 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 		}
 	}
 
-
-
 	//start watch
 	stopper := utils.NewStopper()
 	nodesChan, close1 := etcd_utils.EtcdWatchEvents(client, "nodes/", "nodes0", rev)
 	extentsChan, close2 := etcd_utils.EtcdWatchEvents(client, "extents/", "extents0", rev)
 
-	stopper.RunWorker(func(){
+	stopper.RunWorker(func() {
 		for {
 			select {
-			case <- stopper.ShouldStop():
+			case <-stopper.ShouldStop():
 				return
-			case res := <- extentsChan:
+			case res := <-extentsChan:
 				em.extentLock.Lock()
 				for _, e := range res.Events {
 					var info pb.ExtentInfo
-					
+
 					switch e.Type.String() {
 					case "PUT":
 						if err := info.Unmarshal(e.Kv.Value); err != nil {
@@ -128,12 +121,12 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 							continue
 						}
 						p := em.getExtentInfo(info.ExtentID)
-						if p ==nil || (p !=nil && info.Eversion > p.Eversion) {
+						if p == nil || (p != nil && info.Eversion > p.Eversion) {
 							em.extentInfo[info.ExtentID] = &info
 						}
 
 						var prevInfo *pb.ExtentInfo
-						if e.PrevKv != nil{
+						if e.PrevKv != nil {
 							prevInfo = &pb.ExtentInfo{}
 							if err := prevInfo.Unmarshal(e.PrevKv.Value); err != nil {
 								xlog.Logger.Errorf("reflect: can not get pb.extentInfo")
@@ -143,7 +136,6 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 						if em.extentUpdatedCallback != nil {
 							em.extentUpdatedCallback("PUT", &info, prevInfo)
 						}
-						
 
 					case "DELETE":
 						if err := info.Unmarshal(e.PrevKv.Value); err != nil {
@@ -164,16 +156,16 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 						if em.extentUpdatedCallback != nil {
 							em.extentUpdatedCallback("DELETE", nil, &prevInfo)
 						}
-						
+
 					default:
 						panic("")
 					}
-					
+
 				}
 				em.extentLock.Unlock()
 				em.cond.Broadcast()
 
-			case res := <- nodesChan:
+			case res := <-nodesChan:
 				em.nodesLock.Lock()
 				for _, e := range res.Events {
 					//update nodes
@@ -201,7 +193,6 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 		}
 	})
 
-
 	close := func() {
 		stopper.Stop()
 		close1()
@@ -210,9 +201,8 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 
 	em.closeEtcdResource = close
 
-	return em	
+	return em
 }
-
 
 func (em *ExtentManager) EtcdClient() *clientv3.Client {
 	return em.client
@@ -252,7 +242,7 @@ func (PrimaryPolicy) Choose(em *ExtentManager, extentID uint64) *grpc.ClientConn
 	}
 	nodeInfo := em.GetNodeInfo(exInfo.Replicates[0])
 	pool := conn.GetPools().Connect(nodeInfo.Address)
-	if pool == nil || !pool.IsHealthy(){
+	if pool == nil || !pool.IsHealthy() {
 		return nil
 	}
 	return pool.Get()
@@ -260,20 +250,20 @@ func (PrimaryPolicy) Choose(em *ExtentManager, extentID uint64) *grpc.ClientConn
 
 type AlivePolicy struct{}
 
-func (AlivePolicy) Choose(em *ExtentManager, extentID uint64) *grpc.ClientConn {	
+func (AlivePolicy) Choose(em *ExtentManager, extentID uint64) *grpc.ClientConn {
 	exInfo := em.getExtentInfo(extentID)
 	if exInfo == nil {
 		return nil
 	}
 	//in EC, if all replicates do not work, so it is meaningless to connect parity nodes
 	for i := range exInfo.Replicates {
-		if exInfo.Avali > 0 && ((1 << i) & exInfo.Avali) == 0 {
+		if exInfo.Avali > 0 && ((1<<i)&exInfo.Avali) == 0 {
 			continue
 		}
 		nodeInfo := em.GetNodeInfo(exInfo.Replicates[i])
 
 		pool := conn.GetPools().Connect(nodeInfo.Address)
-		if pool == nil || !pool.IsHealthy(){
+		if pool == nil || !pool.IsHealthy() {
 			continue
 		}
 		return pool.Get()
@@ -285,6 +275,18 @@ func (em *ExtentManager) GetExtentConn(extentID uint64, policy SelectNodePolicy)
 	return policy.Choose(em, extentID)
 }
 
+func (em *ExtentManager) ConnPool(peers []string) ([]*conn.Pool, error) {
+	var ret []*conn.Pool
+	var err error
+	for _, peer := range peers {
+		pool := conn.GetPools().Connect(peer)
+		if pool == nil {
+			err = errors.Errorf("can not connected to %s", peer)
+		}
+		ret = append(ret, pool)
+	}
+	return ret, err
+}
 
 /*
 //    c.L.Lock()
@@ -299,7 +301,7 @@ func (em *ExtentManager) WaitVersion(extentID uint64, version uint64) *pb.Extent
 	em.cond.L.Lock()
 	for {
 		ei = em.GetExtentInfo(extentID)
-		if ei != nil && ei.Eversion >= version{
+		if ei != nil && ei.Eversion >= version {
 			break
 		} else {
 			//fmt.Printf("extent %d wait version START for %d, current is %+v\n", extentID, version, ei)
@@ -310,9 +312,8 @@ func (em *ExtentManager) WaitVersion(extentID uint64, version uint64) *pb.Extent
 	return ei
 }
 
-
 func (em *ExtentManager) Latest(extentID uint64) *pb.ExtentInfo {
-	     
+
 	for {
 		res, err := em.smClient.ExtentInfo(context.Background(), extentID)
 		if err == nil {

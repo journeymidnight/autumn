@@ -44,7 +44,6 @@ type PartitionServer struct {
 	etcdClient          *clientv3.Client
 	config              Config
 	extentManager       *smclient.ExtentManager
-	blockReader         *streamclient.AutumnBlockReader
 	grcpServer          *grpc.Server
 	session             *concurrency.Session
 	watchCh             *clientv3.WatchChan
@@ -167,7 +166,6 @@ func (ps *PartitionServer) Init() {
 	//
 
 	ps.extentManager = smclient.NewExtentManager(ps.smClient, ps.config.EtcdURLs, nil)
-	ps.blockReader = streamclient.NewAutumnBlockReader(ps.extentManager, ps.smClient)
 
 	if err := ps.smClient.Connect(); err != nil {
 		xlog.Logger.Fatalf(err.Error())
@@ -318,7 +316,7 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, mutex *
 	utils.AssertTrue(meta.Rg != nil)
 	utils.AssertTrue(meta.PartID != 0)
 
-	rp, err := range_partition.OpenRangePartition(meta.PartID, metaLog, row, log, ps.blockReader, meta.Rg.StartKey, meta.Rg.EndKey,
+	rp, err := range_partition.OpenRangePartition(meta.PartID, metaLog, row, log, meta.Rg.StartKey, meta.Rg.EndKey,
 		range_partition.DefaultOption(),
 		range_partition.WithMaxSkipList(int64(ps.config.SkipListSize)),
 		range_partition.WithSync(ps.config.MustSync),

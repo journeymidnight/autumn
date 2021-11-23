@@ -23,8 +23,8 @@ type TableInterface interface {
 
 type Table struct {
 	utils.SafeMutex
-	blockReader streamclient.BlockReader //only to read
-	blockIndex []*pspb.BlockOffset
+	blockReader streamclient.StreamClient //only to read
+	blockIndex  []*pspb.BlockOffset
 
 	// The following are initialized once and const.
 	smallest, biggest []byte // Smallest and largest keys (with timestamps).
@@ -34,22 +34,22 @@ type Table struct {
 	bf            *z.Bloom
 	//cache ??
 
-	Loc        pspb.Location //saved address in rowStream
-	LastSeq    uint64
-	 //all data before [vpExtentID, vpOffset] is in rowStream. log replay starts from [vpExtentID, vpOffset]
+	Loc     pspb.Location //saved address in rowStream
+	LastSeq uint64
+	//all data before [vpExtentID, vpOffset] is in rowStream. log replay starts from [vpExtentID, vpOffset]
 	VpExtentID uint64
-	VpOffset   uint32  
+	VpOffset   uint32
 	//extentID => discard count
-	Discards   map[uint64]int64   
+	Discards map[uint64]int64
 }
 
-func OpenTable(blockReader streamclient.BlockReader,
+func OpenTable(blockReader streamclient.StreamClient,
 	extentID uint64, offset uint32) (*Table, error) {
 
 	utils.AssertTrue(xlog.Logger != nil)
 
 	//fmt.Printf("read table from %d, %d\n", extentID, offset)
-	blocks, _, err := blockReader.Read(context.Background(), extentID, offset,1, streamclient.HintReadFromCache)
+	blocks, _, err := blockReader.Read(context.Background(), extentID, offset, 1, streamclient.HintReadFromCache)
 	if err != nil {
 		fmt.Printf("%+v\n", err)
 		return nil, err
@@ -81,7 +81,7 @@ func OpenTable(blockReader streamclient.BlockReader,
 
 	t := &Table{
 		blockIndex:    make([]*pspb.BlockOffset, len(meta.TableIndex.Offsets)),
-		blockReader:        blockReader,
+		blockReader:   blockReader,
 		EstimatedSize: meta.TableIndex.EstimatedSize,
 		Loc: pspb.Location{
 			ExtentID: extentID,
@@ -158,7 +158,6 @@ func (t *Table) block(idx int) (*entriesBlock, error) {
 
 // Smallest is its smallest key, or nil if there are none
 func (t *Table) Smallest() []byte { return t.smallest }
-
 
 // Biggest is its biggest key, or nil if there are none
 func (t *Table) Biggest() []byte { return t.biggest }
