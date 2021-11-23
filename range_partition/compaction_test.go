@@ -16,16 +16,15 @@ import (
 
 func TestCompaction(t *testing.T) {
 
-	br := streamclient.NewMockBlockReader()
-	logStream := streamclient.NewMockStreamClient("log", br)
-	rowStream := streamclient.NewMockStreamClient("sst", br)
-	metaStream := streamclient.NewMockStreamClient("meta", br)
+	logStream := streamclient.NewMockStreamClient("log")
+	rowStream := streamclient.NewMockStreamClient("sst")
+	metaStream := streamclient.NewMockStreamClient("meta")
 
 	defer logStream.Close()
 	defer rowStream.Close()
 	defer metaStream.Close()
 
-	rp, err := OpenRangePartition(3, metaStream, rowStream, logStream, br,
+	rp, err := OpenRangePartition(3, metaStream, rowStream, logStream,
 		[]byte(""), []byte(""), TestOption())
 
 	require.Nil(t, err)
@@ -74,16 +73,15 @@ func TestCompaction(t *testing.T) {
 }
 
 func TestDicardBigData(t *testing.T) {
-	br := streamclient.NewMockBlockReader()
-	logStream := streamclient.NewMockStreamClient("log", br)
-	rowStream := streamclient.NewMockStreamClient("sst", br)
-	metaStream := streamclient.NewMockStreamClient("meta", br)
+	logStream := streamclient.NewMockStreamClient("log")
+	rowStream := streamclient.NewMockStreamClient("sst")
+	metaStream := streamclient.NewMockStreamClient("meta")
 
 	defer logStream.Close()
 	defer rowStream.Close()
 	defer metaStream.Close()
 
-	rp, err := OpenRangePartition(1, metaStream, rowStream, logStream, br,
+	rp, err := OpenRangePartition(1, metaStream, rowStream, logStream,
 		[]byte(""), []byte(""), TestOption())
 
 	require.Nil(t, err)
@@ -110,7 +108,7 @@ func TestDicardBigData(t *testing.T) {
 	rp.Close() //FORCE rp flush table
 
 	//open again
-	rp, err = OpenRangePartition(1, metaStream, rowStream, logStream, br,
+	rp, err = OpenRangePartition(1, metaStream, rowStream, logStream,
 		[]byte(""), []byte(""), TestOption())
 
 	require.Nil(t, err)
@@ -136,7 +134,7 @@ func TestDicardBigData(t *testing.T) {
 	rp.Close()
 
 	//open rp again again
-	rp, err = OpenRangePartition(1, metaStream, rowStream, logStream, br,
+	rp, err = OpenRangePartition(1, metaStream, rowStream, logStream,
 		[]byte(""), []byte(""), TestOption())
 
 	require.Nil(t, err)
@@ -150,10 +148,8 @@ func TestDicardBigData(t *testing.T) {
 	numOfExtents = len(rp.logStream.StreamInfo().GetExtentIDs())
 	require.Equal(t, numOfExtents, len(rp.tables[len(rp.tables)-1].Discards))
 
-	/*
-		for _, t := range rp.tables {
-			fmt.Printf("table %v ,size %d discards %v\n", t.Loc, t.EstimatedSize,  t.Discards)
-		}
-	*/
+	// for _, t := range rp.tables {
+	// 	fmt.Printf("table %v ,size %d discards %v\n", t.Loc, t.EstimatedSize,  t.Discards)
+	// }
 
 }

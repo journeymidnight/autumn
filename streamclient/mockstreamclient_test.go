@@ -19,19 +19,18 @@ func newTestBlock(size uint32) *pb.Block {
 	utils.SetRandStringBytes(data)
 	rand.Seed(time.Now().UnixNano())
 	return &pb.Block{
-		Data:        data,
+		Data: data,
 	}
 }
 
 func TestAppendReadBlocks(t *testing.T) {
 	b := newTestBlock(512)
-	br := NewMockBlockReader()
-	client := NewMockStreamClient("log",br)
+	client := NewMockStreamClient("log")
 	defer client.Close()
-	exID, offsets,_, err := client.Append(context.Background(), []*pb.Block{b}, true)
+	exID, offsets, _, err := client.Append(context.Background(), []*pb.Block{b}, true)
 	assert.Nil(t, err)
 
-	bs,_, err := br.Read(context.Background(), exID, offsets[0], 1, HintReadThrough)
+	bs, _, err := client.Read(context.Background(), exID, offsets[0], 1, HintReadThrough)
 	assert.Nil(t, err)
 	assert.Equal(t, b.Data, bs[0].Data)
 }
@@ -51,13 +50,11 @@ func TestAppendReadEntries(t *testing.T) {
 			},
 		},
 	}
-	br := NewMockBlockReader()
-	client := NewMockStreamClient("log", br)
+	client := NewMockStreamClient("log")
 	defer client.Close()
 	eID, tail, err := client.AppendEntries(context.Background(), cases, true)
 
 	require.NoError(t, err)
-	
 
 	//GC read
 	iter := client.NewLogEntryIter(WithReadFromStart(1))
@@ -72,13 +69,13 @@ func TestAppendReadEntries(t *testing.T) {
 		}
 		ei := iter.Next()
 		require.Equal(t, cases[n].Log.Key, ei.Log.Key)
-		require.Equal(t, []byte(nil), ei.Log.Value)
-		n ++
+		require.Equal(t, 2, len(ei.Log.Value))
+		n++
 	}
-	require.Equal(t,2, n)
+	require.Equal(t, 2, n)
 
 	//iter = client.NewLogEntryIter(ReadOption{}.WithReadFromStart().WithReplay())
-	iter = client.NewLogEntryIter(WithReadFromStart(1), WithReplay())
+	iter = client.NewLogEntryIter(WithReadFromStart(1))
 
 	expectedKeys := [][]byte{
 		[]byte("a"),
@@ -101,7 +98,7 @@ func TestAppendReadEntries(t *testing.T) {
 	_, _, err = client.AppendEntries(context.Background(), cases, true)
 	require.NoError(t, err)
 
-	iter = client.NewLogEntryIter(WithReadFrom(eID, tail, 1), WithReplay())
+	iter = client.NewLogEntryIter(WithReadFrom(eID, tail, 1))
 	for {
 		ok, err := iter.HasNext()
 		require.NoError(t, err)
@@ -129,15 +126,15 @@ func TestAppendReadBigBlocks(t *testing.T) {
 			},
 		},
 	}
-	client := NewMockStreamClient("log", NewMockBlockReader())
+	client := NewMockStreamClient("log")
 	defer client.Close()
 	_, _, err := client.AppendEntries(context.Background(), cases, true)
 
 	require.NoError(t, err)
 
-	iter := client.NewLogEntryIter(WithReadFromStart(1), WithReplay())
+	iter := client.NewLogEntryIter(WithReadFromStart(1))
 	var ans []int //value大小
-	for i :=0 ; i < len(cases) ; i ++ {
+	for i := 0; i < len(cases); i++ {
 		ok, err := iter.HasNext()
 		require.NoError(t, err)
 		if !ok {
@@ -150,9 +147,7 @@ func TestAppendReadBigBlocks(t *testing.T) {
 		ans = append(ans, len(ei.Log.Value))
 	}
 
-	//小key的value长度== 2
-	//big value return nil value
-	require.Equal(t, []int{2,0}, ans) 
+	require.Equal(t, []int{int(len(cases[0].Log.Value)), int(len(cases[1].Log.Value))}, []int{ans[0], ans[1]})
 }
 
 func TestTruncate(t *testing.T) {
@@ -177,24 +172,20 @@ func TestTruncate(t *testing.T) {
 		},
 	}
 
-	br := NewMockBlockReader()
-	client := NewMockStreamClient("log", br).(*MockStreamClient)
+	client := NewMockStreamClient("log").(*MockStreamClient)
 	defer client.Close()
 
 	_, _, err := client.AppendEntries(context.Background(), cases, false)
 	require.NoError(t, err)
 
-
 	_, _, err = client.AppendEntries(context.Background(), cases, false)
 	require.NoError(t, err)
-
 
 	p := client.stream[1]
 	err = client.Truncate(context.Background(), p)
 	require.NoError(t, err)
 
-
-	iter := client.NewLogEntryIter(WithReadFromStart(math.MaxUint32), WithReplay())
+	iter := client.NewLogEntryIter(WithReadFromStart(math.MaxUint32))
 	result := make([]string, 0)
 	for {
 		ok, err := iter.HasNext()
@@ -231,22 +222,19 @@ func TestPunchHoles(t *testing.T) {
 		},
 	}
 
-	br := NewMockBlockReader()
-	client := NewMockStreamClient("log", br).(*MockStreamClient)
+	client := NewMockStreamClient("log").(*MockStreamClient)
 	defer client.Close()
 
 	_, _, err := client.AppendEntries(context.Background(), cases, false)
 	require.NoError(t, err)
 
-
 	_, _, err = client.AppendEntries(context.Background(), cases, false)
 	require.NoError(t, err)
-
 
 	err = client.PunchHoles(context.Background(), []uint64{client.stream[0], client.stream[1]})
 	require.NoError(t, err)
 
-	iter := client.NewLogEntryIter(WithReadFromStart(math.MaxUint32), WithReplay())
+	iter := client.NewLogEntryIter(WithReadFromStart(math.MaxUint32))
 	result := make([]string, 0)
 	for {
 		ok, err := iter.HasNext()
@@ -260,4 +248,3 @@ func TestPunchHoles(t *testing.T) {
 	require.Equal(t, []string{}, result)
 
 }
-

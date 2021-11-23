@@ -602,7 +602,7 @@ func (ex *Extent) CommitLength() uint32 {
 //helper function, block could be pb.Entries, support ReadEntries
 //ReadEntries can only be called on replicated extent
 //node_service will never call this function, this function is only for test
-func (ex *Extent) ReadEntries(offset uint32, maxTotalSize uint32, replay bool) ([]*pb.EntryInfo, uint32, error) {
+func (ex *Extent) ReadEntries(offset uint32, maxTotalSize uint32) ([]*pb.EntryInfo, uint32, error) {
 
 	blocks, offsets, end, err := ex.ReadBlocks(offset, 10, maxTotalSize)
 	if err != nil && err != wire_errors.EndOfExtent {
@@ -610,7 +610,7 @@ func (ex *Extent) ReadEntries(offset uint32, maxTotalSize uint32, replay bool) (
 	}
 	var ret []*pb.EntryInfo
 	for i := range blocks {
-		e, err := ExtractEntryInfo(blocks[i], ex.ID, offsets[i], replay)
+		e, err := ExtractEntryInfo(blocks[i], ex.ID, offsets[i])
 		if err != nil {
 			xlog.Logger.Error(err)
 			continue
@@ -629,37 +629,22 @@ func (ex *Extent) ReadEntries(offset uint32, maxTotalSize uint32, replay bool) (
 
 }
 
-func ExtractEntryInfo(b *pb.Block, extentID uint64, offset uint32, replay bool) (*pb.EntryInfo, error) {
+func ExtractEntryInfo(b *pb.Block, extentID uint64, offset uint32) (*pb.EntryInfo, error) {
 	entry := new(pb.Entry)
 	if err := entry.Unmarshal(b.Data); err != nil {
 		return nil, err
 	}
 
 	if y.ShouldWriteValueToLSM(entry) {
-		if replay { //replay read
-			return &pb.EntryInfo{
-				Log:           entry,
-				EstimatedSize: uint64(entry.Size()),
-				ExtentID:      extentID,
-				Offset:        offset,
-			}, nil
-		} else { //gc read
-			entry.Value = nil //直接返回空entry
-			return &pb.EntryInfo{
-				Log:           entry,
-				EstimatedSize: uint64(entry.Size()),
-				ExtentID:      extentID,
-				Offset:        offset,
-			}, nil
-		}
+		return &pb.EntryInfo{
+			Log:           entry,
+			EstimatedSize: uint64(entry.Size()),
+			ExtentID:      extentID,
+			Offset:        offset,
+		}, nil
 	} else {
-		//big value
 		//keep entry.Value and make sure BitValuePointer
 		entry.Meta |= uint32(y.BitValuePointer)
-		//set value to nil to save network bandwidth
-		if replay {
-			entry.Value = nil
-		}
 		return &pb.EntryInfo{
 			Log:           entry,
 			EstimatedSize: uint64(entry.Size()),

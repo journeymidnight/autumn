@@ -123,6 +123,7 @@ message SealResponse {
 }
 */
 
+/*
 message ReadEntriesRequest {
 	uint64 extentID = 1;
 	uint32 offset = 2;
@@ -137,6 +138,7 @@ message ReadEntriesResponse{
 	repeated EntryInfo entries = 3;
 	uint32 end = 4;
 }
+*/
 
 
 message DF {
@@ -213,8 +215,10 @@ message ReAvaliResponse {
 service ExtentService {
 	//from stream client
 	rpc Append(AppendRequest) returns (AppendResponse){}
-	rpc ReadEntries(ReadEntriesRequest) returns (ReadEntriesResponse){}
-	rpc SmartReadBlocks(ReadBlocksRequest) returns (ReadBlocksResponse){}
+	//rpc ReadEntries(ReadEntriesRequest) returns (ReadEntriesResponse){}
+	//rpc SmartReadBlocks(ReadBlocksRequest) returns (ReadBlocksResponse){}
+	rpc ReadBlocks(ReadBlocksRequest) returns(ReadBlocksResponse){}
+
 
 	//internal rpc
 	rpc ReAvali(ReAvaliRequest) returns (ReAvaliResponse){}
@@ -225,7 +229,6 @@ service ExtentService {
 	rpc CommitLength(CommitLengthRequest) returns (CommitLengthResponse) {}
 	rpc Heartbeat (Payload)  returns (stream Payload) {}
 	rpc ReplicateBlocks(ReplicateBlocksRequest) returns (ReplicateBlocksResponse) {}
-	rpc ReadBlocks(ReadBlocksRequest) returns(ReadBlocksResponse){}
 	rpc AllocExtent(AllocExtentRequest) returns (AllocExtentResponse){}
 }
 

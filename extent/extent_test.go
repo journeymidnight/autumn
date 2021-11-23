@@ -24,8 +24,6 @@ var (
 	_ = fmt.Println
 )
 
-
-
 func init() {
 	xlog.InitLog([]string{"extent_test.log"}, zapcore.DebugLevel)
 }
@@ -49,7 +47,7 @@ func TestReadEntries(t *testing.T) {
 	extent.Lock()
 	extent.AppendBlocks([]*pb.Block{{Data: data}}, true)
 	extent.Unlock()
-	entries, end, err := extent.ReadEntries(0, 10<<20, true)
+	entries, end, err := extent.ReadEntries(0, 10<<20)
 	for i := range entries {
 		require.Equal(t, uint64(100), entries[i].ExtentID)
 		require.Equal(t, []byte("key"), entries[i].Log.Key)
@@ -193,7 +191,6 @@ func TestWalExtent(t *testing.T) {
 
 	extent.Lock()
 
-
 	i := 0
 	end := uint32(0)
 	for _, block := range cases {
@@ -256,7 +253,6 @@ func TestWalExtent(t *testing.T) {
 	fmt.Printf("End:%d\n", end)
 }
 
-
 func TestValidBlock(t *testing.T) {
 	cases := []*pb.Block{
 		generateBlock(4096),
@@ -266,11 +262,9 @@ func TestValidBlock(t *testing.T) {
 	extent, err := CreateExtent("localtest.ext", 100)
 	assert.Nil(t, err)
 
-
 	start, err := extent.ValidAllBlocks(0)
 	assert.Nil(t, err)
 	assert.Equal(t, uint32(0), start)
-
 
 	defer os.Remove("localtest.ext")
 	extent.Lock()
@@ -280,20 +274,17 @@ func TestValidBlock(t *testing.T) {
 	//
 	extent.file.Truncate(5000)
 	extent.commitLength = 5000
-	
+
 	start, err = extent.ValidAllBlocks(0)
-	
+
 	fmt.Printf("start is %d, err is %v\n", start, err)
 	require.Equal(t, record.ComputeEnd(0, 4096), start)
 }
 
-
-
-
 func TestReadLastBlock(t *testing.T) {
-	
+
 	cases := []*pb.Block{
-		generateBlock(65<<10),
+		generateBlock(65 << 10),
 		generateBlock(1234),
 		generateBlock(4096),
 		generateBlock(1),
@@ -307,10 +298,9 @@ func TestReadLastBlock(t *testing.T) {
 	extent.AppendBlocks(cases, true)
 	extent.Unlock()
 
-
 	block, start, tail, err := extent.ReadLastBlock()
 	require.Nil(t, err)
-	require.Equal(t, cases[len(cases) - 1], block[0])
+	require.Equal(t, cases[len(cases)-1], block[0])
 	require.Equal(t, extent.commitLength, tail)
 
 	//assert ComputeEnd
@@ -320,7 +310,7 @@ func TestReadLastBlock(t *testing.T) {
 		require.Equal(t, offset, offsets[i])
 		offset = record.ComputeEnd(offset, uint32(len(cases[i].Data)))
 	}
-	require.Equal(t, offsets[len(offsets) -1 ], start[0])
+	require.Equal(t, offsets[len(offsets)-1], start[0])
 }
 func TestWriteECFriendlyBlock(t *testing.T) {
 	extent, err := CreateExtent("localtest.ext", 100)
@@ -340,7 +330,6 @@ func TestWriteECFriendlyBlock(t *testing.T) {
 	require.Equal(t, b1, blocks[1])
 
 }
-
 
 func BenchmarkExtentWithoutSync(b *testing.B) {
 	extent, err := CreateExtent("localtest.ext", 100)

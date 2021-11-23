@@ -41,9 +41,8 @@ func TestTableIndex(t *testing.T) {
 	key := make([]byte, 32)
 	_, err := rand.Read(key)
 	require.NoError(t, err)
-	br := streamclient.NewMockBlockReader()
 
-	stream := streamclient.NewMockStreamClient("log",br)
+	stream := streamclient.NewMockStreamClient("log")
 	defer stream.Close()
 
 	builder := NewTableBuilder(stream)
@@ -66,7 +65,7 @@ func TestTableIndex(t *testing.T) {
 
 	builder.FinishBlock()
 	id, offset, err := builder.FinishAll(100, 200, 100, nil)
-	table, err := OpenTable(br, id, offset)
+	table, err := OpenTable(stream, id, offset)
 	assert.Nil(t, err)
 	//fmt.Printf("big %s, small %s\n", table.biggest, table.smallest)
 	assert.Equal(t, blockCount, len(table.blockIndex))
