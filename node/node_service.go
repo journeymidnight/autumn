@@ -76,9 +76,17 @@ func (en *ExtentNode) ReplicateBlocks(ctx context.Context, req *pb.ReplicateBloc
 		return errDone(wire_errors.LockedByOther)
 	}
 
-	if ex.CommitLength() != req.Commit {
+	if ex.CommitLength() < req.Commit {
 		return errDone(errors.Errorf("primary commitlength is different with replicates %d vs %d", req.Commit, ex.CommitLength()))
 	}
+
+	if ex.CommitLength() > req.Commit {
+		ex.Truncate(req.Commit)
+	}
+
+	//ex.CommitLength() == req.Commit
+	utils.AssertTrue(ex.CommitLength() == req.Commit)
+
 	ret, end, err := en.AppendWithWal(ex.Extent, req.Revision, req.Blocks, req.MustSync)
 	if err != nil {
 		return errDone(err)
@@ -257,9 +265,11 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 		}
 		if result.Error != nil {
 			fmt.Printf("append on extent %d error: %v\n", req.ExtentID, result.Error)
+			ex.Truncate(offset) //reset local offset
 			return nil, result.Error
 		}
 		if !utils.EqualUint32(result.Offsets, preOffsets) || preEnd != int64(result.End) {
+			ex.Truncate(offset) //reset local offset
 			return nil, errors.Errorf("block is not appended at the same offset [%v] vs [%v], end [%v] vs [%v]",
 				result.Offsets, preOffsets, preEnd, result.End)
 		}
