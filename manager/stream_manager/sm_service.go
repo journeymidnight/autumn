@@ -206,6 +206,11 @@ func (sm *StreamManager) CheckCommitLength(ctx context.Context, req *pb.CheckCom
 	}
 
 	tailExtentID := stream.ExtentIDs[len(stream.ExtentIDs)-1]
+	if err := sm.lockExtent(tailExtentID); err != nil {
+		return errDone(err)
+	}
+	defer sm.unlockExtent(tailExtentID)
+
 	lastExtentInfo, ok := sm.cloneExtentInfo(tailExtentID)
 	if !ok {
 		return errDone(errors.Errorf("internal errors, no such extent %d", tailExtentID))
@@ -219,11 +224,6 @@ func (sm *StreamManager) CheckCommitLength(ctx context.Context, req *pb.CheckCom
 			LastExInfo: lastExtentInfo,
 		}, nil
 	}
-
-	if err := sm.lockExtent(lastExtentInfo.ExtentID); err != nil {
-		return errDone(err)
-	}
-	defer sm.unlockExtent(lastExtentInfo.ExtentID)
 
 	nodes := sm.getNodes(lastExtentInfo)
 	if nodes == nil {
