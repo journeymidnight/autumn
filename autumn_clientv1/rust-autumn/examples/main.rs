@@ -15,6 +15,12 @@ async fn main(){
         Ok(x) => println!("{:#?}", x),
         Err(e) => println!("{}", e),
     }
+
+    match lib.head("x").await {
+        Ok(x) => println!("{:#?}", x),
+        Err(e) => println!("{}", e),
+    }
+    
     match lib.delete("x").await {
         Ok(x) => println!("{:#?}", x),
         Err(e) => println!("{}", e),

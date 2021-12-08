@@ -181,7 +181,6 @@ impl AutumnLib {
             return None;
         }
 
-        println!("key: {:?}", regions);
         //std library of rust do not support binary search??
         let mut lo = 0;
         let mut hi = regions.len();
@@ -297,6 +296,34 @@ impl AutumnLib {
 
         let mut i = 0;
         return Ok(Vec::new());
+    }
+
+    //head return len of key
+    pub async fn head(self: &Self, key: &str) -> Result<u32, std::io::Error> {
+        if let Some((part_id, ps_id)) = self.get_region(key) {
+            let addr = self.get_ps_addr(ps_id).await;
+
+            match self.get_conn(&addr).await {
+                Ok(mut client) => {
+                    let req = pspb::HeadRequest {
+                        key: key.into(),
+                        partid: part_id,
+                    };
+
+                    match client.head(req).await {
+                        Ok(res) => Ok(res.into_inner().info.unwrap().len),
+                        Err(err) => {
+                            return Err(std::io::Error::new(ErrorKind::Other, err));
+                        }
+                    }
+                }
+                Err(err) => {
+                    return Err(std::io::Error::new(ErrorKind::Other, err));
+                }
+            }
+        } else {
+            return Err(std::io::Error::new(ErrorKind::Other, "no region"));
+        }
     }
 
     pub async fn get(self: &Self, key: &str) -> Result<Vec<u8>, std::io::Error> {
