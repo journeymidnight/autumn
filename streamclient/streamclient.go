@@ -30,6 +30,7 @@ import (
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/journeymidnight/autumn/xlog"
+	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"go.etcd.io/etcd/client/v3/concurrency"
 
@@ -112,12 +113,15 @@ func (sc *AutumnStreamClient) SealedLength(extentID uint64) (uint64, error) {
 	return exInfo.SealedLength, nil
 }
 
-func (sc *AutumnStreamClient) smartRead(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32, onlyReadLast bool) ([]*pb.Block, []uint32, uint32, error) {
+func (sc *AutumnStreamClient) smartRead(gctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32, onlyReadLast bool) ([]*pb.Block, []uint32, uint32, error) {
 	if onlyReadLast {
 		utils.AssertTrue(numOfBlocks == 1)
 	}
 
 retry:
+
+	span, ctx := opentracing.StartSpanFromContext(gctx, "SmartRead")
+	defer span.Finish()
 	exInfo := sc.em.GetExtentInfo(extentID)
 	if exInfo == nil {
 		return nil, nil, 0, errors.Errorf("extent %d not exist", extentID)
@@ -196,6 +200,7 @@ retry:
 
 	retry1:
 		c := pb.NewExtentServiceClient(pool.Get())
+
 		res, err = c.ReadBlocks(pctx, req)
 
 		if err != nil { //network error or disk error
@@ -256,7 +261,7 @@ retry:
 			select {
 			case <-stopper.ShouldStop():
 				return
-			case <-time.After(10 * time.Millisecond):
+			case <-time.After(20 * time.Millisecond):
 				submitReq(pools[dataShards+j], j+dataShards)
 			}
 		})
@@ -315,6 +320,7 @@ waitResult:
 	}
 
 	//join each block
+	span.LogKV("DECODE_BLOCKS START", lenOfBlocks)
 	retBlocks := make([]*pb.Block, lenOfBlocks)
 	for i := 0; i < lenOfBlocks; i++ {
 		data := make([][]byte, n)

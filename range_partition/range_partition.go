@@ -1023,7 +1023,7 @@ func (rp *RangePartition) Get(userKey []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-
+		span.LogKV("ExtractLogEntry", 1)
 		entry := y.ExtractLogEntry(blocks[0])
 		return entry.Value, nil
 	}
