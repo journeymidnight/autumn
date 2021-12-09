@@ -34,6 +34,7 @@ import (
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/journeymidnight/autumn/xlog"
+	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 )
 
@@ -1003,6 +1004,10 @@ func (rp *RangePartition) Get(userKey []byte) ([]byte, error) {
 
 	vs := rp.getValueStruct(userKey, 0)
 
+	span := opentracing.GlobalTracer().StartSpan("GetObject")
+	defer span.Finish()
+	ctx := opentracing.ContextWithSpan(context.Background(), span)
+
 	if vs.Version == 0 {
 		return nil, errNotFound
 	} else if vs.Meta&y.BitDelete > 0 {
@@ -1014,7 +1019,7 @@ func (rp *RangePartition) Get(userKey []byte) ([]byte, error) {
 		var vp valuePointer
 		vp.Decode(vs.Value)
 		//fmt.Printf("%s's location is [%d, %d]\n", userKey, vp.extentID, vp.offset)
-		blocks, _, err := rp.logStream.Read(context.Background(), vp.extentID, vp.offset, 1, streamclient.HintReadThrough)
+		blocks, _, err := rp.logStream.Read(ctx, vp.extentID, vp.offset, 1, streamclient.HintReadThrough)
 		if err != nil {
 			return nil, err
 		}
