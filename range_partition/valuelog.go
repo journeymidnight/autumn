@@ -10,6 +10,7 @@ import (
 	"github.com/journeymidnight/autumn/streamclient"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
+	"github.com/opentracing/opentracing-go"
 )
 
 //replay valuelog
@@ -22,7 +23,10 @@ func (rp *RangePartition) writeValueLog(reqs []*request) ([]*pb.EntryInfo, value
 		entries = append(entries, req.entries...)
 	}
 
-	extentID, tail, err := rp.logStream.AppendEntries(context.Background(), entries, rp.opt.MustSync)
+	span := opentracing.GlobalTracer().StartSpan("writeValueLog")
+	defer span.Finish()
+	ctx := opentracing.ContextWithSpan(context.Background(), span)
+	extentID, tail, err := rp.logStream.AppendEntries(ctx, entries, rp.opt.MustSync)
 	if err != nil {
 		return nil, valuePointer{}, err
 	}

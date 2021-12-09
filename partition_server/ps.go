@@ -17,7 +17,10 @@ import (
 	"github.com/journeymidnight/autumn/streamclient"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
+	"github.com/opentracing/opentracing-go"
 	"github.com/robfig/cron/v3"
+	"github.com/uber/jaeger-client-go"
+	"github.com/uber/jaeger-client-go/config"
 	"google.golang.org/grpc"
 )
 
@@ -327,6 +330,20 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, mutex *
 }
 
 func (ps *PartitionServer) ServeGRPC() error {
+
+	cfg, err := config.FromEnv()
+
+	cfg.ServiceName = fmt.Sprintf("PS-%d", ps.config.PSID)
+	cfg.Sampler.Type = "const"
+	cfg.Sampler.Param = 1
+	cfg.Reporter.LogSpans = true
+
+	tracer, _, err := cfg.NewTracer(config.Logger(jaeger.StdLogger))
+	if err != nil {
+		panic(err)
+	}
+	opentracing.SetGlobalTracer(tracer)
+
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(64<<20),
 		grpc.MaxSendMsgSize(64<<20),

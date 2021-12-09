@@ -21,6 +21,8 @@ import (
 	"sync"
 	"time"
 
+	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
+	grpc_opentracing "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
@@ -128,12 +130,16 @@ func (p *Pools) Connect(addr string) *Pool {
 
 // newPool creates a new "pool" with one gRPC connection, refcount 0.
 func newPool(addr string) (*Pool, error) {
+	unaryInterceptor := grpc_middleware.ChainUnaryClient(
+		grpc_opentracing.UnaryClientInterceptor(),
+	)
 	conn, err := grpc.Dial(addr,
-		grpc.WithDefaultCallOptions(//不是这个
+		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(64<<20),
 			grpc.MaxCallSendMsgSize(64<<20),
-			grpc.UseCompressor((snappyCompressor{}).Name())),
+		),
 		grpc.WithBackoffMaxDelay(time.Second),
+		grpc.WithUnaryInterceptor(unaryInterceptor),
 		grpc.WithInsecure())
 	if err != nil {
 		return nil, err
@@ -159,7 +165,6 @@ func (p *Pool) shutdown() {
 		xlog.Logger.Warnf("Could not close pool connection with error: %s", err)
 	}
 }
-
 
 func (p *Pool) LastEcho() time.Time {
 	p.RLock()
