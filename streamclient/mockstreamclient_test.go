@@ -35,6 +35,7 @@ func TestAppendReadBlocks(t *testing.T) {
 	assert.Equal(t, b.Data, bs[0].Data)
 }
 
+/*
 func TestAppendReadEntries(t *testing.T) {
 	cases := []*pb.EntryInfo{
 		{
@@ -110,6 +111,7 @@ func TestAppendReadEntries(t *testing.T) {
 	}
 	require.Equal(t, expectedKeys, ans)
 }
+*/
 
 func TestAppendReadBigBlocks(t *testing.T) {
 	cases := []*pb.EntryInfo{

@@ -18,7 +18,7 @@ package pb;
 //import "gogoproto/gogo.proto";
 
 
-
+/*
 message Entry {
 	bytes  key = 1;
 	bytes  value = 2;
@@ -34,6 +34,7 @@ message EntryInfo {
 	uint64 estimatedSize = 4;
 	uint32 end = 5;
 }
+*/
 
 enum Code {
 	OK = 0;

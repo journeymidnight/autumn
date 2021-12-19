@@ -806,13 +806,14 @@ retry:
 
 	pctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	c := pb.NewExtentServiceClient(conn)
-	res, err := c.Append(pctx, &pb.AppendRequest{
+	app := &pb.AppendRequest{
 		ExtentID: extentID,
 		Blocks:   blocks,
 		Eversion: exInfo.Eversion,
 		Revision: sc.streamLock.revision,
 		MustSync: mustSync,
-	})
+	}
+	res, err := c.Append(pctx, app)
 	cancel()
 
 	if status.Code(err) == codes.DeadlineExceeded || status.Code(err) == codes.Unavailable { //timeout
