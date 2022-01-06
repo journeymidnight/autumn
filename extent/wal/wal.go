@@ -31,7 +31,6 @@ import (
 
 	"github.com/journeymidnight/autumn/extent/record"
 	"github.com/journeymidnight/autumn/extent/storage"
-	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
 )
@@ -255,7 +254,7 @@ func (wal *Wal) doWrites() {
 
 //write will block until write is done
 //thread-safe
-func (wal *Wal) Write(extentID uint64, start uint32, rev int64, blocks []*pb.Block) error {
+func (wal *Wal) Write(extentID uint64, start uint32, rev int64, blocks [][]byte) error {
 	req := requestPool.Get().(*request)
 	req.reset()
 	req.data = blocks
@@ -290,7 +289,7 @@ func (wal *Wal) Close() {
 	}
 }
 
-func (wal *Wal) Replay(callback func(uint64, uint32, int64, []*pb.Block)) error {
+func (wal *Wal) Replay(callback func(uint64, uint32, int64, [][]byte)) error {
 	//delete pendingWals after replay
 	for _, fname := range wal.oldWALs {
 		f, err := os.Open(fname)
@@ -324,10 +323,10 @@ func (wal *Wal) Replay(callback func(uint64, uint32, int64, []*pb.Block)) error 
 }
 
 type request struct {
-	extentID uint64      //encoding
-	start    uint32      //encoding
-	data     []*pb.Block //encoding
-	rev      int64       //encoding
+	extentID uint64   //encoding
+	start    uint32   //encoding
+	data     [][]byte //encoding
+	rev      int64    //encoding
 
 	//return value
 	err error
@@ -352,9 +351,9 @@ func (r *request) encodeTo(buf *bytes.Buffer) {
 	sz = binary.PutVarint(enc[:], r.rev)
 	buf.Write(enc[:sz])
 	for _, block := range r.data {
-		sz := binary.PutUvarint(enc[:], uint64(len(block.Data)))
+		sz := binary.PutUvarint(enc[:], uint64(len(block)))
 		buf.Write(enc[:sz])
-		buf.Write(block.Data)
+		buf.Write(block)
 	}
 }
 
@@ -372,9 +371,9 @@ func (r *request) decode(buf []byte) {
 	buf = buf[off:]
 	for len(buf) > 0 {
 		size, sz := binary.Uvarint(buf)
-		r.data = append(r.data, &pb.Block{
-			Data: buf[sz : sz+int(size)],
-		})
+		r.data = append(r.data,
+			buf[sz:sz+int(size)],
+		)
 
 		buf = buf[sz+int(size):]
 	}

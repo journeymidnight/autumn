@@ -227,7 +227,7 @@ func (en *ExtentNode) LoadExtents() error {
 	wg.Wait()
 
 	//read the wal, and replay writes to extents
-	replay := func(ID uint64, start uint32, rev int64, data []*pb.Block) {
+	replay := func(ID uint64, start uint32, rev int64, data [][]byte) {
 		ex := en.getExtent(ID)
 		if ex == nil {
 			xlog.Logger.Warnf("extentID %d not exist", ID)
@@ -271,8 +271,8 @@ func (en *ExtentNode) ServeGRPC() error {
 
 	cfg.ServiceName = fmt.Sprint("node-", en.nodeID)
 	cfg.Sampler.Type = "const"
-	cfg.Sampler.Param = 1
-	cfg.Reporter.LogSpans = true
+	cfg.Sampler.Param = 0
+	cfg.Reporter.LogSpans = false
 
 	tracer, _, err := cfg.NewTracer(config.Logger(jaeger.StdLogger))
 	if err != nil {
@@ -307,7 +307,7 @@ func (en *ExtentNode) ServeGRPC() error {
 2. req.MustSync is true, noWal or block data is big, "sync append"
 3. req.MustSync is true, hasWal and block data is small, "sync append on wal" and "nosync append on extent" on the same time.
 */
-func (en *ExtentNode) AppendWithWal(ex *extent.Extent, rev int64, blocks []*pb.Block, mustSync bool) ([]uint32, uint32, error) {
+func (en *ExtentNode) AppendWithWal(ex *extent.Extent, rev int64, blocks [][]byte, mustSync bool) ([]uint32, uint32, error) {
 
 	if mustSync == false {
 		return ex.AppendBlocks(blocks, false)

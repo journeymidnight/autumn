@@ -8,53 +8,43 @@ import (
 	"testing"
 	"time"
 
-	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func newTestBlock(size uint32) *pb.Block {
+func newTestBlock(size uint32) block {
 	data := make([]byte, size)
 	utils.SetRandStringBytes(data)
 	rand.Seed(time.Now().UnixNano())
-	return &pb.Block{
-		Data: data,
-	}
+	return data
 }
 
 func TestAppendReadBlocks(t *testing.T) {
 	b := newTestBlock(512)
 	client := NewMockStreamClient("log")
 	defer client.Close()
-	exID, offsets, _, err := client.Append(context.Background(), []*pb.Block{b}, true)
+	exID, offsets, _, err := client.Append(context.Background(), []block{b}, true)
 	assert.Nil(t, err)
 
 	bs, _, err := client.Read(context.Background(), exID, offsets[0], 1, HintReadThrough)
 	assert.Nil(t, err)
-	assert.Equal(t, b.Data, bs[0].Data)
+	assert.Equal(t, b, bs[0])
 }
 
 /*
 func TestAppendReadEntries(t *testing.T) {
-	cases := []*pb.EntryInfo{
-		{
-			Log: &pb.Entry{
-				Key:   []byte("a"),
-				Value: []byte("xx"),
-			},
-		},
-		{
-			Log: &pb.Entry{
-				Key:   []byte("b"),
-				Value: []byte("xx"),
-			},
-		},
+	cases := []block{
+		newTestBlock(512),
+		newTestBlock(512),
+		newTestBlock(8192),
 	}
+
 	client := NewMockStreamClient("log")
 	defer client.Close()
-	eID, tail, err := client.AppendEntries(context.Background(), cases, true)
+	//eID, tail, err := client.AppendEntries(context.Background(), cases, true)
 
+	_, _, _, err := client.Append(context.Background(), cases, true)
 	require.NoError(t, err)
 
 	//GC read
@@ -69,13 +59,11 @@ func TestAppendReadEntries(t *testing.T) {
 			break
 		}
 		ei := iter.Next()
-		require.Equal(t, cases[n].Log.Key, ei.Log.Key)
-		require.Equal(t, 2, len(ei.Log.Value))
+		require.Equal(t, cases[n], ei)
 		n++
 	}
 	require.Equal(t, 2, n)
 
-	//iter = client.NewLogEntryIter(ReadOption{}.WithReadFromStart().WithReplay())
 	iter = client.NewLogEntryIter(WithReadFromStart(1))
 
 	expectedKeys := [][]byte{
@@ -112,25 +100,15 @@ func TestAppendReadEntries(t *testing.T) {
 	require.Equal(t, expectedKeys, ans)
 }
 */
-
 func TestAppendReadBigBlocks(t *testing.T) {
-	cases := []*pb.EntryInfo{
-		{
-			Log: &pb.Entry{
-				Key:   []byte("a"),
-				Value: []byte("xx"),
-			},
-		},
-		{
-			Log: &pb.Entry{
-				Key:   []byte("b"),
-				Value: []byte(fmt.Sprintf("%01048576d", 10)),
-			},
-		},
+	cases := []block{
+		[]byte("a"),
+		[]byte(fmt.Sprintf("%01048576d", 10)),
 	}
+
 	client := NewMockStreamClient("log")
 	defer client.Close()
-	_, _, err := client.AppendEntries(context.Background(), cases, true)
+	_, _, _, err := client.Append(context.Background(), cases, true)
 
 	require.NoError(t, err)
 
@@ -144,43 +122,28 @@ func TestAppendReadBigBlocks(t *testing.T) {
 		}
 		ei := iter.Next()
 		//key都存在
-		require.Equal(t, cases[i].Log.Key, ei.Log.Key)
+		require.Equal(t, cases[i], ei)
 
-		ans = append(ans, len(ei.Log.Value))
+		ans = append(ans, len(ei))
 	}
 
-	require.Equal(t, []int{int(len(cases[0].Log.Value)), int(len(cases[1].Log.Value))}, []int{ans[0], ans[1]})
+	require.Equal(t, []int{int(len(cases[0])), int(len(cases[1]))}, []int{ans[0], ans[1]})
 }
 
 func TestTruncate(t *testing.T) {
-	cases := []*pb.EntryInfo{
-		{
-			Log: &pb.Entry{
-				Key:   []byte("a"),
-				Value: []byte("xx"),
-			},
-		},
-		{
-			Log: &pb.Entry{
-				Key:   []byte("b"),
-				Value: []byte(fmt.Sprintf("%01048576d", 10)), //1MB
-			},
-		},
-		{
-			Log: &pb.Entry{
-				Key:   []byte("c"),
-				Value: []byte("xx"),
-			},
-		},
+	cases := []block{
+		[]byte("axx"),
+		[]byte(fmt.Sprintf("%01048576d", 10)), //1MB
+		[]byte("cxx"),
 	}
 
 	client := NewMockStreamClient("log").(*MockStreamClient)
 	defer client.Close()
 
-	_, _, err := client.AppendEntries(context.Background(), cases, false)
+	_, _, _, err := client.Append(context.Background(), cases, false)
 	require.NoError(t, err)
 
-	_, _, err = client.AppendEntries(context.Background(), cases, false)
+	_, _, _, err = client.Append(context.Background(), cases, false)
 	require.NoError(t, err)
 
 	p := client.stream[1]
@@ -188,7 +151,7 @@ func TestTruncate(t *testing.T) {
 	require.NoError(t, err)
 
 	iter := client.NewLogEntryIter(WithReadFromStart(math.MaxUint32))
-	result := make([]string, 0)
+	result := make([]int, 0)
 	for {
 		ok, err := iter.HasNext()
 		require.NoError(t, err)
@@ -196,48 +159,33 @@ func TestTruncate(t *testing.T) {
 			break
 		}
 		ei := iter.Next()
-		result = append(result, string(ei.Log.Key))
+		result = append(result, len(ei))
 	}
-	require.Equal(t, []string{"a", "b", "c"}, result)
+	require.Equal(t, []int{3, 1 << 20, 3}, result)
 
 }
 
 func TestPunchHoles(t *testing.T) {
-	cases := []*pb.EntryInfo{
-		{
-			Log: &pb.Entry{
-				Key:   []byte("a"),
-				Value: []byte("xx"),
-			},
-		},
-		{
-			Log: &pb.Entry{
-				Key:   []byte("b"),
-				Value: []byte(fmt.Sprintf("%01048576d", 10)), //1MB
-			},
-		},
-		{
-			Log: &pb.Entry{
-				Key:   []byte("c"),
-				Value: []byte("xx"),
-			},
-		},
+	cases := []block{
+		[]byte("axx"),
+		[]byte(fmt.Sprintf("%01048576d", 10)), //1MB
+		[]byte("cxx"),
 	}
 
 	client := NewMockStreamClient("log").(*MockStreamClient)
 	defer client.Close()
 
-	_, _, err := client.AppendEntries(context.Background(), cases, false)
+	_, _, _, err := client.Append(context.Background(), cases, false)
 	require.NoError(t, err)
 
-	_, _, err = client.AppendEntries(context.Background(), cases, false)
+	_, _, _, err = client.Append(context.Background(), cases, false)
 	require.NoError(t, err)
 
 	err = client.PunchHoles(context.Background(), []uint64{client.stream[0], client.stream[1]})
 	require.NoError(t, err)
 
 	iter := client.NewLogEntryIter(WithReadFromStart(math.MaxUint32))
-	result := make([]string, 0)
+	result := make([]int, 0)
 	for {
 		ok, err := iter.HasNext()
 		require.NoError(t, err)
@@ -245,8 +193,8 @@ func TestPunchHoles(t *testing.T) {
 			break
 		}
 		ei := iter.Next()
-		result = append(result, string(ei.Log.Key))
+		result = append(result, len(ei))
 	}
-	require.Equal(t, []string{}, result)
+	require.Equal(t, []int{}, result)
 
 }

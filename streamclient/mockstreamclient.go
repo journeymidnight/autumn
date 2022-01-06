@@ -33,7 +33,7 @@ func (client *MockStreamClient) SealedLength(extentID uint64) (uint64, error) {
 	return uint64(ex.CommitLength()), nil
 }
 
-func (client *MockStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32, hint byte) ([]*pb.Block, uint32, error) {
+func (client *MockStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32, hint byte) ([]block, uint32, error) {
 	client.RLock()
 	ex := client.exs[extentID]
 	client.RUnlock()
@@ -160,6 +160,7 @@ func (client *MockStreamClient) Truncate(ctx context.Context, extentID uint64) e
 }
 
 //block API, entries has been batched
+/*
 func (client *MockStreamClient) AppendEntries(ctx context.Context, entries []*pb.EntryInfo, mustSync bool) (uint64, uint32, error) {
 	blocks := make([]*pb.Block, 0, len(entries))
 
@@ -177,9 +178,10 @@ func (client *MockStreamClient) AppendEntries(ctx context.Context, entries []*pb
 	//fmt.Printf("append return extentID %d\n", extentID)
 	return extentID, tail, err
 }
+*/
 
 //block API
-func (client *MockStreamClient) Append(ctx context.Context, blocks []*pb.Block, mustSync bool) (uint64, []uint32, uint32, error) {
+func (client *MockStreamClient) Append(ctx context.Context, blocks []block, mustSync bool) (uint64, []uint32, uint32, error) {
 	exIndex := len(client.stream) - 1
 	exID := client.stream[exIndex]
 	client.Lock()
@@ -238,7 +240,7 @@ func (client *MockStreamClient) StreamInfo() *pb.StreamInfo {
 	}
 }
 
-func (client *MockStreamClient) ReadLastBlock(ctx context.Context) (*pb.Block, error) {
+func (client *MockStreamClient) ReadLastBlock(ctx context.Context) (block, error) {
 	exIndex := len(client.stream) - 1
 	exID := client.stream[exIndex]
 	client.Lock()
@@ -320,7 +322,7 @@ type MockLockEntryIter struct {
 	currentIndex  int
 	opt           *readOption
 	noMore        bool
-	cache         []*pb.EntryInfo
+	cache         []block
 	n             int //number of extents we have read
 
 }
@@ -345,7 +347,8 @@ func (iter *MockLockEntryIter) receiveEntries() error {
 	ex := iter.sc.exs[exID]
 	iter.sc.RUnlock()
 
-	res, tail, err := ex.ReadEntries(iter.currentOffset, 16*KB)
+	res, _, tail, err := ex.ReadBlocks(iter.currentOffset, 1000, 16*KB)
+	//res, tail, err := ex.ReadEntries(iter.currentOffset, 16*KB)
 
 	if len(res) > 0 {
 		iter.cache = nil
@@ -368,7 +371,7 @@ func (iter *MockLockEntryIter) receiveEntries() error {
 	}
 }
 
-func (iter *MockLockEntryIter) Next() *pb.EntryInfo {
+func (iter *MockLockEntryIter) Next() block {
 	if ok, err := iter.HasNext(); !ok || err != nil {
 		return nil
 	}

@@ -48,17 +48,20 @@ enum Code {
 }
 
 
-
-message Block {
-	bytes data = 1;
+message AppendRequestHeader {
+		uint64 extentID = 1;
+		uint64 eversion = 2;
+		uint32 commit = 3;
+		int64  revision = 4;
+		bool mustSync = 5;
+		repeated uint32 blocks = 6; //length of each block
 }
 
 message AppendRequest {
-	uint64 extentID = 1;
-	repeated Block blocks = 2;
-	uint64 eversion = 3;
-	int64  revision = 4;
-	bool mustSync = 5;
+	oneof data {
+		AppendRequestHeader header = 1;
+		bytes payload = 2;
+	}
 }
 
 message AppendResponse {
@@ -86,12 +89,19 @@ message ReadBlocksRequest {
 	bool onlyLastBlock = 5;
 }
 
-message ReadBlocksResponse {
+message ReadBlockResponseHeader {
 	Code code = 1;
 	string codeDes = 2;
-	repeated Block blocks = 3;
+	repeated uint32 offsets = 3; //offset[i+1] - offset[i] != blockSizes[]
 	uint32 end = 4;
-	repeated uint32 offsets = 5;
+	repeated uint32 blockSizes = 5;
+
+}
+message ReadBlocksResponse {
+	oneof data {
+		ReadBlockResponseHeader header = 1;
+		bytes payload = 2;
+	}
 }
 
 
@@ -102,7 +112,7 @@ message Payload {
 
 message CommitLengthRequest {
 	uint64 extentID = 1;
-	int64 revision = 2; //tell node to update lock's revistion to prevent other node from append
+	int64 revision = 2; //tell node to update lock's revsion to prevent other node from append
 }
 
 message CommitLengthResponse {
@@ -215,10 +225,10 @@ message ReAvaliResponse {
 
 service ExtentService {
 	//from stream client
-	rpc Append(AppendRequest) returns (AppendResponse){}
+	rpc Append(stream AppendRequest) returns (AppendResponse){}
 	//rpc ReadEntries(ReadEntriesRequest) returns (ReadEntriesResponse){}
 	//rpc SmartReadBlocks(ReadBlocksRequest) returns (ReadBlocksResponse){}
-	rpc ReadBlocks(ReadBlocksRequest) returns(ReadBlocksResponse){}
+	rpc ReadBlocks(ReadBlocksRequest) returns(stream ReadBlocksResponse){}
 
 
 	//internal rpc
@@ -229,24 +239,8 @@ service ExtentService {
 
 	rpc CommitLength(CommitLengthRequest) returns (CommitLengthResponse) {}
 	rpc Heartbeat (Payload)  returns (stream Payload) {}
-	rpc ReplicateBlocks(ReplicateBlocksRequest) returns (ReplicateBlocksResponse) {}
+	//rpc ReplicateBlocks(ReplicateBlocksRequest) returns (ReplicateBlocksResponse) {}
 	rpc AllocExtent(AllocExtentRequest) returns (AllocExtentResponse){}
-}
-
-message ReplicateBlocksRequest {
-	uint64 extentID = 1;
-	uint32 commit = 2;
-	repeated Block blocks = 3;
-	int64 revision = 4;
-	bool mustSync = 5;
-
-}
-
-message ReplicateBlocksResponse {
-	Code code = 1;
-	string codeDes = 2;
-	repeated uint32 offsets = 3;
-	uint32 end = 4;
 }
 
 message AllocExtentRequest {
