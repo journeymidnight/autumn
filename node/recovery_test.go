@@ -184,9 +184,9 @@ func (suite *RcoveryTestSuite) TestAutoRecovery() {
 	err = sc.Connect()
 	suite.Require().Nil(err)
 	extentID, _, _, err := sc.Append(context.Background(),
-		[]*pb.Block{
-			{Data: []byte("hello")},
-			{Data: []byte("world")},
+		[][]byte{
+			[]byte("hello"),
+			[]byte("world"),
 		}, false)
 	suite.Require().Nil(err)
 	//find where extentID is located
@@ -206,8 +206,8 @@ func (suite *RcoveryTestSuite) TestAutoRecovery() {
 	}
 
 	newExID, _, _, err := sc.Append(context.Background(),
-		[]*pb.Block{
-			{Data: []byte("autoretry")},
+		[][]byte{
+			[]byte("autoretry"),
 		}, false)
 
 	suite.Require().Nil(err)

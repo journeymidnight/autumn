@@ -28,8 +28,6 @@ import (
 	"sync/atomic"
 
 	"github.com/journeymidnight/autumn/extent/record"
-	"github.com/journeymidnight/autumn/proto/pb"
-	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/journeymidnight/autumn/xlog"
@@ -381,7 +379,7 @@ func (ex *Extent) ResetWriter() {
 	ex.resetWriter()
 }
 
-func (ex *Extent) RecoveryData(start uint32, rev int64, blocks []*pb.Block) error {
+func (ex *Extent) RecoveryData(start uint32, rev int64, blocks []block) error {
 
 	if ex.IsSeal() {
 		return nil
@@ -393,7 +391,7 @@ func (ex *Extent) RecoveryData(start uint32, rev int64, blocks []*pb.Block) erro
 	expectedEnd := start
 
 	for _, block := range blocks {
-		expectedEnd = record.ComputeEnd(expectedEnd, uint32(len(block.Data)))
+		expectedEnd = record.ComputeEnd(expectedEnd, uint32(len(block)))
 	}
 
 	currentLength := atomic.LoadUint32(&ex.commitLength)
@@ -412,7 +410,7 @@ func (ex *Extent) RecoveryData(start uint32, rev int64, blocks []*pb.Block) erro
 	offset := start % record.BlockSize
 	newWriter := record.NewLogWriter(ex.file, int64(bn), int32(offset))
 	for _, block := range blocks {
-		if _, _, err := newWriter.WriteRecord(block.Data); err != nil {
+		if _, _, err := newWriter.WriteRecord(block); err != nil {
 			return err
 		}
 	}
@@ -430,7 +428,7 @@ func (ex *Extent) Sync() error {
 	return ex.writer.Sync()
 }
 
-func (ex *Extent) AppendBlocks(blocks []*pb.Block, doSync bool) ([]uint32, uint32, error) {
+func (ex *Extent) AppendBlocks(blocks []block, doSync bool) ([]uint32, uint32, error) {
 
 	ex.AssertLock()
 
@@ -457,7 +455,7 @@ func (ex *Extent) AppendBlocks(blocks []*pb.Block, doSync bool) ([]uint32, uint3
 	end := int64(currentLength)
 	var err error
 	for _, block := range blocks {
-		start, end, err = ex.writer.WriteRecord(block.Data)
+		start, end, err = ex.writer.WriteRecord(block)
 		utils.AssertTrue(end <= math.MaxUint32)
 		if err != nil {
 			truncate()
@@ -503,9 +501,11 @@ func (ex *Extent) ValidAllBlocks(start int64) (uint32, error) {
 	}
 }
 
-func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize uint32) ([]*pb.Block, []uint32, uint32, error) {
+type block = []byte
 
-	var ret []*pb.Block
+func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize uint32) ([]block, []uint32, uint32, error) {
+
+	var ret []block
 	//TODO: fix block number
 
 	currentLength := atomic.LoadUint32(&ex.commitLength)
@@ -543,7 +543,7 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 			break
 		}
 
-		ret = append(ret, &pb.Block{Data: data})
+		ret = append(ret, data)
 		offsets = append(offsets, uint32(start))
 		end = uint32(rr.End())
 	}
@@ -553,7 +553,7 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 }
 
 //return data, offset, end, error
-func (ex *Extent) ReadLastBlock() ([]*pb.Block, []uint32, uint32, error) {
+func (ex *Extent) ReadLastBlock() ([]block, []uint32, uint32, error) {
 
 	wrapReader := ex.GetReader() //thread-safe
 	offset := int64(atomic.LoadUint32(&ex.commitLength) & ^uint32(record.BlockSizeMask))
@@ -592,7 +592,7 @@ LOOP:
 	if data == nil {
 		return nil, nil, 0, wire_errors.NotFound
 	}
-	return []*pb.Block{{Data: data}}, []uint32{start}, end, nil
+	return []block{data}, []uint32{start}, end, nil
 }
 
 func (ex *Extent) CommitLength() uint32 {
@@ -602,6 +602,7 @@ func (ex *Extent) CommitLength() uint32 {
 //helper function, block could be pb.Entries, support ReadEntries
 //ReadEntries can only be called on replicated extent
 //node_service will never call this function, this function is only for test
+/*
 func (ex *Extent) ReadEntries(offset uint32, maxTotalSize uint32) ([]*pb.EntryInfo, uint32, error) {
 
 	blocks, offsets, end, err := ex.ReadBlocks(offset, 10, maxTotalSize)
@@ -626,9 +627,10 @@ func (ex *Extent) ReadEntries(offset uint32, maxTotalSize uint32) ([]*pb.EntryIn
 	}
 
 	return ret, end, err
-
 }
+*/
 
+/*
 func ExtractEntryInfo(b *pb.Block, extentID uint64, offset uint32) (*pb.EntryInfo, error) {
 	entry := new(pb.Entry)
 	if err := entry.Unmarshal(b.Data); err != nil {
@@ -653,3 +655,4 @@ func ExtractEntryInfo(b *pb.Block, extentID uint64, offset uint32) (*pb.EntryInf
 		}, nil
 	}
 }
+*/

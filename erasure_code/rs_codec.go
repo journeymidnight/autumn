@@ -7,7 +7,6 @@ import (
 	"io"
 
 	"github.com/journeymidnight/autumn/extent"
-	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/klauspost/reedsolomon"
@@ -133,6 +132,8 @@ func which(x [][]byte) {
 	}
 }
 
+type block = []byte
+
 //FIXME: add a channel to make ReadBlocks and Reconstruct asynchronized
 func (ReedSolomon) RebuildECExtent(dataShards, parityShards int, sourceExtent []*extent.Extent, start uint32, replacingIndex int, targetExtent *extent.Extent) error {
 
@@ -140,7 +141,7 @@ func (ReedSolomon) RebuildECExtent(dataShards, parityShards int, sourceExtent []
 
 	enc, err := reedsolomon.New(dataShards, parityShards)
 
-	blocks := make([][]*pb.Block, dataShards+parityShards)
+	blocks := make([][]block, dataShards+parityShards)
 	shards := make([][]byte, dataShards+parityShards)
 
 	if len(sourceExtent) > replacingIndex && sourceExtent[replacingIndex] != nil {
@@ -169,23 +170,21 @@ func (ReedSolomon) RebuildECExtent(dataShards, parityShards int, sourceExtent []
 		}
 
 		start = end
-		writeBlocks := make([]*pb.Block, n)
+		writeBlocks := make([]block, n)
 
 		for k := 0; k < n; k++ {
 			for i := 0; i < dataShards+parityShards; i++ {
 				if blocks[i] == nil {
 					shards[i] = nil
 				} else {
-					shards[i] = blocks[i][k].Data
+					shards[i] = blocks[i][k]
 				}
 			}
 
 			if err = enc.Reconstruct(shards); err != nil {
 				return err
 			}
-			writeBlocks[k] = &pb.Block{
-				Data: shards[replacingIndex],
-			}
+			writeBlocks[k] = shards[replacingIndex]
 		}
 		var doSync bool
 		if done { //last one

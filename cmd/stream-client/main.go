@@ -39,59 +39,16 @@ const (
 )
 
 type writeRequest struct {
-	blocks []*pb.Block
+	blocks [][]byte
 	wg     sync.WaitGroup
 	err    error
 }
 
-func threadedOp(threadNum int, stopper *utils.Stopper, done chan struct{}, op BenchType, sc *streamclient.AutumnStreamClient, blocks []*pb.Block,
-	callback func(s time.Time, loop int, err error)) {
-
-	for i := 0; i < threadNum; i++ {
-		stopper.RunWorker(func() {
-			for {
-				loop := 0 //sample to record lantency
-				select {
-				case <-stopper.ShouldStop():
-					return
-				default:
-					write := func() {
-						start := time.Now()
-						//fmt.Printf("good %s")
-						_, _, _, err := sc.Append(context.Background(), blocks)
-
-						//fmt.Println("not bad")
-
-						callback(start, loop, err)
-						loop++
-					}
-
-					read := func() {}
-					switch op {
-					case "read":
-						read()
-					case "write":
-						write()
-					default:
-						fmt.Println("bench type is wrong")
-						return
-					}
-
-				}
-
-			}
-		})
-
-	}
-
-	stopper.Wait()
-}
-
-var kCapacity = 64
+var kCapacity = 192
 
 //batch op
 func batchOp(stopper *utils.Stopper, done chan struct{}, op BenchType,
-	sc *streamclient.AutumnStreamClient, blocks []*pb.Block, callback func(s time.Time, loop int, err error)) {
+	sc *streamclient.AutumnStreamClient, blocks [][]byte, callback func(s time.Time, loop int, err error)) {
 	//single thread, no batch
 
 	writeCh := make(chan *writeRequest, kCapacity)
@@ -136,11 +93,11 @@ func batchOp(stopper *utils.Stopper, done chan struct{}, op BenchType,
 func doWrites(writeCh chan *writeRequest, done chan struct{}, sc *streamclient.AutumnStreamClient) {
 	pendingCh := make(chan struct{}, 1)
 	writeRequests := func(reqs []*writeRequest) {
-		var blocks []*pb.Block
+		var blocks [][]byte
 		for _, req := range reqs {
 			blocks = append(blocks, req.blocks...)
 		}
-		_, _, _, err := sc.Append(context.Background(), blocks)
+		_, _, _, err := sc.Append(context.Background(), blocks, true)
 		for _, req := range reqs {
 			req.err = err
 			req.wg.Done()
@@ -211,7 +168,7 @@ func benchmark(etcdAddr []string, smAddr []string, op BenchType, duration int, s
 	mutex.Lock(context.Background())
 	defer mutex.Unlock(context.Background())
 
-	sc := streamclient.NewStreamClient(sm, em, s.StreamID, streamclient.MutexToLock(mutex))
+	sc := streamclient.NewStreamClient(sm, em, 512<<20, s.StreamID, streamclient.MutexToLock(mutex))
 	if err = sc.Connect(); err != nil {
 		return err
 	}
@@ -219,11 +176,7 @@ func benchmark(etcdAddr []string, smAddr []string, op BenchType, duration int, s
 	//prepare data
 	data := make([]byte, size)
 	utils.SetRandStringBytes(data)
-	blocks := []*pb.Block{
-		{
-			Data: data,
-		},
-	}
+	blocks := [][]byte{data}
 
 	var lock sync.Mutex //protect results
 	var results []Result
@@ -273,12 +226,7 @@ func benchmark(etcdAddr []string, smAddr []string, op BenchType, duration int, s
 		}
 	}
 
-	if threadNum == 1 {
-		go batchOp(stopper, done, op, sc, blocks, writeDone)
-	} else {
-		go threadedOp(threadNum, stopper, done, op, sc, blocks, writeDone)
-	}
-
+	go batchOp(stopper, done, op, sc, blocks, writeDone)
 	go livePrint()
 
 	go func() {
@@ -394,7 +342,7 @@ func main() {
 				&cli.IntFlag{Name: "thread", Value: 1, Aliases: []string{"t"}},
 				&cli.IntFlag{Name: "duration", Value: 10, Aliases: []string{"d"}},
 				&cli.IntFlag{Name: "size", Value: 8192, Aliases: []string{"s"}},
-				&cli.StringFlag{Name: "replication", Value: "2+1", Required: true},
+				&cli.StringFlag{Name: "replication", Value: "2+1"},
 			},
 			Action: wbench,
 		},

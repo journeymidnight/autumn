@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/gogo/protobuf/proto"
-	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/pkg/errors"
 )
@@ -262,10 +261,10 @@ func (c CRC) Value() uint32 {
 	return uint32(c>>15|c<<17) + 0xa282ead8
 }
 
-func SizeOfBlocks(blocks []*pb.Block) uint32 {
+func SizeOfBlocks(blocks [][]byte) uint32 {
 	ret := uint32(0)
 	for i := range blocks {
-		ret += uint32(len(blocks[i].Data))
+		ret += uint32(len(blocks[i]))
 	}
 	return ret
 }

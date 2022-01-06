@@ -18,15 +18,14 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/dgraph-io/ristretto"
 	"github.com/journeymidnight/autumn/conn"
 	"github.com/journeymidnight/autumn/erasure_code"
-	"github.com/journeymidnight/autumn/extent"
 	"github.com/journeymidnight/autumn/manager/smclient"
 	"github.com/journeymidnight/autumn/proto/pb"
-	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/wire_errors"
 	"github.com/journeymidnight/autumn/xlog"
@@ -35,8 +34,7 @@ import (
 	"go.etcd.io/etcd/client/v3/concurrency"
 
 	"github.com/gogo/protobuf/proto"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	"google.golang.org/grpc"
 )
 
 const (
@@ -47,12 +45,14 @@ const (
 	HardMaxExtentSize = 3 * GB //Hard limit of extent size
 )
 
+type block = []byte
+
 type StreamClient interface {
 	Connect() error
 	Close()
-	AppendEntries(ctx context.Context, entries []*pb.EntryInfo, mustSync bool) (uint64, uint32, error)
-	ReadLastBlock(ctx context.Context) (*pb.Block, error)
-	Append(ctx context.Context, blocks []*pb.Block, mustSync bool) (extentID uint64, offsets []uint32, end uint32, err error)
+	//AppendEntries(ctx context.Context, entries []block, mustSync bool) (uint64, uint32, error)
+	ReadLastBlock(ctx context.Context) (block, error)
+	Append(ctx context.Context, blocks []block, mustSync bool) (extentID uint64, offsets []uint32, end uint32, err error)
 	PunchHoles(ctx context.Context, extentIDs []uint64) error
 	NewLogEntryIter(opt ...ReadOption) LogEntryIter
 	//truncate extent BEFORE extentID
@@ -61,13 +61,13 @@ type StreamClient interface {
 	CommitEnd() uint32 //FIMME:remove this
 	//total number of extents
 	StreamInfo() *pb.StreamInfo
-	Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32, hint byte) ([]*pb.Block, uint32, error)
+	Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32, hint byte) ([]block, uint32, error)
 	SealedLength(extentID uint64) (uint64, error)
 }
 
 type LogEntryIter interface {
 	HasNext() (bool, error)
-	Next() *pb.EntryInfo
+	Next() block
 }
 
 //hint
@@ -84,17 +84,17 @@ func blockCacheID(extentID uint64, offset uint32) []byte {
 }
 
 type blockInCache struct {
-	block   *pb.Block
+	block   block
 	readEnd uint32
 }
 
-func (sc *AutumnStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32, hint byte) ([]*pb.Block, uint32, error) {
+func (sc *AutumnStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32, hint byte) ([]block, uint32, error) {
 	//only cache metadata
 	if (hint&HintReadFromCache) > 0 && numOfBlocks == 1 {
 		data, ok := sc.blockCache.Get(blockCacheID(extentID, offset))
 		if ok && data != nil {
 			x := data.(blockInCache)
-			return []*pb.Block{x.block}, x.readEnd, nil
+			return [][]byte{x.block}, x.readEnd, nil
 		}
 	}
 	blocks, _, end, err := sc.smartRead(ctx, extentID, offset, numOfBlocks, false)
@@ -113,15 +113,78 @@ func (sc *AutumnStreamClient) SealedLength(extentID uint64) (uint64, error) {
 	return exInfo.SealedLength, nil
 }
 
-func (sc *AutumnStreamClient) smartRead(gctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32, onlyReadLast bool) ([]*pb.Block, []uint32, uint32, error) {
+//helper function to read blocks' data
+func (sc *AutumnStreamClient) readBlockData(ctx context.Context, conn *grpc.ClientConn, exInfo *pb.ExtentInfo, request *pb.ReadBlocksRequest) ([]block, []uint32, uint32, error) {
+
+retry:
+	c := pb.NewExtentServiceClient(conn)
+	stream, err := c.ReadBlocks(ctx, request)
+	//network error
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	res, err := stream.Recv()
+	//network error
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	header := res.GetHeader()
+	if header == nil {
+		return nil, nil, 0, errors.Errorf("read response header is nil")
+	}
+
+	//logic error
+	err = wire_errors.FromPBCode(header.Code, header.CodeDes)
+	switch err {
+	case nil, wire_errors.EndOfExtent:
+		//normal case
+	case wire_errors.VersionLow:
+		sc.em.WaitVersion(exInfo.ExtentID, exInfo.Eversion+1)
+		goto retry
+	default:
+		return nil, nil, 0, err
+	}
+
+	buf := new(bytes.Buffer)
+	for {
+		res, err := stream.Recv()
+		if err != nil && err != io.EOF {
+			return nil, nil, 0, err
+		}
+		payload := res.GetPayload()
+		if payload == nil {
+			break
+		}
+		buf.Write(payload)
+	}
+
+	//verfiy all blocks have been received
+	sum := uint32(0)
+	for i := range header.BlockSizes {
+		sum += header.BlockSizes[i]
+	}
+	if sum != uint32(buf.Len()) {
+		return nil, nil, 0, errors.Errorf("read response payload length is not equal to header")
+	}
+	//each block point to slice of buf
+	blocks := make([][]byte, len(header.BlockSizes))
+	n := 0
+	for i := 0; i < len(blocks); i++ {
+		blocks[i] = buf.Bytes()[n : n+int(header.BlockSizes[i])]
+		n += int(header.BlockSizes[i])
+	}
+	return blocks, header.Offsets, header.End, nil
+}
+
+func (sc *AutumnStreamClient) smartRead(gctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32, onlyReadLast bool) ([][]byte, []uint32, uint32, error) {
 	if onlyReadLast {
 		utils.AssertTrue(numOfBlocks == 1)
 	}
 
-retry:
-
 	span, ctx := opentracing.StartSpanFromContext(gctx, "SmartRead")
 	defer span.Finish()
+
 	exInfo := sc.em.GetExtentInfo(extentID)
 	if exInfo == nil {
 		return nil, nil, 0, errors.Errorf("extent %d not exist", extentID)
@@ -129,34 +192,17 @@ retry:
 
 	//replicate read
 	if len(exInfo.Parity) == 0 {
-		//return en.ReadBlocks(ctx, req)
-		conn := sc.em.GetExtentConn(extentID, smclient.AlivePolicy{})
+		conn := sc.em.GetExtentConn(exInfo.ExtentID, smclient.AlivePolicy{})
 		if conn == nil {
 			return nil, nil, 0, errors.Errorf("unable to get extent connection.")
 		}
-		c := pb.NewExtentServiceClient(conn)
-		res, err := c.ReadBlocks(ctx, &pb.ReadBlocksRequest{
+		return sc.readBlockData(ctx, conn, exInfo, &pb.ReadBlocksRequest{
 			ExtentID:      extentID,
 			Offset:        offset,
 			NumOfBlocks:   numOfBlocks,
 			Eversion:      exInfo.Eversion,
-			OnlyLastBlock: onlyReadLast, //if onlyReadLast is true, node server will ignore offset
+			OnlyLastBlock: onlyReadLast,
 		})
-		//network error
-		if err != nil {
-			return nil, nil, 0, err
-		}
-		//logic error
-		err = wire_errors.FromPBCode(res.Code, res.CodeDes)
-		switch err {
-		case nil, wire_errors.EndOfExtent:
-			return res.Blocks, res.Offsets, res.End, err
-		case wire_errors.VersionLow:
-			sc.em.WaitVersion(extentID, exInfo.Eversion+1)
-			goto retry
-		default:
-			return nil, nil, 0, err
-		}
 	}
 
 	//EC read
@@ -167,7 +213,7 @@ retry:
 	//if we read from n > dataShard, call cancel() to stop
 	pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 
-	dataBlocks := make([][]*pb.Block, n)
+	dataBlocks := make([][]block, n)
 
 	//channel
 	type Result struct {
@@ -195,41 +241,20 @@ retry:
 			}
 			return
 		}
-		var res *pb.ReadBlocksResponse
-		var err error
-
-	retry1:
-		c := pb.NewExtentServiceClient(pool.Get())
-
-		res, err = c.ReadBlocks(pctx, req)
-
-		if err != nil { //network error or disk error
-			err = errors.Errorf("%s ReadBlock: %s", pool.Addr, err.Error())
-			//fmt.Printf("%s\n", err)
-			errChan <- Result{
-				Error: err}
-			return
-		}
-		err = wire_errors.FromPBCode(res.Code, res.CodeDes)
-		if err == wire_errors.VersionLow {
-			sc.em.WaitVersion(extentID, exInfo.Eversion+1)
-			goto retry1
-		}
-		if err != nil && err != context.Canceled && err != wire_errors.EndOfExtent {
+		blocks, offsets, end, err := sc.readBlockData(pctx, pool.Get(), exInfo, req)
+		if err != nil && err != wire_errors.EndOfExtent {
 			errChan <- Result{
 				Error: err,
 			}
 			return
 		}
-
 		//successful read
-		//如果读到最后, err有可能是EndOfExtent
-		dataBlocks[pos] = res.Blocks
+		dataBlocks[pos] = blocks
 		retChan <- Result{
 			Error:   err,
-			End:     res.End,
-			Len:     len(res.Blocks),
-			Offsets: res.Offsets,
+			End:     end,
+			Len:     len(blocks),
+			Offsets: offsets,
 		}
 	}
 
@@ -321,13 +346,13 @@ waitResult:
 
 	//join each block
 	span.LogKV("DECODE_BLOCKS START", lenOfBlocks)
-	retBlocks := make([]*pb.Block, lenOfBlocks)
+	retBlocks := make([][]byte, lenOfBlocks)
 	for i := 0; i < lenOfBlocks; i++ {
 		data := make([][]byte, n)
 		for j := range dataBlocks {
 			//in EC read, dataBlocks[j] could be nil, because we have got enough data to decode
 			if dataBlocks[j] != nil {
-				data[j] = dataBlocks[j][i].Data
+				data[j] = dataBlocks[j][i]
 			}
 		}
 		output, err := erasure_code.ReedSolomon{}.Decode(data, dataShards, parityShards)
@@ -335,7 +360,7 @@ waitResult:
 		if err != nil {
 			return nil, nil, 0, err
 		}
-		retBlocks[i] = &pb.Block{Data: output}
+		retBlocks[i] = output
 	}
 	return retBlocks, offsets, end, finalErr
 }
@@ -422,7 +447,7 @@ type AutumnEntryIter struct {
 	currentOffset      uint32
 	currentExtentIndex int
 	noMore             bool
-	cache              []*pb.EntryInfo
+	cache              []block
 	replay             bool
 	n                  int //number of extents we have read
 }
@@ -459,7 +484,7 @@ func (sc *AutumnStreamClient) checkCommitLength() {
 
 }
 
-func (sc *AutumnStreamClient) ReadLastBlock(ctx context.Context) (*pb.Block, error) {
+func (sc *AutumnStreamClient) ReadLastBlock(ctx context.Context) (block, error) {
 
 	if len(sc.streamInfo.ExtentIDs) == 0 {
 		return nil, errors.Errorf("no extent in stream")
@@ -519,7 +544,7 @@ func (iter *AutumnEntryIter) HasNext() (bool, error) {
 	return len(iter.cache) > 0, nil
 }
 
-func (iter *AutumnEntryIter) Next() *pb.EntryInfo {
+func (iter *AutumnEntryIter) Next() block {
 	if ok, err := iter.HasNext(); !ok || err != nil {
 		return nil
 	}
@@ -545,7 +570,7 @@ retry:
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 
-	blocks, offsets, end, err := iter.sc.smartRead(ctx, extentID, iter.currentOffset, 1000, false)
+	blocks, _, end, err := iter.sc.smartRead(ctx, extentID, iter.currentOffset, 1000, false)
 	cancel()
 
 	if err != nil && err != wire_errors.EndOfExtent {
@@ -558,28 +583,30 @@ retry:
 		goto retry
 	}
 
-	entries := make([]*pb.EntryInfo, 0, len(blocks))
-	for i := 0; i < len(blocks); i++ {
-		entry, err := extent.ExtractEntryInfo(blocks[i], extentID, offsets[i])
-		if err != nil {
-			return err
-		}
+	iter.cache = blocks
 
-		//fmt.Printf("Read entries %s\n", string(entry.Log.Key))
-		//fill end field in EntryInfo
-		if i == len(blocks)-1 {
-			entry.End = end
-		} else {
-			entry.End = offsets[i+1]
-		}
-		entries = append(entries, entry)
-	}
+	// entries := make([]block, 0, len(blocks))
+	// for i := 0; i < len(blocks); i++ {
+	// 	entry, err := extent.ExtractEntryInfo(blocks[i], extentID, offsets[i])
+	// 	if err != nil {
+	// 		return err
+	// 	}
 
-	//xlog.Logger.Debugf("res code is %v, len of entries %d\n", res.Code, len(res.Entries))
+	// 	//fmt.Printf("Read entries %s\n", string(entry.Log.Key))
+	// 	//fill end field in EntryInfo
+	// 	if i == len(blocks)-1 {
+	// 		entry.End = end
+	// 	} else {
+	// 		entry.End = offsets[i+1]
+	// 	}
+	// 	entries = append(entries, entry)
+	// }
 
-	if len(entries) > 0 {
-		iter.cache = entries
-	}
+	// //xlog.Logger.Debugf("res code is %v, len of entries %d\n", res.Code, len(res.Entries))
+
+	// if len(entries) > 0 {
+	// 	iter.cache = entries
+	// }
 
 	switch err {
 	case nil:
@@ -748,33 +775,143 @@ func (sc *AutumnStreamClient) Close() {
 
 }
 
-//AppendEntries blocks until success
-//make all entries in the same extentID, and fill entires.
-func (sc *AutumnStreamClient) AppendEntries(ctx context.Context, entries []*pb.EntryInfo, mustSync bool) (uint64, uint32, error) {
-	if len(entries) == 0 {
-		return 0, 0, errors.Errorf("blocks can not be nil")
+//appendBlocks is a helper function for Append
+func (sc *AutumnStreamClient) appendBlocks(ctx context.Context, exInfo *pb.ExtentInfo, blocks []block, mustSync bool) ([]uint32, uint32, error) {
+
+	pools, err := sc.em.ConnPool(sc.em.GetPeers(exInfo.ExtentID))
+	if err != nil {
+		return nil, 0, errors.Errorf("extent %d's append can not get pool[%s]", exInfo.ExtentID, err.Error())
 	}
 
-	blocks := make([]*pb.Block, 0, len(entries))
+	//choose offset
+	offset := sc.end
 
-	for _, entry := range entries {
-		data := utils.MustMarshal(entry.Log)
-		blocks = append(blocks, &pb.Block{
-			data,
+	pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	n := len(pools)
+
+	dataBlocks := make([][]block, n)
+	//erasure code
+	if len(exInfo.Parity) > 0 {
+		//EC, prepare data
+		dataShard := len(exInfo.Replicates)
+		parityShard := len(exInfo.Parity)
+
+		for i := range blocks {
+			striped, err := erasure_code.ReedSolomon{}.Encode(blocks[i], dataShard, parityShard)
+			if err != nil {
+				return nil, 0, err
+			}
+			for j := 0; j < len(striped); j++ {
+				dataBlocks[j] = append(dataBlocks[j], striped[j])
+			}
+
+		}
+		//replicate code
+	} else {
+		for i := 0; i < len(dataBlocks); i++ {
+			dataBlocks[i] = blocks
+		}
+	}
+
+	//FIXME: put stopper into sync.Pool
+	stopper := utils.NewStopper()
+	type Result struct {
+		Error   error
+		Offsets []uint32
+		End     uint32
+	}
+	retChan := make(chan Result, n)
+
+	//leaderless append mode, send Append to all peers
+	for i := 0; i < n; i++ {
+		j := i
+		stopper.RunWorker(func() {
+			conn := pools[j].Get()
+			client := pb.NewExtentServiceClient(conn)
+
+			stream, err := client.Append(pctx)
+			if err != nil {
+				retChan <- Result{err, nil, 0}
+				return
+			}
+
+			//send header
+			sizeOfBlocks := make([]uint32, len(dataBlocks[j]))
+			for i := range sizeOfBlocks {
+				sizeOfBlocks[i] = uint32(len(dataBlocks[j][i]))
+			}
+			if err = stream.Send(&pb.AppendRequest{
+				Data: &pb.AppendRequest_Header{
+					Header: &pb.AppendRequestHeader{
+						ExtentID: exInfo.ExtentID,
+						Commit:   offset,
+						Revision: sc.streamLock.revision,
+						MustSync: mustSync,
+						Blocks:   sizeOfBlocks,
+						Eversion: exInfo.Eversion,
+					}}}); err != nil {
+				retChan <- Result{err, nil, 0}
+				return
+			}
+
+			//send data
+			//grpc payload could be as large as 32MB
+			for i := range dataBlocks[j] {
+				if err = stream.Send(&pb.AppendRequest{
+					Data: &pb.AppendRequest_Payload{
+						Payload: dataBlocks[j][i],
+					},
+				}); err != nil {
+					break
+				}
+			}
+			if err != nil {
+				retChan <- Result{err, nil, 0}
+				return
+			}
+
+			res, err := stream.CloseAndRecv()
+
+			if err == nil {
+				if res.Code != pb.Code_OK {
+					err = wire_errors.FromPBCode(res.Code, res.CodeDes)
+				}
+				retChan <- Result{Error: err, Offsets: res.Offsets, End: res.End}
+			} else {
+				retChan <- Result{Error: err}
+			}
+			xlog.Logger.Debugf("append remote done [%s], %v", pools[j].Addr, err)
 		})
 	}
-	extentID, offsets, tail, err := sc.Append(ctx, blocks, mustSync)
-	if err != nil {
-		return 0, 0, err
+
+	stopper.Wait()
+	close(retChan)
+
+	var preOffsets []uint32
+	preEnd := int64(-1)
+	for result := range retChan {
+		if preOffsets == nil {
+			preOffsets = result.Offsets
+		}
+		if preEnd == -1 {
+			preEnd = int64(result.End)
+		}
+		if result.Error != nil {
+			fmt.Printf("append on extent %d error: %v\n", exInfo.ExtentID, result.Error)
+			return nil, 0, result.Error
+		}
+		if !utils.EqualUint32(result.Offsets, preOffsets) || preEnd != int64(result.End) {
+			return nil, 0, errors.Errorf("block is not appended at the same offset [%v] vs [%v], end [%v] vs [%v]",
+				result.Offsets, preOffsets, preEnd, result.End)
+		}
 	}
-	for i := range entries {
-		entries[i].ExtentID = extentID
-		entries[i].Offset = offsets[i]
-	}
-	return extentID, tail, err
+
+	return preOffsets, uint32(preEnd), nil
 }
 
-func (sc *AutumnStreamClient) Append(ctx context.Context, blocks []*pb.Block, mustSync bool) (uint64, []uint32, uint32, error) {
+func (sc *AutumnStreamClient) Append(ctx context.Context, blocks []block, mustSync bool) (uint64, []uint32, uint32, error) {
 
 	loop := 0
 
@@ -796,28 +933,20 @@ retry:
 		goto retry
 	}
 
-	conn := sc.em.GetExtentConn(extentID, smclient.PrimaryPolicy{})
-	if conn == nil {
-		if err = sc.MustAllocNewExtent(); err != nil {
-			return 0, nil, 0, err
-		}
+	offsets, end, err := sc.appendBlocks(ctx, exInfo, blocks, mustSync)
+
+	if err == wire_errors.LockedByOther {
+		//conflict happend, tell upper layer to close this stream
+		return extentID, nil, 0, err
+	}
+
+	if err == wire_errors.VersionLow {
+		sc.em.WaitVersion(extentID, exInfo.Eversion+1)
 		goto retry
 	}
 
-	pctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	c := pb.NewExtentServiceClient(conn)
-	app := &pb.AppendRequest{
-		ExtentID: extentID,
-		Blocks:   blocks,
-		Eversion: exInfo.Eversion,
-		Revision: sc.streamLock.revision,
-		MustSync: mustSync,
-	}
-	res, err := c.Append(pctx, app)
-	cancel()
-
-	if status.Code(err) == codes.DeadlineExceeded || status.Code(err) == codes.Unavailable { //timeout
-		fmt.Printf("append on extent %d; error is %v\n", extentID, err)
+	if err != nil { //status.Code(err) == codes.DeadlineExceeded || status.Code(err) == codes.Unavailable
+		//fmt.Printf("append on extent %d; error is %v\n", extentID, err)
 		if loop < 2 {
 			loop++
 			time.Sleep(100 * time.Millisecond)
@@ -830,34 +959,17 @@ retry:
 		goto retry
 	}
 
-	if err != nil { //may have other network errors:FIXME
-		return 0, nil, 0, err
-	}
-
-	if res.Code == pb.Code_EVersionLow {
-		sc.em.WaitVersion(extentID, exInfo.Eversion+1)
-		goto retry
-	}
-
-	//logic errors
-	err = wire_errors.FromPBCode(res.Code, res.CodeDes)
-	if err != nil {
-		fmt.Printf("append on extent %d; error is %v\n", extentID, err)
-		return 0, nil, 0, err
-	}
-
-	sc.end = res.End
-	//fmt.Printf("extent %d updated end is %d\n", extentID, sc.end)
+	sc.end = end
 	//检查offset结果, 如果已经超过MaxExtentSize, 调用StreamAllocExtent
-	utils.AssertTrue(res.End > 0)
+	utils.AssertTrue(end > 0)
 
-	if res.End > sc.maxExtentSize {
+	if end > sc.maxExtentSize {
 		if err = sc.MustAllocNewExtent(); err != nil {
 			return 0, nil, 0, err
 		}
 	}
 	//update end
-	return extentID, res.Offsets, res.End, nil
+	return extentID, offsets, end, nil
 }
 
 func (sc *AutumnStreamClient) StreamInfo() *pb.StreamInfo {
@@ -869,16 +981,16 @@ func (sc *AutumnStreamClient) StreamInfo() *pb.StreamInfo {
 
 //add String() function to pb.StringInfo
 
-func FormatEntry(entry *pb.EntryInfo) string {
-	var flag string
-	switch entry.Log.Meta {
-	case 2:
-		flag = "blob"
-	case 1:
-		flag = "delete"
-	case 0:
-		flag = "norm"
-	}
-	return fmt.Sprintf("%s~%d on extent %d:(%d-%d) [%s]",
-		y.ParseKey(entry.Log.Key), y.ParseTs(entry.Log.Key), entry.ExtentID, entry.Offset, entry.End, flag)
-}
+// func FormatEntry(entry *pb.EntryInfo) string {
+// 	var flag string
+// 	switch entry.Log.Meta {
+// 	case 2:
+// 		flag = "blob"
+// 	case 1:
+// 		flag = "delete"
+// 	case 0:
+// 		flag = "norm"
+// 	}
+// 	return fmt.Sprintf("%s~%d on extent %d:(%d-%d) [%s]",
+// 		y.ParseKey(entry.Log.Key), y.ParseTs(entry.Log.Key), entry.ExtentID, entry.Offset, entry.End, flag)
+// }

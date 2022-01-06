@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/journeymidnight/autumn/conn"
-	"github.com/journeymidnight/autumn/erasure_code"
 	"github.com/journeymidnight/autumn/extent"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
@@ -55,49 +54,49 @@ func (en *ExtentNode) Heartbeat(in *pb.Payload, stream pb.ExtentService_Heartbea
 	}
 }
 
-func (en *ExtentNode) ReplicateBlocks(ctx context.Context, req *pb.ReplicateBlocksRequest) (*pb.ReplicateBlocksResponse, error) {
+// func (en *ExtentNode) ReplicateBlocks(ctx context.Context, req *pb.ReplicateBlocksRequest) (*pb.ReplicateBlocksResponse, error) {
 
-	errDone := func(err error) (*pb.ReplicateBlocksResponse, error) {
-		code, desCode := wire_errors.ConvertToPBCode(err)
-		return &pb.ReplicateBlocksResponse{
-			Code:    code,
-			CodeDes: desCode,
-		}, nil
-	}
+// 	errDone := func(err error) (*pb.ReplicateBlocksResponse, error) {
+// 		code, desCode := wire_errors.ConvertToPBCode(err)
+// 		return &pb.ReplicateBlocksResponse{
+// 			Code:    code,
+// 			CodeDes: desCode,
+// 		}, nil
+// 	}
 
-	ex := en.getExtent((req.ExtentID))
-	if ex == nil {
-		return errDone(errors.Errorf("node %d have no such extent :%d", en.nodeID, req.ExtentID))
-	}
-	ex.Lock()
-	defer ex.Unlock()
+// 	ex := en.getExtent((req.ExtentID))
+// 	if ex == nil {
+// 		return errDone(errors.Errorf("node %d have no such extent :%d", en.nodeID, req.ExtentID))
+// 	}
+// 	ex.Lock()
+// 	defer ex.Unlock()
 
-	if !ex.HasLock(req.Revision) {
-		return errDone(wire_errors.LockedByOther)
-	}
+// 	if !ex.HasLock(req.Revision) {
+// 		return errDone(wire_errors.LockedByOther)
+// 	}
 
-	if ex.CommitLength() < req.Commit {
-		return errDone(errors.Errorf("primary commitlength is different with replicates %d vs %d", req.Commit, ex.CommitLength()))
-	}
+// 	if ex.CommitLength() < req.Commit {
+// 		return errDone(errors.Errorf("primary commitlength is different with replicates %d vs %d", req.Commit, ex.CommitLength()))
+// 	}
 
-	if ex.CommitLength() > req.Commit {
-		ex.Truncate(req.Commit)
-	}
+// 	if ex.CommitLength() > req.Commit {
+// 		ex.Truncate(req.Commit)
+// 	}
 
-	//ex.CommitLength() == req.Commit
-	utils.AssertTrue(ex.CommitLength() == req.Commit)
+// 	//ex.CommitLength() == req.Commit
+// 	utils.AssertTrue(ex.CommitLength() == req.Commit)
 
-	ret, end, err := en.AppendWithWal(ex.Extent, req.Revision, req.Blocks, req.MustSync)
-	if err != nil {
-		return errDone(err)
-	}
-	return &pb.ReplicateBlocksResponse{
-		Code:    pb.Code_OK,
-		Offsets: ret,
-		End:     end,
-	}, nil
+// 	ret, end, err := en.AppendWithWal(ex.Extent, req.Revision, req.Blocks, req.MustSync)
+// 	if err != nil {
+// 		return errDone(err)
+// 	}
+// 	return &pb.ReplicateBlocksResponse{
+// 		Code:    pb.Code_OK,
+// 		Offsets: ret,
+// 		End:     end,
+// 	}, nil
 
-}
+// }
 
 //pool有可能是nil, 如果有nil存在返回error
 func (en *ExtentNode) connPool(peers []string) ([]*conn.Pool, error) {
@@ -131,9 +130,7 @@ func (en *ExtentNode) validReq(extentID uint64, version uint64) (*extent.Extent,
 
 	return ex.Extent, extentInfo, nil
 }
-
-func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.AppendResponse, error) {
-
+func (en *ExtentNode) Append(stream pb.ExtentService_AppendServer) error {
 	/*
 		startTime := time.Now()
 		defer func() {
@@ -141,163 +138,104 @@ func (en *ExtentNode) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Ap
 		}()
 	*/
 
-	errDone := func(err error) (*pb.AppendResponse, error) {
+	errDone := func(err error) error {
 		code, desCode := wire_errors.ConvertToPBCode(err)
-		return &pb.AppendResponse{
+		stream.SendAndClose(&pb.AppendResponse{
 			Code:    code,
 			CodeDes: desCode,
-		}, nil
+		})
+		return nil
 	}
 
-	ex, extentInfo, err := en.validReq(req.ExtentID, req.Eversion)
+	req, err := stream.Recv()
+	if err != nil {
+		return errDone(err)
+	}
+
+	header := req.GetHeader()
+
+	ex, extentInfo, err := en.validReq(header.ExtentID, header.Eversion)
 	if err != nil {
 		return errDone(err)
 	}
 
 	if extentInfo.Avali > 0 {
-		return errDone(errors.Errorf("extent %d is sealed", req.ExtentID))
+		return errDone(errors.Errorf("extent %d is sealed", header.ExtentID))
 	}
 
 	ex.Lock()
 	defer ex.Unlock()
 
-	if !ex.HasLock(req.Revision) {
+	if !ex.HasLock(header.Revision) {
 		return errDone(wire_errors.LockedByOther)
 	}
 
-	//extentInfo.Replicates : list of extent node'ID
-	//extentInfo.Parity:
-
-	//if any connection is lost, return error
-	pools, err := en.connPool(en.em.GetPeers(req.ExtentID))
-	if err != nil {
-		return errDone(errors.Errorf("extent %d's append can not get pool[%s]", req.ExtentID, err.Error()))
+	if ex.CommitLength() < header.Commit {
+		return errDone(errors.Errorf("primary commitlength is different with replicates %d vs %d", header.Commit, ex.CommitLength()))
 	}
 
-	//prepare data
-	offset := ex.CommitLength()
+	if ex.CommitLength() > header.Commit {
+		ex.Truncate(header.Commit)
+	}
+	utils.AssertTrue(ex.CommitLength() == header.Commit)
 
-	pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
+	data := make([][]byte, len(header.Blocks))
+	//received header.blocks
+	for i := 0; i < len(header.Blocks); i++ {
+		blockSize := int(header.Blocks[i])
 
-	n := len(pools)
-
-	dataBlocks := make([][]*pb.Block, n)
-	//erasure code
-	if len(extentInfo.Parity) > 0 {
-		//EC, prepare data
-		dataShard := len(extentInfo.Replicates)
-		parityShard := len(extentInfo.Parity)
-
-		for i := range req.Blocks {
-			striped, err := erasure_code.ReedSolomon{}.Encode(req.Blocks[i].Data, dataShard, parityShard)
+		n := 0
+		data[i] = make([]byte, blockSize, blockSize)
+		for n < blockSize {
+			req, err := stream.Recv()
 			if err != nil {
+				xlog.Logger.Errorf("node %d recv error %+v", en.nodeID, err)
 				return errDone(err)
 			}
-			for j := 0; j < len(striped); j++ {
-				dataBlocks[j] = append(dataBlocks[j], &pb.Block{Data: striped[j]})
+			payload := req.GetPayload()
+			if len(payload) > blockSize-n {
+				return errDone(errors.Errorf("payload size is larger than block size %d vs %d", len(payload), blockSize-n))
 			}
-
-		}
-		//replicate code
-	} else {
-		for i := 0; i < len(dataBlocks); i++ {
-			dataBlocks[i] = req.Blocks
+			copy(data[i][n:], payload)
+			n += len(payload)
 		}
 	}
 
-	//FIXME: put stopper into sync.Pool
-	stopper := utils.NewStopper()
-	type Result struct {
-		Error   error
-		Offsets []uint32
-		End     uint32
-	}
-	retChan := make(chan Result, n)
+	ret, end, err := en.AppendWithWal(ex, header.Revision, data, header.MustSync)
 
-	//primary
-	stopper.RunWorker(func() {
-		//ret, err := ex.AppendBlocks(req.Blocks, &offset)
-		ret, end, err := en.AppendWithWal(ex, req.Revision, dataBlocks[0], req.MustSync)
-
-		if ret != nil {
-			retChan <- Result{Error: err, Offsets: ret, End: end}
-		} else {
-			retChan <- Result{Error: err}
-		}
-		xlog.Logger.Debugf("write primary done: %v, %v", ret, err)
-	})
-
-	//secondary
-	for i := 1; i < n; i++ {
-		j := i
-		stopper.RunWorker(func() {
-			conn := pools[j].Get()
-			client := pb.NewExtentServiceClient(conn)
-			res, err := client.ReplicateBlocks(pctx, &pb.ReplicateBlocksRequest{
-				ExtentID: req.ExtentID,
-				Commit:   offset,
-				Blocks:   dataBlocks[j],
-				Revision: req.Revision,
-				MustSync: req.MustSync,
-			})
-			if res != nil {
-				retChan <- Result{Error: err, Offsets: res.Offsets, End: res.End}
-			} else {
-				retChan <- Result{Error: err}
-			}
-			xlog.Logger.Debugf("write seconary done %v", err)
-
-		})
+	if err != nil {
+		return errDone(err)
 	}
 
-	stopper.Wait()
-	close(retChan)
-
-	var preOffsets []uint32
-	preEnd := int64(-1)
-	for result := range retChan {
-		if preOffsets == nil {
-			preOffsets = result.Offsets
-		}
-		if preEnd == -1 {
-			preEnd = int64(result.End)
-		}
-		if result.Error != nil {
-			fmt.Printf("append on extent %d error: %v\n", req.ExtentID, result.Error)
-			ex.Truncate(offset) //reset local offset
-			return nil, result.Error
-		}
-		if !utils.EqualUint32(result.Offsets, preOffsets) || preEnd != int64(result.End) {
-			ex.Truncate(offset) //reset local offset
-			return nil, errors.Errorf("block is not appended at the same offset [%v] vs [%v], end [%v] vs [%v]",
-				result.Offsets, preOffsets, preEnd, result.End)
-		}
-	}
-
-	return &pb.AppendResponse{
+	stream.SendAndClose(&pb.AppendResponse{
 		Code:    pb.Code_OK,
-		Offsets: preOffsets,
-		End:     uint32(preEnd),
-	}, nil
+		Offsets: ret,
+		End:     end,
+	})
+	return nil
 }
 
-func (en *ExtentNode) ReadBlocks(ctx context.Context, req *pb.ReadBlocksRequest) (*pb.ReadBlocksResponse, error) {
+//TODO:add new API: STREAM-READER, read one single block
+func (en *ExtentNode) ReadBlocks(req *pb.ReadBlocksRequest, stream pb.ExtentService_ReadBlocksServer) error {
 
-	errDone := func(err error) (*pb.ReadBlocksResponse, error) {
+	errDone := func(err error) error {
 		code, desCode := wire_errors.ConvertToPBCode(err)
-		return &pb.ReadBlocksResponse{
-			Code:    code,
-			CodeDes: desCode,
-		}, nil
+		stream.Send(&pb.ReadBlocksResponse{
+			Data: &pb.ReadBlocksResponse_Header{
+				Header: &pb.ReadBlockResponseHeader{
+					Code:    code,
+					CodeDes: desCode,
+				},
+			}})
+		return nil
 	}
 
 	ex := en.getExtent(req.ExtentID)
 	if ex == nil {
-		return nil, errors.Errorf("node %d have no such extent :%d", en.nodeID, req.ExtentID)
+		return errDone(errors.Errorf("no such extent %d on node %d", req.ExtentID, en.nodeID))
 	}
 
-	var blocks []*pb.Block
+	var blocks [][]byte
 	var end uint32
 	var err error
 	var offsets []uint32
@@ -312,17 +250,33 @@ func (en *ExtentNode) ReadBlocks(ctx context.Context, req *pb.ReadBlocksRequest)
 		return errDone(err)
 	}
 
+	blockSizes := make([]uint32, len(blocks))
+	for i := 0; i < len(blocks); i++ {
+		blockSizes[i] = uint32(len(blocks[i]))
+	}
+
 	xlog.Logger.Debugf("request extentID: %d, offset: %d, numOfBlocks: %d, response len(%d), %v ", req.ExtentID, req.Offset, req.NumOfBlocks,
 		len(blocks), err)
 
 	code, desCode := wire_errors.ConvertToPBCode(err)
-	return &pb.ReadBlocksResponse{
-		Code:    code,
-		CodeDes: desCode,
-		Blocks:  blocks,
-		End:     end,
-		Offsets: offsets,
-	}, nil
+
+	stream.Send(&pb.ReadBlocksResponse{
+		Data: &pb.ReadBlocksResponse_Header{
+			Header: &pb.ReadBlockResponseHeader{
+				Code:       code,
+				CodeDes:    desCode,
+				End:        end,
+				Offsets:    offsets,
+				BlockSizes: blockSizes,
+			}}})
+
+	for _, block := range blocks {
+		stream.Send(&pb.ReadBlocksResponse{
+			Data: &pb.ReadBlocksResponse_Payload{
+				Payload: block,
+			}})
+	}
+	return nil
 }
 
 func (en *ExtentNode) chooseDisktoAlloc() uint64 {
