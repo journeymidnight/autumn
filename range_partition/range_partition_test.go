@@ -6,7 +6,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/range_partition/skiplist"
 	"github.com/journeymidnight/autumn/streamclient"
 	"github.com/journeymidnight/autumn/utils"
@@ -26,18 +25,18 @@ func TestEstimateSize(t *testing.T) {
 	bigValue := []byte(fmt.Sprintf("%01048576d", 10)) //1MB
 	smallValue := []byte(fmt.Sprintf("%01048d", 10))  //1KB
 
-	entries := []*pb.EntryInfo{
-		{Log: &pb.Entry{Key: y.KeyWithTs([]byte("hello"), 0), Value: []byte("test")}},
-		{Log: &pb.Entry{Key: y.KeyWithTs([]byte("hello1"), 0), Value: bigValue}},
-		{Log: &pb.Entry{Key: y.KeyWithTs([]byte("hello2"), 0), Value: smallValue}},
-		{Log: &pb.Entry{Key: y.KeyWithTs([]byte("hello3"), 0), Value: []byte("testasdfasdfasdfasdfasdfafafasdfasdfa"), ExpiresAt: 1243434343434}},
+	entries := []*Entry{
+		NewPutKVEntry(y.KeyWithTs([]byte("hello"), 0), []byte("test"), 0),
+		NewPutKVEntry(y.KeyWithTs([]byte("hello1"), 0), bigValue, 0),
+		NewPutKVEntry(y.KeyWithTs([]byte("hello2"), 0), smallValue, 0),
+		NewPutKVEntry(y.KeyWithTs([]byte("hello3"), 0), []byte("testasdfasdfasdfasdfasdfafafasdfasdfa"), 0),
 	}
 
 	x := skiplist.NewSkiplist(10 * MB)
 	pre := x.MemSize()
 	for i := range entries {
-		l := int64(estimatedSizeInSkl(entries[i].Log))
-		_writeToLSM(x, []*pb.EntryInfo{entries[i]})
+		l := int64(estimatedSizeInSkl(entries[i]))
+		_writeToLSM(x, []*Entry{entries[i]})
 		fmt.Printf("%d <= %d\n", x.MemSize()-pre, l)
 		require.True(t, x.MemSize()-pre <= l)
 		pre = x.MemSize()
@@ -47,26 +46,26 @@ func TestEstimateSize(t *testing.T) {
 
 //helper function for TestEstimateSize.
 
-func _writeToLSM(skl *skiplist.Skiplist, entires []*pb.EntryInfo) int64 {
+func _writeToLSM(skl *skiplist.Skiplist, entires []*Entry) int64 {
 	for _, entry := range entires {
-		if y.ShouldWriteValueToLSM(entry.Log) { // Will include deletion / tombstone case.
-			skl.Put(entry.Log.Key,
+		if ShouldWriteValueToLSM(entry) { // Will include deletion / tombstone case.
+			skl.Put(entry.Key,
 				y.ValueStruct{
-					Value:     entry.Log.Value,
-					Meta:      getLowerByte(entry.Log.Meta),
-					ExpiresAt: entry.Log.ExpiresAt,
+					Value:     entry.Value,
+					Meta:      getLowerByte(entry.Meta),
+					ExpiresAt: entry.ExpiresAt,
 				})
 		} else {
 			vp := valuePointer{
 				entry.ExtentID,
 				entry.Offset,
-				uint32(len(entry.Log.Value)),
+				uint32(len(entry.Value)),
 			}
-			skl.Put(entry.Log.Key,
+			skl.Put(entry.Key,
 				y.ValueStruct{
 					Value:     vp.Encode(),
-					Meta:      getLowerByte(entry.Log.Meta) | y.BitValuePointer,
-					ExpiresAt: entry.Log.ExpiresAt,
+					Meta:      getLowerByte(entry.Meta) | BitValuePointer,
+					ExpiresAt: entry.ExpiresAt,
 				})
 		}
 	}

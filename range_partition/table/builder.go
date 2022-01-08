@@ -25,7 +25,6 @@ import (
 
 	"github.com/dgraph-io/ristretto/z"
 	"github.com/dgryski/go-farm"
-	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/journeymidnight/autumn/streamclient"
@@ -67,8 +66,8 @@ func (h *header) Decode(buf []byte) {
 // Builder is used in building a table.
 type Builder struct {
 	// Typically tens or hundreds of meg. This is for one single file.
-	blocks       []*pb.Block //64KB per block
-	currentBlock *pb.Block
+	blocks       []block //64KB per block
+	currentBlock block
 	sz           int
 
 	baseKey []byte // Base key for the current block.
@@ -90,12 +89,12 @@ func NewTableBuilder(stream streamclient.StreamClient) *Builder {
 		stream:        stream,
 		writeCh:       make(chan writeBlock, 16),
 		stopper:       utils.NewStopper(),
-		currentBlock:  &pb.Block{Data: make([]byte, 64*KB)},
+		currentBlock:  make([]byte, 64*KB),
 		originDiscard: make(map[uint64]int64),
 	}
 
 	b.stopper.RunWorker(func() {
-		var blocks []*pb.Block
+		var blocks []block
 		var size uint32
 		var baseKeys [][]byte
 		for {
@@ -107,7 +106,7 @@ func NewTableBuilder(stream streamclient.StreamClient) *Builder {
 			slurpLoop:
 				for {
 					blocks = append(blocks, wBlock.b)
-					size += uint32(wBlock.b.Size())
+					size += uint32(len(wBlock.b))
 					baseKeys = append(baseKeys, wBlock.baseKey)
 					if size > 10*MB {
 						break slurpLoop
@@ -162,7 +161,7 @@ func (b *Builder) Close() {}
 // Empty returns whether it's empty.
 func (b *Builder) Empty() bool { return b.sz == 0 }
 
-func (b *Builder) getBlocks() []*pb.Block {
+func (b *Builder) getBlocks() []block {
 	return b.blocks
 }
 
@@ -188,18 +187,19 @@ func blockGrow(block *pb.Block, n uint32) {
 
 func (b *Builder) allocate(need int) []byte {
 	bb := b.currentBlock
-	if len(bb.Data[b.sz:]) < need {
+	if len(bb[b.sz:]) < need {
 		// We need to reallocate.
-		sz := 2 * len(bb.Data)
+		sz := 2 * len(bb)
 		if b.sz+need > sz {
 			sz = b.sz + need
 		}
 		tmp := make([]byte, sz)
-		copy(tmp, bb.Data)
-		bb.Data = tmp
+		copy(tmp, bb)
+		b.currentBlock = tmp
+		bb = b.currentBlock
 	}
 	b.sz += need
-	return bb.Data[b.sz-need : b.sz]
+	return bb[b.sz-need : b.sz]
 }
 
 //append data to current block
@@ -260,8 +260,10 @@ func (b *Builder) addHelper(key []byte, v y.ValueStruct) {
 	b.tableIndex.EstimatedSize += sstSz
 }
 
+type block = []byte
+
 type writeBlock struct {
-	b       *pb.Block
+	b       block //block data
 	baseKey []byte
 }
 
@@ -280,12 +282,12 @@ Structure of Block.
 func (b *Builder) FinishBlock() {
 	b.append(y.U32SliceToBytes(b.entryOffsets))
 	b.append(y.U32ToBytes(uint32(len(b.entryOffsets))))
-	checksum := utils.NewCRC(b.currentBlock.Data[:b.sz]).Value()
+	checksum := utils.NewCRC(b.currentBlock[:b.sz]).Value()
 	b.append(y.U32ToBytes(checksum))
 
 	xlog.Logger.Debugf("real block size is %d, len of entries is %d\n", b.sz, len(b.entryOffsets))
 	//truncate block to b.sz
-	b.currentBlock.Data = b.currentBlock.Data[:b.sz]
+	b.currentBlock = b.currentBlock[:b.sz]
 	b.writeCh <- writeBlock{
 		baseKey: y.Copy(b.baseKey),
 		b:       b.currentBlock,
@@ -324,7 +326,7 @@ func (b *Builder) Add(key []byte, value y.ValueStruct) {
 		b.FinishBlock()
 		// Start a new block. Initialize the block.
 		b.baseKey = []byte{}
-		b.currentBlock = &pb.Block{Data: make([]byte, 64*KB)}
+		b.currentBlock = make([]byte, 64*KB)
 		b.sz = 0
 		b.entryOffsets = b.entryOffsets[:0]
 	}
@@ -367,19 +369,17 @@ func (b *Builder) FinishAll(headExtentID uint64, headOffset uint32, seqNum uint6
 		Discards:         discards,
 	}
 
-	metaBlock := &pb.Block{
-		Data: make([]byte, meta.Size()+4),
-	}
+	metaBlock := make([]byte, meta.Size()+4)
 
-	_, err := meta.MarshalTo(metaBlock.Data)
+	_, err := meta.MarshalTo(metaBlock)
 	utils.Check(err)
 
 	//write checksum
-	checkSum := utils.NewCRC(metaBlock.Data[:meta.Size()]).Value()
-	binary.BigEndian.PutUint32(metaBlock.Data[meta.Size():], checkSum)
+	checkSum := utils.NewCRC(metaBlock[:meta.Size()]).Value()
+	binary.BigEndian.PutUint32(metaBlock[meta.Size():], checkSum)
 
 	//make sure all table is synced
-	extentID, offsets, _, err := b.stream.Append(context.Background(), []*pb.Block{metaBlock}, true)
+	extentID, offsets, _, err := b.stream.Append(context.Background(), []block{metaBlock}, true)
 	if err != nil {
 		return 0, 0, err
 	}

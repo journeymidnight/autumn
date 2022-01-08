@@ -57,7 +57,7 @@ func OpenTable(blockReader streamclient.StreamClient,
 	if len(blocks) != 1 {
 		return nil, errors.Errorf("len of block is not 1")
 	}
-	data := blocks[0].Data
+	data := blocks[0]
 
 	if len(data) <= 4 {
 		return nil, errors.Errorf("meta block should be bigger than 4")
@@ -129,11 +129,11 @@ func (t *Table) block(idx int) (*entriesBlock, error) {
 	if len(blocks) != 1 {
 		return nil, errors.Errorf("len of blocks is not 1")
 	}
-	if len(blocks[0].Data) < 8 {
+	if len(blocks[0]) < 8 {
 		return nil, errors.Errorf("block data should be bigger than 8")
 	}
 
-	data := blocks[0].Data
+	data := blocks[0]
 	expected := y.BytesToU32(data[len(data)-4:])
 	checksum := utils.NewCRC(data[:len(data)-4]).Value()
 	if checksum != expected {

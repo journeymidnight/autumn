@@ -322,7 +322,7 @@ type MockLockEntryIter struct {
 	currentIndex  int
 	opt           *readOption
 	noMore        bool
-	cache         []block
+	cache         []wrapBlockOffset
 	n             int //number of extents we have read
 
 }
@@ -347,13 +347,25 @@ func (iter *MockLockEntryIter) receiveEntries() error {
 	ex := iter.sc.exs[exID]
 	iter.sc.RUnlock()
 
-	res, _, tail, err := ex.ReadBlocks(iter.currentOffset, 1000, 16*KB)
+	blocks, offsets, tail, err := ex.ReadBlocks(iter.currentOffset, 1000, 16*KB)
 	//res, tail, err := ex.ReadEntries(iter.currentOffset, 16*KB)
 
-	if len(res) > 0 {
-		iter.cache = nil
-		iter.cache = append(iter.cache, res...)
+	for i := range blocks {
+		var blockEnd uint32
+		if i == len(blocks)-1 {
+			blockEnd = tail
+		} else {
+			blockEnd = offsets[i+1]
+		}
+
+		iter.cache = append(iter.cache, wrapBlockOffset{
+			blockOffset: offsets[i],
+			data:        blocks[i],
+			extentID:    exID,
+			end:         blockEnd,
+		})
 	}
+
 	switch err {
 	case nil:
 		iter.currentOffset = tail
@@ -371,11 +383,11 @@ func (iter *MockLockEntryIter) receiveEntries() error {
 	}
 }
 
-func (iter *MockLockEntryIter) Next() block {
+func (iter *MockLockEntryIter) Next() (block, uint64, uint32, uint32) {
 	if ok, err := iter.HasNext(); !ok || err != nil {
-		return nil
+		return nil, 0, 0, 0
 	}
 	ret := iter.cache[0]
 	iter.cache = iter.cache[1:]
-	return ret
+	return ret.data, ret.extentID, ret.blockOffset, ret.end
 }

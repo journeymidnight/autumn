@@ -67,7 +67,8 @@ type StreamClient interface {
 
 type LogEntryIter interface {
 	HasNext() (bool, error)
-	Next() block
+	//(block, offset, end)
+	Next() (data block, extentID uint64, offset uint32, end uint32)
 }
 
 //hint
@@ -441,15 +442,23 @@ func NewStreamClient(sm *smclient.SMClient, em *smclient.ExtentManager, maxExten
 	}
 }
 
+type wrapBlockOffset struct {
+	blockOffset uint32
+	data        block
+	extentID    uint64
+	end         uint32
+}
+
 type AutumnEntryIter struct {
 	sc                 *AutumnStreamClient
 	opt                *readOption
 	currentOffset      uint32
 	currentExtentIndex int
 	noMore             bool
-	cache              []block
 	replay             bool
 	n                  int //number of extents we have read
+
+	cache []wrapBlockOffset
 }
 
 /*
@@ -544,13 +553,13 @@ func (iter *AutumnEntryIter) HasNext() (bool, error) {
 	return len(iter.cache) > 0, nil
 }
 
-func (iter *AutumnEntryIter) Next() block {
+func (iter *AutumnEntryIter) Next() (block, uint64, uint32, uint32) {
 	if ok, err := iter.HasNext(); !ok || err != nil {
-		return nil
+		return nil, 0, 0, 0
 	}
 	ret := iter.cache[0]
 	iter.cache = iter.cache[1:]
-	return ret
+	return ret.data, ret.extentID, ret.blockOffset, ret.end
 }
 
 func (iter *AutumnEntryIter) receiveEntries() error {
@@ -570,7 +579,7 @@ retry:
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 
-	blocks, _, end, err := iter.sc.smartRead(ctx, extentID, iter.currentOffset, 1000, false)
+	blocks, offsets, end, err := iter.sc.smartRead(ctx, extentID, iter.currentOffset, 1000, false)
 	cancel()
 
 	if err != nil && err != wire_errors.EndOfExtent {
@@ -583,30 +592,21 @@ retry:
 		goto retry
 	}
 
-	iter.cache = blocks
+	for i := range blocks {
+		var blockEnd uint32
+		if i == len(blocks)-1 {
+			blockEnd = end
+		} else {
+			blockEnd = offsets[i+1]
+		}
 
-	// entries := make([]block, 0, len(blocks))
-	// for i := 0; i < len(blocks); i++ {
-	// 	entry, err := extent.ExtractEntryInfo(blocks[i], extentID, offsets[i])
-	// 	if err != nil {
-	// 		return err
-	// 	}
-
-	// 	//fmt.Printf("Read entries %s\n", string(entry.Log.Key))
-	// 	//fill end field in EntryInfo
-	// 	if i == len(blocks)-1 {
-	// 		entry.End = end
-	// 	} else {
-	// 		entry.End = offsets[i+1]
-	// 	}
-	// 	entries = append(entries, entry)
-	// }
-
-	// //xlog.Logger.Debugf("res code is %v, len of entries %d\n", res.Code, len(res.Entries))
-
-	// if len(entries) > 0 {
-	// 	iter.cache = entries
-	// }
+		iter.cache = append(iter.cache, wrapBlockOffset{
+			blockOffset: offsets[i],
+			data:        blocks[i],
+			extentID:    extentID,
+			end:         blockEnd,
+		})
+	}
 
 	switch err {
 	case nil:

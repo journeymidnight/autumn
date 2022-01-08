@@ -120,7 +120,7 @@ func TestAppendReadBigBlocks(t *testing.T) {
 		if !ok {
 			break
 		}
-		ei := iter.Next()
+		ei, _, _, _ := iter.Next()
 		//key都存在
 		require.Equal(t, cases[i], ei)
 
@@ -158,7 +158,7 @@ func TestTruncate(t *testing.T) {
 		if !ok {
 			break
 		}
-		ei := iter.Next()
+		ei, _, _, _ := iter.Next()
 		result = append(result, len(ei))
 	}
 	require.Equal(t, []int{3, 1 << 20, 3}, result)
@@ -192,7 +192,7 @@ func TestPunchHoles(t *testing.T) {
 		if !ok {
 			break
 		}
-		ei := iter.Next()
+		ei, _, _, _ := iter.Next()
 		result = append(result, len(ei))
 	}
 	require.Equal(t, []int{}, result)

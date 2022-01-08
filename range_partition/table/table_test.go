@@ -682,6 +682,7 @@ func TestTableBigValues(t *testing.T) {
 	for i := 0; i < n; i++ {
 		key := y.KeyWithTs([]byte(key("", i)), 0)
 		vs := y.ValueStruct{Value: value(i)}
+
 		builder.Add(key, vs)
 	}
 	builder.FinishBlock()

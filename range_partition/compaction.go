@@ -223,7 +223,7 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 	}
 
 	updateStats := func(vs y.ValueStruct) {
-		if (vs.Meta & y.BitValuePointer) > 0 { //big Value
+		if (vs.Meta & BitValuePointer) > 0 { //big Value
 			var vp valuePointer
 			vp.Decode(vs.Value)
 			discards[vp.extentID] += int64(vp.len)
@@ -344,7 +344,7 @@ func getDiscards(tbls []*table.Table) map[uint64]int64 {
 }
 
 func isDeletedOrExpired(meta byte, expiresAt uint64) bool {
-	if meta&y.BitDelete > 0 {
+	if meta&BitDelete > 0 {
 		return true
 	}
 	if expiresAt == 0 {

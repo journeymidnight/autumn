@@ -66,7 +66,7 @@ func TestCompaction(t *testing.T) {
 	block, err := metaStream.ReadLastBlock(context.Background())
 	require.Nil(t, err)
 	var tableLocs pspb.TableLocations
-	utils.MustUnMarshal(block.Data, &tableLocs)
+	utils.MustUnMarshal(block, &tableLocs)
 	require.Equal(t, afterNums, len(tableLocs.Locs))
 
 	rp.Close()
