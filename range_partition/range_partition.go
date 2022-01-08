@@ -25,7 +25,6 @@ import (
 	"unsafe"
 
 	"github.com/dgryski/go-farm"
-	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/range_partition/skiplist"
 	"github.com/journeymidnight/autumn/range_partition/table"
@@ -152,7 +151,7 @@ func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStre
 	} else if err != nil {
 		return nil, err
 	} else {
-		utils.MustUnMarshal(block.Data, &tableLocs)
+		utils.MustUnMarshal(block, &tableLocs)
 	}
 
 	fmt.Printf("table locs is %v\n", tableLocs.Locs)
@@ -201,23 +200,23 @@ func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStre
 	replayedLog := 0
 	logSizeRead := uint32(0)
 
-	replay := func(ei *pb.EntryInfo) (bool, error) {
+	replay := func(ei *Entry) (bool, error) {
 		replayedLog++
 		//fmt.Printf("from log %v\n", string(ei.Log.Key))
 		//build ValueStruct from EntryInfo
-		entriesReady := []*pb.EntryInfo{ei}
+		entriesReady := []*Entry{ei}
 
-		userKey := y.ParseKey(ei.Log.Key)
+		userKey := y.ParseKey(ei.Key)
 
 		if !rp.IsUserKeyInRange(userKey) {
 			return true, nil
 		}
 
 		head := valuePointer{extentID: ei.ExtentID, offset: ei.End}
-		logSizeRead += ei.End - ei.Offset
+		logSizeRead += uint32(ei.Size())
 		//print value len of ei
-		if y.ParseTs(ei.Log.Key) > rp.seqNumber {
-			rp.seqNumber = y.ParseTs(ei.Log.Key)
+		if y.ParseTs(ei.Key) > rp.seqNumber {
+			rp.seqNumber = y.ParseTs(ei.Key)
 		}
 
 		i := 0
@@ -243,7 +242,7 @@ func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStre
 			}
 		*/
 
-		rp.writeToLSM([]*pb.EntryInfo{ei})
+		rp.writeToLSM([]*Entry{ei})
 
 		rp.vhead = head
 		return true, nil
@@ -516,7 +515,7 @@ func (rp *RangePartition) saveTableLocs() {
 	backoff := 50 * time.Millisecond
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-		_, _, _, err := rp.metaStream.Append(ctx, []*pb.Block{{Data: data}}, rp.opt.MustSync)
+		_, _, _, err := rp.metaStream.Append(ctx, []block{data}, rp.opt.MustSync)
 		cancel()
 		if err != nil {
 			xlog.Logger.Errorf("failed to set tableLocs for %d, retry...", rp.PartID)
@@ -548,7 +547,7 @@ var requestPool = sync.Pool{
 type request struct {
 	// Input values, 这个以后可能有多个Entry..., 比如一个request里面
 	//A = "x", A:time = "20191224", A:md5 = "fbd80028d33edaa2d7bace539f534cb2"
-	entries []*pb.EntryInfo
+	entries []*Entry
 
 	isGCRequest bool
 	// Output values and wait group stuff below
@@ -558,9 +557,9 @@ type request struct {
 }
 
 //key + valueStruct
-func estimatedSizeInSkl(e *pb.Entry) int {
+func estimatedSizeInSkl(e *Entry) int {
 	sz := len(e.Key)
-	if y.ShouldWriteValueToLSM(e) {
+	if ShouldWriteValueToLSM(e) {
 		sz += len(e.Value) + 1 // Meta
 	} else {
 		sz += int(vptrSize) + 1 // vptrSize for valuePointer, 1 for meta
@@ -574,7 +573,7 @@ func estimatedSizeInSkl(e *pb.Entry) int {
 
 func estimatedVS(key []byte, vs y.ValueStruct) int {
 	sz := len(key)
-	if vs.Meta&y.BitValuePointer == 0 && len(vs.Value) <= y.ValueThrottle {
+	if vs.Meta&BitValuePointer == 0 && len(vs.Value) <= ValueThrottle {
 		sz += len(vs.Value) + 1 // Meta
 	} else {
 		sz += int(vptrSize) + 1 // vptrSize for valuePointer, 1 for meta
@@ -589,7 +588,7 @@ func estimatedVS(key []byte, vs y.ValueStruct) int {
 func (r *request) Size() int {
 	size := 0
 	for i := range r.entries {
-		size += r.entries[i].Log.Size()
+		size += r.entries[i].Size()
 	}
 	return size
 }
@@ -631,13 +630,21 @@ func (rp *RangePartition) writeRequests(reqs []*request) error {
 		utils.AssertTruef(len(reqs) == 1, "GC request should be the only request")
 		gcRequest := reqs[0]
 		for i := len(gcRequest.entries) - 1; i >= 0; i-- {
-			userKey := y.ParseKey(gcRequest.entries[i].Log.Key)
+			userKey := y.ParseKey(gcRequest.entries[i].Key)
 			vs := rp.getValueStruct(userKey, 0)
-			if vs.Version > y.ParseTs(gcRequest.entries[i].Log.Key) {
+			if vs.Version > y.ParseTs(gcRequest.entries[i].Key) {
 				//exclude this entry
 				gcRequest.entries = append(gcRequest.entries[:i], gcRequest.entries[i+1:]...)
 				continue
 			}
+		}
+	}
+
+	//update entry's ts, make sure all entry's ts is strictly increasing
+	for i := range reqs {
+		for j := range reqs[i].entries {
+			//fmt.Printf("updating ts for %s\n", reqs[i].entries[j].Key)
+			reqs[i].entries[j].UpdateTS(atomic.AddUint64(&rp.seqNumber, 1))
 		}
 	}
 
@@ -695,32 +702,32 @@ func getLowerByte(a uint32) byte {
 	return byte(a & 0x000000FF)
 }
 
-func (rp *RangePartition) writeToLSM(entries []*pb.EntryInfo) error {
+func (rp *RangePartition) writeToLSM(entries []*Entry) error {
 	for _, entry := range entries {
-		if y.ShouldWriteValueToLSM(entry.Log) { // Will include deletion / tombstone case.
-			rp.mt.Put(entry.Log.Key,
+		if ShouldWriteValueToLSM(entry) { // Will include deletion / tombstone case.
+			rp.mt.Put(entry.Key,
 				y.ValueStruct{
-					Value:     entry.Log.Value,
-					Meta:      getLowerByte(entry.Log.Meta),
-					ExpiresAt: entry.Log.ExpiresAt,
+					Value:     entry.Value,
+					Meta:      getLowerByte(entry.Meta),
+					ExpiresAt: entry.ExpiresAt,
 				})
 			/*
 				this OriginDiscard will be written to SST's discard field
 				when flushed. it means this key-value pair will be discarded
 				when GC happens.
 			*/
-			rp.mt.OriginDiscard[entry.ExtentID] += int64(entry.Log.Size())
+			rp.mt.OriginDiscard[entry.ExtentID] += int64(entry.Size())
 		} else {
 			vp := valuePointer{
 				entry.ExtentID,
 				entry.Offset,
-				uint32(len(entry.Log.Value)),
+				uint32(len(entry.Value)),
 			}
-			rp.mt.Put(entry.Log.Key,
+			rp.mt.Put(entry.Key,
 				y.ValueStruct{
 					Value:     vp.Encode(),
-					Meta:      getLowerByte(entry.Log.Meta) | y.BitValuePointer,
-					ExpiresAt: entry.Log.ExpiresAt,
+					Meta:      getLowerByte(entry.Meta) | BitValuePointer,
+					ExpiresAt: entry.ExpiresAt,
 				})
 		}
 	}
@@ -832,14 +839,14 @@ func (rp *RangePartition) doWrites() {
 	}
 }
 
-func (rp *RangePartition) ensureRoomForWrite(entries []*pb.EntryInfo, head valuePointer) error {
+func (rp *RangePartition) ensureRoomForWrite(entries []*Entry, head valuePointer) error {
 
 	rp.Lock()
 	defer rp.Unlock()
 
 	n := int64(0)
 	for i := range entries {
-		n += int64(estimatedSizeInSkl(entries[i].Log))
+		n += int64(estimatedSizeInSkl(entries[i]))
 	}
 
 	utils.AssertTrue(n <= rp.opt.MaxSkipList)
@@ -981,11 +988,11 @@ func (rp *RangePartition) Head(userKey []byte) (*pspb.HeadInfo, error) {
 
 	if vs.Version == 0 {
 		return nil, errNotFound
-	} else if (vs.Meta & y.BitDelete) > 0 {
+	} else if (vs.Meta & BitDelete) > 0 {
 		return nil, errNotFound
 	}
 	dataLen := uint32(0)
-	if vs.Meta&y.BitValuePointer > 0 {
+	if vs.Meta&BitValuePointer > 0 {
 		var vp valuePointer
 		vp.Decode(vs.Value)
 		dataLen = vp.len
@@ -1010,23 +1017,25 @@ func (rp *RangePartition) Get(userKey []byte) ([]byte, error) {
 
 	if vs.Version == 0 {
 		return nil, errNotFound
-	} else if vs.Meta&y.BitDelete > 0 {
+	} else if vs.Meta&BitDelete > 0 {
 		return nil, errNotFound
 	}
 
-	if vs.Meta&y.BitValuePointer > 0 {
-
+	if vs.Meta&BitValuePointer > 0 {
 		var vp valuePointer
 		vp.Decode(vs.Value)
-		//fmt.Printf("%s's location is [%d, %d]\n", userKey, vp.extentID, vp.offset)
 		blocks, _, err := rp.logStream.Read(ctx, vp.extentID, vp.offset, 1, streamclient.HintReadThrough)
 		if err != nil {
 			return nil, err
 		}
 		span.LogKV("ExtractLogEntry", 1)
-		entry := y.ExtractLogEntry(blocks[0])
+		entry, err := DecodeEntry(blocks[0])
+		if err != nil {
+			return nil, err
+		}
 		return entry.Value, nil
 	}
+
 	return vs.Value, nil
 
 }
@@ -1154,30 +1163,6 @@ func (rp *RangePartition) close(gracefull bool) error {
 	return nil
 }
 
-func (rp *RangePartition) WriteAsync(key, value []byte, f func(error)) {
-
-	newSeqNumber := atomic.AddUint64(&rp.seqNumber, 1)
-
-	e := &pb.EntryInfo{
-		Log: &pb.Entry{
-			Key:   y.KeyWithTs(key, newSeqNumber),
-			Value: value,
-		},
-	}
-
-	req, err := rp.sendToWriteCh([]*pb.EntryInfo{e}, false)
-	if err != nil {
-		f(err)
-		return
-	}
-	go func() {
-		err := req.Wait()
-		// Write is complete. Let's call the callback function now.
-		f(err)
-	}()
-
-}
-
 //submit a major compaction task
 func (rp *RangePartition) SubmitCompaction() error {
 	if atomic.LoadInt32(&rp.blockWrites) == 1 {
@@ -1206,19 +1191,13 @@ func (rp *RangePartition) SubmitGC(task GcTask) error {
 func (rp *RangePartition) Delete(key []byte) error {
 	//search
 	vs := rp.getValueStruct(key, 0)
-	if vs.Version == 0 || vs.Meta&y.BitDelete > 0 {
+	if vs.Version == 0 || vs.Meta&BitDelete > 0 {
 		return errNotFound
 	}
 
-	newSeqNumber := atomic.AddUint64(&rp.seqNumber, 1)
-	e := &pb.EntryInfo{
-		Log: &pb.Entry{
-			Key:  y.KeyWithTs(key, newSeqNumber),
-			Meta: uint32(y.BitDelete),
-		},
-	}
+	e := NewDeleteEntry(key)
 
-	req, err := rp.sendToWriteCh([]*pb.EntryInfo{e}, false)
+	req, err := rp.sendToWriteCh([]*Entry{e}, false)
 	if err != nil {
 		return err
 	}
@@ -1259,17 +1238,31 @@ func (rp *RangePartition) CheckTableOrder(out []*table.Table) {
 
 }
 
-//req.Wait will free the request
-func (rp *RangePartition) Write(key, value []byte) error {
-	newSeqNumber := atomic.AddUint64(&rp.seqNumber, 1)
-
-	e := &pb.EntryInfo{
-		Log: &pb.Entry{
-			Key:   y.KeyWithTs(key, newSeqNumber),
-			Value: value,
-		},
+func (rp *RangePartition) WriteEntryAsync(e *Entry, f func(error)) {
+	req, err := rp.sendToWriteCh([]*Entry{e}, false)
+	if err != nil {
+		f(err)
+		return
 	}
-	req, err := rp.sendToWriteCh([]*pb.EntryInfo{e}, false)
+	go func() {
+		err := req.Wait()
+		// Write is complete. Let's call the callback function now.
+		f(err)
+	}()
+
+}
+
+func (rp *RangePartition) WriteAsync(k, v []byte, f func(error)) {
+	e := NewPutKVEntry(k, v, 0)
+	rp.WriteEntryAsync(e, f)
+}
+
+func (rp *RangePartition) Write(k, v []byte) error {
+	return rp.WriteEntries([]*Entry{NewPutKVEntry(k, v, 0)})
+}
+
+func (rp *RangePartition) WriteEntries(entries []*Entry) error {
+	req, err := rp.sendToWriteCh(entries, false)
 	if err != nil {
 		return err
 	}
@@ -1277,7 +1270,7 @@ func (rp *RangePartition) Write(key, value []byte) error {
 }
 
 //block API
-func (rp *RangePartition) sendToWriteCh(entries []*pb.EntryInfo, isGC bool) (*request, error) {
+func (rp *RangePartition) sendToWriteCh(entries []*Entry, isGC bool) (*request, error) {
 	if atomic.LoadInt32(&rp.blockWrites) == 1 {
 		return nil, ErrBlockedWrites
 	}

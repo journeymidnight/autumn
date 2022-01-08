@@ -44,7 +44,7 @@ type writeRequest struct {
 	err    error
 }
 
-var kCapacity = 192
+var kCapacity = 64
 
 //batch op
 func batchOp(stopper *utils.Stopper, done chan struct{}, op BenchType,
@@ -97,7 +97,7 @@ func doWrites(writeCh chan *writeRequest, done chan struct{}, sc *streamclient.A
 		for _, req := range reqs {
 			blocks = append(blocks, req.blocks...)
 		}
-		_, _, _, err := sc.Append(context.Background(), blocks, true)
+		_, _, _, err := sc.Append(context.Background(), blocks, false)
 		for _, req := range reqs {
 			req.err = err
 			req.wg.Done()

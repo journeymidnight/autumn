@@ -23,9 +23,6 @@ import (
 	"math"
 	"reflect"
 	"unsafe"
-
-	"github.com/journeymidnight/autumn/proto/pb"
-	"github.com/journeymidnight/autumn/utils"
 )
 
 // KeyWithTs generates a new key by appending ts to key.
@@ -122,21 +119,4 @@ func BytesToU32Slice(b []byte) []uint32 {
 	hdr.Cap = hdr.Len
 	hdr.Data = uintptr(unsafe.Pointer(&b[0]))
 	return u32s
-}
-
-const (
-	BitDelete       byte = 1 << 0    // Set if the key has been deleted.
-	BitValuePointer byte = 1 << 1    // Set if the value is NOT stored directly next to key.
-	ValueThrottle        = (1 << 10) // 1 *KB
-)
-
-func ShouldWriteValueToLSM(e *pb.Entry) bool {
-	return e.Meta&uint32(BitValuePointer) == 0 && len(e.Value) <= ValueThrottle
-}
-
-func ExtractLogEntry(block *pb.Block) *pb.Entry {
-	entry := new(pb.Entry)
-	err := entry.Unmarshal(block.Data)
-	utils.Check(err)
-	return entry
 }

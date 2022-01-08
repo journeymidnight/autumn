@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/journeymidnight/autumn/streamclient"
 	"github.com/journeymidnight/autumn/utils"
@@ -15,26 +14,41 @@ import (
 
 //replay valuelog
 //compact valuelog
-func (rp *RangePartition) writeValueLog(reqs []*request) ([]*pb.EntryInfo, valuePointer, error) {
+func (rp *RangePartition) writeValueLog(reqs []*request) ([]*Entry, valuePointer, error) {
 
-	var entries []*pb.EntryInfo
+	var blocks []block
+	var entries []*Entry
 
 	for _, req := range reqs {
-		entries = append(entries, req.entries...)
+		for _, e := range req.entries {
+			blocks = append(blocks, e.Encode())
+			entries = append(entries, e)
+		}
 	}
 
 	span := opentracing.GlobalTracer().StartSpan("writeValueLog")
 	defer span.Finish()
 	ctx := opentracing.ContextWithSpan(context.Background(), span)
-	extentID, tail, err := rp.logStream.AppendEntries(ctx, entries, rp.opt.MustSync)
+	extentID, offsets, tail, err := rp.logStream.Append(ctx, blocks, rp.opt.MustSync)
 	if err != nil {
 		return nil, valuePointer{}, err
+	}
+
+	//update entries
+	for i := range entries {
+		entries[i].ExtentID = extentID
+		entries[i].Offset = offsets[i]
+		if i == len(entries)-1 {
+			entries[i].End = tail
+		} else {
+			entries[i].End = offsets[i+1]
+		}
 	}
 	return entries, valuePointer{extentID: extentID, offset: tail}, nil
 
 }
 
-func replayLog(stream streamclient.StreamClient, replayFunc func(*pb.EntryInfo) (bool, error), opts ...streamclient.ReadOption) error {
+func replayLog(stream streamclient.StreamClient, replayFunc func(*Entry) (bool, error), opts ...streamclient.ReadOption) error {
 
 	iter := stream.NewLogEntryIter(opts...)
 
@@ -46,7 +60,15 @@ func replayLog(stream streamclient.StreamClient, replayFunc func(*pb.EntryInfo) 
 		if !ok {
 			break
 		}
-		ei := iter.Next()
+		data, extentID, offset, end := iter.Next()
+		ei, err := DecodeEntry(data)
+		ei.ExtentID = extentID
+		ei.Offset = offset
+		ei.End = end
+
+		if err != nil {
+			return err
+		}
 		next, err := replayFunc(ei)
 		if err != nil {
 			return err
@@ -58,8 +80,8 @@ func replayLog(stream streamclient.StreamClient, replayFunc func(*pb.EntryInfo) 
 	return nil
 }
 
-func discardEntry(ei *pb.EntryInfo, vs y.ValueStruct) bool {
-	if vs.Version != y.ParseTs(ei.Log.Key) {
+func discardEntry(ei *Entry, vs y.ValueStruct) bool {
+	if vs.Version != y.ParseTs(ei.Key) {
 		// Version not found. Discard.
 		return true
 	}
@@ -166,22 +188,22 @@ func (rp *RangePartition) runGC(extentID uint64) {
 	var count, moved int
 	var freeSize uint64
 	var moveSize uint64
-	wb := make([]*pb.EntryInfo, 0, 100)
+	wb := make([]*Entry, 0, 100)
 
-	fe := func(ei *pb.EntryInfo) (bool, error) {
+	fe := func(ei *Entry) (bool, error) {
 
 		count++
 		if count%100000 == 0 {
 			xlog.Logger.Debugf("Processing entry %d", count)
 		}
 
-		freeSize += ei.EstimatedSize
+		freeSize += uint64(ei.Size())
 
-		userKey := y.ParseKey(ei.Log.Key)
+		userKey := y.ParseKey(ei.Key)
 
 		//fmt.Printf("processing %s\n", userKey)
 		//if small file
-		if (ei.Log.Meta & uint32(y.BitValuePointer)) == 0 {
+		if (ei.Meta & uint32(BitValuePointer)) == 0 {
 			//fmt.Printf("discard small entry, key: %s\n", streamclient.FormatEntry(ei))
 			return true, nil
 		}
@@ -210,13 +232,8 @@ func (rp *RangePartition) runGC(extentID uint64) {
 			moved++
 			//write ne to mt
 			//keep seqNum
-			ne := &pb.EntryInfo{
-				Log: &pb.Entry{
-					Key:   ei.Log.Key,
-					Value: ei.Log.Value,
-				},
-			}
 
+			ne := ei //use the same entry
 			//fmt.Printf("MOVE %s\n", userKey)
 			if len(wb) > 4 {
 				//如果是GC request, 在写入log之前,还要再读一遍key, 如果有新Key已经写入, 则放弃
@@ -228,7 +245,7 @@ func (rp *RangePartition) runGC(extentID uint64) {
 				wb = wb[:0]
 			}
 			wb = append(wb, ne)
-			moveSize += ei.EstimatedSize
+			moveSize += uint64(ei.Size())
 		}
 		return true, nil
 	}
