@@ -21,21 +21,22 @@ import (
 	"testing"
 	"time"
 
-	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zapcore"
 )
 
+type block = []byte
+
 func TestWalEncode(t *testing.T) {
 	x := request{
 		extentID: 10,
 		start:    3,
-		data:     make([]*pb.Block, 2),
-		rev: 1000,
+		data:     make([]block, 2),
+		rev:      1000,
 	}
-	x.data[0] = &pb.Block{make([]byte, 99)}
-	x.data[1] = &pb.Block{make([]byte, 567)}
+	x.data[0] = make([]byte, 99)
+	x.data[1] = make([]byte, 567)
 
 	buf := new(bytes.Buffer)
 	x.encodeTo(buf)
@@ -46,8 +47,8 @@ func TestWalEncode(t *testing.T) {
 	require.Equal(t, uint64(10), y.extentID)
 	require.Equal(t, uint32(3), y.start)
 	require.Equal(t, 2, len(y.data))
-	require.Equal(t, 99, len(y.data[0].Data))
-	require.Equal(t, 567, len(y.data[1].Data))
+	require.Equal(t, 99, len(y.data[0]))
+	require.Equal(t, 567, len(y.data[1]))
 	require.Equal(t, int64(1000), y.rev)
 }
 
@@ -66,14 +67,14 @@ func TestWalWrite(t *testing.T) {
 	require.Nil(t, err)
 
 	for i := 0; i < 10; i++ {
-		wal.Write(10, 10, 0, []*pb.Block{&pb.Block{Data: make([]byte, 100)}, &pb.Block{Data: make([]byte, 9)}})
+		wal.Write(10, 10, 0, []block{make([]byte, 100), make([]byte, 9)})
 	}
 	wal.Close()
 
 	wal, err = OpenWal(p, func() {})
 	require.Nil(t, err)
 
-	wal.Replay(func(id uint64, start uint32, rev int64, data []*pb.Block) {
+	wal.Replay(func(id uint64, start uint32, rev int64, data []block) {
 		require.Equal(t, uint32(10), start)
 		require.Equal(t, 2, len(data))
 	})
@@ -89,7 +90,7 @@ func TestMultiWal(t *testing.T) {
 	maxWalSize = (1 << 20) //for debug
 	require.Nil(t, err)
 	for i := 0; i < 100; i++ {
-		wal.Write(10, 10, 0,[]*pb.Block{&pb.Block{Data: make([]byte, 50240)}, &pb.Block{Data: make([]byte, 9)}})
+		wal.Write(10, 10, 0, []block{make([]byte, 50240), make([]byte, 9)})
 	}
 
 	wal.Close()
@@ -120,7 +121,7 @@ func BenchmarkRecordWrite(b *testing.B) {
 			b.SetBytes(int64(len(buf)))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				err := wal.Write(10, 10, 0, []*pb.Block{{Data: buf}})
+				err := wal.Write(10, 10, 0, []block{buf})
 				if err != nil {
 					b.Fatal(err)
 				}
