@@ -115,6 +115,7 @@ func (sc *AutumnStreamClient) SealedLength(extentID uint64) (uint64, error) {
 }
 
 //helper function to read blocks' data
+//err is [nil, err, wire_errors.EndOfExtent]
 func (sc *AutumnStreamClient) readBlockData(ctx context.Context, conn *grpc.ClientConn, exInfo *pb.ExtentInfo, request *pb.ReadBlocksRequest) ([]block, []uint32, uint32, error) {
 
 retry:
@@ -175,9 +176,10 @@ retry:
 		blocks[i] = buf.Bytes()[n : n+int(header.BlockSizes[i])]
 		n += int(header.BlockSizes[i])
 	}
-	return blocks, header.Offsets, header.End, nil
+	return blocks, header.Offsets, header.End, err
 }
 
+//err could be [nil, error, wire_errors.EndOfExtent]
 func (sc *AutumnStreamClient) smartRead(gctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32, onlyReadLast bool) ([][]byte, []uint32, uint32, error) {
 	if onlyReadLast {
 		utils.AssertTrue(numOfBlocks == 1)

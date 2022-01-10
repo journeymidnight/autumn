@@ -261,7 +261,7 @@ func (ex *Extent) Seal(commit uint32) error {
 		ex.resetWriter()
 		return errors.New("commit is less than current commit length")
 	}
-	ex.commitLength = commit
+	atomic.StoreUint32(&ex.commitLength, commit)
 	if err = ex.file.Truncate(int64(commit)); err != nil {
 		return err
 	}
@@ -547,7 +547,7 @@ func (ex *Extent) ReadBlocks(offset uint32, maxNumOfBlocks uint32, maxTotalSize 
 		offsets = append(offsets, uint32(start))
 		end = uint32(rr.End())
 	}
-	utils.AssertTrue(end <= ex.commitLength)
+	utils.AssertTrue(end <= atomic.LoadUint32(&ex.commitLength))
 	//fmt.Printf("read block at extent ID %d, end is %d\n", ex.ID, end)
 	return ret, offsets, end, nil
 }

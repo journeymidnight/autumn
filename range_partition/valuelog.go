@@ -51,7 +51,6 @@ func (rp *RangePartition) writeValueLog(reqs []*request) ([]*Entry, valuePointer
 func replayLog(stream streamclient.StreamClient, replayFunc func(*Entry) (bool, error), opts ...streamclient.ReadOption) error {
 
 	iter := stream.NewLogEntryIter(opts...)
-
 	for {
 		ok, err := iter.HasNext()
 		if err != nil {
@@ -61,6 +60,7 @@ func replayLog(stream streamclient.StreamClient, replayFunc func(*Entry) (bool, 
 			break
 		}
 		data, extentID, offset, end := iter.Next()
+
 		ei, err := DecodeEntry(data)
 		ei.ExtentID = extentID
 		ei.Offset = offset

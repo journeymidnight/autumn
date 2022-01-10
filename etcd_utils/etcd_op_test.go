@@ -31,9 +31,10 @@ func (suite *EtcdUtilTestSuite) SetupSuite() {
 	config.Name = "etcd"
 	config.Dir = "etcd.db"
 
-	config.LCUrls = mustParseURL("http://127.0.0.1:2379")
+	//prevent etcd port conflict with node_test.go
+	config.LCUrls = mustParseURL("http://127.0.0.1:12379")
 	config.LPUrls = mustParseURL("http://127.0.0.1:2380")
-	config.ACUrls = mustParseURL("http://127.0.0.1:2379")
+	config.ACUrls = mustParseURL("http://127.0.0.1:12379")
 	config.APUrls = mustParseURL("http://127.0.0.1:2380")
 	config.InitialCluster = "etcd=http://127.0.0.1:2380"
 	config.ClusterState = "new"

@@ -335,8 +335,8 @@ func (ps *PartitionServer) ServeGRPC() error {
 
 	cfg.ServiceName = fmt.Sprintf("PS-%d", ps.config.PSID)
 	cfg.Sampler.Type = "const"
-	cfg.Sampler.Param = 1
-	cfg.Reporter.LogSpans = true
+	cfg.Sampler.Param = 0
+	cfg.Reporter.LogSpans = false
 
 	tracer, _, err := cfg.NewTracer(config.Logger(jaeger.StdLogger))
 	if err != nil {

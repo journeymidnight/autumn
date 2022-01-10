@@ -250,6 +250,7 @@ func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStre
 
 	start := time.Now()
 	if lastTable == nil {
+		fmt.Println("replay log from start")
 		err := replayLog(rp.logStream, replay, streamclient.WithReadFromStart(math.MaxUint32))
 		if err != nil {
 			return nil, err
