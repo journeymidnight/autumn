@@ -74,7 +74,7 @@ func (ps *PartitionServer) StreamPut(stream pspb.PartitionKV_StreamPutServer) er
 
 	//valid uploaded size
 	if len(entry.Value) != int(header.LenOfValue) {
-		return errDone(errors.Errorf("payload is %s, header.LenOfValue is %d", len(entry.Value), header.LenOfValue))
+		return errDone(errors.Errorf("payload is %d, header.LenOfValue is %d", len(entry.Value), header.LenOfValue))
 	}
 
 	if err = rp.WriteEntries([]*range_partition.Entry{entry}); err != nil {

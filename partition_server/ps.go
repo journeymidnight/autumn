@@ -19,7 +19,6 @@ import (
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/opentracing/opentracing-go"
 	"github.com/robfig/cron/v3"
-	"github.com/uber/jaeger-client-go"
 	"github.com/uber/jaeger-client-go/config"
 	"google.golang.org/grpc"
 )
@@ -36,6 +35,7 @@ type Config struct {
 	MaxExtentSize        uint32 //in the unit of Bytes
 	MaxMetaExtentSize    uint32 //in the unit of Bytes
 	SkipListSize         uint32 //in the unit of Bytes
+	TraceSampler         float64
 }
 
 type PartitionServer struct {
@@ -329,16 +329,16 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, mutex *
 	return rp, err
 }
 
-func (ps *PartitionServer) ServeGRPC() error {
+func (ps *PartitionServer) ServeGRPC(traceSampler float64) error {
 
 	cfg, err := config.FromEnv()
 
 	cfg.ServiceName = fmt.Sprintf("PS-%d", ps.config.PSID)
 	cfg.Sampler.Type = "const"
-	cfg.Sampler.Param = 0
+	cfg.Sampler.Param = traceSampler
 	cfg.Reporter.LogSpans = false
 
-	tracer, _, err := cfg.NewTracer(config.Logger(jaeger.StdLogger))
+	tracer, _, err := cfg.NewTracer()
 	if err != nil {
 		panic(err)
 	}

@@ -30,7 +30,7 @@ func main() {
 	utils.Check(err)
 
 	//start grpc service
-	err = node.ServeGRPC()
+	err = node.ServeGRPC(config.TraceSampler)
 	utils.Check(err)
 
 	fmt.Println("node is ready")

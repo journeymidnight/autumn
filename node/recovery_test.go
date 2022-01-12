@@ -152,7 +152,7 @@ func (suite *RcoveryTestSuite) SetupSuite() {
 		if err != nil {
 			panic(err)
 		}
-		err = suite.ens[i].ServeGRPC()
+		err = suite.ens[i].ServeGRPC(0)
 		if err != nil {
 			panic(err)
 		}

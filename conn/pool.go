@@ -21,11 +21,11 @@ import (
 	"sync"
 	"time"
 
-	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
-	grpc_opentracing "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
+	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
 	"github.com/journeymidnight/autumn/proto/pb"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
+	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 )
@@ -130,16 +130,14 @@ func (p *Pools) Connect(addr string) *Pool {
 
 // newPool creates a new "pool" with one gRPC connection, refcount 0.
 func newPool(addr string) (*Pool, error) {
-	unaryInterceptor := grpc_middleware.ChainUnaryClient(
-		grpc_opentracing.UnaryClientInterceptor(),
-	)
 	conn, err := grpc.Dial(addr,
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(64<<20),
 			grpc.MaxCallSendMsgSize(64<<20),
 		),
 		grpc.WithBackoffMaxDelay(time.Second),
-		grpc.WithUnaryInterceptor(unaryInterceptor),
+		grpc.WithStreamInterceptor(
+			otgrpc.OpenTracingStreamClientInterceptor(opentracing.GlobalTracer())),
 		grpc.WithInsecure())
 	if err != nil {
 		return nil, err
