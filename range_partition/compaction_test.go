@@ -9,6 +9,7 @@ import (
 
 	"github.com/journeymidnight/autumn/proto/pspb"
 	"github.com/journeymidnight/autumn/range_partition/table"
+	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/journeymidnight/autumn/streamclient"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/stretchr/testify/require"
@@ -52,6 +53,17 @@ func TestCompaction(t *testing.T) {
 
 	tbls = rp.getTables()
 	afterNums := len(tbls)
+
+	//all item's ts is between prev table's lastSeq and current tables' lastSeq
+	prevTblSeq := uint64(0)
+	for _, tbl := range tbls {
+		iter := tbl.NewIterator(false)
+		for ; iter.Valid(); iter.Next() {
+			require.LessOrEqual(t, y.ParseTs(iter.Key()), tbl.LastSeq)
+			require.Greater(t, y.ParseTs(iter.Key()), prevTblSeq)
+		}
+		prevTblSeq = tbl.LastSeq
+	}
 
 	require.Less(t, afterNums, beforeNums)
 
