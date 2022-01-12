@@ -435,7 +435,34 @@ func autumnRange(c *cli.Context) error {
 	return nil
 }
 
-//FIXME: grpc stream is better to send big values
+func streamPut(c *cli.Context) error {
+	client, err := connectToAutumn(c)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	key := c.Args().First()
+	if len(key) == 0 {
+		return errors.New("no key")
+	}
+	fileName := c.Args().Get(1)
+	if len(fileName) == 0 {
+		return errors.New("no fileName")
+	}
+
+	info, err := os.Stat(fileName)
+	if err != nil {
+		return err
+	}
+	fileSize := info.Size()
+	f, err := os.Open(fileName)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return client.StreamPut(context.Background(), []byte(key), f, uint32(fileSize))
+}
+
 func put(c *cli.Context) error {
 	client, err := connectToAutumn(c)
 	if err != nil {
@@ -443,9 +470,6 @@ func put(c *cli.Context) error {
 	}
 	defer client.Close()
 
-	if err := client.Connect(); err != nil {
-		return err
-	}
 	key := c.Args().First()
 	if len(key) == 0 {
 		return errors.New("no key")
@@ -604,7 +628,14 @@ func main() {
 			},
 			Action: bootstrap,
 		},
-
+		{
+			Name:  "streamput",
+			Usage: "streamput --etcd-urls <addrs> <KEY> <FILE>",
+			Flags: []cli.Flag{
+				&cli.StringFlag{Name: "etcd-urls", Value: "127.0.0.1:2379"},
+			},
+			Action: streamPut,
+		},
 		{
 			Name:  "put",
 			Usage: "put --etcd-urls <addrs> <KEY> <FILE>",

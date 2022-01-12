@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"sort"
 	"time"
 
@@ -201,6 +202,78 @@ func (lib *AutumnLib) getRegions() []*pspb.RegionInfo {
 	lib.RLock()
 	defer lib.RUnlock()
 	return lib.regions
+}
+
+func (lib *AutumnLib) StreamPut(ctx context.Context, key []byte, reader io.Reader, valueSize uint32) error {
+	if len(key) == 0 || valueSize == 0 {
+		return errors.New("key or value is empty")
+	}
+	if valueSize > 32<<20 {
+		return errors.New("value is too large")
+	}
+	sortedRegions := lib.getRegions()
+	if len(sortedRegions) == 0 {
+		return errors.New("no regions to write")
+	}
+	idx := sort.Search(len(sortedRegions), func(i int) bool {
+		if len(sortedRegions[i].Rg.EndKey) == 0 {
+			return true
+		}
+		return bytes.Compare(sortedRegions[i].Rg.EndKey, key) > 0
+	})
+
+	conn := lib.getConn(lib.getPSAddr((sortedRegions[idx].PSID)))
+	client := pspb.NewPartitionKVClient(conn)
+
+	stream, err := client.StreamPut(ctx)
+	if err != nil {
+		return err
+	}
+
+	if err = stream.Send(&pspb.StreamPutRequest{
+		Data: &pspb.StreamPutRequest_Header{
+			Header: &pspb.StreamPutRequestHeader{
+				Key:        key,
+				LenOfValue: valueSize,
+				ExpiresAt:  0,
+				Partid:     sortedRegions[idx].PartID,
+			},
+		},
+	}); err != nil {
+		return err
+	}
+
+	reader = io.LimitReader(reader, int64(valueSize))
+	var buf [512 * 1024]byte
+	var n int
+	var res *pspb.PutResponse
+	for {
+		n, err = reader.Read(buf[:])
+		if err != nil && err != io.EOF {
+			return err
+		}
+		if n == 0 {
+			if res, err = stream.CloseAndRecv(); err != nil {
+				return err
+			}
+			break
+		}
+
+		if err = stream.Send(&pspb.StreamPutRequest{
+			Data: &pspb.StreamPutRequest_Payload{
+				Payload: buf[:n],
+			},
+		}); err != nil {
+			return err
+		}
+	}
+
+	//if key is not equal to requested.
+	//the key itself contains error information
+	if bytes.Compare(res.Key, key) != 0 {
+		return errors.New(string(res.Key))
+	}
+	return nil
 }
 
 func (lib *AutumnLib) Put(ctx context.Context, key, value []byte) error {

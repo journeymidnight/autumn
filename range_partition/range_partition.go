@@ -183,10 +183,9 @@ func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStre
 	var lastTable *table.Table
 	rp.seqNumber = 0
 	for i := range rp.tables {
-		/*
-			fmt.Printf("table %d, table lastSeq %d, loc [%d, %d], len of table %d\n",
-					i, rp.tables[i].LastSeq, rp.tables[i].Loc.ExtentID, rp.tables[i].Loc.Offset, rp.tables[i].EstimatedSize)
-		*/
+		fmt.Printf("table %d, table lastSeq %d, loc [%d, %d], len of table %d\n",
+			i, rp.tables[i].LastSeq, rp.tables[i].Loc.ExtentID, rp.tables[i].Loc.Offset, rp.tables[i].EstimatedSize)
+
 		if rp.tables[i].LastSeq > rp.seqNumber {
 			rp.seqNumber = rp.tables[i].LastSeq
 			lastTable = rp.tables[i]

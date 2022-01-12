@@ -113,8 +113,8 @@ func (entry *Entry) writeMeta(userKey []byte, expireAt uint64, meta uint32, lenO
 	entry.writeUint32(lenOfValue)
 }
 
-func (entry *Entry) WriteValue(d []byte) {
-	entry.write(d)
+func (entry *Entry) WriteValue(d []byte) error {
+	return entry.write(d)
 }
 
 func (entry *Entry) Format() string {

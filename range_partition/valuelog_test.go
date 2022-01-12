@@ -1,6 +1,7 @@
 package range_partition
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sync"
@@ -184,59 +185,35 @@ func TestRunGCMove(t *testing.T) {
 	require.Equal(t, expectedValue, result)
 }
 
-// func TestLogReplay(t *testing.T) {
+func TestLogReplay(t *testing.T) {
 
-// 	val1 := []byte("sampleval012345678901234567890123")
-// 	val2 := []byte(fmt.Sprintf("%01048576d", 10)) // Return 1MB value which is > math.MaxUint16.
+	val1 := []byte("sampleval012345678901234567890123")
+	val2 := []byte(fmt.Sprintf("%01048576d", 10)) // Return 1MB value which is > math.MaxUint16.
 
-// 	cases := []block{
-// 		NewPutKVEntry([]byte("a"), val1, 0).Encode(),
-// 		NewPutKVEntry([]byte("a1"), val1, 0).Encode(),
-// 		NewPutKVEntry([]byte("b"), val2, 0).Encode(),
-// 	}
+	cases := []block{
+		NewPutKVEntry([]byte("a"), val1, 0).Encode(),
+		NewPutKVEntry([]byte("a1"), val1, 0).Encode(),
+		NewPutKVEntry([]byte("b"), val2, 0).Encode(),
+	}
 
-// 	logStream := streamclient.NewMockStreamClient("log")
-// 	defer logStream.Close()
+	logStream := streamclient.NewMockStreamClient("log")
+	defer logStream.Close()
 
-// 	extentID, offset, _, err := logStream.Append(context.Background(), cases, false)
-// 	require.NoError(t, err)
-// 	expecteEI := []*pb.EntryInfo{
-// 		{
-// 			Log: &pb.Entry{
-// 				Key:   []byte("a"),
-// 				Value: val1,
-// 			},
-// 			ExtentID:      100,
-// 			Offset:        512,
-// 			EstimatedSize: 38},
-// 		{
-// 			Log: &pb.Entry{
-// 				Key:   []byte("a1"), //key is one byte bigger than previous
-// 				Value: val1,
-// 			},
-// 			ExtentID:      100,
-// 			Offset:        512,
-// 			EstimatedSize: 39},
-// 		{
-// 			Log: &pb.Entry{
-// 				Key:   []byte("b"),
-// 				Value: nil,
-// 				Meta:  2,
-// 			},
-// 			ExtentID:      100,
-// 			Offset:        4096 + 512 /*mix block size*/ + 512, /*extent header*/
-// 			EstimatedSize: 1049600,
-// 		},
-// 	}
-// 	i := 0
-// 	replayLog(logStream, func(ei *pb.EntryInfo) (bool, error) {
-// 		fmt.Printf("%s\n", ei.Log.Key)
-// 		require.Equal(t, expecteEI[i], ei)
-// 		i++
-// 		return true, nil
-// 	}, streamclient.WithReadFrom(extentID, offset, math.MaxUint32))
+	extentID, offset, _, err := logStream.Append(context.Background(), cases, false)
+	require.NoError(t, err)
 
-// }
+	i := 0
+	expectedKeys := [][]byte{[]byte("a"), []byte("a1"), []byte("b")}
+	replayLog(logStream, func(ei *Entry) (bool, error) {
+		fmt.Printf("%s, %d, %d, %d\n", ei.Key, ei.ExtentID, ei.Offset, ei.End)
+		require.Equal(t, expectedKeys[i], y.ParseKey(ei.Key))
+		require.Equal(t, len(cases[i]), ei.Size())
+		require.Greater(t, ei.End, uint32(0))
+		i++
+		return true, nil
+	}, streamclient.WithReadFrom(extentID, offset[0], math.MaxUint32))
+
+}
 
 func TestSubmitGC(t *testing.T) {
 	logStream := streamclient.NewMockStreamClient("log")
