@@ -247,6 +247,7 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 		for ; it.Valid(); it.Next() {
 
 			userKey := y.ParseKey(it.Key())
+			ts := y.ParseTs(it.Key())
 
 			//fmt.Printf("processing %s~%d\n", y.ParseKey(it.Key()), y.ParseTs(it.Key()))
 			if !rp.IsUserKeyInRange(userKey) {
@@ -278,6 +279,9 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 			}
 			numKeys++
 			memStore.Put(it.Key(), vs)
+			if ts > maxSeq {
+				maxSeq = ts
+			}
 		}
 
 		xlog.Logger.Debugf("LOG Compact %d tables Added %d keys. Skipped %d keys. Iteration took: %v, ", len(tbls),
@@ -302,6 +306,8 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 			task.discards = discards
 		}
 		//fmt.Printf("send task %+v", task.discards)
+		//reset maxSeq
+		maxSeq = 0
 		rp.flushChan <- task
 		numBuilds++
 	}

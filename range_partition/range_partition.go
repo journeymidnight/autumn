@@ -857,10 +857,10 @@ func (rp *RangePartition) ensureRoomForWrite(entries []*Entry, head valuePointer
 	utils.AssertTrue(rp.mt != nil)
 	xlog.Logger.Debugf("Flushing memtable, mt.size=%d", rp.mt.MemSize())
 
-	seqNum := atomic.AddUint64(&rp.seqNumber, 1)
+	//make sure seqNum is greater or equal to table's max seqNum
 	//non-block, block if flushChan is full,
 	select {
-	case rp.flushChan <- flushTask{mt: rp.mt, vptr: head, seqNum: seqNum, isCompact: false, discards: rp.mt.OriginDiscard}:
+	case rp.flushChan <- flushTask{mt: rp.mt, vptr: head, seqNum: atomic.LoadUint64(&rp.seqNumber), isCompact: false, discards: rp.mt.OriginDiscard}:
 		// After every memtable flush, let's reset the counter.
 
 		// Ensure value log is synced to disk so this memtable's contents wouldn't be lost.
@@ -1136,7 +1136,7 @@ func (rp *RangePartition) close(gracefull bool) error {
 				defer rp.Unlock()
 				utils.AssertTrue(rp.mt != nil)
 				select {
-				case rp.flushChan <- flushTask{mt: rp.mt, vptr: rp.vhead, seqNum: rp.seqNumber + 1, discards: rp.mt.OriginDiscard}:
+				case rp.flushChan <- flushTask{mt: rp.mt, vptr: rp.vhead, seqNum: atomic.LoadUint64(&rp.seqNumber), discards: rp.mt.OriginDiscard}:
 					//fmt.Printf("Gracefull stop: submitted to flushkask vp %+v\n", rp.vhead)
 					rp.imm = append(rp.imm, rp.mt) // Flusher will attempt to remove this from s.imm.
 					rp.mt = nil                    // Will segfault if we try writing!
