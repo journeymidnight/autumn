@@ -209,6 +209,20 @@ message HeadInfo {
 	bytes key = 1;
 	uint32 len = 3;
 }
+message StreamPutRequestHeader {
+	bytes key = 1;
+	uint32 lenOfValue = 2;
+	uint64 ExpiresAt = 3;
+	uint64 partid = 4;
+}
+
+message StreamPutRequest {
+	oneof data {
+		StreamPutRequestHeader header = 1;
+		bytes payload = 2;
+	}
+}
+
 
 service PartitionKV {
 	rpc Batch(BatchRequest) returns (BatchResponse) {}
@@ -217,7 +231,11 @@ service PartitionKV {
 	rpc Get (GetRequest) returns (GetResponse) {}
 	rpc Delete(DeleteRequest) returns (DeleteResponse) {}
 	rpc Range(RangeRequest) returns (RangeResponse) {}
+	rpc StreamPut(stream StreamPutRequest) returns (PutResponse) {}
+	//TODO
+	//rpc StreamGet: non-EC can be done by stream
 
+	
 	//ps management API
 	//system performace
 	rpc SplitPart(SplitPartRequest) returns (SplitPartResponse) {}

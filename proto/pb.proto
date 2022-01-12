@@ -18,23 +18,6 @@ package pb;
 //import "gogoproto/gogo.proto";
 
 
-/*
-message Entry {
-	bytes  key = 1;
-	bytes  value = 2;
-	uint32 meta = 3;
-	uint64 ExpiresAt = 4;
-}
-
-message EntryInfo {
-	Entry log = 1;
-	//used when read bigger blocks log.value = nil, log.meta & bitValuePointer > 0 
-	uint64 extentID = 2;
-	uint32 offset = 3;
-	uint64 estimatedSize = 4;
-	uint32 end = 5;
-}
-*/
 
 enum Code {
 	OK = 0;
