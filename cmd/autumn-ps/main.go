@@ -38,6 +38,7 @@ func main() {
 	var noSync bool
 	var maxExtentMBString string //in the unit of MB
 	var skiplistMBString string  //in the unit of MB
+	var traceSampler float64
 
 	app := &cli.App{
 		HelpName: "",
@@ -87,6 +88,10 @@ func main() {
 				Required:    true,
 				Usage:       "skiplist size in MB",
 			},
+			&cli.Float64Flag{
+				Name:        "trace-sampler",
+				Destination: &traceSampler,
+			},
 		},
 	}
 
@@ -132,13 +137,14 @@ func main() {
 		MaxExtentSize:        uint32((maxExtentMB << 20)),
 		MaxMetaExtentSize:    (4 << 20),
 		SkipListSize:         uint32((skiplistSizeMB << 20)),
+		TraceSampler:         traceSampler,
 	}
 
 	ps := partition_server.NewPartitionServer(config)
 
 	ps.Init()
 
-	utils.Check(ps.ServeGRPC())
+	utils.Check(ps.ServeGRPC(config.TraceSampler))
 
 	xlog.Logger.Infof("PS is ready!")
 

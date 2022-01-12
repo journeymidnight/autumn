@@ -96,13 +96,13 @@ function previewImage(url){
         var img = new Image();
         img.load(url)
         img.width = 400;
-        document.getElementById("link").innerHTML = `http://${window.location.hostname}:5000${url}`;
+        document.getElementById("link").innerHTML = `http://${window.location.hostname}:${window.location.port}${url}`;
         var previewDiv = document.getElementById('preview');
         previewDiv.innerHTML = '';
         document.getElementById('preview').appendChild(img);
     }
     else if (ext == '.mp4' || ext == '.webm') {
-        document.getElementById("link").innerHTML = `http://${window.location.hostname}:5000${url}`;
+        document.getElementById("link").innerHTML = `http://${window.location.hostname}:${window.location.port}${url}`;
         var previewDiv = document.getElementById('preview');
         var video = document.createElement('video');
         video.width = 400;
@@ -113,7 +113,7 @@ function previewImage(url){
         previewDiv.innerHTML = '';
         previewDiv.appendChild(video);
     } else {
-        document.getElementById("link").innerHTML = `http://${window.location.hostname}:5000${url}`;
+        document.getElementById("link").innerHTML = `http://${window.location.hostname}:${window.location.port}${url}`;
         //ajax request to get a text from url
         var xhr = new XMLHttpRequest();
         xhr.open('GET', url,true);

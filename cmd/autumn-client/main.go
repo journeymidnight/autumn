@@ -859,6 +859,7 @@ func format(c *cli.Context) error {
 	config.SmURLs = smURLs
 	config.EtcdURLs = etcdURLs
 	config.ListenURL = listenURL
+	config.TraceSampler = 0
 
 	if len(output) == 0 {
 		fmt.Printf("display config \n")

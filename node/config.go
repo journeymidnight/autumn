@@ -11,12 +11,13 @@ import (
 )
 
 type Config struct {
-	ID        uint64
-	ListenURL string
-	Dirs      []string
-	WalDir    string
-	SmURLs   []string
-	EtcdURLs []string
+	ID           uint64
+	ListenURL    string
+	Dirs         []string
+	WalDir       string
+	SmURLs       []string
+	EtcdURLs     []string
+	TraceSampler float64
 }
 
 func NewConfig() (*Config, error) {
@@ -60,11 +61,16 @@ func NewConfig() (*Config, error) {
 			Name:        "etcd-urls",
 			Destination: &etcdURLsSlice,
 		},
-		(&cli.StringFlag{
+		&cli.StringFlag{
 			Name:        "sm-urls",
 			Destination: &smURLsSlice,
-		}),
+		},
+		&cli.Float64Flag{
+			Name:        "trace-sampler",
+			Destination: &config.TraceSampler,
+		},
 	}
+
 	app := &cli.App{
 		Name:  "extent-node",
 		Flags: flags,

@@ -318,6 +318,8 @@ waitResult:
 	close(retChan)
 	close(errChan)
 
+	span.LogKV("READ BLOCKS DONE", 0)
+
 	var lenOfBlocks int
 	var end uint32
 	var finalErr error

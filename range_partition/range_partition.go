@@ -1028,7 +1028,6 @@ func (rp *RangePartition) Get(userKey []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		span.LogKV("ExtractLogEntry", 1)
 		entry, err := DecodeEntry(blocks[0])
 		if err != nil {
 			return nil, err

@@ -32,7 +32,6 @@ import (
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
 	"github.com/opentracing/opentracing-go"
-	"github.com/uber/jaeger-client-go"
 	"github.com/uber/jaeger-client-go/config"
 	"google.golang.org/grpc"
 )
@@ -265,16 +264,16 @@ func (en *ExtentNode) Shutdown() {
 	})
 }
 
-func (en *ExtentNode) ServeGRPC() error {
+func (en *ExtentNode) ServeGRPC(traceSampler float64) error {
 
 	cfg, err := config.FromEnv()
 
 	cfg.ServiceName = fmt.Sprint("node-", en.nodeID)
 	cfg.Sampler.Type = "const"
-	cfg.Sampler.Param = 0
+	cfg.Sampler.Param = traceSampler
 	cfg.Reporter.LogSpans = false
 
-	tracer, _, err := cfg.NewTracer(config.Logger(jaeger.StdLogger))
+	tracer, _, err := cfg.NewTracer()
 	if err != nil {
 		panic(err)
 	}
@@ -284,8 +283,8 @@ func (en *ExtentNode) ServeGRPC() error {
 		grpc.MaxRecvMsgSize(64<<20),
 		grpc.MaxSendMsgSize(64<<20),
 		grpc.MaxConcurrentStreams(1000),
-		grpc.UnaryInterceptor(
-			otgrpc.OpenTracingServerInterceptor(tracer)),
+		grpc.StreamInterceptor(
+			otgrpc.OpenTracingStreamServerInterceptor(tracer)),
 	)
 
 	pb.RegisterExtentServiceServer(grpcServer, en)
