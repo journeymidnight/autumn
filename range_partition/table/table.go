@@ -2,8 +2,10 @@ package table
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 
+	"github.com/dgraph-io/ristretto"
 	"github.com/dgraph-io/ristretto/z"
 	"github.com/gogo/protobuf/proto"
 	"github.com/journeymidnight/autumn/proto/pspb"
@@ -11,6 +13,7 @@ import (
 	"github.com/journeymidnight/autumn/streamclient"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
+	"github.com/klauspost/compress/snappy" //snappy use S2 compression
 	"github.com/pkg/errors"
 )
 
@@ -41,6 +44,8 @@ type Table struct {
 	VpOffset   uint32
 	//extentID => discard count
 	Discards map[uint64]int64
+
+	blockCache *ristretto.Cache
 }
 
 func OpenTable(blockReader streamclient.StreamClient,
@@ -49,7 +54,7 @@ func OpenTable(blockReader streamclient.StreamClient,
 	utils.AssertTrue(xlog.Logger != nil)
 
 	//fmt.Printf("read table from %d, %d\n", extentID, offset)
-	blocks, _, err := blockReader.Read(context.Background(), extentID, offset, 1, streamclient.HintReadFromCache)
+	blocks, _, err := blockReader.Read(context.Background(), extentID, offset, 1)
 	if err != nil {
 		fmt.Printf("%+v\n", err)
 		return nil, err
@@ -79,6 +84,14 @@ func OpenTable(blockReader streamclient.StreamClient,
 		return nil, err
 	}
 
+	blockCache, err := ristretto.NewCache(&ristretto.Config{
+		NumCounters: 1e7,     // number of keys to track frequency of (10M).
+		MaxCost:     1 << 30, // maximum cost of cache (1GB).
+		BufferItems: 64,      // number of keys per Get buffer.
+	})
+
+	utils.AssertTruef(err == nil, "NewCache error: %v", err)
+
 	t := &Table{
 		blockIndex:    make([]*pspb.BlockOffset, len(meta.TableIndex.Offsets)),
 		blockReader:   blockReader,
@@ -91,6 +104,7 @@ func OpenTable(blockReader streamclient.StreamClient,
 		VpExtentID: meta.VpExtentID,
 		VpOffset:   meta.VpOffset,
 		Discards:   meta.Discards,
+		blockCache: blockCache,
 	}
 
 	//read bloom filter
@@ -118,22 +132,60 @@ type entriesBlock struct {
 	entryOffsets      []uint32 // used to binary search an entry in the block.
 }
 
-//TODO: cache block: FIXME
-func (t *Table) block(idx int) (*entriesBlock, error) {
-	extentID := t.blockIndex[idx].ExtentID
-	offset := t.blockIndex[idx].Offset
-	blocks, _, err := t.blockReader.Read(context.Background(), extentID, offset, 1, streamclient.HintReadFromCache)
+func (t *Table) decompress(data []byte) ([]byte, error) {
+	sz, err := snappy.DecodedLen(data)
 	if err != nil {
 		return nil, err
 	}
-	if len(blocks) != 1 {
-		return nil, errors.Errorf("len of blocks is not 1")
+	decompressed := make([]byte, sz, sz)
+	if _, err := snappy.Decode(decompressed, data); err != nil {
+		return nil, err
 	}
-	if len(blocks[0]) < 8 {
-		return nil, errors.Errorf("block data should be bigger than 8")
+	return decompressed, nil
+}
+
+func blockCacheID(extentID uint64, offset uint32) []byte {
+	buf := make([]byte, 12)
+	binary.BigEndian.PutUint64(buf[0:8], extentID)
+	binary.BigEndian.PutUint32(buf[8:12], offset)
+	return buf
+}
+
+func (t *Table) Close() {
+	t.blockCache.Close()
+}
+
+func (t *Table) block(idx int) (*entriesBlock, error) {
+
+	extentID := t.blockIndex[idx].ExtentID
+	offset := t.blockIndex[idx].Offset
+
+	var data []byte
+	dataInCache, ok := t.blockCache.Get(blockCacheID(extentID, offset))
+	//if cache miss, read data and decompress
+	if !ok {
+		//fmt.Printf("cache miss for %d, %d\n", extentID, offset)
+		blocks, _, err := t.blockReader.Read(context.Background(), extentID, offset, 1)
+		if err != nil {
+			return nil, err
+		}
+		if len(blocks) != 1 {
+			return nil, errors.Errorf("len of blocks is not 1")
+		}
+		if len(blocks[0]) < 8 {
+			return nil, errors.Errorf("block data should be bigger than 8")
+		}
+		data, err = t.decompress(blocks[0])
+		if err != nil {
+			return nil, err
+		}
+		//set cache
+		t.blockCache.Set(blockCacheID(extentID, offset), data, 0)
+	} else {
+		//fmt.Printf("hit cache for %d, %d\n", extentID, offset)
+		data = dataInCache.([]byte)
 	}
 
-	data := blocks[0]
 	expected := y.BytesToU32(data[len(data)-4:])
 	checksum := utils.NewCRC(data[:len(data)-4]).Value()
 	if checksum != expected {

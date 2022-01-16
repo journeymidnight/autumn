@@ -30,6 +30,7 @@ import (
 	"github.com/journeymidnight/autumn/streamclient"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
+	"github.com/klauspost/compress/snappy" //snappy use S2 compression
 )
 
 const (
@@ -39,6 +40,13 @@ const (
 	// When a block is encrypted, it's length increases. We add 200 bytes of padding to
 	// handle cases when block size increases. This is an approximate number.
 	padding = 200
+)
+
+type CompressionType uint32
+
+const (
+	None   CompressionType = 0
+	Snappy CompressionType = 1
 )
 
 type header struct {
@@ -79,6 +87,7 @@ type Builder struct {
 	writeCh       chan writeBlock
 	stopper       *utils.Stopper
 	originDiscard map[uint64]int64
+	compression   CompressionType
 }
 
 // NewTableBuilder makes a new TableBuilder.
@@ -91,6 +100,7 @@ func NewTableBuilder(stream streamclient.StreamClient) *Builder {
 		stopper:       utils.NewStopper(),
 		currentBlock:  make([]byte, 64*KB),
 		originDiscard: make(map[uint64]int64),
+		compression:   Snappy,
 	}
 
 	b.stopper.RunWorker(func() {
@@ -288,11 +298,27 @@ func (b *Builder) FinishBlock() {
 	xlog.Logger.Debugf("real block size is %d, len of entries is %d\n", b.sz, len(b.entryOffsets))
 	//truncate block to b.sz
 	b.currentBlock = b.currentBlock[:b.sz]
+
+	//fmt.Printf("origin size is :%d, compressed size is %d\n", len(b.currentBlock), len(b.compressData(b.currentBlock)))
+	b.currentBlock = b.compressData(b.currentBlock)
 	b.writeCh <- writeBlock{
 		baseKey: y.Copy(b.baseKey),
 		b:       b.currentBlock,
 	}
 	return
+}
+
+func (b *Builder) compressData(data []byte) []byte {
+	switch b.compression {
+	case None:
+		return data
+	case Snappy:
+		sz := snappy.MaxEncodedLen(len(data))
+		dst := make([]byte, sz)
+		return snappy.Encode(dst, data)
+	default:
+		panic("Unknown compression type")
+	}
 }
 
 func (b *Builder) addBlockToIndex(baseKey []byte, extentID uint64, offset uint32) {

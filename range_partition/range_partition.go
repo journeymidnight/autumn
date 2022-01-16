@@ -1024,7 +1024,7 @@ func (rp *RangePartition) Get(userKey []byte) ([]byte, error) {
 	if vs.Meta&BitValuePointer > 0 {
 		var vp valuePointer
 		vp.Decode(vs.Value)
-		blocks, _, err := rp.logStream.Read(ctx, vp.extentID, vp.offset, 1, streamclient.HintReadThrough)
+		blocks, _, err := rp.logStream.Read(ctx, vp.extentID, vp.offset, 1)
 		if err != nil {
 			return nil, err
 		}
@@ -1111,6 +1111,9 @@ func (rp *RangePartition) Close() error {
 	rp.closeOnce.Do(func() {
 		err = rp.close(true)
 	})
+	for _, tbl := range rp.tables {
+		tbl.Close()
+	}
 	return err
 }
 

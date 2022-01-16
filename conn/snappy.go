@@ -18,7 +18,8 @@ import (
 	"io"
 	"sync"
 
-	"github.com/golang/snappy"
+	"github.com/klauspost/compress/snappy" //snappy use S2 compression
+
 	"google.golang.org/grpc/encoding"
 )
 

@@ -16,6 +16,7 @@ require (
 	github.com/golang/snappy v0.0.4
 	github.com/grpc-ecosystem/go-grpc-middleware v1.3.0 // indirect
 	github.com/grpc-ecosystem/grpc-opentracing v0.0.0-20180507213350-8e809c8a8645 // indirect
+	github.com/klauspost/compress v1.14.1 // indirect
 	github.com/klauspost/reedsolomon v1.9.13
 	github.com/mattn/go-colorable v0.1.11 // indirect
 	github.com/opentracing/opentracing-go v1.1.0 // indirect
