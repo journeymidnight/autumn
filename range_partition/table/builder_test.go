@@ -67,6 +67,7 @@ func TestTableIndex(t *testing.T) {
 	id, offset, err := builder.FinishAll(100, 200, 100, nil)
 	table, err := OpenTable(stream, id, offset)
 	assert.Nil(t, err)
+	defer table.Close()
 	//fmt.Printf("big %s, small %s\n", table.biggest, table.smallest)
 	assert.Equal(t, blockCount, len(table.blockIndex))
 	assert.Equal(t, fmt.Sprintf("%016x", 99999), string(table.biggest))

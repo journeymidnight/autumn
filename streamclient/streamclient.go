@@ -21,7 +21,6 @@ import (
 	"io"
 	"time"
 
-	"github.com/dgraph-io/ristretto"
 	"github.com/journeymidnight/autumn/conn"
 	"github.com/journeymidnight/autumn/erasure_code"
 	"github.com/journeymidnight/autumn/manager/smclient"
@@ -61,7 +60,7 @@ type StreamClient interface {
 	CommitEnd() uint32 //FIMME:remove this
 	//total number of extents
 	StreamInfo() *pb.StreamInfo
-	Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32, hint byte) ([]block, uint32, error)
+	Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]block, uint32, error)
 	SealedLength(extentID uint64) (uint64, error)
 }
 
@@ -84,25 +83,8 @@ func blockCacheID(extentID uint64, offset uint32) []byte {
 	return buf
 }
 
-type blockInCache struct {
-	block   block
-	readEnd uint32
-}
-
-func (sc *AutumnStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32, hint byte) ([]block, uint32, error) {
-	//only cache metadata
-	if (hint&HintReadFromCache) > 0 && numOfBlocks == 1 {
-		data, ok := sc.blockCache.Get(blockCacheID(extentID, offset))
-		if ok && data != nil {
-			x := data.(blockInCache)
-			return [][]byte{x.block}, x.readEnd, nil
-		}
-	}
+func (sc *AutumnStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]block, uint32, error) {
 	blocks, _, end, err := sc.smartRead(ctx, extentID, offset, numOfBlocks, false)
-
-	if (hint&HintReadFromCache) > 0 && numOfBlocks == 1 {
-		sc.blockCache.Set(blockCacheID(extentID, offset), blockInCache{block: blocks[0], readEnd: end}, 0)
-	}
 	return blocks, end, err
 }
 
@@ -423,26 +405,19 @@ type AutumnStreamClient struct {
 	maxExtentSize uint32
 
 	utils.SafeMutex //protect streamInfo from allocStream, Truncate, PunchHole
-	blockCache      *ristretto.Cache
 }
 
 func NewStreamClient(sm *smclient.SMClient, em *smclient.ExtentManager, maxExtentSize uint32, streamID uint64, streamLock StreamLock) *AutumnStreamClient {
 	utils.AssertTrue(xlog.Logger != nil)
 
 	utils.AssertTruef(maxExtentSize < HardMaxExtentSize, "maxExtentSize %d is too large", maxExtentSize)
-	blockCache, err := ristretto.NewCache(&ristretto.Config{
-		NumCounters: 1e7,     // number of keys to track frequency of (10M).
-		MaxCost:     1 << 30, // maximum cost of cache (1GB).
-		BufferItems: 64,      // number of keys per Get buffer.
-	})
-	utils.AssertTruef(err == nil, "NewCache error: %v", err)
+
 	return &AutumnStreamClient{
 		smClient:      sm,
 		em:            em,
 		streamID:      streamID,
 		streamLock:    streamLock,
 		maxExtentSize: maxExtentSize,
-		blockCache:    blockCache,
 	}
 }
 

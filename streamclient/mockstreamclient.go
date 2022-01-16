@@ -33,7 +33,7 @@ func (client *MockStreamClient) SealedLength(extentID uint64) (uint64, error) {
 	return uint64(ex.CommitLength()), nil
 }
 
-func (client *MockStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32, hint byte) ([]block, uint32, error) {
+func (client *MockStreamClient) Read(ctx context.Context, extentID uint64, offset uint32, numOfBlocks uint32) ([]block, uint32, error) {
 	client.RLock()
 	ex := client.exs[extentID]
 	client.RUnlock()
