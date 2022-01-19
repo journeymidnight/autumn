@@ -211,7 +211,7 @@ func (suite *ExtentNodeTestSuite) TestAppendReadValue() {
 	//fmt.Printf("%d=>%d, on extent %d\n", offsets[0], end, extentID)
 
 	sc = streamclient.NewStreamClient(sm, em, testExtentSize, si.StreamID, streamclient.MutexToLock(suite.mutex))
-	ret, end, err := sc.Read(context.Background(), extentID, offsets[0], 2, streamclient.HintReadFromCache)
+	ret, end, err := sc.Read(context.Background(), extentID, offsets[0], 2)
 	suite.Require().Nil(err)
 
 	fmt.Printf("ret:%v, end %d\n", ret, end)

@@ -6,6 +6,7 @@ require (
 	fyne.io/fyne/v2 v2.0.4
 	github.com/BurntSushi/toml v0.3.1
 	github.com/ChimeraCoder/gojson v1.1.0 // indirect
+	github.com/DataDog/zstd v1.5.0 // indirect
 	github.com/HdrHistogram/hdrhistogram-go v1.1.1
 	github.com/cornelk/hashmap v1.0.1
 	github.com/dgraph-io/ristretto v0.1.0

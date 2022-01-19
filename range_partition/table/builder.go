@@ -23,6 +23,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/DataDog/zstd"
 	"github.com/dgraph-io/ristretto/z"
 	"github.com/dgryski/go-farm"
 	"github.com/journeymidnight/autumn/proto/pspb"
@@ -47,6 +48,7 @@ type CompressionType uint32
 const (
 	None   CompressionType = 0
 	Snappy CompressionType = 1
+	ZSTD   CompressionType = 2
 )
 
 type header struct {
@@ -80,27 +82,29 @@ type Builder struct {
 
 	baseKey []byte // Base key for the current block.
 	//baseOffset   uint32   // Offset for the current block.
-	entryOffsets  []uint32 // Offsets of entries present in current block.
-	tableIndex    *pspb.TableIndex
-	keyHashes     []uint64 // Used for building the bloomfilter.
-	stream        streamclient.StreamClient
-	writeCh       chan writeBlock
-	stopper       *utils.Stopper
-	originDiscard map[uint64]int64
-	compression   CompressionType
+	entryOffsets     []uint32 // Offsets of entries present in current block.
+	tableIndex       *pspb.TableIndex
+	keyHashes        []uint64 // Used for building the bloomfilter.
+	stream           streamclient.StreamClient
+	writeCh          chan writeBlock
+	stopper          *utils.Stopper
+	originDiscard    map[uint64]int64
+	compressionType  CompressionType
+	compressedSize   uint32
+	unCompressedSize uint32
 }
 
 // NewTableBuilder makes a new TableBuilder.
-func NewTableBuilder(stream streamclient.StreamClient) *Builder {
+func NewTableBuilder(stream streamclient.StreamClient, ct CompressionType) *Builder {
 	b := &Builder{
-		tableIndex:    &pspb.TableIndex{},
-		keyHashes:     make([]uint64, 0, 1024), // Avoid some malloc calls.
-		stream:        stream,
-		writeCh:       make(chan writeBlock, 16),
-		stopper:       utils.NewStopper(),
-		currentBlock:  make([]byte, 64*KB),
-		originDiscard: make(map[uint64]int64),
-		compression:   Snappy,
+		tableIndex:      &pspb.TableIndex{},
+		keyHashes:       make([]uint64, 0, 1024), // Avoid some malloc calls.
+		stream:          stream,
+		writeCh:         make(chan writeBlock, 16),
+		stopper:         utils.NewStopper(),
+		currentBlock:    make([]byte, 64*KB),
+		originDiscard:   make(map[uint64]int64),
+		compressionType: ct,
 	}
 
 	b.stopper.RunWorker(func() {
@@ -265,9 +269,10 @@ func (b *Builder) addHelper(key []byte, v y.ValueStruct) {
 	dst := b.allocate(int(v.EncodedSize()))
 	v.Encode(dst)
 
-	// Size of KV on SST.
-	sstSz := uint64(uint32(headerSize) + uint32(len(diffKey)) + v.EncodedSize())
-	b.tableIndex.EstimatedSize += sstSz
+	// sstSz := uint64(uint32(headerSize) + uint32(len(diffKey)) + v.EncodedSize())
+
+	// Size of KV on Memory
+	// b.tableIndex.EstimatedSize += sizeInMemory
 }
 
 type block = []byte
@@ -300,7 +305,9 @@ func (b *Builder) FinishBlock() {
 	b.currentBlock = b.currentBlock[:b.sz]
 
 	//fmt.Printf("origin size is :%d, compressed size is %d\n", len(b.currentBlock), len(b.compressData(b.currentBlock)))
+	b.unCompressedSize += uint32(len(b.currentBlock))
 	b.currentBlock = b.compressData(b.currentBlock)
+	b.compressedSize += uint32(len(b.currentBlock))
 	b.writeCh <- writeBlock{
 		baseKey: y.Copy(b.baseKey),
 		b:       b.currentBlock,
@@ -309,13 +316,21 @@ func (b *Builder) FinishBlock() {
 }
 
 func (b *Builder) compressData(data []byte) []byte {
-	switch b.compression {
+	switch b.compressionType {
 	case None:
 		return data
 	case Snappy:
 		sz := snappy.MaxEncodedLen(len(data))
 		dst := make([]byte, sz)
 		return snappy.Encode(dst, data)
+	case ZSTD:
+		sz := zstd.CompressBound(len(data))
+		dst := make([]byte, sz)
+		dst, err := zstd.Compress(dst, data)
+		if err != nil {
+			xlog.Logger.Panicf("compress data failed, err: %v\n", err)
+		}
+		return dst
 	default:
 		panic("Unknown compression type")
 	}
@@ -373,7 +388,8 @@ The table structure looks like
 //return metablock position(extentID, offset, error)
 //tailExtentID和tailOffset表示当前commitLog对应的结尾, 在打开commitlog后, 从(tailExtentID, tailOffset)开始的
 //block读数据, 生成mt
-func (b *Builder) FinishAll(headExtentID uint64, headOffset uint32, seqNum uint64, discards map[uint64]int64) (uint64, uint32, error) {
+func (b *Builder) FinishAll(headExtentID uint64, headOffset uint32, seqNum uint64, discards map[uint64]int64,
+	memorySize uint64) (uint64, uint32, error) {
 
 	close(b.writeCh)
 	b.stopper.Wait()
@@ -384,16 +400,21 @@ func (b *Builder) FinishAll(headExtentID uint64, headOffset uint32, seqNum uint6
 	}
 	// Add bloom filter to the index.
 	b.tableIndex.BloomFilter = bf.JSONMarshal()
+	b.tableIndex.EstimatedSize = memorySize
 
 	meta := &pspb.BlockMeta{
-		UnCompressedSize: uint32(b.tableIndex.Size()),
-		CompressedSize:   0,
-		VpExtentID:       headExtentID,
-		VpOffset:         headOffset,
-		SeqNum:           seqNum,
-		TableIndex:       b.tableIndex,
-		Discards:         discards,
+		CompressedSize:  0,
+		VpExtentID:      headExtentID,
+		VpOffset:        headOffset,
+		SeqNum:          seqNum,
+		TableIndex:      b.tableIndex,
+		Discards:        discards,
+		CompressionType: uint32(b.compressionType),
 	}
+
+	//compressedSize = all block size + meta block size
+	meta.CompressedSize = b.compressedSize + uint32(meta.Size())
+	meta.UnCompressedSize = b.unCompressedSize + uint32(meta.Size())
 
 	metaBlock := make([]byte, meta.Size()+4)
 

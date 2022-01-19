@@ -45,7 +45,7 @@ func TestTableIndex(t *testing.T) {
 	stream := streamclient.NewMockStreamClient("log")
 	defer stream.Close()
 
-	builder := NewTableBuilder(stream)
+	builder := NewTableBuilder(stream, None)
 
 	blockFirstKeys := make([][]byte, 0)
 	blockCount := 0
@@ -64,7 +64,7 @@ func TestTableIndex(t *testing.T) {
 	}
 
 	builder.FinishBlock()
-	id, offset, err := builder.FinishAll(100, 200, 100, nil)
+	id, offset, err := builder.FinishAll(100, 200, 100, nil, 0)
 	table, err := OpenTable(stream, id, offset)
 	assert.Nil(t, err)
 	defer table.Close()

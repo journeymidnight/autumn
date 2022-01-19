@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
+	"github.com/DataDog/zstd"
 	"github.com/dgraph-io/ristretto"
 	"github.com/dgraph-io/ristretto/z"
 	"github.com/gogo/protobuf/proto"
@@ -26,13 +27,13 @@ type TableInterface interface {
 
 type Table struct {
 	utils.SafeMutex
-	blockReader streamclient.StreamClient //only to read
-	blockIndex  []*pspb.BlockOffset
+	streamReader streamclient.StreamClient //only to read
+	blockIndex   []*pspb.BlockOffset
 
 	// The following are initialized once and const.
 	smallest, biggest []byte // Smallest and largest keys (with timestamps).
 
-	// Stores the total size of key-values stored in this table (exclude the size on vlog).
+	// Stores the total size of key-values in skiplist.
 	EstimatedSize uint64
 	bf            *z.Bloom
 	//cache ??
@@ -45,16 +46,19 @@ type Table struct {
 	//extentID => discard count
 	Discards map[uint64]int64
 
-	blockCache *ristretto.Cache
+	blockCache       *ristretto.Cache
+	CompressionType  CompressionType
+	CompressedSize   uint32
+	UncompressedSize uint32
 }
 
-func OpenTable(blockReader streamclient.StreamClient,
+func OpenTable(streamReader streamclient.StreamClient,
 	extentID uint64, offset uint32) (*Table, error) {
 
 	utils.AssertTrue(xlog.Logger != nil)
 
 	//fmt.Printf("read table from %d, %d\n", extentID, offset)
-	blocks, _, err := blockReader.Read(context.Background(), extentID, offset, 1)
+	blocks, _, err := streamReader.Read(context.Background(), extentID, offset, 1)
 	if err != nil {
 		fmt.Printf("%+v\n", err)
 		return nil, err
@@ -79,6 +83,7 @@ func OpenTable(blockReader streamclient.StreamClient,
 
 	var meta pspb.BlockMeta
 
+	//meta block is not compressed.
 	err = meta.Unmarshal(data[:len(data)-4])
 	if err != nil {
 		return nil, err
@@ -94,17 +99,20 @@ func OpenTable(blockReader streamclient.StreamClient,
 
 	t := &Table{
 		blockIndex:    make([]*pspb.BlockOffset, len(meta.TableIndex.Offsets)),
-		blockReader:   blockReader,
+		streamReader:  streamReader,
 		EstimatedSize: meta.TableIndex.EstimatedSize,
 		Loc: pspb.Location{
 			ExtentID: extentID,
 			Offset:   offset,
 		},
-		LastSeq:    meta.SeqNum,
-		VpExtentID: meta.VpExtentID,
-		VpOffset:   meta.VpOffset,
-		Discards:   meta.Discards,
-		blockCache: blockCache,
+		LastSeq:          meta.SeqNum,
+		VpExtentID:       meta.VpExtentID,
+		VpOffset:         meta.VpOffset,
+		Discards:         meta.Discards,
+		blockCache:       blockCache,
+		CompressionType:  CompressionType(meta.CompressionType),
+		CompressedSize:   meta.CompressedSize,
+		UncompressedSize: meta.UnCompressedSize,
 	}
 
 	//read bloom filter
@@ -133,15 +141,24 @@ type entriesBlock struct {
 }
 
 func (t *Table) decompress(data []byte) ([]byte, error) {
-	sz, err := snappy.DecodedLen(data)
-	if err != nil {
-		return nil, err
+	switch t.CompressionType {
+	case Snappy:
+		sz, err := snappy.DecodedLen(data)
+		if err != nil {
+			return nil, err
+		}
+		decompressed := make([]byte, sz, sz)
+		if _, err := snappy.Decode(decompressed, data); err != nil {
+			return nil, err
+		}
+		return decompressed, nil
+	case ZSTD:
+		return zstd.Decompress(nil, data)
+	case None:
+		return data, nil
+	default:
+		return nil, errors.Errorf("unknown compression type: %d", t.CompressionType)
 	}
-	decompressed := make([]byte, sz, sz)
-	if _, err := snappy.Decode(decompressed, data); err != nil {
-		return nil, err
-	}
-	return decompressed, nil
 }
 
 func blockCacheID(extentID uint64, offset uint32) []byte {
@@ -165,7 +182,7 @@ func (t *Table) block(idx int) (*entriesBlock, error) {
 	//if cache miss, read data and decompress
 	if !ok {
 		//fmt.Printf("cache miss for %d, %d\n", extentID, offset)
-		blocks, _, err := t.blockReader.Read(context.Background(), extentID, offset, 1)
+		blocks, _, err := t.streamReader.Read(context.Background(), extentID, offset, 1)
 		if err != nil {
 			return nil, err
 		}

@@ -50,7 +50,7 @@ func buildTable(t *testing.T, keyValues [][]string) (streamclient.StreamClient, 
 	//open local stream
 
 	stream := streamclient.NewMockStreamClient("log")
-	b := NewTableBuilder(stream)
+	b := NewTableBuilder(stream, None)
 	defer b.Close()
 
 	sort.Slice(keyValues, func(i, j int) bool {
@@ -58,10 +58,11 @@ func buildTable(t *testing.T, keyValues [][]string) (streamclient.StreamClient, 
 	})
 	for _, kv := range keyValues {
 		utils.AssertTrue(len(kv) == 2)
+		//sizeInMemory is 0
 		b.Add(y.KeyWithTs([]byte(kv[0]), 0), y.ValueStruct{Value: []byte(kv[1]), Meta: 'A'})
 	}
-	b.FinishBlock()                               //finish current block
-	ex, offset, err := b.FinishAll(0, 0, 10, nil) //finish all table
+	b.FinishBlock()                                  //finish current block
+	ex, offset, err := b.FinishAll(0, 0, 10, nil, 0) //finish all table
 	assert.Nil(t, err)
 	return stream, ex, offset
 }
@@ -678,7 +679,7 @@ func TestTableBigValues(t *testing.T) {
 
 	n := 100 // Insert 100 keys.
 
-	builder := NewTableBuilder(stream)
+	builder := NewTableBuilder(stream, Snappy)
 	for i := 0; i < n; i++ {
 		key := y.KeyWithTs([]byte(key("", i)), 0)
 		vs := y.ValueStruct{Value: value(i)}
@@ -686,7 +687,7 @@ func TestTableBigValues(t *testing.T) {
 		builder.Add(key, vs)
 	}
 	builder.FinishBlock()
-	id, offset, err := builder.FinishAll(0, 0, 0, map[uint64]int64{10: 10})
+	id, offset, err := builder.FinishAll(0, 0, 0, map[uint64]int64{10: 10}, 0)
 	require.NoError(t, err)
 
 	tbl, err := OpenTable(stream, id, offset)
