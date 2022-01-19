@@ -1,1 +1,1 @@
-ps:./autumn-ps --advertise-listen 127.0.0.1:9955 --listen :9955 --psid 12 --sm-urls 127.0.0.1:3401 --etcd-urls 127.0.0.1:2379 --max-extent-size 1024 --skiplist-size 120 --nosync --trace-sampler 0
+ps:./autumn-ps --advertise-listen 127.0.0.1:9955 --listen :9955 --psid 12 --sm-urls 127.0.0.1:3401 --etcd-urls 127.0.0.1:2379 --max-extent-size 1024 --skiplist-size 120 --nosync --trace-sampler 0 --compression zstd

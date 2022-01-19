@@ -36,6 +36,7 @@ type Config struct {
 	MaxMetaExtentSize    uint32 //in the unit of Bytes
 	SkipListSize         uint32 //in the unit of Bytes
 	TraceSampler         float64
+	Compression          string
 }
 
 type PartitionServer struct {
@@ -323,6 +324,7 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, mutex *
 		range_partition.DefaultOption(),
 		range_partition.WithMaxSkipList(int64(ps.config.SkipListSize)),
 		range_partition.WithSync(ps.config.MustSync),
+		range_partition.WithCompression(ps.config.Compression),
 	)
 
 	xlog.Logger.Infof("open range partition %d, StartKey:[%s], EndKey:[%s]: err is %v", meta.PartID, meta.Rg.StartKey, meta.Rg.EndKey, err)

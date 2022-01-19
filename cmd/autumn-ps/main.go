@@ -39,6 +39,7 @@ func main() {
 	var maxExtentMBString string //in the unit of MB
 	var skiplistMBString string  //in the unit of MB
 	var traceSampler float64
+	var compression string
 
 	app := &cli.App{
 		HelpName: "",
@@ -92,6 +93,12 @@ func main() {
 				Name:        "trace-sampler",
 				Destination: &traceSampler,
 			},
+			&cli.StringFlag{
+				Name:        "compression",
+				Destination: &compression,
+				Usage:       "compression type, none, snappy, zstd",
+				Value:       "snappy",
+			},
 		},
 	}
 
@@ -125,6 +132,10 @@ func main() {
 		panic(fmt.Sprint("skiplist-size must be greater than zero and less than 120MB"))
 	}
 
+	if compression != "snappy" && compression != "none" && compression != "zstd" {
+		panic("compression type must be snappy, none or zstd")
+	}
+
 	config := partition_server.Config{
 		PSID:                 id,
 		AdvertiseURL:         advertiseListen,
@@ -138,12 +149,14 @@ func main() {
 		MaxMetaExtentSize:    (4 << 20),
 		SkipListSize:         uint32((skiplistSizeMB << 20)),
 		TraceSampler:         traceSampler,
+		Compression:         compression,
 	}
 
 	ps := partition_server.NewPartitionServer(config)
 
 	ps.Init()
 
+	
 	utils.Check(ps.ServeGRPC(config.TraceSampler))
 
 	xlog.Logger.Infof("PS is ready!")

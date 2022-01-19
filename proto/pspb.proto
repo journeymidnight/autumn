@@ -80,11 +80,12 @@ message PartitionMeta {
 message BlockMeta {
 	TableIndex tableIndex = 1;
     uint32  CompressedSize = 2;
-    uint32  UnCompressedSize  = 3;
+    uint32  UnCompressedSize  = 3; 
     uint64  vpExtentID = 4;
     uint32  vpOffset = 5;
     uint64  seqNum = 6;
 	map<uint64, int64> discards = 7; //extentID=>size
+	uint32  CompressionType = 8; //0:none, 1:snappy
 }
 
 message BlockOffset {
@@ -96,7 +97,7 @@ message BlockOffset {
 message TableIndex {
   repeated BlockOffset offsets = 1;//相当于二级索引, 每个block定长64KB
   bytes bloomFilter = 2;
-  uint64 estimatedSize = 3;
+  uint64 estimatedSize = 3;  //estimatedSize in memstore
   uint32 numOfBlocks = 4;
 }
 

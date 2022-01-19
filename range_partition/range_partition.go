@@ -183,8 +183,9 @@ func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStre
 	var lastTable *table.Table
 	rp.seqNumber = 0
 	for i := range rp.tables {
-		fmt.Printf("table %d, table lastSeq %d, loc [%d, %d], len of table %d\n",
-			i, rp.tables[i].LastSeq, rp.tables[i].Loc.ExtentID, rp.tables[i].Loc.Offset, rp.tables[i].EstimatedSize)
+		fmt.Printf("table %d, table lastSeq %d, loc [%d, %d], len of mem %d, len of compressed %d, len of uncompressed %d\n",
+			i, rp.tables[i].LastSeq, rp.tables[i].Loc.ExtentID, rp.tables[i].Loc.Offset, rp.tables[i].EstimatedSize,
+			rp.tables[i].CompressedSize, rp.tables[i].UncompressedSize)
 
 		if rp.tables[i].LastSeq > rp.seqNumber {
 			rp.seqNumber = rp.tables[i].LastSeq
@@ -364,7 +365,7 @@ func (rp *RangePartition) handleFlushTask(ft flushTask) (*table.Table, error) {
 
 	iter := ft.mt.NewIterator()
 	defer iter.Close()
-	b := table.NewTableBuilder(rp.rowStream)
+	b := table.NewTableBuilder(rp.rowStream, rp.opt.CompressionType)
 	defer b.Close()
 
 	//var vp valuePointer
@@ -381,7 +382,7 @@ func (rp *RangePartition) handleFlushTask(ft flushTask) (*table.Table, error) {
 
 	b.FinishBlock()
 
-	id, offset, err := b.FinishAll(ft.vptr.extentID, ft.vptr.offset, ft.seqNum, ft.discards)
+	id, offset, err := b.FinishAll(ft.vptr.extentID, ft.vptr.offset, ft.seqNum, ft.discards, uint64(ft.mt.MemSize()))
 	if err != nil {
 		xlog.Logger.Errorf("ERROR while build table: %v", err)
 		return nil, err
@@ -511,7 +512,7 @@ func (rp *RangePartition) saveTableLocs() {
 
 	data := utils.MustMarshal(&locations)
 
-	//fmt.Printf("Set table locations %v\n", locations.Locs)
+	fmt.Printf("Set table locations %v\n", locations.Locs)
 	backoff := 50 * time.Millisecond
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
@@ -1222,6 +1223,7 @@ func (rp *RangePartition) CheckTableOrder(out []*table.Table) {
 		return
 	}
 
+	//check for same key whose ts is bigger will in table whose lastSeq is bigger
 	for _, tbl := range tbls {
 		it := tbl.NewIterator(false)
 		for ; it.Valid(); it.Next() {
@@ -1236,6 +1238,25 @@ func (rp *RangePartition) CheckTableOrder(out []*table.Table) {
 				index[string(userKey)] = ts
 			}
 		}
+	}
+
+	//all item's ts is between prev table's lastSeq and current tables' lastSeq
+	prevTblSeq := uint64(0)
+	for _, tbl := range tbls {
+		iter := tbl.NewIterator(false)
+		for ; iter.Valid(); iter.Next() {
+			//require.LessOrEqual(t, y.ParseTs(iter.Key()), tbl.LastSeq)
+
+			if y.ParseTs(iter.Key()) > tbl.LastSeq {
+				panic("table order error, ts is greater than lastSeq")
+			}
+			//require.Greater(t, y.ParseTs(iter.Key()), prevTblSeq)
+
+			if y.ParseTs(iter.Key()) <= prevTblSeq {
+				panic("table order error, ts is less than prevTblSeq")
+			}
+		}
+		prevTblSeq = tbl.LastSeq
 	}
 
 }

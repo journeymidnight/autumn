@@ -17,9 +17,9 @@ import (
 //given all tables in range partition, if eID is not 0, caller can call stream.Truncate(eID) to
 //truncate the stream, in our system, every extentID is bigger than 0.
 //RETURN: if tables is nil, do not compact
-//
+//if table's estimated size is near maxCapacity, minor compaction policy will not choose this table
 type PickupTables interface {
-	PickupTables(tbls []*table.Table) (tables []*table.Table, eID uint64)
+	PickupTables(tbls []*table.Table, maxCapacity uint64) (tables []*table.Table, eID uint64)
 }
 
 type DefaultPickupPolicy struct {
@@ -30,7 +30,7 @@ type DefaultPickupPolicy struct {
 }
 
 //In size-tiered compaction, newer and smaller SSTables are successively merged into older and larger SSTables
-func (p DefaultPickupPolicy) PickupTables(tbls []*table.Table) ([]*table.Table, uint64) {
+func (p DefaultPickupPolicy) PickupTables(tbls []*table.Table, maxCapacity uint64) ([]*table.Table, uint64) {
 
 	utils.AssertTruef(p.n > 1, "PickupPolicy: n must be greater than 1")
 
@@ -118,23 +118,15 @@ func (p DefaultPickupPolicy) PickupTables(tbls []*table.Table) ([]*table.Table, 
 
 	throttle := uint64(math.Round(p.compactRatio * float64(p.opt.MaxSkipList)))
 
-	for i := 0; i < len(tbls); i++ {
-		for i < len(tbls) && tbls[i].EstimatedSize < throttle && len(compactTbls) < p.n {
-			//merge to older and larger SSTables
-			if i > 0 && len(compactTbls) == 0 {
-				compactTbls = append(compactTbls, tbls[i-1])
-			}
-			compactTbls = append(compactTbls, tbls[i])
-			i++
+	i := 0
+	for ; i < len(tbls) && tbls[i].EstimatedSize < throttle && len(compactTbls) < p.n; i++ {
+		//merge to older and larger SSTables
+		if i > 0 && len(compactTbls) == 0 && tbls[i-1].EstimatedSize < uint64(float64(maxCapacity)*0.9) {
+			compactTbls = append(compactTbls, tbls[i-1])
 		}
-		if len(compactTbls) > 0 {
-			//corner case : 1, 100, 100, 100
-			if len(compactTbls) == 1 {
-				compactTbls = append(compactTbls, tbls[i])
-			}
-			break
-		}
+		compactTbls = append(compactTbls, tbls[i])
 	}
+
 	if len(compactTbls) > 1 {
 		return compactTbls, 0
 	}
@@ -174,7 +166,7 @@ func (rp *RangePartition) compact() {
 			fmt.Printf("fininshed major compaction tasks for tables %+v\n", allTables)
 		case <-randTicker.C:
 			allTables := rp.getTables()
-			compactTables, eID := rp.pickupTablePolicy.PickupTables(allTables)
+			compactTables, eID := rp.pickupTablePolicy.PickupTables(allTables, uint64(2*rp.opt.MaxSkipList))
 			if len(compactTables) < 2 {
 				continue
 			}
@@ -239,6 +231,7 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 	resultCh := make(chan struct{})
 
 	capacity := int64(2 * rp.opt.MaxSkipList)
+	fmt.Printf("merge capacity is %d\n", capacity)
 	for it.Valid() {
 		var skipKey []byte
 		timeStart := time.Now()
@@ -275,6 +268,7 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 			}
 
 			if memStore.MemSize()+int64(estimatedVS(it.Key(), it.Value())) > capacity {
+				//fmt.Printf("current memtable size is %d, estimated size is %d, break\n", memStore.MemSize(), estimatedVS(it.Key(), it.Value()))
 				break
 			}
 			numKeys++
