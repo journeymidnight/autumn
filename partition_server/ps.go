@@ -37,6 +37,7 @@ type Config struct {
 	SkipListSize         uint32 //in the unit of Bytes
 	TraceSampler         float64
 	Compression          string
+	AssertKeys           bool //Check if all tables' keys are valid
 }
 
 type PartitionServer struct {
@@ -320,12 +321,16 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, mutex *
 	utils.AssertTrue(meta.Rg != nil)
 	utils.AssertTrue(meta.PartID != 0)
 
-	rp, err := range_partition.OpenRangePartition(meta.PartID, metaLog, row, log, meta.Rg.StartKey, meta.Rg.EndKey,
+	var options = []range_partition.OptionFunc{
 		range_partition.DefaultOption(),
 		range_partition.WithMaxSkipList(int64(ps.config.SkipListSize)),
 		range_partition.WithSync(ps.config.MustSync),
 		range_partition.WithCompression(ps.config.Compression),
-	)
+	}
+	if ps.config.AssertKeys {
+		options = append(options, range_partition.WithAssertKeys())
+	}
+	rp, err := range_partition.OpenRangePartition(meta.PartID, metaLog, row, log, meta.Rg.StartKey, meta.Rg.EndKey, options...)
 
 	xlog.Logger.Infof("open range partition %d, StartKey:[%s], EndKey:[%s]: err is %v", meta.PartID, meta.Rg.StartKey, meta.Rg.EndKey, err)
 	return rp, err

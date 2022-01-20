@@ -25,6 +25,7 @@ type Option struct {
 	MustSync        bool
 	MaxExtentSize   uint32
 	CompressionType table.CompressionType
+	AssertKeys      bool
 }
 
 type OptionFunc func(*Option)
@@ -36,6 +37,7 @@ func DefaultOption() OptionFunc {
 		opt.MustSync = true
 		opt.MaxExtentSize = 1 * GB
 		opt.CompressionType = table.Snappy
+		opt.AssertKeys = false
 	}
 }
 
@@ -46,9 +48,15 @@ func TestOption() OptionFunc {
 		opt.MustSync = false
 		opt.MaxExtentSize = 8 * MB
 		opt.CompressionType = table.None
+		opt.AssertKeys = true
 	}
 }
 
+func WithAssertKeys() OptionFunc {
+	return func(opt *Option) {
+		opt.AssertKeys = true
+	}
+}
 func WithSync(b bool) OptionFunc {
 	return func(opt *Option) {
 		opt.MustSync = b
