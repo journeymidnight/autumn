@@ -246,6 +246,7 @@ func (sc *AutumnStreamClient) smartRead(gctx context.Context, extentID uint64, o
 	//pools里面有可能有nil
 	pools, err := sc.em.ConnPool(sc.em.GetPeers(req.ExtentID))
 	if err != nil {
+		cancel()
 		return nil, nil, 0, err
 	}
 

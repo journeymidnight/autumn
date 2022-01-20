@@ -118,18 +118,35 @@ func (p DefaultPickupPolicy) PickupTables(tbls []*table.Table, maxCapacity uint6
 
 	throttle := uint64(math.Round(p.compactRatio * float64(p.opt.MaxSkipList)))
 
-	i := 0
-	for ; i < len(tbls) && tbls[i].EstimatedSize < throttle && len(compactTbls) < p.n; i++ {
-		//merge to older and larger SSTables
-		if i > 0 && len(compactTbls) == 0 && tbls[i-1].EstimatedSize < uint64(float64(maxCapacity)*0.9) {
-			compactTbls = append(compactTbls, tbls[i-1])
+	for i := 0; i < len(tbls); i++ {
+		for ; i < len(tbls) && tbls[i].EstimatedSize < throttle && len(compactTbls) < p.n; i++ {
+			//merge to older and larger SSTables
+			if i > 0 && len(compactTbls) == 0 && tbls[i].EstimatedSize+tbls[i-1].EstimatedSize < maxCapacity {
+				compactTbls = append(compactTbls, tbls[i-1])
+			}
+			compactTbls = append(compactTbls, tbls[i])
 		}
-		compactTbls = append(compactTbls, tbls[i])
+		if len(compactTbls) > 0 {
+			if len(compactTbls) == 1 {
+				//corner case : 1, 100, 100, 100, only one table is selected
+				if i < len(tbls) && compactTbls[0].EstimatedSize+tbls[i].EstimatedSize < maxCapacity {
+					compactTbls = append(compactTbls, tbls[i])
+				} else {
+					//cases : 120, 1, 120, 1, 1
+					//the first 1 will not be compacted, but we could compact the last 2 tables
+					//reset
+					compactTbls = compactTbls[:1]
+					continue
+				}
+			}
+			break
+		}
 	}
 
 	if len(compactTbls) > 1 {
 		return compactTbls, 0
 	}
+
 	return nil, 0
 }
 
