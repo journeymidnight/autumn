@@ -248,7 +248,6 @@ func (rp *RangePartition) doCompact(tbls []*table.Table, major bool) {
 	resultCh := make(chan struct{})
 
 	capacity := int64(2 * rp.opt.MaxSkipList)
-	fmt.Printf("merge capacity is %d\n", capacity)
 	for it.Valid() {
 		var skipKey []byte
 		timeStart := time.Now()

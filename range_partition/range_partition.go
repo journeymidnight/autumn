@@ -194,7 +194,9 @@ func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStre
 	}
 
 	//ASSERT
-	rp.CheckTableOrder(rp.tables)
+	if rp.opt.AssertKeys {
+		rp.CheckTableOrder(rp.tables)
+	}
 
 	//FIXME:poor performace: prefetch read will be better
 	replayedLog := 0

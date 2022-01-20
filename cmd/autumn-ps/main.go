@@ -40,6 +40,7 @@ func main() {
 	var skiplistMBString string  //in the unit of MB
 	var traceSampler float64
 	var compression string
+	var assertKeys bool
 
 	app := &cli.App{
 		HelpName: "",
@@ -99,6 +100,12 @@ func main() {
 				Usage:       "compression type, none, snappy, zstd",
 				Value:       "snappy",
 			},
+			&cli.BoolFlag{
+				Name:        "assert-keys",
+				Destination: &assertKeys,
+				Value:       false,
+				Usage:       "assert keys in all table(debug only)",
+			},
 		},
 	}
 
@@ -149,14 +156,14 @@ func main() {
 		MaxMetaExtentSize:    (4 << 20),
 		SkipListSize:         uint32((skiplistSizeMB << 20)),
 		TraceSampler:         traceSampler,
-		Compression:         compression,
+		Compression:          compression,
+		AssertKeys:           assertKeys,
 	}
 
 	ps := partition_server.NewPartitionServer(config)
 
 	ps.Init()
 
-	
 	utils.Check(ps.ServeGRPC(config.TraceSampler))
 
 	xlog.Logger.Infof("PS is ready!")
