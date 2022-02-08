@@ -266,12 +266,15 @@ func (en *ExtentNode) Shutdown() {
 
 func (en *ExtentNode) ServeGRPC(traceSampler float64) error {
 
-	cfg, err := config.FromEnv()
-
+	cfg := &config.Configuration{}
 	cfg.ServiceName = fmt.Sprint("node-", en.nodeID)
-	cfg.Sampler.Type = "const"
-	cfg.Sampler.Param = traceSampler
-	cfg.Reporter.LogSpans = false
+	cfg.Sampler = &config.SamplerConfig{
+		Type:  "const",
+		Param: traceSampler,
+	}
+	cfg.Reporter = &config.ReporterConfig{
+		LogSpans: false,
+	}
 
 	tracer, _, err := cfg.NewTracer()
 	if err != nil {
@@ -284,7 +287,9 @@ func (en *ExtentNode) ServeGRPC(traceSampler float64) error {
 		grpc.MaxSendMsgSize(64<<20),
 		grpc.MaxConcurrentStreams(1000),
 		grpc.StreamInterceptor(
-			otgrpc.OpenTracingStreamServerInterceptor(tracer)),
+			otgrpc.OpenTracingStreamServerInterceptor(opentracing.GlobalTracer())),
+		grpc.UnaryInterceptor(
+			otgrpc.OpenTracingServerInterceptor(opentracing.GlobalTracer())),
 	)
 
 	pb.RegisterExtentServiceServer(grpcServer, en)

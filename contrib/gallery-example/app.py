@@ -105,7 +105,7 @@ def list():
     except Exception as e:
         return str(e)
 
-chunk_size = 4 * 1024 * 1024
+chunk_size = 8 * 1024 * 1024
 
 def split(filename, data):
     ## split file into chunks
@@ -173,5 +173,5 @@ def static_files(path):
 lib = lib.AutumnLib()
 
 if __name__ == '__main__':
-    lib.Connect()
+    lib.Connect('127.0.0.1', 2379)
     app.run(host='0.0.0.0', port=5001, threaded=True)

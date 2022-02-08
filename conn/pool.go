@@ -137,8 +137,10 @@ func newPool(addr string) (*Pool, error) {
 			//grpc.UseCompressor((snappyCompressor{}).Name()),
 		),
 		grpc.WithBackoffMaxDelay(time.Second),
-		grpc.WithStreamInterceptor(
+		grpc.WithChainStreamInterceptor(
 			otgrpc.OpenTracingStreamClientInterceptor(opentracing.GlobalTracer())),
+		grpc.WithChainUnaryInterceptor(
+			otgrpc.OpenTracingClientInterceptor(opentracing.GlobalTracer())),
 		grpc.WithInsecure())
 	if err != nil {
 		return nil, err
