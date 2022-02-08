@@ -157,9 +157,9 @@ class AutumnLib:
             print("key is %s" % key)
             return None
 
-    def Connect(self):
+    def Connect(self, host, port):
         try:
-            self.etcdClient = etcd3.client(grpc_options={
+            self.etcdClient = etcd3.client(host=host, port=port, grpc_options={
                 '"grpc.max_reconnect_backoff_ms': 1000,
             }.items())
 
@@ -192,4 +192,4 @@ class AutumnLib:
 
 if __name__ == "__main__":
     lib = AutumnLib()
-    lib.Connect()
+    lib.Connect('127.0.0.1', 2379)

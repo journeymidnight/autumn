@@ -337,13 +337,16 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, mutex *
 }
 
 func (ps *PartitionServer) ServeGRPC(traceSampler float64) error {
-
-	cfg, err := config.FromEnv()
-
+	cfg := &config.Configuration{}
 	cfg.ServiceName = fmt.Sprintf("PS-%d", ps.config.PSID)
-	cfg.Sampler.Type = "const"
-	cfg.Sampler.Param = traceSampler
-	cfg.Reporter.LogSpans = false
+
+	cfg.Sampler = &config.SamplerConfig{
+		Type:  "const",
+		Param: traceSampler,
+	}
+	cfg.Reporter = &config.ReporterConfig{
+		LogSpans: false,
+	}
 
 	tracer, _, err := cfg.NewTracer()
 	if err != nil {

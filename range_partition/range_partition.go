@@ -1225,7 +1225,7 @@ func (rp *RangePartition) CheckTableOrder(out []*table.Table) {
 		return
 	}
 
-	//check for same key whose ts is bigger will in table whose lastSeq is bigger
+	//check for same key whose ts is bigger will always in the table whose lastSeq is bigger
 	for _, tbl := range tbls {
 		it := tbl.NewIterator(false)
 		for ; it.Valid(); it.Next() {
@@ -1243,7 +1243,6 @@ func (rp *RangePartition) CheckTableOrder(out []*table.Table) {
 	}
 
 	//all item's ts is between prev table's lastSeq and current tables' lastSeq
-	prevTblSeq := uint64(0)
 	for _, tbl := range tbls {
 		iter := tbl.NewIterator(false)
 		for ; iter.Valid(); iter.Next() {
@@ -1254,11 +1253,10 @@ func (rp *RangePartition) CheckTableOrder(out []*table.Table) {
 			}
 			//require.Greater(t, y.ParseTs(iter.Key()), prevTblSeq)
 
-			if y.ParseTs(iter.Key()) <= prevTblSeq {
-				panic("table order error, ts is less than prevTblSeq")
-			}
+			// if y.ParseTs(iter.Key()) <= prevTblSeq {
+			// 	panic("table order error, ts is less than prevTblSeq")
+			// }
 		}
-		prevTblSeq = tbl.LastSeq
 	}
 
 }
