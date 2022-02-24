@@ -13,8 +13,11 @@
  */
 
 syntax = "proto3";
+
 package pb;
 
+
+option go_package = "github.com/journeymidnight/autumn/proto/pb";
 //import "gogoproto/gogo.proto";
 
 

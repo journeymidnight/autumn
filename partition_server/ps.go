@@ -38,6 +38,7 @@ type Config struct {
 	TraceSampler         float64
 	Compression          string
 	AssertKeys           bool //Check if all tables' keys are valid
+	GatewayListenURL     string
 }
 
 type PartitionServer struct {

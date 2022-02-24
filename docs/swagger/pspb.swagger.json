@@ -1,0 +1,362 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "pspb.proto",
+    "version": "version not set"
+  },
+  "consumes": [
+    "application/json"
+  ],
+  "produces": [
+    "application/json"
+  ],
+  "paths": {
+    "/api/v1/get": {
+      "get": {
+        "operationId": "PartitionKV_Get",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/pspbGetResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/runtimeError"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "key",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "byte"
+          },
+          {
+            "name": "partid",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "uint64"
+          }
+        ],
+        "tags": [
+          "PartitionKV"
+        ]
+      }
+    },
+    "/api/v1/head": {
+      "get": {
+        "operationId": "PartitionKV_Head",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/pspbHeadResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/runtimeError"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "key",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "byte"
+          },
+          {
+            "name": "partid",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "uint64"
+          }
+        ],
+        "tags": [
+          "PartitionKV"
+        ]
+      }
+    },
+    "/api/v1/range": {
+      "get": {
+        "operationId": "PartitionKV_Range",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/pspbRangeResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/runtimeError"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "prefix",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "byte"
+          },
+          {
+            "name": "start",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "byte"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int64"
+          },
+          {
+            "name": "partid",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "uint64"
+          }
+        ],
+        "tags": [
+          "PartitionKV"
+        ]
+      }
+    }
+  },
+  "definitions": {
+    "protobufAny": {
+      "type": "object",
+      "properties": {
+        "type_url": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string",
+          "format": "byte"
+        }
+      }
+    },
+    "pspbAutoGCOp": {
+      "type": "object"
+    },
+    "pspbBatchResponse": {
+      "type": "object",
+      "properties": {
+        "res": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/pspbRequestOp"
+          }
+        }
+      }
+    },
+    "pspbCompactOp": {
+      "type": "object"
+    },
+    "pspbDeleteRequest": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string",
+          "format": "byte"
+        },
+        "partid": {
+          "type": "string",
+          "format": "uint64"
+        }
+      }
+    },
+    "pspbDeleteResponse": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string",
+          "format": "byte"
+        }
+      }
+    },
+    "pspbForceGCOp": {
+      "type": "object",
+      "properties": {
+        "exIDs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uint64"
+          }
+        }
+      }
+    },
+    "pspbGetRequest": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string",
+          "format": "byte"
+        },
+        "partid": {
+          "type": "string",
+          "format": "uint64"
+        }
+      }
+    },
+    "pspbGetResponse": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string",
+          "format": "byte"
+        },
+        "value": {
+          "type": "string",
+          "format": "byte"
+        }
+      }
+    },
+    "pspbHeadInfo": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string",
+          "format": "byte"
+        },
+        "len": {
+          "type": "integer",
+          "format": "int64"
+        }
+      }
+    },
+    "pspbHeadResponse": {
+      "type": "object",
+      "properties": {
+        "info": {
+          "$ref": "#/definitions/pspbHeadInfo"
+        }
+      }
+    },
+    "pspbMaintenanceResponse": {
+      "type": "object"
+    },
+    "pspbPutRequest": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string",
+          "format": "byte"
+        },
+        "value": {
+          "type": "string",
+          "format": "byte"
+        },
+        "ExpiresAt": {
+          "type": "string",
+          "format": "uint64"
+        },
+        "partid": {
+          "type": "string",
+          "format": "uint64"
+        }
+      }
+    },
+    "pspbPutResponse": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string",
+          "format": "byte"
+        }
+      }
+    },
+    "pspbRangeResponse": {
+      "type": "object",
+      "properties": {
+        "truncated": {
+          "type": "boolean"
+        },
+        "keys": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "byte"
+          }
+        }
+      }
+    },
+    "pspbRequestOp": {
+      "type": "object",
+      "properties": {
+        "request_put": {
+          "$ref": "#/definitions/pspbPutRequest"
+        },
+        "request_delete": {
+          "$ref": "#/definitions/pspbDeleteRequest"
+        },
+        "request_get": {
+          "$ref": "#/definitions/pspbGetRequest"
+        }
+      }
+    },
+    "pspbSplitPartResponse": {
+      "type": "object"
+    },
+    "pspbStreamPutRequestHeader": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string",
+          "format": "byte"
+        },
+        "lenOfValue": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "ExpiresAt": {
+          "type": "string",
+          "format": "uint64"
+        },
+        "partid": {
+          "type": "string",
+          "format": "uint64"
+        }
+      }
+    },
+    "runtimeError": {
+      "type": "object",
+      "properties": {
+        "error": {
+          "type": "string"
+        },
+        "code": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/protobufAny"
+          }
+        }
+      }
+    }
+  }
+}

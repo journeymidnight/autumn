@@ -15,18 +15,61 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"mime"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"syscall"
 
+	"github.com/grpc-ecosystem/grpc-gateway/runtime"
 	"github.com/journeymidnight/autumn/partition_server"
+	"github.com/journeymidnight/autumn/proto/pspb"
+	_ "github.com/journeymidnight/autumn/statik"
 	"github.com/journeymidnight/autumn/utils"
 	"github.com/journeymidnight/autumn/xlog"
+	"github.com/rakyll/statik/fs"
 	"github.com/urfave/cli/v2"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
+
+func runGRPCGateway(endpoint string, gatewayListen string) error {
+	if gatewayListen == "" {
+		return nil
+	}
+	ctx := context.Background()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	gwmux := runtime.NewServeMux()
+	pspb.RegisterPartitionKVHandlerFromEndpoint(ctx, gwmux, endpoint, opts)
+
+	mux := http.NewServeMux()
+	mux.Handle("/", gwmux)
+	serveSwaggerAPI(mux)
+	return http.ListenAndServe(gatewayListen, mux)
+}
+
+// serveOpenAPI serves an OpenAPI UI on /openapi-ui/
+// Adapted from https://github.com/philips/grpc-gateway-example/blob/a269bcb5931ca92be0ceae6130ac27ae89582ecc/cmd/serve.go#L63
+func serveSwaggerAPI(mux *http.ServeMux) error {
+	mime.AddExtensionType(".svg", "image/svg+xml")
+
+	statikFS, err := fs.New()
+	if err != nil {
+		return err
+	}
+
+	// Expose files in static on <host>/openapi-ui
+	fileServer := http.FileServer(statikFS)
+	prefix := "/openapi-ui/"
+	mux.Handle(prefix, http.StripPrefix(prefix, fileServer))
+	return nil
+}
 
 func main() {
 
@@ -41,6 +84,7 @@ func main() {
 	var traceSampler float64
 	var compression string
 	var assertKeys bool
+	var gateWayListen string
 
 	app := &cli.App{
 		HelpName: "",
@@ -56,6 +100,12 @@ func main() {
 				Usage:       "ps grpc listen url",
 				Destination: &listen,
 				Required:    true,
+			},
+			&cli.StringFlag{
+				Name:        "gateway-listen",
+				Usage:       "ps grpc gateway listen url",
+				Destination: &gateWayListen,
+				Required:    false,
 			},
 			&cli.StringFlag{
 				Name:        "psid",
@@ -158,6 +208,7 @@ func main() {
 		TraceSampler:         traceSampler,
 		Compression:          compression,
 		AssertKeys:           assertKeys,
+		GatewayListenURL:     gateWayListen,
 	}
 
 	ps := partition_server.NewPartitionServer(config)
@@ -167,6 +218,8 @@ func main() {
 	utils.Check(ps.ServeGRPC(config.TraceSampler))
 
 	xlog.Logger.Infof("PS is ready!")
+
+	go runGRPCGateway(config.ListenURL, config.GatewayListenURL)
 
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc,
