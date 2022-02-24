@@ -14,12 +14,19 @@
 
 syntax = "proto3";
 
+
 package pspb;
 
+option go_package = "github.com/journeymidnight/autumn/proto/pspb";
+
+
+
+
+//required by grpc_gateway
+import "google/api/annotations.proto";
 //import "gogoproto/gogo.proto";
 
 /*
-
 PART/{PartID} => {id, id <startKey, endKEY>} //immutable
 
 PARTSTATS/{PartID}/tables => [(extentID,offset),...,(extentID,offset)]
@@ -228,10 +235,22 @@ message StreamPutRequest {
 service PartitionKV {
 	rpc Batch(BatchRequest) returns (BatchResponse) {}
 	rpc Put(PutRequest) returns (PutResponse) {}
-	rpc Head(HeadRequest) returns (HeadResponse) {}
-	rpc Get (GetRequest) returns (GetResponse) {}
+	rpc Head(HeadRequest) returns (HeadResponse) {
+		option (google.api.http) = {
+            get: "/api/v1/head"
+        };
+	}
+	rpc Get (GetRequest) returns (GetResponse) {
+		option (google.api.http) = {
+            get: "/api/v1/get"
+        };
+	}
 	rpc Delete(DeleteRequest) returns (DeleteResponse) {}
-	rpc Range(RangeRequest) returns (RangeResponse) {}
+	rpc Range(RangeRequest) returns (RangeResponse) {
+		option (google.api.http) = {
+            get: "/api/v1/range"
+        };
+	}
 	rpc StreamPut(stream StreamPutRequest) returns (PutResponse) {}
 	//TODO
 	//rpc StreamGet: non-EC can be done by stream
