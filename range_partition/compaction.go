@@ -180,6 +180,8 @@ func (rp *RangePartition) compact() {
 					xlog.Logger.Warnf("LOG Truncate extent %d error %v", eID, err)
 				}
 			}
+
+			atomic.StoreUint32(&rp.hasOverlap, 0)
 			fmt.Printf("fininshed major compaction tasks for tables %+v\n", allTables)
 		case <-randTicker.C:
 			allTables := rp.getTables()

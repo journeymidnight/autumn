@@ -171,12 +171,12 @@ func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStre
 
 		key := y.ParseKey(tbl.Smallest())
 
-		if !rp.IsUserKeyInRange(key) {
-			rp.hasOverlap = 1
+		if atomic.LoadUint32(&rp.hasOverlap) == 0 && !rp.IsUserKeyInRange(key) {
+			atomic.StoreUint32(&rp.hasOverlap, 1)
 		}
 		key = y.ParseKey(tbl.Biggest())
-		if !rp.IsUserKeyInRange(key) {
-			rp.hasOverlap = 1
+		if atomic.LoadUint32(&rp.hasOverlap) == 0 && !rp.IsUserKeyInRange(key) {
+			atomic.StoreUint32(&rp.hasOverlap, 1)
 		}
 	}
 
@@ -306,6 +306,9 @@ func (rp *RangePartition) GetSplitPoint() []byte {
 	//find the biggest table
 	rp.tableLock.Lock()
 	defer rp.tableLock.Unlock()
+	if len(rp.tables) == 0 {
+		return nil
+	}
 
 	var biggestTable *table.Table
 	biggestTable = rp.tables[0]
@@ -320,10 +323,21 @@ func (rp *RangePartition) GetSplitPoint() []byte {
 
 //split相关, 提供相关参数给上层
 //ADD more policy here, to support different Split policy
-func (rp *RangePartition) CanSplit() bool {
-	rp.tableLock.Lock()
-	defer rp.tableLock.Unlock()
-	return atomic.LoadUint32(&rp.hasOverlap) == 0 && len(rp.tables) > 0
+func (rp *RangePartition) CanSplit() error {
+	if atomic.LoadUint32(&rp.hasOverlap) != 0 {
+		return errors.New("can not split, has overlap")
+	}
+
+	midKey := rp.GetSplitPoint()
+
+	if bytes.Compare(midKey, rp.StartKey) <= 0 {
+		return errors.Errorf("can not split, midKey [%s] is not greater than startKey [%s]", string(midKey), string(rp.StartKey))
+	}
+
+	if len(rp.EndKey) > 0 && bytes.Compare(midKey, rp.EndKey) >= 0 {
+		return errors.Errorf("can not split, midKey [%s] is not less than endKey [%s]", string(midKey), string(rp.EndKey))
+	}
+	return nil
 }
 
 type CommitEnds struct {

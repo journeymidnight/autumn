@@ -123,6 +123,9 @@ func HumanReadableThroughput(t float64) string {
 }
 
 func SplitAndTrim(s string, sep string) []string {
+	if len(s) == 0 {
+		return []string{}
+	}
 	parts := strings.Split(s, sep)
 	for i := 0; i < len(parts); i++ {
 		parts[i] = strings.TrimSpace(parts[i])
