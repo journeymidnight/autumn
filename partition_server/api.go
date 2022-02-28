@@ -228,8 +228,8 @@ func (ps *PartitionServer) SplitPart(ctx context.Context, req *pspb.SplitPartReq
 		return nil, errors.New("no such partid")
 	}
 
-	if !rp.CanSplit() {
-		return nil, errors.New("range partition overlaps")
+	if err := rp.CanSplit(); err != nil {
+		return nil, err
 	}
 
 	mutex, ok := ps.rangePartitionLocks[rp.PartID]

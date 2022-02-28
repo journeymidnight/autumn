@@ -19,7 +19,6 @@ require (
 	github.com/grpc-ecosystem/grpc-opentracing v0.0.0-20180507213350-8e809c8a8645
 	github.com/klauspost/compress v1.14.1
 	github.com/klauspost/reedsolomon v1.9.13
-	github.com/mwitkow/go-proto-validators v0.3.2
 	github.com/opentracing/opentracing-go v1.1.0
 	github.com/pkg/errors v0.9.1
 	github.com/pkg/xattr v0.4.3
@@ -39,7 +38,7 @@ require (
 	golang.org/x/sys v0.0.0-20211210111614-af8b64212486 // indirect
 	golang.org/x/text v0.3.7 // indirect
 	golang.org/x/tools v0.1.5 // indirect
-	google.golang.org/genproto v0.0.0-20220118154757-00ab72f36ad5 // indirect
+	google.golang.org/genproto v0.0.0-20220118154757-00ab72f36ad5
 	google.golang.org/grpc v1.43.0
 	sigs.k8s.io/yaml v1.3.0 // indirect
 )
