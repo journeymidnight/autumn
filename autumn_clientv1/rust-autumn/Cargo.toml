@@ -12,3 +12,4 @@ prost = {version = "0.9.0"}
 tonic = "0.6.1"
 [build-dependencies]
 tonic-build = {version = "0.6.0", default-features = true, features = ["prost"]}
+git2 = "0.13.1"
