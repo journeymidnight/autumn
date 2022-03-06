@@ -280,22 +280,65 @@ impl AutumnLib {
         return regions;
     }
 
-    //TODO:
     pub async fn range(
         self: &Self,
         prefix: &str,
         start: &str,
-        end: &str,
+        limit: u32,
     ) -> Result<Vec<Vec<u8>>, std::io::Error> {
         //clone region list
         let regions = self.clone_region();
-
+        let mut limit = limit;
         if regions.len() == 0 {
             return Err(std::io::Error::new(ErrorKind::Other, "no region"));
         }
 
-        let mut i = 0;
-        return Ok(Vec::new());
+        let more = false;
+        let mut result = Vec::new();
+        let (part_id, ps_id) = match self.get_region(start) {
+            Some(x) => x,
+            None => return Err(std::io::Error::new(ErrorKind::Other, "no region")),
+        };
+
+        for i in 0..regions.len() {
+            if limit <= 0 {
+                break;
+            }
+            if let Some(range) = &regions[i].rg {
+                if !range.start_key.starts_with(prefix.as_bytes()) {
+                    break;
+                }
+            } else {
+                break;
+            }
+
+            let addr = self.get_ps_addr(ps_id).await;
+            match self.get_conn(&addr).await {
+                Ok(mut client) => {
+                    let req = pspb::RangeRequest {
+                        prefix: prefix.into(),
+                        partid: regions[i].part_id,
+                        start: start.into(),
+                        limit: limit,
+                    };
+                    match client.range(req).await {
+                        Ok(res) => {
+                            let keys = res.into_inner().keys;
+                            limit -= keys.len() as u32;
+                            result.extend(keys);
+                        }
+                        Err(e) => {
+                            return Err(std::io::Error::new(ErrorKind::Other, e));
+                        }
+                    }
+                }
+                Err(err) => {
+                    return Err(std::io::Error::new(ErrorKind::Other, err));
+                }
+            }
+        }
+
+        return Ok(result);
     }
 
     //head return len of key

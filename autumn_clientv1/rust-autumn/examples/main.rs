@@ -15,6 +15,10 @@ async fn main(){
         Ok(x) => println!("{:#?}", x),
         Err(e) => println!("{}", e),
     }
+    match lib.range("", "", 100).await {
+        Ok(x) => println!("{:#?}", x),
+        Err(e) => println!("{}", e),
+    }
 
     match lib.head("x").await {
         Ok(x) => println!("{:#?}", x),
