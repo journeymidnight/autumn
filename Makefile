@@ -12,7 +12,7 @@ lint: ## run lint
 	fi
 	./bin/golangci-lint run --skip-files '\w+_test.go'
 test:
-	go test -v -race -coverprofile=coverage.out -covermode=atomic `go list ./...|grep -v cmd`
+	go test -v -race -coverprofile=coverage.out -covermode=atomic `go list ./...|grep -v cmd|grep -v googleapi`
 image:
 	@mkdir -p linux
 	@for dir in $(subdirs); do \
