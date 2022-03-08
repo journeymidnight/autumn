@@ -48,6 +48,8 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap/zapcore"
 	_ "go.uber.org/zap/zapcore"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type Result struct {
@@ -76,7 +78,7 @@ func benchmark(etcdUrls []string, op BenchType, threadNum int, duration int) err
 	}
 	defer client.Close()
 
-	stopper := utils.NewStopper()
+	stopper := utils.NewStopper(context.Background())
 
 	var size int
 	var isWriteBench bool
@@ -144,26 +146,21 @@ func benchmark(etcdUrls []string, op BenchType, threadNum int, duration int) err
 			t := i
 			stopper.RunWorker(func() {
 				j := 0 //for wbench
-				var ctx context.Context
-				var cancel context.CancelFunc
 				for {
 					select {
 					case <-stopper.ShouldStop():
-						if cancel != nil {
-							cancel()
-						}
 						return
 					default:
 						write := func(t int) int {
 							key := fmt.Sprintf("test%d_%d_%d", n, t, j)
-							ctx, cancel = context.WithCancel(context.Background())
 							start := time.Now()
-							err := client.Put(ctx, []byte(key), data)
-							cancel()
+							err := client.Put(stopper.Ctx(), []byte(key), data)
 							end := time.Now()
 							j++
 							if err != nil {
-								fmt.Printf("%v\n", err)
+								if  status.Code(err) != codes.Canceled {
+									fmt.Printf("%+v", err)
+								}
 								return -1
 							}
 							if (loop % 1) == 0 {
@@ -188,10 +185,12 @@ func benchmark(etcdUrls []string, op BenchType, threadNum int, duration int) err
 								return -1
 							}
 							start := time.Now()
-							data, err := client.Get(context.Background(), []byte(keys[t][0]))
+							data, err := client.Get(stopper.Ctx(), []byte(keys[t][0]))
 							end := time.Now()
 							if err != nil {
-								fmt.Printf("%v\n", err)
+								if  status.Code(err) != codes.Canceled {
+									fmt.Printf("%+v", err)
+								}
 								return -1
 							}
 							if (loop % 5) == 0 {
@@ -257,6 +256,9 @@ func benchmark(etcdUrls []string, op BenchType, threadNum int, duration int) err
 	}
 
 	f, err := os.OpenFile(fileName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
+	if err != nil {
+		panic(err)
+	}
 	defer f.Close()
 	if err == nil {
 		out, err := json.Marshal(results)

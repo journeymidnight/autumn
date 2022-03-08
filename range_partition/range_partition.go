@@ -355,7 +355,7 @@ func (rp *RangePartition) LogRowMetaStreamEnd() CommitEnds {
 }
 
 func (rp *RangePartition) startWriteLoop() {
-	rp.writeStopper = utils.NewStopper()
+	rp.writeStopper = utils.NewStopper(context.Background())
 	rp.writeCh = make(chan *request, rp.opt.WriteChCapacity)
 
 	rp.writeStopper.RunWorker(rp.doWrites)
@@ -368,7 +368,7 @@ func (rp *RangePartition) IsUserKeyInRange(userKey []byte) bool {
 func (rp *RangePartition) startMemoryFlush() {
 	// Start memory fluhser.
 
-	rp.flushStopper = utils.NewStopper()
+	rp.flushStopper = utils.NewStopper(context.Background())
 	rp.flushChan = make(chan flushTask, 16)
 
 	rp.flushStopper.RunWorker(rp.flushMemtable)

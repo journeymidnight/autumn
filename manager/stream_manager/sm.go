@@ -133,7 +133,7 @@ func NewStreamManager(etcd *embed.Etcd, client *clientv3.Client, config *manager
 		config:  config,
 		ID:      uint64(etcd.Server.ID()),
 		policy:  new(SimplePolicy),
-		stopper: utils.NewStopper(),
+		stopper: utils.NewStopper(context.Background()),
 	}
 
 	v := pb.MemberValue{

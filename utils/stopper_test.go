@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -18,7 +19,8 @@ func printHello(stopper *Stopper, id int) {
 	}
 }
 func TestStop(t *testing.T) {
-	stopper := NewStopper()
+
+	stopper := NewStopper(context.Background())
 	stopper.RunWorker(func() {
 		printHello(stopper, 1)
 	})

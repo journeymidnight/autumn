@@ -101,7 +101,7 @@ const (
 )
 
 func (rp *RangePartition) startGC() {
-	rp.gcStopper = utils.NewStopper()
+	rp.gcStopper = utils.NewStopper(context.Background())
 	rp.gcRunChan = make(chan GcTask, 1)
 	//only one compact goroutine
 	rp.gcStopper.RunWorker(func() {
@@ -175,7 +175,7 @@ func (rp *RangePartition) startGC() {
 				//delete extent for stream
 				fmt.Printf("deleted extent [%v], for stream %d\n", holes, logStreamInfo.StreamID)
 				//delete extent for block
-				if err := rp.logStream.PunchHoles(context.Background(), holes); err != nil {
+				if err := rp.logStream.PunchHoles(rp.gcStopper.Ctx(), holes); err != nil {
 					xlog.Logger.Errorf("punch holes error: %v in runGC", err)
 				}
 			}

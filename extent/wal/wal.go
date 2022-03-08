@@ -16,6 +16,7 @@ package wal
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -112,7 +113,7 @@ func OpenWal(dir string, userSync func()) (*Wal, error) {
 		currentWAL: currentWal,
 		last:       last,
 		writeCh:    make(chan *request, 5),
-		stopper:    utils.NewStopper(),
+		stopper:    utils.NewStopper(context.Background()),
 		writer:     record.NewLogWriter(currentWal, 0, 0),
 		walOffset:  0,
 		syncing:    0,

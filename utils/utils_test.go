@@ -40,9 +40,5 @@ func TestAlign(t *testing.T) {
 	require.Equal(t, uint32(8), Floor(9, 8))
 	require.Equal(t, uint32(8), Floor(8, 8))
 
-
-
-
-
 }
 

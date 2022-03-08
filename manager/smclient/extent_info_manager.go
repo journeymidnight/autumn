@@ -100,7 +100,7 @@ func NewExtentManager(smclient *SMClient, etcdAddr []string, extentsUpdate exten
 	}
 
 	//start watch
-	stopper := utils.NewStopper()
+	stopper := utils.NewStopper(context.Background())
 	nodesChan, close1 := etcd_utils.EtcdWatchEvents(client, "nodes/", "nodes0", rev)
 	extentsChan, close2 := etcd_utils.EtcdWatchEvents(client, "extents/", "extents0", rev)
 

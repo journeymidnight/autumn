@@ -180,7 +180,8 @@ func (client *SMClient) CreateStream(ctx context.Context, dataShard uint32, pari
 		//logical error
 		if res.Code != pb.Code_OK {
 			err = wire_errors.FromPBCode(res.Code, res.CodeDes)
-			return false
+			//if remote is not a leader, retry
+			return err == wire_errors.NotLeader
 		}
 		ei = res.Extent
 		si = res.Stream
