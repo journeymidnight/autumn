@@ -86,9 +86,6 @@ func (sm *StreamManager) routineUpdateDF() {
 
 	ticker := utils.NewRandomTicker(10*time.Second, 20*time.Second)
 
-	var ctx context.Context
-	var cancel context.CancelFunc
-
 	defer func() {
 		xlog.Logger.Infof("routineUpdateDF quit")
 	}()
@@ -102,7 +99,7 @@ func (sm *StreamManager) routineUpdateDF() {
 		}()
 
 		conn := node.GetConn()
-		pctx, pCancel := context.WithTimeout(ctx, 5*time.Second)
+		pctx, pCancel := context.WithTimeout(sm.stopper.Ctx(), 5 * time.Second)
 		client := pb.NewExtentServiceClient(conn)
 		res, err := client.Df(pctx, &pb.DfRequest{
 			Tasks: sm.taskPool.GetFromNode(node.NodeID),
@@ -136,12 +133,8 @@ func (sm *StreamManager) routineUpdateDF() {
 	for {
 		select {
 		case <-sm.stopper.ShouldStop():
-			if cancel != nil {
-				cancel()
-			}
 			return
 		case <-ticker.C:
-			ctx, cancel = context.WithCancel(context.Background())
 			nodes := sm.getAllNodeStatus(false)
 			for i := range nodes {
 				node := nodes[i]

@@ -132,7 +132,7 @@ func (en *ExtentNode) recoveryErasureExtent(exInfo *pb.ExtentInfo, exceptID, off
 		}
 	}
 
-	stopper := utils.NewStopper()
+	stopper := utils.NewStopper(context.Background())
 
 	var completes int32
 	for i := range sourceExtent {

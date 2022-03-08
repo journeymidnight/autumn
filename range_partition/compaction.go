@@ -151,11 +151,13 @@ func (p DefaultPickupPolicy) PickupTables(tbls []*table.Table, maxCapacity uint6
 }
 
 func (rp *RangePartition) startCompact() {
-	rp.compactStopper = utils.NewStopper()
+	rp.compactStopper = utils.NewStopper(context.Background())
 	rp.majorCompactChan = make(chan struct{}, 1)
 	rp.compactStopper.RunWorker(rp.compact)
 }
 
+
+//compact funtion runs inside rp.compactStopper
 func (rp *RangePartition) compact() {
 	randTicker := utils.NewRandomTicker(10*time.Second, 20*time.Second)
 	for {
@@ -175,7 +177,7 @@ func (rp *RangePartition) compact() {
 			rp.doCompact(allTables, true)
 			if eID != 0 {
 				//last table's meta extentd
-				err := rp.rowStream.Truncate(context.Background(), eID)
+				err := rp.rowStream.Truncate(rp.compactStopper.Ctx(), eID)
 				if err != nil {
 					xlog.Logger.Warnf("LOG Truncate extent %d error %v", eID, err)
 				}
@@ -193,7 +195,7 @@ func (rp *RangePartition) compact() {
 			rp.doCompact(compactTables, false)
 			if eID != 0 {
 				//last table's meta extentd
-				err := rp.rowStream.Truncate(context.Background(), eID)
+				err := rp.rowStream.Truncate(rp.compactStopper.Ctx(), eID)
 				if err != nil {
 					xlog.Logger.Warnf("LOG Truncate extent %d error %v", eID, err)
 				}

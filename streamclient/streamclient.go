@@ -208,7 +208,7 @@ func (sc *AutumnStreamClient) smartRead(gctx context.Context, extentID uint64, o
 		Offsets []uint32
 	}
 
-	stopper := utils.NewStopper()
+	stopper := utils.NewStopper(pctx)
 	retChan := make(chan Result, n)
 	errChan := make(chan Result, n)
 	req := &pb.ReadBlocksRequest{
@@ -796,7 +796,7 @@ func (sc *AutumnStreamClient) appendBlocks(ctx context.Context, exInfo *pb.Exten
 	}
 
 	//FIXME: put stopper into sync.Pool
-	stopper := utils.NewStopper()
+	stopper := utils.NewStopper(pctx)
 	type Result struct {
 		Error   error
 		Offsets []uint32
@@ -811,7 +811,7 @@ func (sc *AutumnStreamClient) appendBlocks(ctx context.Context, exInfo *pb.Exten
 			conn := pools[j].Get()
 			client := pb.NewExtentServiceClient(conn)
 
-			stream, err := client.Append(pctx)
+			stream, err := client.Append(stopper.Ctx())
 			if err != nil {
 				retChan <- Result{err, nil, 0}
 				return

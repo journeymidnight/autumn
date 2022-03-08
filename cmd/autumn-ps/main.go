@@ -170,8 +170,8 @@ func main() {
 		panic(fmt.Sprint("psid can not be zero"))
 	}
 
-	fmt.Printf("smURL is %v\n", utils.SplitAndTrim(smURLs, ","))
-	fmt.Printf("etcdURL is %v\n", utils.SplitAndTrim(etcdURLs, ","))
+	fmt.Printf("smURL is %+v\n", utils.SplitAndTrim(smURLs, ","))
+	fmt.Printf("etcdURL is %+v\n", utils.SplitAndTrim(etcdURLs, ","))
 
 	maxExtentMB, err := strconv.Atoi(maxExtentMBString)
 	if err != nil {

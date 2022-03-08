@@ -631,7 +631,7 @@ func (sm *StreamManager) receiveCommitlength(ctx context.Context, nodes []*NodeS
 	pctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
 
-	stopper := utils.NewStopper()
+	stopper := utils.NewStopper(ctx)
 	result := make([]int64, len(nodes))
 	for i, node := range nodes {
 		addr := node.Address
@@ -673,7 +673,7 @@ func (sm *StreamManager) sendAllocToNodes(ctx context.Context, nodes []*NodeStat
 	pctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
 
-	stopper := utils.NewStopper()
+	stopper := utils.NewStopper(pctx)
 	n := int32(len(nodes))
 
 	diskIDs := make([]uint64, len(nodes))
@@ -686,7 +686,7 @@ func (sm *StreamManager) sendAllocToNodes(ctx context.Context, nodes []*NodeStat
 				return
 			}
 			c := pb.NewExtentServiceClient(conn)
-			res, err := c.AllocExtent(pctx, &pb.AllocExtentRequest{
+			res, err := c.AllocExtent(stopper.Ctx(), &pb.AllocExtentRequest{
 				ExtentID: extentID,
 			})
 			if err != nil {
