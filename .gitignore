@@ -2,7 +2,6 @@ coverage.out
 coverage.txt
 *.log
 .DS_Store
-pspb.rs
 *.json
 *.toml
 googleapis/
