@@ -66,7 +66,7 @@ func NewPartitionManager(etcd *embed.Etcd, client *clientv3.Client, config *mana
 		config:  config,
 		ID:      uint64(etcd.Server.ID()),
 		policy:  SimplePolicy{},
-		stopper: utils.NewStopper(context.Background()),
+		stopper: utils.NewStopper(),
 	}
 
 	v := pb.MemberValue{

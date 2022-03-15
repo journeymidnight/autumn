@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/journeymidnight/autumn/conn"
@@ -208,7 +209,7 @@ func (sc *AutumnStreamClient) smartRead(gctx context.Context, extentID uint64, o
 		Offsets []uint32
 	}
 
-	stopper := utils.NewStopper(pctx)
+	var wg sync.WaitGroup
 	retChan := make(chan Result, n)
 	errChan := make(chan Result, n)
 	req := &pb.ReadBlocksRequest{
@@ -253,30 +254,32 @@ func (sc *AutumnStreamClient) smartRead(gctx context.Context, extentID uint64, o
 	//only read from avali data
 	//read data shards
 	for i := 0; i < dataShards; i++ {
-		j := i
-		if exInfo.Avali > 0 && (exInfo.Avali&(1<<j)) == 0 {
+		if exInfo.Avali > 0 && (exInfo.Avali&(1<<i)) == 0 {
 			continue
 		}
-		stopper.RunWorker(func() {
-			submitReq(pools[j], j)
-		})
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			submitReq(pools[i], i)
+		}(i)
 	}
 
 	//read parity data
 	for i := 0; i < parityShards; i++ {
-		j := i
-		if exInfo.Avali > 0 && (1<<(j+dataShards))&exInfo.Avali == 0 {
+		if exInfo.Avali > 0 && (1<<(i+dataShards))&exInfo.Avali == 0 {
 			continue
 		}
-		stopper.RunWorker(func() {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
 			select {
-			case <-stopper.ShouldStop():
+			case <-pctx.Done():
 				return
-			case <-time.After(20 * time.Millisecond):
-				submitReq(pools[dataShards+j], j+dataShards)
+			case <- time.After(20 * time.Millisecond):
+				submitReq(pools[i+dataShards], i+dataShards)
 			}
-		})
-
+			submitReq(pools[i+dataShards], i+dataShards)
+		}(i)
 	}
 
 	successRet := make([]Result, 0, dataShards)
@@ -297,7 +300,7 @@ waitResult:
 	}
 
 	cancel()
-	stopper.Stop()
+	wg.Wait()
 	close(retChan)
 	close(errChan)
 
@@ -795,8 +798,7 @@ func (sc *AutumnStreamClient) appendBlocks(ctx context.Context, exInfo *pb.Exten
 		}
 	}
 
-	//FIXME: put stopper into sync.Pool
-	stopper := utils.NewStopper(pctx)
+	var wg sync.WaitGroup
 	type Result struct {
 		Error   error
 		Offsets []uint32
@@ -806,21 +808,22 @@ func (sc *AutumnStreamClient) appendBlocks(ctx context.Context, exInfo *pb.Exten
 
 	//leaderless append mode, send Append to all peers
 	for i := 0; i < n; i++ {
-		j := i
-		stopper.RunWorker(func() {
-			conn := pools[j].Get()
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			conn := pools[i].Get()
 			client := pb.NewExtentServiceClient(conn)
 
-			stream, err := client.Append(stopper.Ctx())
+			stream, err := client.Append(pctx)
 			if err != nil {
 				retChan <- Result{err, nil, 0}
 				return
 			}
 
 			//send header
-			sizeOfBlocks := make([]uint32, len(dataBlocks[j]))
-			for i := range sizeOfBlocks {
-				sizeOfBlocks[i] = uint32(len(dataBlocks[j][i]))
+			sizeOfBlocks := make([]uint32, len(dataBlocks[i]))
+			for j := range sizeOfBlocks {
+				sizeOfBlocks[j] = uint32(len(dataBlocks[i][j]))
 			}
 			if err = stream.Send(&pb.AppendRequest{
 				Data: &pb.AppendRequest_Header{
@@ -838,10 +841,10 @@ func (sc *AutumnStreamClient) appendBlocks(ctx context.Context, exInfo *pb.Exten
 
 			//send data
 			//grpc payload could be as large as 32MB
-			for i := range dataBlocks[j] {
+			for j := range dataBlocks[i] {
 				if err = stream.Send(&pb.AppendRequest{
 					Data: &pb.AppendRequest_Payload{
-						Payload: dataBlocks[j][i],
+						Payload: dataBlocks[i][j],
 					},
 				}); err != nil {
 					break
@@ -862,11 +865,11 @@ func (sc *AutumnStreamClient) appendBlocks(ctx context.Context, exInfo *pb.Exten
 			} else {
 				retChan <- Result{Error: err}
 			}
-			xlog.Logger.Debugf("append remote done [%s], %v", pools[j].Addr, err)
-		})
+			xlog.Logger.Debugf("append remote done [%s], %v", pools[i].Addr, err)
+		}(i)
 	}
 
-	stopper.Wait()
+	wg.Wait()
 	close(retChan)
 
 	var preOffsets []uint32

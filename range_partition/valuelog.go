@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/journeymidnight/autumn/range_partition/y"
 	"github.com/journeymidnight/autumn/streamclient"
@@ -101,7 +102,7 @@ const (
 )
 
 func (rp *RangePartition) startGC() {
-	rp.gcStopper = utils.NewStopper(context.Background())
+	rp.gcStopper = utils.NewStopper()
 	rp.gcRunChan = make(chan GcTask, 1)
 	//only one compact goroutine
 	rp.gcStopper.RunWorker(func() {
@@ -175,9 +176,11 @@ func (rp *RangePartition) startGC() {
 				//delete extent for stream
 				fmt.Printf("deleted extent [%v], for stream %d\n", holes, logStreamInfo.StreamID)
 				//delete extent for block
-				if err := rp.logStream.PunchHoles(rp.gcStopper.Ctx(), holes); err != nil {
+				pctx, cancel := context.WithTimeout(rp.gcStopper.Ctx(), time.Second*5)
+				if err := rp.logStream.PunchHoles(pctx, holes); err != nil {
 					xlog.Logger.Errorf("punch holes error: %v in runGC", err)
 				}
+				cancel()
 			}
 		}
 	})

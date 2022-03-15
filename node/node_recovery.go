@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -132,16 +133,16 @@ func (en *ExtentNode) recoveryErasureExtent(exInfo *pb.ExtentInfo, exceptID, off
 		}
 	}
 
-	stopper := utils.NewStopper(context.Background())
-
+	var wg sync.WaitGroup
 	var completes int32
 	for i := range sourceExtent {
 		if i == replacingIndex {
 			continue
 		}
-		j := i
-		stopper.RunWorker(func() {
-			ex := sourceExtent[j]
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ex := sourceExtent[i]
 			ex.Lock() //ex.GetRawExtent() asserts ex is locked
 			defer ex.Unlock()
 			rawWriter, err := ex.GetRawWriter()
@@ -149,16 +150,17 @@ func (en *ExtentNode) recoveryErasureExtent(exInfo *pb.ExtentInfo, exceptID, off
 				xlog.Logger.Errorf("GetRawWrier failed, disk failure?")
 				return
 			}
-			if err := en.copyRemoteExtent(conns[j], exInfo, rawWriter, offset, size); err != nil {
+			if err := en.copyRemoteExtent(conns[i], exInfo, rawWriter, offset, size); err != nil {
 				xlog.Logger.Warnf("ErasureExtent can not copyRemoteExtent %v", err)
-				sourceExtent[j] = nil
+				sourceExtent[i] = nil
 				return
 			}
 			atomic.AddInt32(&completes, 1)
-		})
+		}(i)
 	}
 
-	stopper.Wait()
+	wg.Wait()
+
 	fmt.Printf("completes is %d\n", completes)
 	if completes < int32(len(exInfo.Replicates)) {
 		return errors.Errorf("can not call enought shards")

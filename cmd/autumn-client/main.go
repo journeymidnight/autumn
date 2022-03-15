@@ -78,7 +78,7 @@ func benchmark(etcdUrls []string, op BenchType, threadNum int, duration int) err
 	}
 	defer client.Close()
 
-	stopper := utils.NewStopper(context.Background())
+	stopper := utils.NewStopper()
 
 	var size int
 	var isWriteBench bool
