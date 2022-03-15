@@ -20,7 +20,7 @@ func printHello(stopper *Stopper, id int) {
 }
 func TestStop(t *testing.T) {
 
-	stopper := NewStopper(context.Background())
+	stopper := NewStopper()
 	stopper.RunWorker(func() {
 		printHello(stopper, 1)
 	})
