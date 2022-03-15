@@ -145,7 +145,7 @@ func newPool(addr string) (*Pool, error) {
 	if err != nil {
 		return nil, err
 	}
-	pl := &Pool{conn: conn, Addr: addr, lastEcho: time.Now(), stopper: utils.NewStopper(context.Background())}
+	pl := &Pool{conn: conn, Addr: addr, lastEcho: time.Now(), stopper: utils.NewStopper()}
 	pl.stopper.RunWorker(func() {
 		pl.MonitorHealth()
 	})

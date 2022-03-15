@@ -631,16 +631,19 @@ func (sm *StreamManager) receiveCommitlength(ctx context.Context, nodes []*NodeS
 	pctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
 
-	stopper := utils.NewStopper(ctx)
 	result := make([]int64, len(nodes))
-	for i, node := range nodes {
-		addr := node.Address
-		j := i
-		stopper.RunWorker(func() {
-			pool := conn.GetPools().Connect(addr)
+
+	var wg sync.WaitGroup
+	for i := range nodes {
+
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+
+			pool := conn.GetPools().Connect(nodes[i].Address)
 
 			if pool == nil {
-				result[j] = -1
+				result[i] = -1
 				fmt.Println("no result")
 				return
 			}
@@ -656,13 +659,14 @@ func (sm *StreamManager) receiveCommitlength(ctx context.Context, nodes []*NodeS
 
 			if err != nil { //timeout or other error
 				xlog.Logger.Warnf(err.Error())
-				result[j] = -1
+				result[i] = -1
 				return
 			}
-			result[j] = int64(res.Length)
-		})
+			result[i] = int64(res.Length)
+		}(i)
 	}
-	stopper.Wait()
+	
+	wg.Wait()
 	xlog.Logger.Debugf("get commitlenght of extent %d, the sizes is %+v", extentID, result)
 	fmt.Printf("extent/%d receive commmit length: %v\n", extentID, result)
 
@@ -673,20 +677,23 @@ func (sm *StreamManager) sendAllocToNodes(ctx context.Context, nodes []*NodeStat
 	pctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
 
-	stopper := utils.NewStopper(pctx)
 	n := int32(len(nodes))
 
 	diskIDs := make([]uint64, len(nodes))
 	var complets int32
-	for i, node := range nodes {
-		conn := node.GetConn()
-		j := i
-		stopper.RunWorker(func() {
+	var wg sync.WaitGroup
+
+	for i := range nodes {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+
+			conn := nodes[i].GetConn()
 			if conn == nil {
 				return
 			}
 			c := pb.NewExtentServiceClient(conn)
-			res, err := c.AllocExtent(stopper.Ctx(), &pb.AllocExtentRequest{
+			res, err := c.AllocExtent(pctx, &pb.AllocExtentRequest{
 				ExtentID: extentID,
 			})
 			if err != nil {
@@ -697,11 +704,13 @@ func (sm *StreamManager) sendAllocToNodes(ctx context.Context, nodes []*NodeStat
 				xlog.Logger.Warnf("%v", res)
 				return
 			}
-			diskIDs[j] = res.DiskID
+			diskIDs[i] = res.DiskID
 			atomic.AddInt32(&complets, 1)
-		})
+		}(i)
 	}
-	stopper.Wait()
+
+	wg.Wait()
+
 	if complets != n || !sm.AmLeader() {
 		return nil, errors.Errorf("leader? %v, fail to create stream: complets %d < n %d", sm.AmLeader(), complets, n)
 	}

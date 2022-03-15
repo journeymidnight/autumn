@@ -13,8 +13,8 @@ type Stopper struct {
 }
 
 // NewStopper return a new Stopper instance.
-func NewStopper(ctx context.Context) *Stopper {
-	ctx, cancel := context.WithCancel(ctx)
+func NewStopper() *Stopper {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Stopper{
 		ctx:    ctx,
 		cancel: cancel,

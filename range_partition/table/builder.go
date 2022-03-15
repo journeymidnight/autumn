@@ -101,7 +101,7 @@ func NewTableBuilder(stream streamclient.StreamClient, ct CompressionType) *Buil
 		keyHashes:       make([]uint64, 0, 1024), // Avoid some malloc calls.
 		stream:          stream,
 		writeCh:         make(chan writeBlock, 16),
-		stopper:         utils.NewStopper(context.Background()),
+		stopper:         utils.NewStopper(),
 		currentBlock:    make([]byte, 64*KB),
 		originDiscard:   make(map[uint64]int64),
 		compressionType: ct,
