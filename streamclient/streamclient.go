@@ -251,6 +251,7 @@ func (sc *AutumnStreamClient) smartRead(gctx context.Context, extentID uint64, o
 		return nil, nil, 0, err
 	}
 
+
 	//only read from avali data
 	//read data shards
 	for i := 0; i < dataShards; i++ {
@@ -266,7 +267,7 @@ func (sc *AutumnStreamClient) smartRead(gctx context.Context, extentID uint64, o
 
 	//read parity data
 	for i := 0; i < parityShards; i++ {
-		if exInfo.Avali > 0 && (1<<(i+dataShards))&exInfo.Avali == 0 {
+		if exInfo.Avali > 0 && exInfo.Avali & (1<<(i+dataShards)) == 0 {
 			continue
 		}
 		wg.Add(1)
@@ -278,7 +279,6 @@ func (sc *AutumnStreamClient) smartRead(gctx context.Context, extentID uint64, o
 			case <- time.After(20 * time.Millisecond):
 				submitReq(pools[i+dataShards], i+dataShards)
 			}
-			submitReq(pools[i+dataShards], i+dataShards)
 		}(i)
 	}
 
@@ -468,7 +468,6 @@ func (sc *AutumnStreamClient) checkCommitLength() {
 			sc.end = end
 			break
 		}
-		fmt.Printf("err is %s\n\n", err.Error())
 		xlog.Logger.Warnf(err.Error())
 		time.Sleep(5 * time.Second)
 		continue
@@ -504,7 +503,6 @@ func (sc *AutumnStreamClient) ReadLastBlock(ctx context.Context) (block, error) 
 		if idx == -1 {
 			return nil, wire_errors.NotFound
 		}
-
 		blocks, _, _, err := sc.smartRead(ctx, exInfo.ExtentID, 0, 1, true)
 		if err == wire_errors.NotFound {
 			i = idx - 1
@@ -569,7 +567,7 @@ retry:
 		if loop > 5 {
 			return err
 		}
-		fmt.Printf("receiveEntries get error %s\n", err.Error())
+		xlog.Logger.Warnf("recevierEntries failed, retry %d, %v", loop, err)
 		loop++
 		time.Sleep(3 * time.Second)
 		goto retry
