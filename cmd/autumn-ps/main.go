@@ -85,6 +85,7 @@ func main() {
 	var compression string
 	var assertKeys bool
 	var gateWayListen string
+	var MaxUnCommitedLogSizeMB uint64
 
 	app := &cli.App{
 		HelpName: "",
@@ -156,6 +157,12 @@ func main() {
 				Value:       false,
 				Usage:       "assert keys in all table(debug only)",
 			},
+			&cli.Uint64Flag{
+				Name:       "max-uncommited-logsize",
+				Destination: &MaxUnCommitedLogSizeMB,
+				Value:      1024,
+				Usage:      "max uncommited log size in MB",
+			},
 		},
 	}
 
@@ -209,6 +216,7 @@ func main() {
 		Compression:          compression,
 		AssertKeys:           assertKeys,
 		GatewayListenURL:     gateWayListen,
+		MaxUnCommitedLogSize: MaxUnCommitedLogSizeMB << 20,
 	}
 
 	ps := partition_server.NewPartitionServer(config)

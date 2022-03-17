@@ -105,6 +105,7 @@ type RangePartition struct {
 
 	gcRunChan chan GcTask
 	gcStopper *utils.Stopper
+	unCommitedLogSize uint64// if unCommitedLogSize is biggger than throshold, force to flush sst.
 }
 
 //TODO
@@ -200,7 +201,7 @@ func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStre
 
 	//FIXME:poor performace: prefetch read will be better
 	replayedLog := 0
-	logSizeRead := uint32(0)
+	logSizeRead := uint64(0)
 
 	replay := func(ei *Entry) (bool, error) {
 		replayedLog++
@@ -215,7 +216,7 @@ func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStre
 		}
 
 		head := valuePointer{extentID: ei.ExtentID, offset: ei.End}
-		logSizeRead += uint32(ei.Size())
+		logSizeRead += uint64(ei.Size())
 		//print value len of ei
 		if y.ParseTs(ei.Key) > rp.seqNumber {
 			rp.seqNumber = y.ParseTs(ei.Key)
@@ -244,6 +245,8 @@ func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStre
 			}
 		*/
 
+
+
 		rp.writeToLSM([]*Entry{ei})
 
 		rp.vhead = head
@@ -266,6 +269,8 @@ func OpenRangePartition(id uint64, metaStream streamclient.StreamClient, rowStre
 			return nil, err
 		}
 	}
+
+	rp.unCommitedLogSize = logSizeRead
 
 	//xlog.Logger.Infof("replayed log number: %d, time taken %v\n", replayedLog, time.Since(start))
 	fmt.Printf("replayed log number: %d, mt size is %d, time taken %v, read size %v \n", replayedLog, rp.mt.MemSize(), time.Since(start), logSizeRead)
@@ -680,9 +685,7 @@ func (rp *RangePartition) writeRequests(reqs []*request) error {
 		return err
 	}
 
-	//lastReq := reqs[len(reqs)-1]
-	//e := lastReq.entries[len(lastReq.entries)-1]
-	//seqNum := y.ParseTs(e.Log.Key)
+
 
 	xlog.Logger.Info("Writing to memtable")
 	i := 0
@@ -708,6 +711,11 @@ func (rp *RangePartition) writeRequests(reqs []*request) error {
 			done(err)
 			return errors.Wrap(err, "writeRequests")
 		}
+	}
+	
+	//accumulate all entries size
+	for _, r := range reqs {
+		rp.unCommitedLogSize += uint64(r.Size())
 	}
 
 	rp.vhead = head
@@ -868,13 +876,14 @@ func (rp *RangePartition) ensureRoomForWrite(entries []*Entry, head valuePointer
 
 	utils.AssertTrue(n <= rp.opt.MaxSkipList)
 
-	if rp.mt.MemSize()+n < rp.opt.MaxSkipList {
+	if rp.mt.MemSize()+n < rp.opt.MaxSkipList && rp.unCommitedLogSize < rp.opt.MaxUnCommitedLogSize{
 		return nil
 	}
 	utils.AssertTrue(rp.mt != nil)
 	xlog.Logger.Debugf("Flushing memtable, mt.size=%d", rp.mt.MemSize())
 
-	//make sure seqNum is greater or equal to table's max seqNum
+	rp.unCommitedLogSize = 0
+
 	//non-block, block if flushChan is full,
 	select {
 	case rp.flushChan <- flushTask{mt: rp.mt, vptr: head, seqNum: atomic.LoadUint64(&rp.seqNumber), isCompact: false, discards: rp.mt.OriginDiscard}:

@@ -26,6 +26,7 @@ type Option struct {
 	MaxExtentSize   uint32
 	CompressionType table.CompressionType
 	AssertKeys      bool
+	MaxUnCommitedLogSize uint64
 }
 
 type OptionFunc func(*Option)
@@ -38,6 +39,7 @@ func DefaultOption() OptionFunc {
 		opt.MaxExtentSize = 1 * GB
 		opt.CompressionType = table.Snappy
 		opt.AssertKeys = false
+		opt.MaxUnCommitedLogSize = 1000 * MB
 	}
 }
 
@@ -49,6 +51,7 @@ func TestOption() OptionFunc {
 		opt.MaxExtentSize = 8 * MB
 		opt.CompressionType = table.None
 		opt.AssertKeys = true
+		opt.MaxUnCommitedLogSize = 1000 * MB
 	}
 }
 
@@ -85,6 +88,13 @@ func WithCompression(codec string) OptionFunc {
 		default:
 			xlog.Logger.Fatal("unknown compression type:", codec)
 		}
+	}
+}
+
+// MaxUnCommitedLogSize is the max size of uncommitted log, the unit is Byte
+func WithMaxUnCommitedLogSize(n uint64) OptionFunc {
+	return func(opt *Option) {
+		opt.MaxUnCommitedLogSize = n
 	}
 }
 
