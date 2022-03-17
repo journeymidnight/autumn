@@ -39,6 +39,7 @@ type Config struct {
 	Compression          string
 	AssertKeys           bool //Check if all tables' keys are valid
 	GatewayListenURL     string
+	MaxUnCommitedLogSize uint64 //in the unit of Bytes
 }
 
 type PartitionServer struct {
@@ -327,7 +328,9 @@ func (ps *PartitionServer) startRangePartition(meta *pspb.PartitionMeta, mutex *
 		range_partition.WithMaxSkipList(int64(ps.config.SkipListSize)),
 		range_partition.WithSync(ps.config.MustSync),
 		range_partition.WithCompression(ps.config.Compression),
+		range_partition.WithMaxUnCommitedLogSize(ps.config.MaxUnCommitedLogSize),
 	}
+
 	if ps.config.AssertKeys {
 		options = append(options, range_partition.WithAssertKeys())
 	}
