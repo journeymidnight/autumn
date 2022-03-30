@@ -20,6 +20,7 @@ type Config struct {
 	InitialCluster      string // --initial-cluster
 	InitialClusterState string // --initial-cluster-state
 	ClusterToken        string
+	MaxTxnOps           uint   // --max-txn-ops
 
 	GrpcUrl string // --listen-stream-manager-grpc
 	//GrpcUrlPM string
@@ -44,6 +45,7 @@ func (config *Config) GetEmbedConfig() (*embed.Config, error) {
 	embedConfig.InitialClusterToken = config.ClusterToken
 	embedConfig.InitialCluster = config.InitialCluster
 	embedConfig.LogLevel = "error" //ignore etcd warnings and infos
+	embedConfig.MaxTxnOps = config.MaxTxnOps
 
 	lcurls, err := parseUrls(config.ClientUrls)
 	if err != nil {
@@ -136,6 +138,12 @@ func NewConfig() *Config {
 				Name:        "listen-grpc",
 				Destination: &config.GrpcUrl,
 				Required:    true,
+			},
+			&cli.UintFlag{
+				Name:        "max-txn-ops",
+				Destination: &config.MaxTxnOps,
+				Required:    false,
+				Value:       3000,
 			},
 			/*
 				&cli.StringFlag{
