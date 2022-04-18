@@ -60,8 +60,7 @@ func (lib *AutumnLib) saveRegion(regions *pspb.Regions) {
 	//if so, do not update region
 	for i := 0; i < len(newRegions); i++ {
 		if i < len(newRegions)-1 && bytes.Compare(newRegions[i].Rg.EndKey, newRegions[i+1].Rg.StartKey) != 0 {
-			return
-			//panic(fmt.Sprintf("region %d end key is not equal to start key of region %d", newRegions[i].PartID, newRegions[i+1].PartID))
+			panic(fmt.Sprintf("region %d end key is not equal to start key of region %d", newRegions[i].PartID, newRegions[i+1].PartID))
 		}
 	}
 	lib.Lock()
@@ -221,6 +220,9 @@ func (lib *AutumnLib) StreamPut(ctx context.Context, key []byte, reader io.Reade
 		}
 		return bytes.Compare(sortedRegions[i].Rg.EndKey, key) > 0
 	})
+	if idx >= len(sortedRegions) {
+		return errors.Errorf("key %s is out of range", key)
+	}
 
 	conn := lib.getConn(lib.getPSAddr((sortedRegions[idx].PSID)))
 	client := pspb.NewPartitionKVClient(conn)
@@ -294,6 +296,10 @@ func (lib *AutumnLib) Put(ctx context.Context, key, value []byte) error {
 		return bytes.Compare(sortedRegions[i].Rg.EndKey, key) > 0
 	})
 
+	if idx >= len(sortedRegions) {
+		return errors.Errorf("key %s is out of range", key)
+	} 
+
 	conn := lib.getConn(lib.getPSAddr((sortedRegions[idx].PSID)))
 	client := pspb.NewPartitionKVClient(conn)
 	_, err := client.Put(ctx, &pspb.PutRequest{
@@ -316,6 +322,10 @@ func (lib *AutumnLib) Get(ctx context.Context, key []byte) ([]byte, error) {
 		}
 		return bytes.Compare(sortedRegions[i].Rg.EndKey, key) > 0
 	})
+	if idx >= len(sortedRegions) {
+		return nil, errors.Errorf("key %s is out of range", key)
+	}
+
 
 	conn := lib.getConn(lib.getPSAddr((sortedRegions[idx].PSID)))
 	client := pspb.NewPartitionKVClient(conn)
@@ -334,7 +344,7 @@ func (lib *AutumnLib) Get(ctx context.Context, key []byte) ([]byte, error) {
 func (lib *AutumnLib) Range(ctx context.Context, prefix []byte, start []byte, limit uint32) ([][]byte, bool, error) {
 	sortedRegions := lib.getRegions()
 	if len(sortedRegions) == 0 {
-		return nil, false, errors.New("no regions to write")
+		return nil, false, errors.New("no regions to range")
 	}
 	idx := sort.Search(len(sortedRegions), func(i int) bool {
 		if len(sortedRegions[i].Rg.EndKey) == 0 {
@@ -342,6 +352,10 @@ func (lib *AutumnLib) Range(ctx context.Context, prefix []byte, start []byte, li
 		}
 		return bytes.Compare(sortedRegions[i].Rg.EndKey, start) > 0
 	})
+	if idx >= len(sortedRegions) {
+		return nil, false, errors.Errorf("key %s is out of range", start)
+	} 
+
 	//start from idx
 	//FIXME: pipline to call range function
 	results := make([][]byte, 0)
@@ -471,6 +485,10 @@ func (lib *AutumnLib) Delete(ctx context.Context, key []byte) error {
 		return bytes.Compare(sortedRegions[i].Rg.EndKey, key) > 0
 	})
 
+	if idx >= len(sortedRegions) {
+		return errors.Errorf("key %s is out of range", key)
+	}
+
 	conn := lib.getConn(lib.getPSAddr((sortedRegions[idx].PSID)))
 	client := pspb.NewPartitionKVClient(conn)
 	_, err = client.Delete(ctx, &pspb.DeleteRequest{
@@ -495,6 +513,10 @@ func (lib *AutumnLib) Head(ctx context.Context, key []byte) ([]byte, uint32, err
 		}
 		return bytes.Compare(sortedRegions[i].Rg.EndKey, key) > 0
 	})
+
+	if idx >= len(sortedRegions) {
+		return nil, 0, errors.Errorf("key %s is out of range", key)
+	}
 
 	conn := lib.getConn(lib.getPSAddr((sortedRegions[idx].PSID)))
 	client := pspb.NewPartitionKVClient(conn)

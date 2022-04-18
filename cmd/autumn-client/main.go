@@ -273,7 +273,54 @@ func benchmark(etcdUrls []string, op BenchType, threadNum int, duration int) err
 	return nil
 }
 
+
+func createOnePartition(smc *smclient.SMClient, etcdClient *clientv3.Client, r, s int, start, end []byte) error {
+		//choose the first one
+		log, _, err := smc.CreateStream(context.Background(), uint32(r), uint32(s))
+		if err != nil {
+			fmt.Printf("can not create log stream\n")
+			return err
+		}
+		fmt.Printf("log stream %d created, replication is [%d+%d]\n", log.StreamID, r, s)
+	
+		row, _, err := smc.CreateStream(context.Background(), uint32(r), uint32(s))
+		if err != nil {
+			fmt.Printf("can not create row stream\n")
+			return err
+		}
+		fmt.Printf("row stream %d created, replication is [%d+%d]\n", row.StreamID, r, s)
+	
+		meta, _, err := smc.CreateStream(context.Background(), uint32(r), 0)
+		if err != nil {
+			fmt.Printf("can not create meta stream\n")
+			return err
+		}
+		fmt.Printf("meta stream %d created, replication is [%d+%d]\n", row.StreamID, r, s)
+	
+		partID, _, err := etcd_utils.EtcdAllocUniqID(etcdClient, stream_manager.IdKey, 1)
+		if err != nil {
+			fmt.Printf("can not create partID %v\n", err)
+			return err
+		}
+	
+		zeroMeta := pspb.PartitionMeta{
+			LogStream:  log.StreamID,
+			RowStream:  row.StreamID,
+			MetaStream: meta.StreamID,
+			Rg:         &pspb.Range{StartKey: start, EndKey: end},
+			PartID:     partID,
+		}
+	
+		err = etcd_utils.EtcdSetKV(etcdClient, fmt.Sprintf("PART/%d", partID), utils.MustMarshal(&zeroMeta))
+		if err != nil {
+			return err
+		}
+		fmt.Printf("bootstrap succeed, created new range partition %d\n", partID)
+		return nil
+}
+
 func bootstrap(c *cli.Context) error {
+	preSplitType := c.String("presplit")
 
 	etcdUrls := utils.SplitAndTrim(c.String("etcd-urls"), ",")
 	etcdClient, err := clientv3.New(clientv3.Config{
@@ -285,6 +332,40 @@ func bootstrap(c *cli.Context) error {
 	}
 
 	smUrls := utils.SplitAndTrim(c.String("sm-urls"), ",")
+
+
+	parts := utils.SplitAndTrim(preSplitType, ":")
+	if len(parts) != 2 {
+		return errors.Errorf("invalid partition type: %s", preSplitType)
+	}
+	preSplitNum, err := strconv.ParseInt(parts[0], 10, 32)
+	if err != nil {
+		return errors.Errorf("invalid partition type: %s", preSplitType)
+	}
+	var isHexString bool
+	switch parts[1] {
+	case "normal":
+		if preSplitNum != 1 {
+			return errors.Errorf("invalid partition type: %s, only support 1:normal", preSplitType)
+		}
+	case "hexstring":
+		isHexString = true
+	default:
+		return errors.Errorf("invalid partition type: %s, only support 1:normal or n:hexstring", preSplitType)
+	}
+
+	var ranges []utils.Range
+	if isHexString {
+		preSplit := utils.NewHexStringSplitAlgorithm()
+		ranges, err = preSplit.SplitAllReginos(int(preSplitNum))
+		if err != nil {
+			return err
+		}
+	} else {
+		ranges = []utils.Range{
+			{StartKey: []byte(""), EndKey: []byte("")}}
+	}
+
 
 	smc := smclient.NewSMClient(smUrls)
 	if err := smc.Connect(); err != nil {
@@ -301,48 +382,13 @@ func bootstrap(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	//choose the first one
-	log, _, err := smc.CreateStream(context.Background(), uint32(r), uint32(s))
-	if err != nil {
-		fmt.Printf("can not create log stream\n")
-		return err
-	}
-	fmt.Printf("log stream %d created, replication is [%d+%d]\n", log.StreamID, r, s)
 
-	row, _, err := smc.CreateStream(context.Background(), uint32(r), uint32(s))
-	if err != nil {
-		fmt.Printf("can not create row stream\n")
-		return err
-	}
-	fmt.Printf("row stream %d created, replication is [%d+%d]\n", row.StreamID, r, s)
-
-	meta, _, err := smc.CreateStream(context.Background(), uint32(r), 0)
-	if err != nil {
-		fmt.Printf("can not create meta stream\n")
-		return err
-	}
-	fmt.Printf("meta stream %d created, replication is [%d+%d]\n", row.StreamID, r, s)
-
-	partID, _, err := etcd_utils.EtcdAllocUniqID(etcdClient, stream_manager.IdKey, 1)
-	if err != nil {
-		fmt.Printf("can not create partID %v\n", err)
-		return err
+	for _, rng := range ranges {
+		if err := createOnePartition(smc, etcdClient, r, s, rng.StartKey, rng.EndKey); err != nil {
+			return err
+		}
 	}
 
-	zeroMeta := pspb.PartitionMeta{
-		LogStream:  log.StreamID,
-		RowStream:  row.StreamID,
-		MetaStream: meta.StreamID,
-		Rg:         &pspb.Range{StartKey: []byte(""), EndKey: []byte("")},
-		PartID:     partID,
-	}
-
-	err = etcd_utils.EtcdSetKV(etcdClient, fmt.Sprintf("PART/%d", partID), utils.MustMarshal(&zeroMeta))
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("bootstrap succeed, created new range partition %d\n", partID)
 	return nil
 }
 
@@ -401,7 +447,6 @@ func get(c *cli.Context) error {
 	}
 	//print the raw data to stdout, fmt.Println does not work
 	binary.Write(os.Stdout, binary.LittleEndian, value)
-
 	return nil
 }
 
@@ -622,17 +667,18 @@ func main() {
 
 		{
 			Name:  "bootstrap",
-			Usage: "bootstrap --sm-urls <addrs> --etcd-urls <addrs>",
+			Usage: "bootstrap --sm-urls <addrs> --etcd-urls <addrs> --partition-num <num> --presplit <data>",
 			Flags: []cli.Flag{
 				&cli.StringFlag{Name: "sm-urls", Value: "127.0.0.1:3401"},
 				&cli.StringFlag{Name: "etcd-urls", Value: "127.0.0.1:2379"},
 				&cli.StringFlag{Name: "replication", Value: "2+1"},
+				&cli.StringFlag{Name: "presplit", Value: "1:normal"},
 			},
 			Action: bootstrap,
 		},
 		{
 			Name:  "streamput",
-			Usage: "streamput --etcd-urls <addrs> <KEY> <FILE>",
+			Usage: "streamput --etcd-urls <addrs> <KEY> <FILE> ",
 			Flags: []cli.Flag{
 				&cli.StringFlag{Name: "etcd-urls", Value: "127.0.0.1:2379"},
 			},
