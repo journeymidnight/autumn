@@ -49,7 +49,6 @@ type Extent struct {
 	ID           uint64
 	fileName     string
 	file         *os.File
-	//FIXME: add SSD Chanel
 	writer       *record.LogWriter
 	lastRevision int64
 }

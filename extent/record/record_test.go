@@ -647,20 +647,31 @@ func BenchmarkNormalWrite(b *testing.B) {
 	}
 }
 func BenchmarkRecordWrite(b *testing.B) {
-	for _, size := range []int{8, 16, 32, 64, 128, 1 << 20, 2 << 20} {
+	for _, size := range []int{8, 16, 32, 64, 128, 4<<10,  1 << 20, 2 << 20} {
 		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
 			w := NewLogWriter(ioutil.Discard, 0, 0)
 			defer w.Close()
 			buf := make([]byte, size)
 
+			utils.SetRandStringBytes(buf)
 			b.SetBytes(int64(len(buf)))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				if _, _, err := w.WriteRecord(buf); err != nil {
 					b.Fatal(err)
 				}
+				w.Sync()
 			}
 			b.StopTimer()
 		})
 	}
+}
+
+func BenchmarkCRC(b *testing.B) {
+	buf := make([]byte, 1<<20)
+	utils.SetRandStringBytes(buf)
+	for i := 0; i < b.N; i++ {
+		utils.NewCRC(buf).Value()
+	}
+
 }
