@@ -357,7 +357,7 @@ func bootstrap(c *cli.Context) error {
 	var ranges []utils.Range
 	if isHexString {
 		preSplit := utils.NewHexStringSplitAlgorithm()
-		ranges, err = preSplit.SplitAllReginos(int(preSplitNum))
+		ranges, err = preSplit.SplitAllRegions(int(preSplitNum))
 		if err != nil {
 			return err
 		}
