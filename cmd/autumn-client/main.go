@@ -158,7 +158,7 @@ func benchmark(etcdUrls []string, op BenchType, threadNum int, duration int) err
 							end := time.Now()
 							j++
 							if err != nil {
-								if  status.Code(err) != codes.Canceled {
+								if status.Code(err) != codes.Canceled {
 									fmt.Printf("%+v", err)
 								}
 								return -1
@@ -188,7 +188,7 @@ func benchmark(etcdUrls []string, op BenchType, threadNum int, duration int) err
 							data, err := client.Get(stopper.Ctx(), []byte(keys[t][0]))
 							end := time.Now()
 							if err != nil {
-								if  status.Code(err) != codes.Canceled {
+								if status.Code(err) != codes.Canceled {
 									fmt.Printf("%+v", err)
 								}
 								return -1
@@ -273,50 +273,49 @@ func benchmark(etcdUrls []string, op BenchType, threadNum int, duration int) err
 	return nil
 }
 
-
 func createOnePartition(smc *smclient.SMClient, etcdClient *clientv3.Client, r, s int, start, end []byte) error {
-		//choose the first one
-		log, _, err := smc.CreateStream(context.Background(), uint32(r), uint32(s))
-		if err != nil {
-			fmt.Printf("can not create log stream\n")
-			return err
-		}
-		fmt.Printf("log stream %d created, replication is [%d+%d]\n", log.StreamID, r, s)
-	
-		row, _, err := smc.CreateStream(context.Background(), uint32(r), uint32(s))
-		if err != nil {
-			fmt.Printf("can not create row stream\n")
-			return err
-		}
-		fmt.Printf("row stream %d created, replication is [%d+%d]\n", row.StreamID, r, s)
-	
-		meta, _, err := smc.CreateStream(context.Background(), uint32(r), 0)
-		if err != nil {
-			fmt.Printf("can not create meta stream\n")
-			return err
-		}
-		fmt.Printf("meta stream %d created, replication is [%d+%d]\n", row.StreamID, r, s)
-	
-		partID, _, err := etcd_utils.EtcdAllocUniqID(etcdClient, stream_manager.IdKey, 1)
-		if err != nil {
-			fmt.Printf("can not create partID %v\n", err)
-			return err
-		}
-	
-		zeroMeta := pspb.PartitionMeta{
-			LogStream:  log.StreamID,
-			RowStream:  row.StreamID,
-			MetaStream: meta.StreamID,
-			Rg:         &pspb.Range{StartKey: start, EndKey: end},
-			PartID:     partID,
-		}
-	
-		err = etcd_utils.EtcdSetKV(etcdClient, fmt.Sprintf("PART/%d", partID), utils.MustMarshal(&zeroMeta))
-		if err != nil {
-			return err
-		}
-		fmt.Printf("bootstrap succeed, created new range partition %d\n", partID)
-		return nil
+	//choose the first one
+	log, _, err := smc.CreateStream(context.Background(), uint32(r), uint32(s))
+	if err != nil {
+		fmt.Printf("can not create log stream\n")
+		return err
+	}
+	fmt.Printf("log stream %d created, replication is [%d+%d]\n", log.StreamID, r, s)
+
+	row, _, err := smc.CreateStream(context.Background(), uint32(r), uint32(s))
+	if err != nil {
+		fmt.Printf("can not create row stream\n")
+		return err
+	}
+	fmt.Printf("row stream %d created, replication is [%d+%d]\n", row.StreamID, r, s)
+
+	meta, _, err := smc.CreateStream(context.Background(), uint32(r), 0)
+	if err != nil {
+		fmt.Printf("can not create meta stream\n")
+		return err
+	}
+	fmt.Printf("meta stream %d created, replication is [%d+%d]\n", row.StreamID, r, s)
+
+	partID, _, err := etcd_utils.EtcdAllocUniqID(etcdClient, stream_manager.IdKey, 1)
+	if err != nil {
+		fmt.Printf("can not create partID %v\n", err)
+		return err
+	}
+
+	zeroMeta := pspb.PartitionMeta{
+		LogStream:  log.StreamID,
+		RowStream:  row.StreamID,
+		MetaStream: meta.StreamID,
+		Rg:         &pspb.Range{StartKey: start, EndKey: end},
+		PartID:     partID,
+	}
+
+	err = etcd_utils.EtcdSetKV(etcdClient, fmt.Sprintf("PART/%d", partID), utils.MustMarshal(&zeroMeta))
+	if err != nil {
+		return err
+	}
+	fmt.Printf("bootstrap succeed, created new range partition %d\n", partID)
+	return nil
 }
 
 func bootstrap(c *cli.Context) error {
@@ -332,7 +331,6 @@ func bootstrap(c *cli.Context) error {
 	}
 
 	smUrls := utils.SplitAndTrim(c.String("sm-urls"), ",")
-
 
 	parts := utils.SplitAndTrim(preSplitType, ":")
 	if len(parts) != 2 {
@@ -357,7 +355,7 @@ func bootstrap(c *cli.Context) error {
 	var ranges []utils.Range
 	if isHexString {
 		preSplit := utils.NewHexStringSplitAlgorithm()
-		ranges, err = preSplit.SplitAllReginos(int(preSplitNum))
+		ranges, err = preSplit.SplitAllRegions(int(preSplitNum))
 		if err != nil {
 			return err
 		}
@@ -365,7 +363,6 @@ func bootstrap(c *cli.Context) error {
 		ranges = []utils.Range{
 			{StartKey: []byte(""), EndKey: []byte("")}}
 	}
-
 
 	smc := smclient.NewSMClient(smUrls)
 	if err := smc.Connect(); err != nil {
