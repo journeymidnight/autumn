@@ -102,7 +102,7 @@ func NewExtentNode(nodeID uint64, diskDirs []string, walDir string, listenUrl st
 			xlog.Logger.Warnf("can not open waldir :%s", walDir)
 		} else {
 			en.wal = wal
-		}
+		} 
 	}
 	return en
 }
@@ -117,7 +117,7 @@ func (en *ExtentNode) extentInfoUpdatedfunc(eventType string, cur *pb.ExtentInfo
 				xlog.Logger.Infof("SEAL extent %d", cur.ExtentID)
 				ex.Lock()
 				if err := ex.Seal(uint32(cur.SealedLength)); err != nil {
-					//if error happend, wait for manager send a ReAvali msg to recovery data
+					//if error happend, wnodeait for manager send a ReAvali msg to recovery data
 					xlog.Logger.Errorf(err.Error())
 				}
 				ex.Unlock()
@@ -316,7 +316,7 @@ func (en *ExtentNode) AppendWithWal(ex *extent.Extent, rev int64, blocks [][]byt
 	if mustSync == false {
 		return ex.AppendBlocks(blocks, false)
 	} else if en.wal == nil || utils.SizeOfBlocks(blocks) > (2<<20) {
-		//force sync write
+		//force sync writenode.
 		return ex.AppendBlocks(blocks, true)
 	}
 

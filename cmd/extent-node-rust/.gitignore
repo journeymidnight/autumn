@@ -1,0 +1,27 @@
+# Rust
+target/
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Test data
+/tmp/extent_node*
+/data/test_*
+
+# Runtime
+*.pid
+
+# Generated files
+src/proto_generated/
