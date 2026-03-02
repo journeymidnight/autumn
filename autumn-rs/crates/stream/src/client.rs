@@ -286,6 +286,33 @@ impl StreamClient {
         }
     }
 
+    pub async fn append_batch_repeated(
+        &mut self,
+        stream_id: u64,
+        block: &[u8],
+        count: usize,
+        must_sync: bool,
+    ) -> Result<AppendBatchResult> {
+        if count == 0 {
+            return Err(anyhow!("append_batch_repeated requires count > 0"));
+        }
+
+        let block_len = u32::try_from(block.len()).map_err(|_| anyhow!("block too large"))?;
+        let total = block
+            .len()
+            .checked_mul(count)
+            .ok_or_else(|| anyhow!("append payload too large"))?;
+
+        let mut payload = Vec::with_capacity(total);
+        for _ in 0..count {
+            payload.extend_from_slice(block);
+        }
+
+        let blocks = vec![block_len; count];
+        self.append_payload(stream_id, payload, blocks, must_sync)
+            .await
+    }
+
     pub async fn append_batch(
         &mut self,
         stream_id: u64,
@@ -321,8 +348,9 @@ impl StreamClient {
         payload: &[u8],
         must_sync: bool,
     ) -> Result<AppendResult> {
-        let blocks = [payload];
-        let batch = self.append_batch(stream_id, &blocks, must_sync).await?;
+        let batch = self
+            .append_batch_repeated(stream_id, payload, 1, must_sync)
+            .await?;
         let offset = batch.offsets.first().copied().unwrap_or(0);
         Ok(AppendResult {
             extent_id: batch.extent_id,
