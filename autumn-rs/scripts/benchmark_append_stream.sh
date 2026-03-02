@@ -7,13 +7,13 @@ cd "$ROOT_DIR"
 OPS="${APPEND_BENCH_OPS:-20000}"
 PAYLOAD="${APPEND_BENCH_PAYLOAD:-4096}"
 WARMUP="${APPEND_BENCH_WARMUP:-1000}"
-INFLIGHT="${APPEND_BENCH_INFLIGHT:-8}"
+DEPTH="${APPEND_BENCH_DEPTH:-8}"
 SYNC="${APPEND_BENCH_SYNC:-false}"
 
-echo "[append-bench] ops=$OPS payload=$PAYLOAD warmup=$WARMUP batch=16 inflight=$INFLIGHT extent=512MiB sync=$SYNC"
+echo "[append-bench] ops=$OPS payload=$PAYLOAD warmup=$WARMUP batch=16 depth=$DEPTH extent=512MiB sync=$SYNC"
 APPEND_BENCH_OPS="$OPS" \
 APPEND_BENCH_PAYLOAD="$PAYLOAD" \
 APPEND_BENCH_WARMUP="$WARMUP" \
-APPEND_BENCH_INFLIGHT="$INFLIGHT" \
+APPEND_BENCH_DEPTH="$DEPTH" \
 APPEND_BENCH_SYNC="$SYNC" \
   cargo test -p autumn-manager --test append_benchmark benchmark_append_stream_throughput -- --nocapture

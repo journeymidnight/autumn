@@ -7,7 +7,7 @@ use autumn_manager::AutumnManager;
 use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
 use autumn_proto::autumn::{CreateStreamRequest, RegisterNodeRequest};
 use autumn_stream::{ExtentNode, ExtentNodeConfig, StreamClient};
-use tokio::sync::Barrier;
+use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tonic::Request;
 
@@ -32,17 +32,6 @@ fn env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-fn split_ops(total: usize, workers: usize) -> Vec<usize> {
-    if workers == 0 {
-        return Vec::new();
-    }
-    let base = total / workers;
-    let rem = total % workers;
-    (0..workers)
-        .map(|i| if i < rem { base + 1 } else { base })
-        .collect()
-}
-
 fn batch_count(iter: usize, total_blocks: usize, batch_size: usize, num_reqs: usize) -> usize {
     if iter + 1 < num_reqs {
         return batch_size;
@@ -55,61 +44,19 @@ fn batch_count(iter: usize, total_blocks: usize, batch_size: usize, num_reqs: us
     }
 }
 
-async fn append_worker(
-    endpoint: String,
-    stream_id: u64,
-    max_extent_size: u32,
-    payload: Arc<Vec<u8>>,
-    warmup_ops: usize,
-    bench_ops: usize,
-    worker_id: usize,
-    start_barrier: Arc<Barrier>,
-    must_sync: bool,
-) {
-    let mut client = StreamClient::connect(
-        &endpoint,
-        format!("owner/bench/{worker_id}"),
-        max_extent_size,
-    )
-    .await
-    .expect("stream client");
-
-    const BATCH_SIZE: usize = 16;
-
-    let warmup_reqs = warmup_ops.div_ceil(BATCH_SIZE);
-    for i in 0..warmup_reqs {
-        let n = batch_count(i, warmup_ops, BATCH_SIZE, warmup_reqs);
-        let _ = client
-            .append_batch_repeated(stream_id, payload.as_slice(), n, must_sync)
-            .await
-            .expect("warmup append");
-    }
-
-    start_barrier.wait().await;
-
-    let bench_reqs = bench_ops.div_ceil(BATCH_SIZE);
-    for i in 0..bench_reqs {
-        let n = batch_count(i, bench_ops, BATCH_SIZE, bench_reqs);
-        let _ = client
-            .append_batch_repeated(stream_id, payload.as_slice(), n, must_sync)
-            .await
-            .expect("bench append");
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn benchmark_append_stream_throughput() {
     // Tunables:
     // APPEND_BENCH_OPS (default 20000)
     // APPEND_BENCH_PAYLOAD (default 4096 bytes)
     // APPEND_BENCH_WARMUP (default 1000 ops)
-    // APPEND_BENCH_INFLIGHT (default 8 workers)
+    // APPEND_BENCH_DEPTH (default 8 in-flight requests)
     // APPEND_BENCH_SYNC (default false)
     // fixed: BATCH=16, EXTENT=512MiB
     let ops = env_usize("APPEND_BENCH_OPS", 20_000);
     let payload_size = env_usize("APPEND_BENCH_PAYLOAD", 4096);
     let warmup_ops = env_usize("APPEND_BENCH_WARMUP", 1000);
-    let inflight = env_usize("APPEND_BENCH_INFLIGHT", 8).max(1);
+    let depth = env_usize("APPEND_BENCH_DEPTH", 8).max(1);
     let must_sync = env_bool("APPEND_BENCH_SYNC", false);
 
     let manager = AutumnManager::new();
@@ -170,38 +117,48 @@ async fn benchmark_append_stream_throughput() {
 
     let max_extent_size = 512 * 1024 * 1024;
     let payload = Arc::new(vec![b'x'; payload_size]);
+    const BATCH_SIZE: usize = 16;
+    let mut client = StreamClient::connect(&endpoint, "owner/bench/0".to_string(), max_extent_size)
+        .await
+        .expect("stream client");
 
-    let warmup_by_worker = split_ops(warmup_ops, inflight);
-    let bench_by_worker = split_ops(ops, inflight);
-    let start_barrier = Arc::new(Barrier::new(inflight + 1));
-    let mut workers = Vec::with_capacity(inflight);
-
-    for worker_id in 0..inflight {
-        let endpoint = endpoint.clone();
-        let payload = Arc::clone(&payload);
-        let start_barrier = Arc::clone(&start_barrier);
-        let warmup_each = warmup_by_worker[worker_id];
-        let bench_each = bench_by_worker[worker_id];
-        workers.push(tokio::spawn(async move {
-            append_worker(
-                endpoint,
-                stream_id,
-                max_extent_size,
-                payload,
-                warmup_each,
-                bench_each,
-                worker_id,
-                start_barrier,
-                must_sync,
-            )
+    let warmup_reqs = warmup_ops.div_ceil(BATCH_SIZE);
+    for i in 0..warmup_reqs {
+        let n = batch_count(i, warmup_ops, BATCH_SIZE, warmup_reqs);
+        let _ = client
+            .append_batch_repeated(stream_id, payload.as_slice(), n, must_sync)
             .await
-        }));
+            .expect("warmup append");
     }
 
-    start_barrier.wait().await;
+    let bench_reqs = ops.div_ceil(BATCH_SIZE);
+    let mut pending = JoinSet::new();
     let start = Instant::now();
-    for worker in workers {
-        worker.await.expect("worker task");
+    for i in 0..bench_reqs {
+        let n = batch_count(i, ops, BATCH_SIZE, bench_reqs);
+        let mut req_client = client.clone();
+        let payload = Arc::clone(&payload);
+        pending.spawn(async move {
+            req_client
+                .append_batch_repeated(stream_id, payload.as_slice(), n, must_sync)
+                .await
+        });
+        if pending.len() >= depth {
+            let completed = pending
+                .join_next()
+                .await
+                .expect("pending task")
+                .expect("bench task join");
+            completed.expect("bench append");
+        }
+    }
+    while pending.len() > 0 {
+        let completed = pending
+            .join_next()
+            .await
+            .expect("pending task")
+            .expect("bench task join");
+        completed.expect("bench append");
     }
     let elapsed = start.elapsed();
 
@@ -211,8 +168,8 @@ async fn benchmark_append_stream_throughput() {
     let ops_per_sec = (ops as f64) / secs;
 
     println!(
-        "BENCH_RESULT ops={} payload={}B batch=16 inflight={} extent=512MiB sync={} elapsed={:.3}s throughput={:.2}MiB/s ops_per_sec={:.2}",
-        ops, payload_size, inflight, must_sync, secs, mbps, ops_per_sec
+        "BENCH_RESULT ops={} payload={}B batch=16 depth={} extent=512MiB sync={} elapsed={:.3}s throughput={:.2}MiB/s ops_per_sec={:.2}",
+        ops, payload_size, depth, must_sync, secs, mbps, ops_per_sec
     );
 
     assert!(mbps > 0.0);

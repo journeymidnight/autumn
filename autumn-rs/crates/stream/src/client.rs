@@ -26,6 +26,7 @@ pub struct AppendBatchResult {
     pub end: u32,
 }
 
+#[derive(Clone)]
 pub struct StreamClient {
     manager: StreamManagerServiceClient<Channel>,
     owner_key: String,
