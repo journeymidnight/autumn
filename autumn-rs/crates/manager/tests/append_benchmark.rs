@@ -30,16 +30,30 @@ fn env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn batch_count(iter: usize, total_blocks: usize, batch_size: usize, num_reqs: usize) -> usize {
+    if iter + 1 < num_reqs {
+        return batch_size;
+    }
+    let rem = total_blocks % batch_size;
+    if rem == 0 {
+        batch_size
+    } else {
+        rem
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn benchmark_append_stream_throughput() {
     // Tunables:
     // APPEND_BENCH_OPS (default 20000)
     // APPEND_BENCH_PAYLOAD (default 4096 bytes)
     // APPEND_BENCH_WARMUP (default 1000 ops)
+    // APPEND_BENCH_BATCH (default 1 block/rpc)
     // APPEND_BENCH_SYNC (default false)
     let ops = env_usize("APPEND_BENCH_OPS", 20_000);
     let payload_size = env_usize("APPEND_BENCH_PAYLOAD", 4096);
     let warmup_ops = env_usize("APPEND_BENCH_WARMUP", 1000);
+    let batch_size = env_usize("APPEND_BENCH_BATCH", 1).max(1);
     let must_sync = env_bool("APPEND_BENCH_SYNC", false);
 
     let manager = AutumnManager::new();
@@ -105,18 +119,24 @@ async fn benchmark_append_stream_throughput() {
         .expect("stream client");
 
     let payload = vec![b'x'; payload_size];
+    let warmup_reqs = warmup_ops.div_ceil(batch_size);
+    let bench_reqs = ops.div_ceil(batch_size);
 
-    for _ in 0..warmup_ops {
+    for i in 0..warmup_reqs {
+        let n = batch_count(i, warmup_ops, batch_size, warmup_reqs);
+        let blocks = vec![payload.as_slice(); n];
         let _ = client
-            .append(stream_id, &payload, must_sync)
+            .append_batch(stream_id, &blocks, must_sync)
             .await
             .expect("warmup append");
     }
 
     let start = Instant::now();
-    for _ in 0..ops {
+    for i in 0..bench_reqs {
+        let n = batch_count(i, ops, batch_size, bench_reqs);
+        let blocks = vec![payload.as_slice(); n];
         let _ = client
-            .append(stream_id, &payload, must_sync)
+            .append_batch(stream_id, &blocks, must_sync)
             .await
             .expect("bench append");
     }
@@ -128,8 +148,8 @@ async fn benchmark_append_stream_throughput() {
     let ops_per_sec = (ops as f64) / secs;
 
     println!(
-        "BENCH_RESULT ops={} payload={}B sync={} elapsed={:.3}s throughput={:.2}MiB/s ops_per_sec={:.2}",
-        ops, payload_size, must_sync, secs, mbps, ops_per_sec
+        "BENCH_RESULT ops={} payload={}B batch={} sync={} elapsed={:.3}s throughput={:.2}MiB/s ops_per_sec={:.2}",
+        ops, payload_size, batch_size, must_sync, secs, mbps, ops_per_sec
     );
 
     assert!(mbps > 0.0);

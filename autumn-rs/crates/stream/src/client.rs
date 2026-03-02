@@ -19,6 +19,13 @@ pub struct AppendResult {
     pub end: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct AppendBatchResult {
+    pub extent_id: u64,
+    pub offsets: Vec<u32>,
+    pub end: u32,
+}
+
 pub struct StreamClient {
     manager: StreamManagerServiceClient<Channel>,
     owner_key: String,
@@ -213,12 +220,13 @@ impl StreamClient {
         ))
     }
 
-    pub async fn append(
+    async fn append_payload(
         &mut self,
         stream_id: u64,
-        payload: &[u8],
+        payload: Vec<u8>,
+        blocks: Vec<u32>,
         must_sync: bool,
-    ) -> Result<AppendResult> {
+    ) -> Result<AppendBatchResult> {
         let mut retry = 0usize;
         loop {
             let tail = self.stream_tail(stream_id).await?;
@@ -232,11 +240,11 @@ impl StreamClient {
                         commit: 0,
                         revision,
                         must_sync,
-                        blocks: vec![payload.len() as u32],
+                        blocks: blocks.clone(),
                     })),
                 },
                 AppendRequest {
-                    data: Some(append_request::Data::Payload(payload.to_vec())),
+                    data: Some(append_request::Data::Payload(payload.clone())),
                 },
             ];
 
@@ -270,13 +278,57 @@ impl StreamClient {
                 let _ = self.cache_stream_tail(stream_id, new_tail).await?;
             }
 
-            let offset = appended.offsets.first().copied().unwrap_or(0);
-            return Ok(AppendResult {
+            return Ok(AppendBatchResult {
                 extent_id: tail.extent.extent_id,
-                offset,
+                offsets: appended.offsets,
                 end: appended.end,
             });
         }
+    }
+
+    pub async fn append_batch(
+        &mut self,
+        stream_id: u64,
+        blocks: &[&[u8]],
+        must_sync: bool,
+    ) -> Result<AppendBatchResult> {
+        if blocks.is_empty() {
+            return Err(anyhow!("append_batch requires at least one block"));
+        }
+
+        let mut sizes = Vec::with_capacity(blocks.len());
+        let mut total = 0usize;
+        for b in blocks {
+            let len_u32 = u32::try_from(b.len()).map_err(|_| anyhow!("block too large"))?;
+            sizes.push(len_u32);
+            total = total
+                .checked_add(b.len())
+                .ok_or_else(|| anyhow!("append payload too large"))?;
+        }
+
+        let mut payload = Vec::with_capacity(total);
+        for b in blocks {
+            payload.extend_from_slice(b);
+        }
+
+        self.append_payload(stream_id, payload, sizes, must_sync)
+            .await
+    }
+
+    pub async fn append(
+        &mut self,
+        stream_id: u64,
+        payload: &[u8],
+        must_sync: bool,
+    ) -> Result<AppendResult> {
+        let blocks = [payload];
+        let batch = self.append_batch(stream_id, &blocks, must_sync).await?;
+        let offset = batch.offsets.first().copied().unwrap_or(0);
+        Ok(AppendResult {
+            extent_id: batch.extent_id,
+            offset,
+            end: batch.end,
+        })
     }
 
     pub async fn commit_length(&mut self, stream_id: u64) -> Result<u32> {
