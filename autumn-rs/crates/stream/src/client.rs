@@ -6,7 +6,7 @@ use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceCli
 use autumn_proto::autumn::{
     append_request, AcquireOwnerLockRequest, AppendRequest, AppendRequestHeader,
     CheckCommitLengthRequest, Code, ExtentInfo, NodesInfoResponse, PunchHolesRequest,
-    StreamAllocExtentRequest, StreamInfo, TruncateRequest,
+    StreamAllocExtentRequest, StreamInfo, StreamInfoRequest, TruncateRequest,
 };
 use tokio_stream::iter;
 use tonic::transport::Channel;
@@ -25,10 +25,22 @@ pub struct StreamClient {
     revision: i64,
     max_extent_size: u32,
     extent_clients: HashMap<String, ExtentServiceClient<Channel>>,
+    stream_tails: HashMap<u64, StreamTail>,
+    nodes_cache: HashMap<u64, String>,
+}
+
+#[derive(Debug, Clone)]
+struct StreamTail {
+    extent: ExtentInfo,
+    primary_addr: String,
 }
 
 impl StreamClient {
-    pub async fn connect(manager_endpoint: &str, owner_key: String, max_extent_size: u32) -> Result<Self> {
+    pub async fn connect(
+        manager_endpoint: &str,
+        owner_key: String,
+        max_extent_size: u32,
+    ) -> Result<Self> {
         let endpoint = normalize_endpoint(manager_endpoint);
         let mut manager = StreamManagerServiceClient::connect(endpoint).await?;
         let lock = manager
@@ -47,6 +59,8 @@ impl StreamClient {
             revision: lock.revision,
             max_extent_size,
             extent_clients: HashMap::new(),
+            stream_tails: HashMap::new(),
+            nodes_cache: HashMap::new(),
         })
     }
 
@@ -61,7 +75,7 @@ impl StreamClient {
             .ok_or_else(|| anyhow!("missing extent client for {}", addr))
     }
 
-    async fn nodes_map(&mut self) -> Result<HashMap<u64, String>> {
+    async fn refresh_nodes_map(&mut self) -> Result<()> {
         let resp: NodesInfoResponse = self
             .manager
             .nodes_info(Request::new(autumn_proto::autumn::Empty {}))
@@ -70,11 +84,12 @@ impl StreamClient {
         if resp.code != Code::Ok as i32 {
             return Err(anyhow!("nodes_info failed: {}", resp.code_des));
         }
-        Ok(resp
+        self.nodes_cache = resp
             .nodes
             .into_iter()
             .map(|(id, node)| (id, node.address))
-            .collect())
+            .collect();
+        Ok(())
     }
 
     fn primary_addr<'a>(ex: &ExtentInfo, nodes: &'a HashMap<u64, String>) -> Result<&'a str> {
@@ -87,6 +102,70 @@ impl StreamClient {
             .get(&id)
             .map(|s| s.as_str())
             .ok_or_else(|| anyhow!("node {} missing", id))
+    }
+
+    async fn primary_addr_for_extent(&mut self, ex: &ExtentInfo) -> Result<String> {
+        if self.nodes_cache.is_empty() {
+            self.refresh_nodes_map().await?;
+        }
+        if let Ok(addr) = Self::primary_addr(ex, &self.nodes_cache) {
+            return Ok(addr.to_string());
+        }
+
+        self.refresh_nodes_map().await?;
+        Ok(Self::primary_addr(ex, &self.nodes_cache)?.to_string())
+    }
+
+    async fn cache_stream_tail(
+        &mut self,
+        stream_id: u64,
+        extent: ExtentInfo,
+    ) -> Result<StreamTail> {
+        let primary_addr = self.primary_addr_for_extent(&extent).await?;
+        let tail = StreamTail {
+            extent,
+            primary_addr,
+        };
+        self.stream_tails.insert(stream_id, tail.clone());
+        Ok(tail)
+    }
+
+    async fn load_stream_tail(&mut self, stream_id: u64) -> Result<StreamTail> {
+        let resp = self
+            .manager
+            .stream_info(Request::new(StreamInfoRequest {
+                stream_ids: vec![stream_id],
+            }))
+            .await?
+            .into_inner();
+
+        if resp.code != Code::Ok as i32 {
+            return Err(anyhow!("stream_info failed: {}", resp.code_des));
+        }
+
+        let stream = resp
+            .streams
+            .get(&stream_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("stream {} not found", stream_id))?;
+        let tail_id = stream
+            .extent_ids
+            .last()
+            .copied()
+            .ok_or_else(|| anyhow!("stream {} has no extent", stream_id))?;
+        let tail_extent = resp
+            .extents
+            .get(&tail_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("tail extent {} not found", tail_id))?;
+        self.cache_stream_tail(stream_id, tail_extent).await
+    }
+
+    async fn stream_tail(&mut self, stream_id: u64) -> Result<StreamTail> {
+        if let Some(tail) = self.stream_tails.get(&stream_id) {
+            return Ok(tail.clone());
+        }
+        self.load_stream_tail(stream_id).await
     }
 
     async fn check_commit(&mut self, stream_id: u64) -> Result<(StreamInfo, ExtentInfo, u32)> {
@@ -110,7 +189,11 @@ impl StreamClient {
         ))
     }
 
-    async fn alloc_new_extent(&mut self, stream_id: u64, end: u32) -> Result<StreamInfo> {
+    async fn alloc_new_extent(
+        &mut self,
+        stream_id: u64,
+        end: u32,
+    ) -> Result<(StreamInfo, ExtentInfo)> {
         let resp = self
             .manager
             .stream_alloc_extent(Request::new(StreamAllocExtentRequest {
@@ -124,7 +207,10 @@ impl StreamClient {
         if resp.code != Code::Ok as i32 {
             return Err(anyhow!("stream_alloc_extent failed: {}", resp.code_des));
         }
-        resp.stream_info.context("stream_info missing")
+        Ok((
+            resp.stream_info.context("stream_info missing")?,
+            resp.last_ex_info.context("last_ex_info missing")?,
+        ))
     }
 
     pub async fn append(
@@ -133,18 +219,16 @@ impl StreamClient {
         payload: &[u8],
         must_sync: bool,
     ) -> Result<AppendResult> {
+        let mut retry = 0usize;
         loop {
-            let (stream, last_ex, _) = self.check_commit(stream_id).await?;
-            let nodes = self.nodes_map().await?;
-            let addr = Self::primary_addr(&last_ex, &nodes)?.to_string();
+            let tail = self.stream_tail(stream_id).await?;
             let revision = self.revision;
-            let ex_client = self.extent_client(&addr).await?;
 
             let reqs = vec![
                 AppendRequest {
                     data: Some(append_request::Data::Header(AppendRequestHeader {
-                        extent_id: last_ex.extent_id,
-                        eversion: last_ex.eversion,
+                        extent_id: tail.extent.extent_id,
+                        eversion: tail.extent.eversion,
                         commit: 0,
                         revision,
                         must_sync,
@@ -156,13 +240,24 @@ impl StreamClient {
                 },
             ];
 
-            let appended = ex_client
-                .append(Request::new(iter(reqs)))
-                .await?
-                .into_inner();
+            let appended = {
+                let ex_client = self.extent_client(&tail.primary_addr).await?;
+                match ex_client.append(Request::new(iter(reqs))).await {
+                    Ok(v) => v.into_inner(),
+                    Err(e) => {
+                        self.stream_tails.remove(&stream_id);
+                        retry += 1;
+                        if retry <= 3 {
+                            continue;
+                        }
+                        return Err(e.into());
+                    }
+                }
+            };
 
             if appended.code == Code::NotFound as i32 {
-                let _ = self.alloc_new_extent(stream_id, 0).await?;
+                let (_, new_tail) = self.alloc_new_extent(stream_id, 0).await?;
+                let _ = self.cache_stream_tail(stream_id, new_tail).await?;
                 continue;
             }
 
@@ -171,13 +266,13 @@ impl StreamClient {
             }
 
             if appended.end >= self.max_extent_size {
-                let _ = self.alloc_new_extent(stream_id, appended.end).await?;
+                let (_, new_tail) = self.alloc_new_extent(stream_id, appended.end).await?;
+                let _ = self.cache_stream_tail(stream_id, new_tail).await?;
             }
 
-            let _ = stream;
             let offset = appended.offsets.first().copied().unwrap_or(0);
             return Ok(AppendResult {
-                extent_id: last_ex.extent_id,
+                extent_id: tail.extent.extent_id,
                 offset,
                 end: appended.end,
             });
@@ -189,7 +284,11 @@ impl StreamClient {
         Ok(end)
     }
 
-    pub async fn punch_holes(&mut self, stream_id: u64, extent_ids: Vec<u64>) -> Result<StreamInfo> {
+    pub async fn punch_holes(
+        &mut self,
+        stream_id: u64,
+        extent_ids: Vec<u64>,
+    ) -> Result<StreamInfo> {
         let resp = self
             .manager
             .stream_punch_holes(Request::new(PunchHolesRequest {
@@ -220,7 +319,8 @@ impl StreamClient {
         if resp.code != Code::Ok as i32 {
             return Err(anyhow!("truncate failed: {}", resp.code_des));
         }
-        resp.updated_stream_info.context("updated_stream_info missing")
+        resp.updated_stream_info
+            .context("updated_stream_info missing")
     }
 }
 
