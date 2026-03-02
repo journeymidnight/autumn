@@ -5,7 +5,6 @@ use std::thread;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{normalize_path, IoEngine, IoFile};
@@ -55,7 +54,6 @@ enum Command {
 impl BlockingIoEngine {
     pub fn new() -> Result<Self> {
         let (tx, mut rx) = mpsc::channel::<Command>(8192);
-        const WORKER_BATCH_LIMIT: usize = 128;
 
         thread::Builder::new()
             .name("autumn-blocking-io-worker".to_string())
@@ -65,13 +63,6 @@ impl BlockingIoEngine {
 
                 while let Some(cmd) = rx.blocking_recv() {
                     handle_command(cmd, &mut files, &mut next_file_id);
-                    for _ in 1..WORKER_BATCH_LIMIT {
-                        match rx.try_recv() {
-                            Ok(next) => handle_command(next, &mut files, &mut next_file_id),
-                            Err(TryRecvError::Empty) => break,
-                            Err(TryRecvError::Disconnected) => return,
-                        }
-                    }
                 }
             })
             .context("spawn blocking io worker")?;
