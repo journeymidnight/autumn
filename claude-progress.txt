@@ -1,0 +1,34 @@
+Date: 2026-03-16
+TaskStatus: not_completed
+Task scope: 按 feature 流程补齐 autumn-rs 手动测试 README，并固化开发规则。
+
+Current summary:
+- 已读取并核对 claude-progress.txt（开始任务前检查已完成）。
+- 已在 AGENTS.md 增加“feature->开发->测试->更新README->git 完成feature”规则。
+- 已新增 autumn-rs/README.md，提供 build/smoke/etcd/all 手动测试步骤。
+- 已执行 smoke 手测脚本并通过。
+- 已在 feature_list.json 新增并完成 F013。
+
+What is already implemented (high confidence):
+- Proto + gRPC 服务骨架可用（stream/partition/extent）。
+- IO engine: Standard + Blocking 后端可用。
+- Manager 核心流控：register/create/info/check_commit/alloc/punch/truncate/split。
+- ExtentNode 核心 API：append/read/copy/recovery/re_avali/df/heartbeat/commit。
+- StreamClient 写路径与流操作接口。
+- PartitionServer KV API + split + flush + table/WAL replay 恢复。
+- 关键集成测试在本地可通过（非 etcd 依赖路径）。
+
+Main gaps to full Go->Rust migration:
+- 缺少 Go 侧 PartitionKV 的 Batch/StreamPut/Maintenance 对应能力。
+- 缺少 Go range_partition 的完整高级存储行为（compaction/GC/value-log 等）。
+- 未见完整 Rust EC 模块与 Go erasure_code 等价能力。
+- io_uring 后端尚未实现。
+
+Next recommended execution order:
+1) F010：先确认是否允许扩展 Rust proto，补 Go 侧 Batch/StreamPut/Maintenance 等价能力。
+2) F011：按 feature 拆分实现 partition layer compaction/GC/value-log。
+3) F012：设计并实现 EC 编解码与恢复闭环。
+4) 每完成一个 feature：开发->测试->更新 README->提交 commit->更新 feature_list/progress。
+
+Handover note:
+- 本次已完成文档型 feature（F013），业务主链路代码未改。

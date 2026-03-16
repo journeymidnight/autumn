@@ -1,0 +1,178 @@
+{
+  "project": "autumn go->rust migration",
+  "scope": "autumn-rs",
+  "last_updated": "2026-03-16",
+  "rules": {
+    "immutable_fields_after_creation": [
+      "id",
+      "title",
+      "area",
+      "target",
+      "evidence"
+    ],
+    "mutable_fields": [
+      "passes",
+      "notes"
+    ]
+  },
+  "features": [
+    {
+      "id": "F001",
+      "title": "Proto and service contracts compile",
+      "area": "foundation",
+      "target": "Rust protobuf/gRPC contracts for stream/partition/extent services are available and buildable",
+      "passes": true,
+      "evidence": [
+        "autumn-rs/crates/proto/proto/autumn.proto",
+        "autumn-rs/crates/proto/src/lib.rs"
+      ],
+      "notes": "Current contracts do not include Go-side PartitionKV Batch/StreamPut/Maintenance."
+    },
+    {
+      "id": "F002",
+      "title": "IO engine backends",
+      "area": "foundation",
+      "target": "Standard and blocking IO backends work for random read/write/truncate/sync",
+      "passes": true,
+      "evidence": [
+        "autumn-rs/crates/io-engine/src/lib.rs",
+        "autumn-rs/crates/io-engine/src/std_io.rs",
+        "autumn-rs/crates/io-engine/src/blocking_io.rs"
+      ],
+      "notes": "IoUring backend not implemented yet."
+    },
+    {
+      "id": "F003",
+      "title": "Metadata store and owner lock revision model",
+      "area": "manager-core",
+      "target": "In-memory metadata and owner-revision validation support manager APIs",
+      "passes": true,
+      "evidence": [
+        "autumn-rs/crates/common/src/store.rs",
+        "autumn-rs/crates/manager/src/lib.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "F004",
+      "title": "Stream manager core API parity",
+      "area": "manager-core",
+      "target": "register/create/info/check_commit/alloc/punch/truncate/split work end-to-end",
+      "passes": true,
+      "evidence": [
+        "autumn-rs/crates/manager/src/lib.rs",
+        "autumn-rs/crates/manager/tests/integration.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "F005",
+      "title": "Etcd mirror, replay, leader election, recovery loops",
+      "area": "manager-etcd",
+      "target": "Manager can mirror to etcd, replay state, elect leader, dispatch/collect recovery tasks",
+      "passes": true,
+      "evidence": [
+        "autumn-rs/crates/manager/src/lib.rs",
+        "autumn-rs/crates/manager/tests/etcd_stream_integration.rs"
+      ],
+      "notes": "Code path exists; environment-dependent etcd integration tests may fail locally if embedded etcd does not start."
+    },
+    {
+      "id": "F006",
+      "title": "Extent node API implementation",
+      "area": "stream-node",
+      "target": "Append/read/copy/recovery/availability/heartbeat/df/commit APIs are available",
+      "passes": true,
+      "evidence": [
+        "autumn-rs/crates/stream/src/extent_node.rs",
+        "autumn-rs/crates/stream/tests/extent_append_semantics.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "F007",
+      "title": "Stream client write path",
+      "area": "stream-client",
+      "target": "Client append and stream mutation APIs run with owner lock and retry logic",
+      "passes": true,
+      "evidence": [
+        "autumn-rs/crates/stream/src/client.rs",
+        "autumn-rs/crates/manager/tests/integration.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "F008",
+      "title": "Partition server KV API and split",
+      "area": "partition-layer",
+      "target": "Put/Get/Delete/Head/Range/SplitPart work against manager stream metadata",
+      "passes": true,
+      "evidence": [
+        "autumn-rs/crates/partition-server/src/lib.rs",
+        "autumn-rs/crates/manager/tests/integration.rs"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "F009",
+      "title": "Partition flush and restart recovery",
+      "area": "partition-layer",
+      "target": "Memtable flush to table and table+WAL replay after restart",
+      "passes": true,
+      "evidence": [
+        "autumn-rs/crates/partition-server/src/lib.rs",
+        "autumn-rs/crates/manager/tests/integration.rs (partition_server_recovery_replays_table_and_wal)"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "F010",
+      "title": "Partition API parity with Go legacy endpoints",
+      "area": "partition-layer-parity",
+      "target": "Go-side Batch/StreamPut/Maintenance equivalents are available in Rust",
+      "passes": false,
+      "evidence": [
+        "partition_server/api.go (Go reference)",
+        "autumn-rs/crates/proto/proto/autumn.proto"
+      ],
+      "notes": "Rust proto/service currently does not expose these endpoints."
+    },
+    {
+      "id": "F011",
+      "title": "Go range_partition advanced storage behaviors",
+      "area": "partition-layer-parity",
+      "target": "Compaction/GC/value-log/maintenance lifecycle equivalent to Go range_partition",
+      "passes": false,
+      "evidence": [
+        "range_partition/*.go (Go reference)",
+        "autumn-rs/crates/partition-server/src/lib.rs"
+      ],
+      "notes": "Current Rust partition layer is a simplified table+WAL model."
+    },
+    {
+      "id": "F012",
+      "title": "Erasure coding parity with Go implementation",
+      "area": "stream-layer-parity",
+      "target": "EC encode/decode/recovery path equivalent to Go erasure_code package",
+      "passes": false,
+      "evidence": [
+        "erasure_code/*.go (Go reference)",
+        "autumn-rs/crates/stream/src/*",
+        "autumn-rs/crates/manager/src/lib.rs"
+      ],
+      "notes": "No standalone Rust EC module observed yet."
+    },
+    {
+      "id": "F013",
+      "title": "autumn-rs README manual test guide",
+      "area": "developer-experience",
+      "target": "Provide a single README in autumn-rs that explains build and manual validation steps",
+      "passes": true,
+      "evidence": [
+        "autumn-rs/README.md",
+        "autumn-rs/scripts/manual_stream_test.sh"
+      ],
+      "notes": "Validated with ./scripts/manual_stream_test.sh smoke."
+    }
+  ]
+}
