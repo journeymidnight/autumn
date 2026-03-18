@@ -38,6 +38,11 @@ enum Command {
         data: Vec<u8>,
         resp: oneshot::Sender<std::result::Result<(), String>>,
     },
+    Truncate {
+        file_id: u64,
+        len: u64,
+        resp: oneshot::Sender<std::result::Result<(), String>>,
+    },
     SyncAll {
         file_id: u64,
         resp: oneshot::Sender<std::result::Result<(), String>>,
@@ -136,6 +141,13 @@ fn handle_command(cmd: Command, files: &mut HashMap<u64, std::fs::File>, next_fi
                 .get(&file_id)
                 .ok_or_else(|| format!("file_id {file_id} not found"))
                 .and_then(|f| write_at_impl(f, offset, &data).map_err(|e| e.to_string()));
+            let _ = resp.send(result);
+        }
+        Command::Truncate { file_id, len, resp } => {
+            let result = files
+                .get(&file_id)
+                .ok_or_else(|| format!("file_id {file_id} not found"))
+                .and_then(|f| f.set_len(len).map_err(|e| e.to_string()));
             let _ = resp.send(result);
         }
         Command::SyncAll { file_id, resp } => {
@@ -247,6 +259,21 @@ impl IoFile for BlockingIoFile {
             .context("send write request")?;
 
         let out = resp_rx.await.context("write worker dropped")?;
+        out.map_err(|e| anyhow!(e))
+    }
+
+    async fn truncate(&self, len: u64) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Command::Truncate {
+                file_id: self.file_id,
+                len,
+                resp: resp_tx,
+            })
+            .await
+            .context("send truncate request")?;
+
+        let out = resp_rx.await.context("truncate worker dropped")?;
         out.map_err(|e| anyhow!(e))
     }
 

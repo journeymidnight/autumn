@@ -1,7 +1,7 @@
 {
   "project": "autumn go->rust migration",
   "scope": "autumn-rs",
-  "last_updated": "2026-03-16",
+  "last_updated": "2026-03-17",
   "rules": {
     "immutable_fields_after_creation": [
       "id",
@@ -173,6 +173,43 @@
         "autumn-rs/scripts/manual_stream_test.sh"
       ],
       "notes": "Validated with ./scripts/manual_stream_test.sh smoke."
+    },
+    {
+      "id": "F014",
+      "title": "Standalone server binaries with gRPC reflection",
+      "area": "developer-experience",
+      "target": "autumn-manager-server and autumn-extent-node are runnable as independent processes; gRPC reflection enabled so grpcurl works without proto files",
+      "passes": true,
+      "evidence": [
+        "autumn-rs/crates/server/src/bin/manager.rs",
+        "autumn-rs/crates/server/src/bin/extent_node.rs",
+        "autumn-rs/crates/proto/build.rs",
+        "autumn-rs/crates/proto/src/lib.rs"
+      ],
+      "notes": "Validated: grpcurl -plaintext 127.0.0.1:9001 list shows all autumn.v1 services. Service package is autumn.v1, not autumn."
+    },
+    {
+      "id": "F015",
+      "title": "autumn-stream-cli manual test tool",
+      "area": "developer-experience",
+      "target": "Single CLI binary covering the full stream layer manual test cycle: register-node / create-stream / stream-info / append / read",
+      "passes": true,
+      "evidence": [
+        "autumn-rs/crates/server/src/bin/stream_cli.rs"
+      ],
+      "notes": "Validated end-to-end with 3-replica stream: register 3 nodes, create-stream --data-shard 3, append two blocks, read back both blocks with correct content and byte counts."
+    },
+    {
+      "id": "F016",
+      "title": "Manager etcd persistence and restart recovery",
+      "area": "manager-etcd",
+      "target": "autumn-manager-server accepts --etcd endpoints; all metadata survives manager restart; recovery loops activate automatically with etcd",
+      "passes": true,
+      "evidence": [
+        "autumn-rs/crates/server/src/bin/manager.rs",
+        "autumn-rs/crates/manager/src/lib.rs (new_with_etcd, replay_from_etcd)"
+      ],
+      "notes": "Validated: write data → kill manager → restart with --etcd → stream-info returns same extent/replica layout → read returns correct data. Without --etcd falls back to in-memory mode with a WARN log."
     }
   ]
 }

@@ -1,0 +1,472 @@
+syntax = "proto3";
+
+package autumn.v1;
+
+enum Code {
+  CODE_OK = 0;
+  CODE_ERROR = 1;
+  CODE_NOT_LEADER = 2;
+  CODE_NOT_FOUND = 3;
+  CODE_PRECONDITION_FAILED = 4;
+}
+
+message Empty {}
+
+message StatusResponse {
+  Code code = 1;
+  string code_des = 2;
+}
+
+message Range {
+  bytes start_key = 1;
+  bytes end_key = 2;
+}
+
+message DiskInfo {
+  uint64 disk_id = 1;
+  bool online = 2;
+  string uuid = 3;
+}
+
+message NodeInfo {
+  uint64 node_id = 1;
+  string address = 2;
+  repeated uint64 disks = 3;
+}
+
+message ExtentInfo {
+  uint64 extent_id = 1;
+  repeated uint64 replicates = 2;
+  repeated uint64 parity = 3;
+  uint64 eversion = 4;
+  uint64 refs = 5;
+  uint64 sealed_length = 6;
+  uint32 avali = 7;
+  repeated uint64 replicate_disks = 8;
+  repeated uint64 parity_disks = 9;
+}
+
+message StreamInfo {
+  uint64 stream_id = 1;
+  repeated uint64 extent_ids = 2;
+}
+
+message AcquireOwnerLockRequest {
+  string owner_key = 1;
+}
+
+message AcquireOwnerLockResponse {
+  Code code = 1;
+  string code_des = 2;
+  int64 revision = 3;
+}
+
+message RegisterNodeRequest {
+  string addr = 1;
+  repeated string disk_uuids = 2;
+}
+
+message RegisterNodeResponse {
+  Code code = 1;
+  string code_des = 2;
+  uint64 node_id = 3;
+  map<string, uint64> disk_uuids = 4;
+}
+
+message CreateStreamRequest {
+  uint32 data_shard = 1;
+  uint32 parity_shard = 2;
+}
+
+message CreateStreamResponse {
+  Code code = 1;
+  string code_des = 2;
+  StreamInfo stream = 3;
+  ExtentInfo extent = 4;
+}
+
+message StreamInfoRequest {
+  repeated uint64 stream_ids = 1;
+}
+
+message StreamInfoResponse {
+  Code code = 1;
+  string code_des = 2;
+  map<uint64, StreamInfo> streams = 3;
+  map<uint64, ExtentInfo> extents = 4;
+}
+
+message ExtentInfoRequest {
+  uint64 extent_id = 1;
+}
+
+message ExtentInfoResponse {
+  Code code = 1;
+  string code_des = 2;
+  ExtentInfo ex_info = 3;
+}
+
+message NodesInfoResponse {
+  Code code = 1;
+  string code_des = 2;
+  map<uint64, NodeInfo> nodes = 3;
+}
+
+message CheckCommitLengthRequest {
+  uint64 stream_id = 1;
+  string owner_key = 2;
+  int64 revision = 3;
+}
+
+message CheckCommitLengthResponse {
+  Code code = 1;
+  string code_des = 2;
+  StreamInfo stream_info = 3;
+  uint32 end = 4;
+  ExtentInfo last_ex_info = 5;
+}
+
+message StreamAllocExtentRequest {
+  uint64 stream_id = 1;
+  string owner_key = 2;
+  int64 revision = 3;
+  uint32 end = 4;
+}
+
+message StreamAllocExtentResponse {
+  Code code = 1;
+  string code_des = 2;
+  StreamInfo stream_info = 3;
+  ExtentInfo last_ex_info = 4;
+}
+
+message PunchHolesRequest {
+  uint64 stream_id = 1;
+  repeated uint64 extent_ids = 2;
+  string owner_key = 3;
+  int64 revision = 4;
+}
+
+message PunchHolesResponse {
+  Code code = 1;
+  string code_des = 2;
+  StreamInfo stream = 3;
+}
+
+message TruncateRequest {
+  uint64 stream_id = 1;
+  uint64 extent_id = 2;
+  string owner_key = 3;
+  int64 revision = 4;
+}
+
+message TruncateResponse {
+  Code code = 1;
+  string code_des = 2;
+  StreamInfo updated_stream_info = 3;
+}
+
+message MultiModifySplitRequest {
+  uint64 part_id = 1;
+  bytes mid_key = 2;
+  string owner_key = 3;
+  int64 revision = 4;
+  uint32 log_stream_sealed_length = 5;
+  uint32 row_stream_sealed_length = 6;
+  uint32 meta_stream_sealed_length = 7;
+}
+
+message MultiModifySplitResponse {
+  Code code = 1;
+  string code_des = 2;
+}
+
+message PartitionMeta {
+  uint64 log_stream = 1;
+  uint64 row_stream = 2;
+  Range rg = 3;
+  uint64 part_id = 4;
+  uint64 meta_stream = 5;
+}
+
+message RegionInfo {
+  Range rg = 1;
+  uint64 part_id = 2;
+  uint64 ps_id = 3;
+}
+
+message Regions {
+  map<uint64, RegionInfo> regions = 1;
+}
+
+message PsDetail {
+  uint64 ps_id = 1;
+  string address = 2;
+}
+
+message RegisterPsRequest {
+  uint64 ps_id = 1;
+  string address = 2;
+}
+
+message RegisterPsResponse {
+  Code code = 1;
+  string code_des = 2;
+}
+
+message UpsertPartitionRequest {
+  PartitionMeta meta = 1;
+}
+
+message UpsertPartitionResponse {
+  Code code = 1;
+  string code_des = 2;
+}
+
+message GetRegionsResponse {
+  Code code = 1;
+  string code_des = 2;
+  Regions regions = 3;
+}
+
+message PutRequest {
+  bytes key = 1;
+  bytes value = 2;
+  uint64 expires_at = 3;
+  uint64 part_id = 4;
+}
+
+message PutResponse {
+  bytes key = 1;
+}
+
+message GetRequest {
+  bytes key = 1;
+  uint64 part_id = 2;
+}
+
+message GetResponse {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message DeleteRequest {
+  bytes key = 1;
+  uint64 part_id = 2;
+}
+
+message DeleteResponse {
+  bytes key = 1;
+}
+
+message HeadInfo {
+  bytes key = 1;
+  uint32 len = 2;
+}
+
+message HeadRequest {
+  bytes key = 1;
+  uint64 part_id = 2;
+}
+
+message HeadResponse {
+  HeadInfo info = 1;
+}
+
+message RangeRequest {
+  bytes prefix = 1;
+  bytes start = 2;
+  uint32 limit = 3;
+  uint64 part_id = 4;
+}
+
+message RangeResponse {
+  bool truncated = 1;
+  repeated bytes keys = 2;
+}
+
+message SplitPartRequest {
+  uint64 part_id = 1;
+}
+
+message SplitPartResponse {}
+
+message AppendRequestHeader {
+  uint64 extent_id = 1;
+  uint64 eversion = 2;
+  uint32 commit = 3;
+  int64 revision = 4;
+  bool must_sync = 5;
+  repeated uint32 blocks = 6;
+}
+
+message AppendRequest {
+  oneof data {
+    AppendRequestHeader header = 1;
+    bytes payload = 2;
+  }
+}
+
+message AppendResponse {
+  Code code = 1;
+  string code_des = 2;
+  repeated uint32 offsets = 3;
+  uint32 end = 4;
+}
+
+message ReadBlocksRequest {
+  uint64 extent_id = 1;
+  uint32 offset = 2;
+  uint32 num_of_blocks = 3;
+  uint64 eversion = 4;
+  bool only_last_block = 5;
+}
+
+message ReadBlockResponseHeader {
+  Code code = 1;
+  string code_des = 2;
+  repeated uint32 offsets = 3;
+  uint32 end = 4;
+  repeated uint32 block_sizes = 5;
+}
+
+message ReadBlocksResponse {
+  oneof data {
+    ReadBlockResponseHeader header = 1;
+    bytes payload = 2;
+  }
+}
+
+message Payload {
+  bytes data = 1;
+}
+
+message CommitLengthRequest {
+  uint64 extent_id = 1;
+  int64 revision = 2;
+}
+
+message CommitLengthResponse {
+  Code code = 1;
+  string code_des = 2;
+  uint32 length = 3;
+}
+
+message DF {
+  uint64 total = 1;
+  uint64 free = 2;
+  bool online = 3;
+}
+
+message RecoveryTask {
+  uint64 extent_id = 1;
+  uint64 replace_id = 2;
+  uint64 node_id = 3;
+  int64 start_time = 4;
+}
+
+message RecoveryTaskStatus {
+  RecoveryTask task = 1;
+  uint64 ready_disk_id = 2;
+}
+
+message DfRequest {
+  repeated RecoveryTask tasks = 1;
+  repeated uint64 disk_ids = 2;
+}
+
+message DfResponse {
+  repeated RecoveryTaskStatus done_task = 4;
+  map<uint64, DF> disk_status = 5;
+}
+
+message RequireRecoveryRequest {
+  RecoveryTask task = 1;
+}
+
+message RequireRecoveryResponse {
+  Code code = 1;
+  string code_des = 2;
+}
+
+message CopyResponseHeader {
+  Code code = 1;
+  string code_des = 2;
+  uint64 payload_len = 3;
+}
+
+message CopyExtentRequest {
+  uint64 extent_id = 1;
+  uint64 offset = 2;
+  uint64 size = 3;
+  uint64 eversion = 4;
+}
+
+message CopyExtentResponse {
+  oneof data {
+    CopyResponseHeader header = 1;
+    bytes payload = 2;
+  }
+}
+
+message ReAvaliRequest {
+  uint64 extent_id = 1;
+  uint64 eversion = 2;
+}
+
+message ReAvaliResponse {
+  Code code = 1;
+  string code_des = 2;
+}
+
+message AllocExtentRequest {
+  uint64 extent_id = 1;
+}
+
+message AllocExtentResponse {
+  Code code = 1;
+  string code_des = 2;
+  uint64 disk_id = 3;
+}
+
+service StreamManagerService {
+  rpc Status(Empty) returns (StatusResponse);
+  rpc AcquireOwnerLock(AcquireOwnerLockRequest) returns (AcquireOwnerLockResponse);
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+  rpc CreateStream(CreateStreamRequest) returns (CreateStreamResponse);
+  rpc StreamInfo(StreamInfoRequest) returns (StreamInfoResponse);
+  rpc ExtentInfo(ExtentInfoRequest) returns (ExtentInfoResponse);
+  rpc NodesInfo(Empty) returns (NodesInfoResponse);
+  rpc CheckCommitLength(CheckCommitLengthRequest) returns (CheckCommitLengthResponse);
+  rpc StreamAllocExtent(StreamAllocExtentRequest) returns (StreamAllocExtentResponse);
+  rpc StreamPunchHoles(PunchHolesRequest) returns (PunchHolesResponse);
+  rpc Truncate(TruncateRequest) returns (TruncateResponse);
+  rpc MultiModifySplit(MultiModifySplitRequest) returns (MultiModifySplitResponse);
+}
+
+service PartitionManagerService {
+  rpc RegisterPs(RegisterPsRequest) returns (RegisterPsResponse);
+  rpc UpsertPartition(UpsertPartitionRequest) returns (UpsertPartitionResponse);
+  rpc GetRegions(Empty) returns (GetRegionsResponse);
+}
+
+service PartitionKv {
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Head(HeadRequest) returns (HeadResponse);
+  rpc Range(RangeRequest) returns (RangeResponse);
+  rpc SplitPart(SplitPartRequest) returns (SplitPartResponse);
+}
+
+service ExtentService {
+  rpc Append(stream AppendRequest) returns (AppendResponse);
+  rpc ReadBlocks(ReadBlocksRequest) returns (stream ReadBlocksResponse);
+  rpc ReAvali(ReAvaliRequest) returns (ReAvaliResponse);
+  rpc CopyExtent(CopyExtentRequest) returns (stream CopyExtentResponse);
+  rpc Df(DfRequest) returns (DfResponse);
+  rpc RequireRecovery(RequireRecoveryRequest) returns (RequireRecoveryResponse);
+  rpc CommitLength(CommitLengthRequest) returns (CommitLengthResponse);
+  rpc Heartbeat(Payload) returns (stream Payload);
+  rpc AllocExtent(AllocExtentRequest) returns (AllocExtentResponse);
+}

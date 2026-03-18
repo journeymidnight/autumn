@@ -1,13 +1,13 @@
-Date: 2026-03-16
-TaskStatus: not_completed
-Task scope: 按 feature 流程补齐 autumn-rs 手动测试 README，并固化开发规则。
+Date: 2026-03-17
+TaskStatus: completed
+Task scope: 新增 server binaries、autumn-stream-cli、etcd 持久化支持，并补全文档。
 
 Current summary:
-- 已读取并核对 claude-progress.txt（开始任务前检查已完成）。
-- 已在 AGENTS.md 增加“feature->开发->测试->更新README->git 完成feature”规则。
-- 已新增 autumn-rs/README.md，提供 build/smoke/etcd/all 手动测试步骤。
-- 已执行 smoke 手测脚本并通过。
-- 已在 feature_list.json 新增并完成 F013。
+- F014: autumn-manager-server / autumn-extent-node 独立进程 binary，gRPC reflection 已启用（grpcurl 无需 proto 文件）。
+- F015: autumn-stream-cli 覆盖 register-node / create-stream / stream-info / append / read 完整手测流程，三副本 end-to-end 验证通过。
+- F016: autumn-manager-server 支持 --etcd 参数，manager 重启后从 etcd replay 元数据，数据可读，recovery loops 随 etcd 自动启动。
+- README 全面更新：进程启动步骤、CLI 用法、etcd 持久化测试、grpcurl 示例、binary 参数表。
+- feature_list.json 新增 F014/F015/F016，状态均为 passes:true。
 
 What is already implemented (high confidence):
 - Proto + gRPC 服务骨架可用（stream/partition/extent）。
@@ -16,19 +16,22 @@ What is already implemented (high confidence):
 - ExtentNode 核心 API：append/read/copy/recovery/re_avali/df/heartbeat/commit。
 - StreamClient 写路径与流操作接口。
 - PartitionServer KV API + split + flush + table/WAL replay 恢复。
-- 关键集成测试在本地可通过（非 etcd 依赖路径）。
+- 独立进程 binary + CLI 手测工具，etcd 持久化。
 
 Main gaps to full Go->Rust migration:
-- 缺少 Go 侧 PartitionKV 的 Batch/StreamPut/Maintenance 对应能力。
-- 缺少 Go range_partition 的完整高级存储行为（compaction/GC/value-log 等）。
-- 未见完整 Rust EC 模块与 Go erasure_code 等价能力。
+- 缺少 Go 侧 PartitionKV 的 Batch/StreamPut/Maintenance 对应能力（F010）。
+- 缺少 Go range_partition 的高级存储行为（compaction/GC/value-log 等）（F011）。
+- 未见完整 Rust EC 模块与 Go erasure_code 等价能力（F012）。
 - io_uring 后端尚未实现。
+- recovery loop 仅在 --etcd 模式下启动（无 etcd 时循环不跑）。
 
 Next recommended execution order:
-1) F010：先确认是否允许扩展 Rust proto，补 Go 侧 Batch/StreamPut/Maintenance 等价能力。
-2) F011：按 feature 拆分实现 partition layer compaction/GC/value-log。
-3) F012：设计并实现 EC 编解码与恢复闭环。
-4) 每完成一个 feature：开发->测试->更新 README->提交 commit->更新 feature_list/progress。
+1) 修复 recovery loop：无 etcd 时也应启动（去掉 start_runtime_tasks 里的 etcd guard）。
+2) F010：补 Partition Batch/StreamPut/Maintenance API。
+3) F011：按 feature 拆分实现 partition layer compaction/GC/value-log。
+4) F012：设计并实现 EC 编解码与恢复闭环。
 
 Handover note:
-- 本次已完成文档型 feature（F013），业务主链路代码未改。
+- 所有 binary 在 autumn-rs/crates/server/src/bin/ 下。
+- etcd 用 brew install etcd，启动命令见 README。
+- grpcurl 服务名前缀是 autumn.v1，不是 autumn。

@@ -7,7 +7,7 @@ use autumn_manager::AutumnManager;
 use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
 use autumn_proto::autumn::{CreateStreamRequest, RegisterNodeRequest};
 use autumn_stream::{ExtentNode, ExtentNodeConfig, StreamClient};
-use tokio::task::JoinSet;
+use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tonic::Request;
 
@@ -41,6 +41,25 @@ fn batch_count(iter: usize, total_blocks: usize, batch_size: usize, num_reqs: us
         batch_size
     } else {
         rem
+    }
+}
+
+async fn bench_worker(
+    mut client: StreamClient,
+    stream_id: u64,
+    payload: Arc<Vec<u8>>,
+    must_sync: bool,
+    mut req_rx: mpsc::Receiver<usize>,
+    done_tx: mpsc::Sender<anyhow::Result<()>>,
+) {
+    while let Some(n) = req_rx.recv().await {
+        let out = client
+            .append_batch_repeated(stream_id, payload.as_slice(), n, must_sync)
+            .await
+            .map(|_| ());
+        if done_tx.send(out).await.is_err() {
+            return;
+        }
     }
 }
 
@@ -131,34 +150,47 @@ async fn benchmark_append_stream_throughput() {
             .expect("warmup append");
     }
 
+    let (done_tx, mut done_rx) = mpsc::channel::<anyhow::Result<()>>(depth * 2);
+    let mut req_txs = Vec::with_capacity(depth);
+    let mut workers = Vec::with_capacity(depth);
+    for _ in 0..depth {
+        let worker_client = client.clone();
+        let (req_tx, req_rx) = mpsc::channel::<usize>(depth * 2);
+        req_txs.push(req_tx);
+        workers.push(tokio::spawn(bench_worker(
+            worker_client,
+            stream_id,
+            Arc::clone(&payload),
+            must_sync,
+            req_rx,
+            done_tx.clone(),
+        )));
+    }
+    drop(done_tx);
+
     let bench_reqs = ops.div_ceil(BATCH_SIZE);
-    let mut pending = JoinSet::new();
+    let mut inflight = 0usize;
     let start = Instant::now();
     for i in 0..bench_reqs {
         let n = batch_count(i, ops, BATCH_SIZE, bench_reqs);
-        let mut req_client = client.clone();
-        let payload = Arc::clone(&payload);
-        pending.spawn(async move {
-            req_client
-                .append_batch_repeated(stream_id, payload.as_slice(), n, must_sync)
-                .await
-        });
-        if pending.len() >= depth {
-            let completed = pending
-                .join_next()
-                .await
-                .expect("pending task")
-                .expect("bench task join");
+        let tx = &req_txs[i % depth];
+        tx.send(n).await.expect("send bench request");
+        inflight += 1;
+        if inflight >= depth {
+            let completed = done_rx.recv().await.expect("bench completion");
             completed.expect("bench append");
+            inflight -= 1;
         }
     }
-    while pending.len() > 0 {
-        let completed = pending
-            .join_next()
-            .await
-            .expect("pending task")
-            .expect("bench task join");
+    while inflight > 0 {
+        let completed = done_rx.recv().await.expect("bench completion");
         completed.expect("bench append");
+        inflight -= 1;
+    }
+
+    drop(req_txs);
+    for worker in workers {
+        worker.await.expect("worker task");
     }
     let elapsed = start.elapsed();
 

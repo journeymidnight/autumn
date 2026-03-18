@@ -397,7 +397,9 @@ impl PartitionServer {
         let mut bytes = Vec::new();
         for (k, entry) in &part.mem_ops {
             match entry {
-                Some(v) => bytes.extend_from_slice(&Self::encode_record(1, k, &v.value, v.expires_at)),
+                Some(v) => {
+                    bytes.extend_from_slice(&Self::encode_record(1, k, &v.value, v.expires_at))
+                }
                 None => bytes.extend_from_slice(&Self::encode_record(2, k, &[], 0)),
             }
         }

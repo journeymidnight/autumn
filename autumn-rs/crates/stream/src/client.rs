@@ -5,8 +5,8 @@ use autumn_proto::autumn::extent_service_client::ExtentServiceClient;
 use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
 use autumn_proto::autumn::{
     append_request, AcquireOwnerLockRequest, AppendRequest, AppendRequestHeader,
-    CheckCommitLengthRequest, Code, ExtentInfo, NodesInfoResponse, PunchHolesRequest,
-    StreamAllocExtentRequest, StreamInfo, StreamInfoRequest, TruncateRequest,
+    CheckCommitLengthRequest, Code, CommitLengthRequest, ExtentInfo, NodesInfoResponse,
+    PunchHolesRequest, StreamAllocExtentRequest, StreamInfo, StreamInfoRequest, TruncateRequest,
 };
 use tokio_stream::iter;
 use tonic::transport::Channel;
@@ -40,7 +40,7 @@ pub struct StreamClient {
 #[derive(Debug, Clone)]
 struct StreamTail {
     extent: ExtentInfo,
-    primary_addr: String,
+    replica_addrs: Vec<String>,
 }
 
 impl StreamClient {
@@ -100,28 +100,30 @@ impl StreamClient {
         Ok(())
     }
 
-    fn primary_addr<'a>(ex: &ExtentInfo, nodes: &'a HashMap<u64, String>) -> Result<&'a str> {
-        let id = ex
-            .replicates
-            .first()
-            .copied()
-            .ok_or_else(|| anyhow!("extent {} has no replicate", ex.extent_id))?;
-        nodes
-            .get(&id)
-            .map(|s| s.as_str())
-            .ok_or_else(|| anyhow!("node {} missing", id))
+    fn replica_addrs(ex: &ExtentInfo, nodes: &HashMap<u64, String>) -> Result<Vec<String>> {
+        let mut addrs = Vec::with_capacity(ex.replicates.len() + ex.parity.len());
+        for node_id in ex.replicates.iter().chain(ex.parity.iter()) {
+            let addr = nodes
+                .get(node_id)
+                .ok_or_else(|| anyhow!("node {} missing", node_id))?;
+            addrs.push(addr.clone());
+        }
+        if addrs.is_empty() {
+            return Err(anyhow!("extent {} has no replicas", ex.extent_id));
+        }
+        Ok(addrs)
     }
 
-    async fn primary_addr_for_extent(&mut self, ex: &ExtentInfo) -> Result<String> {
+    async fn replica_addrs_for_extent(&mut self, ex: &ExtentInfo) -> Result<Vec<String>> {
         if self.nodes_cache.is_empty() {
             self.refresh_nodes_map().await?;
         }
-        if let Ok(addr) = Self::primary_addr(ex, &self.nodes_cache) {
-            return Ok(addr.to_string());
+        if let Ok(addrs) = Self::replica_addrs(ex, &self.nodes_cache) {
+            return Ok(addrs);
         }
 
         self.refresh_nodes_map().await?;
-        Ok(Self::primary_addr(ex, &self.nodes_cache)?.to_string())
+        Self::replica_addrs(ex, &self.nodes_cache)
     }
 
     async fn cache_stream_tail(
@@ -129,10 +131,10 @@ impl StreamClient {
         stream_id: u64,
         extent: ExtentInfo,
     ) -> Result<StreamTail> {
-        let primary_addr = self.primary_addr_for_extent(&extent).await?;
+        let replica_addrs = self.replica_addrs_for_extent(&extent).await?;
         let tail = StreamTail {
             extent,
-            primary_addr,
+            replica_addrs,
         };
         self.stream_tails.insert(stream_id, tail.clone());
         Ok(tail)
@@ -232,13 +234,14 @@ impl StreamClient {
         loop {
             let tail = self.stream_tail(stream_id).await?;
             let revision = self.revision;
+            let commit = self.current_commit(&tail).await?;
 
             let reqs = vec![
                 AppendRequest {
                     data: Some(append_request::Data::Header(AppendRequestHeader {
                         extent_id: tail.extent.extent_id,
                         eversion: tail.extent.eversion,
-                        commit: 0,
+                        commit,
                         revision,
                         must_sync,
                         blocks: blocks.clone(),
@@ -249,30 +252,59 @@ impl StreamClient {
                 },
             ];
 
-            let appended = {
-                let ex_client = self.extent_client(&tail.primary_addr).await?;
-                match ex_client.append(Request::new(iter(reqs))).await {
+            let mut first_resp: Option<autumn_proto::autumn::AppendResponse> = None;
+            let mut saw_not_found = false;
+            let mut append_error = None;
+
+            for addr in &tail.replica_addrs {
+                let resp = {
+                    let ex_client = self.extent_client(addr).await?;
+                    ex_client.append(Request::new(iter(reqs.clone()))).await
+                };
+                let inner = match resp {
                     Ok(v) => v.into_inner(),
                     Err(e) => {
-                        self.stream_tails.remove(&stream_id);
-                        retry += 1;
-                        if retry <= 3 {
-                            continue;
-                        }
-                        return Err(e.into());
+                        append_error = Some(anyhow!(e));
+                        break;
                     }
+                };
+                if inner.code == Code::NotFound as i32 {
+                    saw_not_found = true;
+                    break;
                 }
-            };
+                if inner.code != Code::Ok as i32 {
+                    append_error = Some(anyhow!("append failed on {addr}: {}", inner.code_des));
+                    break;
+                }
 
-            if appended.code == Code::NotFound as i32 {
+                if let Some(first) = &first_resp {
+                    if inner.offsets != first.offsets || inner.end != first.end {
+                        append_error = Some(anyhow!(
+                            "replica append offset mismatch on extent {}",
+                            tail.extent.extent_id
+                        ));
+                        break;
+                    }
+                } else {
+                    first_resp = Some(inner);
+                }
+            }
+
+            if saw_not_found {
                 let (_, new_tail) = self.alloc_new_extent(stream_id, 0).await?;
                 let _ = self.cache_stream_tail(stream_id, new_tail).await?;
                 continue;
             }
-
-            if appended.code != Code::Ok as i32 {
-                return Err(anyhow!("append failed: {}", appended.code_des));
+            if let Some(err) = append_error {
+                self.stream_tails.remove(&stream_id);
+                retry += 1;
+                if retry <= 3 {
+                    continue;
+                }
+                return Err(err);
             }
+            let appended =
+                first_resp.ok_or_else(|| anyhow!("append failed: no replica response"))?;
 
             if appended.end >= self.max_extent_size {
                 let (_, new_tail) = self.alloc_new_extent(stream_id, appended.end).await?;
@@ -285,6 +317,31 @@ impl StreamClient {
                 end: appended.end,
             });
         }
+    }
+
+    async fn current_commit(&mut self, tail: &StreamTail) -> Result<u32> {
+        let mut min_len: Option<u32> = None;
+        let revision = self.revision;
+        for addr in &tail.replica_addrs {
+            let resp = {
+                let ex_client = self.extent_client(addr).await?;
+                ex_client
+                    .commit_length(Request::new(CommitLengthRequest {
+                        extent_id: tail.extent.extent_id,
+                        revision,
+                    }))
+                    .await
+            };
+            let Ok(resp) = resp else {
+                continue;
+            };
+            let inner = resp.into_inner();
+            if inner.code != Code::Ok as i32 {
+                continue;
+            }
+            min_len = Some(min_len.map_or(inner.length, |cur| cur.min(inner.length)));
+        }
+        min_len.ok_or_else(|| anyhow!("no available replica for commit_length"))
     }
 
     pub async fn append_batch_repeated(
