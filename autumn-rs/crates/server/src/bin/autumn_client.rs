@@ -7,6 +7,7 @@ use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceCli
 use autumn_proto::autumn::{
     CreateStreamRequest, DeleteRequest, Empty, GetRequest, HeadRequest, NodesInfoResponse,
     PutRequest, RangeRequest, RegionInfo, SplitPartRequest, StreamInfoRequest,
+    StreamPutRequest, StreamPutRequestHeader,
     UpsertPartitionRequest,
 };
 use autumn_proto::autumn::{PartitionMeta, Range};
@@ -142,6 +143,10 @@ enum Command {
         key: String,
         file: String,
     },
+    StreamPut {
+        key: String,
+        file: String,
+    },
     Get {
         key: String,
     },
@@ -173,6 +178,7 @@ fn usage() -> ! {
     eprintln!("Commands:");
     eprintln!("  bootstrap [--replication 3+0]     Create initial partition");
     eprintln!("  put <KEY> <FILE>                  Put key with value from file");
+    eprintln!("  streamput <KEY> <FILE>             Stream-put large file in chunks");
     eprintln!("  get <KEY>                         Get value for key");
     eprintln!("  del <KEY>                         Delete key");
     eprintln!("  head <KEY>                        Get key metadata (size)");
@@ -230,6 +236,15 @@ fn parse_args() -> Args {
             let key = raw[i].clone();
             let file = raw[i + 1].clone();
             Command::Put { key, file }
+        }
+        "streamput" => {
+            if i + 1 >= raw.len() {
+                eprintln!("streamput requires <KEY> <FILE>");
+                std::process::exit(1);
+            }
+            let key = raw[i].clone();
+            let file = raw[i + 1].clone();
+            Command::StreamPut { key, file }
         }
         "get" => {
             if i >= raw.len() {
@@ -435,6 +450,53 @@ async fn main() -> Result<()> {
             .await
             .context("put")?;
             println!("ok");
+        }
+
+        Command::StreamPut { key, file } => {
+            let metadata = tokio::fs::metadata(&file)
+                .await
+                .with_context(|| format!("stat file {file}"))?;
+            let file_size = metadata.len() as u32;
+            let (part_id, ps_addr) = client.resolve_key(key.as_bytes()).await?;
+            let ps = client.get_ps_client(&ps_addr).await?;
+
+            // Build the streaming request: header then payload chunks.
+            let key_bytes = key.into_bytes();
+            let file_bytes = tokio::fs::read(&file)
+                .await
+                .with_context(|| format!("read file {}", &file))?;
+
+            const CHUNK_SIZE: usize = 512 * 1024;
+            let header_msg = StreamPutRequest {
+                data: Some(autumn_proto::autumn::stream_put_request::Data::Header(
+                    StreamPutRequestHeader {
+                        key: key_bytes.clone(),
+                        len_of_value: file_size,
+                        expires_at: 0,
+                        part_id,
+                    },
+                )),
+            };
+
+            let mut messages = vec![header_msg];
+            for chunk in file_bytes.chunks(CHUNK_SIZE) {
+                messages.push(StreamPutRequest {
+                    data: Some(autumn_proto::autumn::stream_put_request::Data::Payload(
+                        chunk.to_vec(),
+                    )),
+                });
+            }
+
+            let resp = ps
+                .stream_put(Request::new(tokio_stream::iter(messages)))
+                .await
+                .context("stream put")?
+                .into_inner();
+
+            if resp.key != key_bytes {
+                bail!("stream put error: {}", String::from_utf8_lossy(&resp.key));
+            }
+            println!("ok ({file_size} bytes)");
         }
 
         Command::Get { key } => {

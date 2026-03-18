@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,6 +13,7 @@ use autumn_proto::autumn::{
     AcquireOwnerLockRequest, Code, DeleteRequest, DeleteResponse, Empty, GetRequest, GetResponse,
     HeadInfo, HeadRequest, HeadResponse, MultiModifySplitRequest, PutRequest, PutResponse, Range,
     RangeRequest, RangeResponse, RegisterPsRequest, SplitPartRequest, SplitPartResponse,
+    StreamPutRequest,
 };
 use dashmap::DashMap;
 use tokio::sync::{Mutex, RwLock};
@@ -22,11 +23,66 @@ use tonic::{Request, Response, Status};
 const FLUSH_MEM_BYTES: u64 = 256 * 1024;
 const FLUSH_MEM_OPS: usize = 512;
 
-#[derive(Debug, Clone)]
-struct ValueEntry {
-    value: Vec<u8>,
-    expires_at: u64,
+// ---------------------------------------------------------------------------
+// MVCC internal-key helpers (F026)
+//
+// Internal key = user_key ++ BigEndian(u64::MAX - seq).
+// Higher seq ⇒ smaller suffix ⇒ sorts first among same user-key versions.
+// ---------------------------------------------------------------------------
+
+const TS_SIZE: usize = 8;
+
+fn key_with_ts(user_key: &[u8], ts: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(user_key.len() + TS_SIZE);
+    out.extend_from_slice(user_key);
+    out.extend_from_slice(&(u64::MAX - ts).to_be_bytes());
+    out
 }
+
+fn parse_key(internal_key: &[u8]) -> &[u8] {
+    if internal_key.len() <= TS_SIZE {
+        return internal_key;
+    }
+    &internal_key[..internal_key.len() - TS_SIZE]
+}
+
+fn parse_ts(internal_key: &[u8]) -> u64 {
+    if internal_key.len() <= TS_SIZE {
+        return 0;
+    }
+    let ts_bytes: [u8; 8] = internal_key[internal_key.len() - TS_SIZE..]
+        .try_into()
+        .unwrap();
+    u64::MAX - u64::from_be_bytes(ts_bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Value location – where to read value bytes from disk (F027)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+enum ValueLoc {
+    /// Value is in the WAL file at the given record offset.
+    Wal { record_offset: u64 },
+    /// Value is in SSTable `table_id` at the given record offset.
+    Table { table_id: u64, record_offset: u64 },
+}
+
+/// In-memory index entry – no value bytes stored (F027).
+#[derive(Debug, Clone)]
+struct KeyMeta {
+    expires_at: u64,
+    deleted: bool,
+    /// Length of the internal key inside the on-disk record.
+    internal_key_len: u32,
+    /// Length of the value inside the on-disk record (0 for tombstones).
+    value_len: u32,
+    loc: ValueLoc,
+}
+
+// Record wire format (unchanged):
+//   [op:1][key_len:4 LE][val_len:4 LE][expires_at:8 LE][key bytes][value bytes]
+const RECORD_HEADER_SIZE: u64 = 1 + 4 + 4 + 8; // 17 bytes
 
 #[derive(Debug, Default, Clone)]
 struct PartitionPersistState {
@@ -37,13 +93,20 @@ struct PartitionPersistState {
     wal_len: u64,
     table_ids: Vec<u64>,
 }
+// NOTE: seq_number is NOT persisted in state file.
+// It is reconstructed from data on recovery by taking max(parse_ts(key))
+// across all SSTable and WAL records, matching Go's approach where
+// seqNumber is recovered from max(table.LastSeq) across all tables.
 
 struct PartitionData {
     part_id: u64,
     rg: Range,
-    kv: BTreeMap<Vec<u8>, ValueEntry>,
-    mem_ops: BTreeMap<Vec<u8>, Option<ValueEntry>>,
+    /// Internal-key → metadata index. Keys include the 8-byte MVCC suffix.
+    kv: BTreeMap<Vec<u8>, KeyMeta>,
+    /// Operations since last flush (for SSTable write). Same key format.
+    mem_ops: BTreeMap<Vec<u8>, KeyMeta>,
     mem_bytes: u64,
+    seq_number: u64,
     table_ids: Vec<u64>,
     next_table_id: u64,
     log_end: u64,
@@ -51,6 +114,68 @@ struct PartitionData {
     meta_end: u64,
     log_file: Arc<dyn IoFile>,
     log_len: u64,
+    /// Open SSTable file handles for on-demand value reads.
+    table_files: HashMap<u64, Arc<dyn IoFile>>,
+}
+
+impl PartitionData {
+    /// Read value bytes from disk given a KeyMeta.
+    async fn read_value(&self, meta: &KeyMeta) -> Result<Vec<u8>> {
+        if meta.deleted || meta.value_len == 0 {
+            return Ok(Vec::new());
+        }
+        let (file, record_offset): (Arc<dyn IoFile>, u64) = match meta.loc {
+            ValueLoc::Wal { record_offset } => (self.log_file.clone(), record_offset),
+            ValueLoc::Table {
+                table_id,
+                record_offset,
+            } => {
+                let f = self
+                    .table_files
+                    .get(&table_id)
+                    .ok_or_else(|| anyhow!("table {} file not open", table_id))?;
+                (f.clone(), record_offset)
+            }
+        };
+        let value_offset = record_offset + RECORD_HEADER_SIZE + meta.internal_key_len as u64;
+        file.read_at(value_offset, meta.value_len as usize).await
+    }
+
+    /// Find the latest live version for a user key. Returns `None` if the
+    /// latest version is a tombstone or does not exist.
+    fn latest_meta(&self, user_key: &[u8]) -> Option<(&[u8], &KeyMeta)> {
+        let seek = key_with_ts(user_key, u64::MAX);
+        for (k, meta) in self.kv.range(seek..) {
+            if parse_key(k) != user_key {
+                break;
+            }
+            // First match is the latest version.
+            return Some((k.as_slice(), meta));
+        }
+        None
+    }
+
+    /// Collect unique user keys for range / split. Returns deduplicated
+    /// user keys (latest version only, skipping tombstones/expired).
+    fn unique_user_keys(&self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut last_user_key: Option<&[u8]> = None;
+        for (k, meta) in &self.kv {
+            let uk = parse_key(k);
+            if last_user_key == Some(uk) {
+                continue;
+            }
+            last_user_key = Some(uk);
+            if meta.deleted {
+                continue;
+            }
+            if meta.expires_at > 0 && meta.expires_at <= now_secs() {
+                continue;
+            }
+            out.push(uk.to_vec());
+        }
+        out
+    }
 }
 
 #[derive(Clone)]
@@ -174,6 +299,11 @@ impl PartitionServer {
         Ok(out)
     }
 
+    // -----------------------------------------------------------------------
+    // Record encode / decode – wire format unchanged from before.
+    // The `key` field is now an *internal key* (user_key + 8-byte ts suffix).
+    // -----------------------------------------------------------------------
+
     fn encode_record(op: u8, key: &[u8], value: &[u8], expires_at: u64) -> Vec<u8> {
         let mut buf = Vec::with_capacity(1 + 4 + 4 + 8 + key.len() + value.len());
         buf.push(op);
@@ -185,7 +315,57 @@ impl PartitionServer {
         buf
     }
 
-    fn decode_records(bytes: &[u8]) -> Vec<(u8, Vec<u8>, Vec<u8>, u64)> {
+    /// Decode records and return (op, key, value_len, expires_at, record_offset).
+    /// Value bytes are NOT returned – caller reads from disk on demand.
+    fn decode_record_metas(bytes: &[u8]) -> Vec<(u8, Vec<u8>, u32, u64, u64)> {
+        let mut out = Vec::new();
+        let mut cursor = 0usize;
+        while cursor < bytes.len() {
+            let record_offset = cursor as u64;
+            if bytes.len().saturating_sub(cursor) < 17 {
+                break;
+            }
+            let op = bytes[cursor];
+            cursor += 1;
+            let Some(key_len_bytes) = bytes.get(cursor..cursor + 4) else {
+                break;
+            };
+            let key_len = u32::from_le_bytes(match key_len_bytes.try_into() {
+                Ok(v) => v,
+                Err(_) => break,
+            }) as usize;
+            cursor += 4;
+            let Some(val_len_bytes) = bytes.get(cursor..cursor + 4) else {
+                break;
+            };
+            let val_len = u32::from_le_bytes(match val_len_bytes.try_into() {
+                Ok(v) => v,
+                Err(_) => break,
+            }) as usize;
+            cursor += 4;
+            let Some(expires_bytes) = bytes.get(cursor..cursor + 8) else {
+                break;
+            };
+            let expires_at = u64::from_le_bytes(match expires_bytes.try_into() {
+                Ok(v) => v,
+                Err(_) => break,
+            });
+            cursor += 8;
+            if bytes.len().saturating_sub(cursor) < key_len + val_len {
+                break;
+            }
+            let key = bytes[cursor..cursor + key_len].to_vec();
+            cursor += key_len;
+            // Skip value bytes – we just record the length.
+            cursor += val_len;
+            out.push((op, key, val_len as u32, expires_at, record_offset));
+        }
+        out
+    }
+
+    /// Legacy full-decode used only during flush (we need value bytes to copy
+    /// from WAL into SSTable).
+    fn decode_records_full(bytes: &[u8]) -> Vec<(u8, Vec<u8>, Vec<u8>, u64)> {
         let mut out = Vec::new();
         let mut cursor = 0usize;
         while cursor < bytes.len() {
@@ -230,28 +410,58 @@ impl PartitionServer {
         out
     }
 
-    fn apply_record(
-        kv: &mut BTreeMap<Vec<u8>, ValueEntry>,
+    fn apply_record_meta(
+        kv: &mut BTreeMap<Vec<u8>, KeyMeta>,
         op: u8,
         key: Vec<u8>,
-        value: Vec<u8>,
+        value_len: u32,
         expires_at: u64,
+        loc: ValueLoc,
     ) {
+        let internal_key_len = key.len() as u32;
         match op {
             1 => {
-                kv.insert(key, ValueEntry { value, expires_at });
+                kv.insert(
+                    key,
+                    KeyMeta {
+                        expires_at,
+                        deleted: false,
+                        internal_key_len,
+                        value_len,
+                        loc,
+                    },
+                );
             }
             2 => {
-                kv.remove(&key);
+                kv.insert(
+                    key,
+                    KeyMeta {
+                        expires_at: 0,
+                        deleted: true,
+                        internal_key_len,
+                        value_len: 0,
+                        loc,
+                    },
+                );
             }
             _ => {}
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Persist state – now includes seq_number (F026).
+    // Format line 1: next_table_id log_end row_end meta_end wal_len seq_number
+    // Format line 2: comma-separated table ids
+    // -----------------------------------------------------------------------
+
     fn encode_persist_state(state: &PartitionPersistState) -> String {
         let mut s = format!(
             "{} {} {} {} {}\n",
-            state.next_table_id, state.log_end, state.row_end, state.meta_end, state.wal_len
+            state.next_table_id,
+            state.log_end,
+            state.row_end,
+            state.meta_end,
+            state.wal_len,
         );
         if state.table_ids.is_empty() {
             s.push('\n');
@@ -276,7 +486,7 @@ impl PartitionServer {
             return PartitionPersistState::default();
         }
         let parts = header.split_whitespace().collect::<Vec<_>>();
-        if parts.len() != 4 && parts.len() != 5 {
+        if parts.len() < 4 {
             return PartitionPersistState::default();
         }
         let mut state = PartitionPersistState {
@@ -324,6 +534,10 @@ impl PartitionServer {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Open / recover a partition – loads SSTables + WAL, builds key-only index.
+    // -----------------------------------------------------------------------
+
     async fn open_partition(&self, part_id: u64, rg: Range) -> Result<Arc<RwLock<PartitionData>>> {
         let state = self.load_persist_state(part_id).await?;
         let log_file = self.io.create(&self.part_log_path(part_id)).await?;
@@ -336,8 +550,11 @@ impl PartitionServer {
 
         let mut kv = BTreeMap::new();
         let mut table_bytes_total = 0u64;
-        for table_id in &table_ids {
-            let table_path = self.part_table_path(part_id, *table_id);
+        let mut table_files: HashMap<u64, Arc<dyn IoFile>> = HashMap::new();
+        let mut max_seq_from_data: u64 = 0;
+
+        for &table_id in &table_ids {
+            let table_path = self.part_table_path(part_id, table_id);
             if !tokio::fs::try_exists(&table_path).await.unwrap_or(false) {
                 continue;
             }
@@ -347,16 +564,46 @@ impl PartitionServer {
                 continue;
             }
             let table_bytes = table_file.read_at(0, table_len as usize).await?;
-            for (op, key, value, expires_at) in Self::decode_records(&table_bytes) {
-                Self::apply_record(&mut kv, op, key, value, expires_at);
+            for (op, key, value_len, expires_at, record_offset) in
+                Self::decode_record_metas(&table_bytes)
+            {
+                let ts = parse_ts(&key);
+                if ts > max_seq_from_data {
+                    max_seq_from_data = ts;
+                }
+                Self::apply_record_meta(
+                    &mut kv,
+                    op,
+                    key,
+                    value_len,
+                    expires_at,
+                    ValueLoc::Table {
+                        table_id,
+                        record_offset,
+                    },
+                );
             }
             table_bytes_total = table_bytes_total.saturating_add(table_len);
+            table_files.insert(table_id, table_file);
         }
 
         if wal_len > 0 {
             let wal_bytes = log_file.read_at(0, wal_len as usize).await?;
-            for (op, key, value, expires_at) in Self::decode_records(&wal_bytes) {
-                Self::apply_record(&mut kv, op, key, value, expires_at);
+            for (op, key, value_len, expires_at, record_offset) in
+                Self::decode_record_metas(&wal_bytes)
+            {
+                let ts = parse_ts(&key);
+                if ts > max_seq_from_data {
+                    max_seq_from_data = ts;
+                }
+                Self::apply_record_meta(
+                    &mut kv,
+                    op,
+                    key,
+                    value_len,
+                    expires_at,
+                    ValueLoc::Wal { record_offset },
+                );
             }
         }
 
@@ -368,12 +615,16 @@ impl PartitionServer {
             .join(",")
             .len() as u64;
         let unaccounted_wal = wal_len.saturating_sub(state.wal_len);
+        // seq_number is reconstructed purely from data (like Go's max table.LastSeq).
+        let seq_number = max_seq_from_data;
+
         Ok(Arc::new(RwLock::new(PartitionData {
             part_id,
             rg,
             kv,
             mem_ops: BTreeMap::new(),
             mem_bytes: 0,
+            seq_number,
             table_ids: table_ids.clone(),
             next_table_id: state.next_table_id.max(max_table_id.saturating_add(1)),
             log_end: state.log_end.saturating_add(unaccounted_wal),
@@ -381,24 +632,33 @@ impl PartitionServer {
             meta_end: state.meta_end.max(manifest_len),
             log_file,
             log_len: wal_len,
+            table_files,
         })))
     }
+
+    // -----------------------------------------------------------------------
+    // WAL append
+    // -----------------------------------------------------------------------
 
     async fn append_log(
         part: &mut PartitionData,
         op: u8,
-        key: &[u8],
+        internal_key: &[u8],
         value: &[u8],
         expires_at: u64,
-    ) -> Result<()> {
-        let buf = Self::encode_record(op, key, value, expires_at);
-
+    ) -> Result<u64> {
+        let buf = Self::encode_record(op, internal_key, value, expires_at);
+        let record_offset = part.log_len;
         part.log_file.write_at(part.log_len, &buf).await?;
         part.log_file.sync_all().await?;
         part.log_len += buf.len() as u64;
         part.log_end += buf.len() as u64;
-        Ok(())
+        Ok(record_offset)
     }
+
+    // -----------------------------------------------------------------------
+    // Flush memtable → SSTable
+    // -----------------------------------------------------------------------
 
     async fn flush_memtable_locked(&self, part: &mut PartitionData) -> Result<bool> {
         if part.mem_ops.is_empty() {
@@ -410,20 +670,79 @@ impl PartitionServer {
         let table_path = self.part_table_path(part.part_id, table_id);
         let table_file = self.io.create(&table_path).await?;
 
-        let mut bytes = Vec::new();
-        for (k, entry) in &part.mem_ops {
-            match entry {
-                Some(v) => {
-                    bytes.extend_from_slice(&Self::encode_record(1, k, &v.value, v.expires_at))
-                }
-                None => bytes.extend_from_slice(&Self::encode_record(2, k, &[], 0)),
+        // We need to read value bytes from WAL and write them into the SSTable.
+        // Read WAL bytes once.
+        let wal_bytes = if part.log_len > 0 {
+            part.log_file.read_at(0, part.log_len as usize).await?
+        } else {
+            Vec::new()
+        };
+
+        let mut sst_bytes = Vec::new();
+        let mut new_locs: Vec<(Vec<u8>, u64, u32)> = Vec::new(); // (internal_key, sst_record_offset, value_len)
+
+        for (internal_key, meta) in &part.mem_ops {
+            let sst_record_offset = sst_bytes.len() as u64;
+
+            if meta.deleted {
+                sst_bytes
+                    .extend_from_slice(&Self::encode_record(2, internal_key, &[], 0));
+                new_locs.push((internal_key.clone(), sst_record_offset, 0));
+            } else {
+                // Read value from WAL.
+                let value = match meta.loc {
+                    ValueLoc::Wal { record_offset } => {
+                        let value_offset =
+                            record_offset + RECORD_HEADER_SIZE + meta.internal_key_len as u64;
+                        let end = value_offset + meta.value_len as u64;
+                        if (end as usize) <= wal_bytes.len() {
+                            wal_bytes[value_offset as usize..end as usize].to_vec()
+                        } else {
+                            part.log_file
+                                .read_at(value_offset, meta.value_len as usize)
+                                .await?
+                        }
+                    }
+                    ValueLoc::Table {
+                        table_id: tid,
+                        record_offset,
+                    } => {
+                        let f = part
+                            .table_files
+                            .get(&tid)
+                            .ok_or_else(|| anyhow!("table {} not open", tid))?;
+                        let value_offset =
+                            record_offset + RECORD_HEADER_SIZE + meta.internal_key_len as u64;
+                        f.read_at(value_offset, meta.value_len as usize).await?
+                    }
+                };
+                sst_bytes.extend_from_slice(&Self::encode_record(
+                    1,
+                    internal_key,
+                    &value,
+                    meta.expires_at,
+                ));
+                new_locs.push((internal_key.clone(), sst_record_offset, meta.value_len));
             }
         }
 
-        table_file.write_at(0, &bytes).await?;
+        table_file.write_at(0, &sst_bytes).await?;
         table_file.sync_all().await?;
 
-        part.row_end = part.row_end.saturating_add(bytes.len() as u64);
+        // Update kv index to point to the new SSTable.
+        for (internal_key, sst_record_offset, _value_len) in &new_locs {
+            if let Some(meta) = part.kv.get_mut(internal_key) {
+                meta.loc = ValueLoc::Table {
+                    table_id,
+                    record_offset: *sst_record_offset,
+                };
+            }
+        }
+
+        // Keep table file open for future reads.
+        part.table_files.insert(table_id, table_file);
+
+        part.row_end = part.row_end.saturating_add(sst_bytes.len() as u64);
         part.table_ids.push(table_id);
         let manifest_len = part
             .table_ids
@@ -434,7 +753,6 @@ impl PartitionServer {
             .len();
         part.meta_end = part.meta_end.saturating_add(manifest_len as u64);
 
-        // Save pre-truncate state first so crash in the middle still replays WAL safely.
         self.save_persist_state(part).await?;
 
         part.mem_ops.clear();
@@ -526,6 +844,10 @@ impl PartitionServer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// gRPC PartitionKv implementation
+// ---------------------------------------------------------------------------
+
 #[tonic::async_trait]
 impl PartitionKv for PartitionServer {
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
@@ -540,31 +862,30 @@ impl PartitionKv for PartitionServer {
             return Err(Status::invalid_argument("key is out of range"));
         }
 
-        part.kv.insert(
-            req.key.clone(),
-            ValueEntry {
-                value: req.value,
-                expires_at: req.expires_at,
-            },
-        );
-        let written_value = part
-            .kv
-            .get(&req.key)
-            .map(|v| v.value.clone())
-            .unwrap_or_default();
-        part.mem_ops.insert(
-            req.key.clone(),
-            Some(ValueEntry {
-                value: written_value.clone(),
-                expires_at: req.expires_at,
-            }),
-        );
-        part.mem_bytes = part
-            .mem_bytes
-            .saturating_add((req.key.len() + written_value.len() + 24) as u64);
-        Self::append_log(&mut part, 1, &req.key, &written_value, req.expires_at)
+        // Assign MVCC sequence number.
+        part.seq_number += 1;
+        let seq = part.seq_number;
+        let internal_key = key_with_ts(&req.key, seq);
+
+        // Append to WAL (with value bytes).
+        let record_offset = Self::append_log(&mut part, 1, &internal_key, &req.value, req.expires_at)
             .await
             .map_err(internal_to_status)?;
+
+        let meta = KeyMeta {
+            expires_at: req.expires_at,
+            deleted: false,
+            internal_key_len: internal_key.len() as u32,
+            value_len: req.value.len() as u32,
+            loc: ValueLoc::Wal { record_offset },
+        };
+
+        part.kv.insert(internal_key.clone(), meta.clone());
+        part.mem_ops.insert(internal_key.clone(), meta);
+        part.mem_bytes = part
+            .mem_bytes
+            .saturating_add((req.key.len() + req.value.len() + 32) as u64);
+
         self.maybe_flush_locked(&mut part)
             .await
             .map_err(internal_to_status)?;
@@ -582,16 +903,26 @@ impl PartitionKv for PartitionServer {
         if !Self::in_range(&part.rg, &req.key) {
             return Err(Status::invalid_argument("key is out of range"));
         }
-        let val = part
-            .kv
-            .get(&req.key)
+
+        let (_ikey, meta) = part
+            .latest_meta(&req.key)
             .ok_or_else(|| Status::not_found("key not found"))?;
-        if val.expires_at > 0 && val.expires_at <= now_secs() {
+
+        if meta.deleted {
             return Err(Status::not_found("key not found"));
         }
+        if meta.expires_at > 0 && meta.expires_at <= now_secs() {
+            return Err(Status::not_found("key not found"));
+        }
+
+        let value = part
+            .read_value(meta)
+            .await
+            .map_err(internal_to_status)?;
+
         Ok(Response::new(GetResponse {
             key: req.key,
-            value: val.value.clone(),
+            value,
         }))
     }
 
@@ -608,15 +939,32 @@ impl PartitionKv for PartitionServer {
         if !Self::in_range(&part.rg, &req.key) {
             return Err(Status::invalid_argument("key is out of range"));
         }
-        part.kv.remove(&req.key);
-        part.mem_ops.insert(req.key.clone(), None);
-        part.mem_bytes = part.mem_bytes.saturating_add((req.key.len() + 24) as u64);
-        Self::append_log(&mut part, 2, &req.key, &[], 0)
+
+        // Write tombstone with new seq.
+        part.seq_number += 1;
+        let seq = part.seq_number;
+        let internal_key = key_with_ts(&req.key, seq);
+
+        let record_offset = Self::append_log(&mut part, 2, &internal_key, &[], 0)
             .await
             .map_err(internal_to_status)?;
+
+        let meta = KeyMeta {
+            expires_at: 0,
+            deleted: true,
+            internal_key_len: internal_key.len() as u32,
+            value_len: 0,
+            loc: ValueLoc::Wal { record_offset },
+        };
+
+        part.kv.insert(internal_key.clone(), meta.clone());
+        part.mem_ops.insert(internal_key.clone(), meta);
+        part.mem_bytes = part.mem_bytes.saturating_add((req.key.len() + 32) as u64);
+
         self.maybe_flush_locked(&mut part)
             .await
             .map_err(internal_to_status)?;
+
         Ok(Response::new(DeleteResponse { key: req.key }))
     }
 
@@ -630,17 +978,22 @@ impl PartitionKv for PartitionServer {
         if !Self::in_range(&part.rg, &req.key) {
             return Err(Status::invalid_argument("key is out of range"));
         }
-        let val = part
-            .kv
-            .get(&req.key)
+
+        let (_ikey, meta) = part
+            .latest_meta(&req.key)
             .ok_or_else(|| Status::not_found("key not found"))?;
-        if val.expires_at > 0 && val.expires_at <= now_secs() {
+
+        if meta.deleted {
             return Err(Status::not_found("key not found"));
         }
+        if meta.expires_at > 0 && meta.expires_at <= now_secs() {
+            return Err(Status::not_found("key not found"));
+        }
+
         Ok(Response::new(HeadResponse {
             info: Some(HeadInfo {
                 key: req.key,
-                len: val.value.len() as u32,
+                len: meta.value_len,
             }),
         }))
     }
@@ -663,21 +1016,39 @@ impl PartitionKv for PartitionServer {
             }));
         }
 
-        let mut out = Vec::new();
-        let start = if req.start.is_empty() {
+        let start_user_key = if req.start.is_empty() {
             req.prefix.clone()
         } else {
             req.start.clone()
         };
 
-        for (k, v) in part.kv.range(start..) {
-            if !req.prefix.is_empty() && !k.starts_with(&req.prefix) {
+        let seek = key_with_ts(&start_user_key, u64::MAX);
+
+        let mut out = Vec::new();
+        let mut last_user_key: Option<Vec<u8>> = None;
+        let now = now_secs();
+
+        for (k, meta) in part.kv.range(seek..) {
+            let uk = parse_key(k);
+
+            if !req.prefix.is_empty() && !uk.starts_with(&req.prefix) {
                 break;
             }
-            if v.expires_at > 0 && v.expires_at <= now_secs() {
+
+            // Deduplicate: skip older versions of the same user key.
+            if last_user_key.as_deref() == Some(uk) {
                 continue;
             }
-            out.push(k.clone());
+            last_user_key = Some(uk.to_vec());
+
+            if meta.deleted {
+                continue;
+            }
+            if meta.expires_at > 0 && meta.expires_at <= now {
+                continue;
+            }
+
+            out.push(uk.to_vec());
             if out.len() >= req.limit as usize {
                 break;
             }
@@ -701,19 +1072,24 @@ impl PartitionKv for PartitionServer {
             .map_err(|err| part_lookup_to_status(req.part_id, err))?;
 
         let mut part = p.write().await;
-        if part.kv.len() < 2 {
+
+        // Collect unique live user keys.
+        let user_keys = part.unique_user_keys();
+        if user_keys.len() < 2 {
+            drop(part);
             self.partitions.insert(req.part_id, p.clone());
             return Err(Status::failed_precondition(
                 "part has less than 2 keys, cannot split",
             ));
         }
+
         if let Err(err) = self.flush_memtable_locked(&mut part).await {
             drop(part);
             self.partitions.insert(req.part_id, p.clone());
             return Err(internal_to_status(err));
         }
-        let keys: Vec<Vec<u8>> = part.kv.keys().cloned().collect();
-        let mid = keys[keys.len() / 2].clone();
+
+        let mid = user_keys[user_keys.len() / 2].clone();
         let log_end = part.log_end.min(u32::MAX as u64) as u32;
         let row_end = part.row_end.min(u32::MAX as u64) as u32;
         let meta_end = part.meta_end.min(u32::MAX as u64) as u32;
@@ -784,6 +1160,60 @@ impl PartitionKv for PartitionServer {
         self.sync_regions_once().await.map_err(internal_to_status)?;
         Ok(Response::new(SplitPartResponse {}))
     }
+
+    async fn stream_put(
+        &self,
+        request: Request<tonic::Streaming<StreamPutRequest>>,
+    ) -> Result<Response<PutResponse>, Status> {
+        use autumn_proto::autumn::stream_put_request::Data;
+
+        let mut stream = request.into_inner();
+
+        // First message must be the header.
+        let first = stream
+            .message()
+            .await
+            .map_err(internal_to_status)?
+            .ok_or_else(|| Status::invalid_argument("empty stream"))?;
+
+        let header = match first.data {
+            Some(Data::Header(h)) => h,
+            _ => return Err(Status::invalid_argument("first message must be header")),
+        };
+
+        let expected_len = header.len_of_value as usize;
+
+        // Receive payload chunks.
+        let mut value = Vec::with_capacity(expected_len);
+        while let Some(msg) = stream.message().await.map_err(internal_to_status)? {
+            match msg.data {
+                Some(Data::Payload(chunk)) => {
+                    value.extend_from_slice(&chunk);
+                    if value.len() > expected_len {
+                        return Err(Status::invalid_argument("payload exceeds declared length"));
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        if value.len() != expected_len {
+            return Err(Status::invalid_argument(format!(
+                "payload {} bytes, header declared {}",
+                value.len(),
+                expected_len
+            )));
+        }
+
+        // Delegate to the normal put path.
+        let put_req = PutRequest {
+            key: header.key.clone(),
+            value,
+            expires_at: header.expires_at,
+            part_id: header.part_id,
+        };
+        self.put(Request::new(put_req)).await
+    }
 }
 
 fn normalize_endpoint(endpoint: &str) -> Result<String> {
@@ -828,5 +1258,40 @@ mod tests {
             normalize_endpoint("http://127.0.0.1:9000").unwrap(),
             "http://127.0.0.1:9000"
         );
+    }
+
+    #[test]
+    fn mvcc_key_encoding() {
+        let uk = b"hello";
+        let k1 = key_with_ts(uk, 1);
+        let k2 = key_with_ts(uk, 2);
+        let k3 = key_with_ts(uk, 100);
+
+        // Higher seq ⇒ smaller suffix ⇒ sorts first.
+        assert!(k3 < k2);
+        assert!(k2 < k1);
+
+        assert_eq!(parse_key(&k1), uk.as_slice());
+        assert_eq!(parse_key(&k2), uk.as_slice());
+        assert_eq!(parse_ts(&k1), 1);
+        assert_eq!(parse_ts(&k2), 2);
+        assert_eq!(parse_ts(&k3), 100);
+    }
+
+    #[test]
+    fn persist_state_roundtrip() {
+        let state = PartitionPersistState {
+            next_table_id: 5,
+            log_end: 100,
+            row_end: 200,
+            meta_end: 50,
+            wal_len: 80,
+            table_ids: vec![1, 2, 3],
+        };
+        let encoded = PartitionServer::encode_persist_state(&state);
+        let decoded = PartitionServer::decode_persist_state(&encoded);
+        assert_eq!(decoded.next_table_id, 5);
+        assert_eq!(decoded.wal_len, 80);
+        assert_eq!(decoded.table_ids, vec![1, 2, 3]);
     }
 }

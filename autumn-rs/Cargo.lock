@@ -136,6 +136,7 @@ dependencies = [
  "autumn-proto",
  "autumn-stream",
  "tokio",
+ "tokio-stream",
  "tonic 0.11.0",
  "tonic-reflection",
  "tracing",

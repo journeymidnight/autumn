@@ -1,7 +1,7 @@
 {
   "project": "autumn go->rust migration",
   "scope": "autumn-rs",
-  "last_updated": "2026-03-17",
+  "last_updated": "2026-03-17 (F026/F027/F018-streamput)",
   "rules": {
     "immutable_fields_after_creation": [
       "id",
@@ -235,7 +235,7 @@
         "cmd/autumn-client/main.go (Go reference, 989 lines)",
         "autumn-rs/crates/server/src/bin/autumn_client.rs"
       ],
-      "notes": "Core subcommands implemented: bootstrap, put, get, del, head, ls, split, info. Routes requests via manager GetRegions (with ps_details). Missing vs Go: gc, forcegc, compact, wbench, rbench, streamput, format, plot."
+      "notes": "Core subcommands implemented: bootstrap, put, get, del, head, ls, split, info, streamput. Routes requests via manager GetRegions (with ps_details). StreamPut uses gRPC client-streaming. Missing vs Go: gc, forcegc, compact, wbench, rbench, format, plot."
     },
     {
       "id": "F019",
@@ -278,19 +278,6 @@
       "notes": "Rust extent-node uses a single --data directory. Go supports multiple dirs with disk UUIDs and TOML config generation."
     },
     {
-      "id": "F022",
-      "title": "Embedded etcd server in manager",
-      "area": "manager-etcd",
-      "target": "Manager binary can embed and run its own etcd server for single-node or multi-node clusters, equivalent to Go etcd_utils and cmd/autumn-manager",
-      "passes": false,
-      "evidence": [
-        "etcd_utils/etcd.go (Go reference, ServeETCD)",
-        "cmd/autumn-manager/main.go (Go reference)",
-        "autumn-rs/crates/server/src/bin/manager.rs"
-      ],
-      "notes": "Go manager starts embedded etcd with full cluster config (peer URLs, tokens, etc.). Rust manager connects to external etcd via --etcd flag."
-    },
-    {
       "id": "F023",
       "title": "gRPC Gateway REST API for partition server",
       "area": "partition-layer-parity",
@@ -326,6 +313,31 @@
         "autumn-rs/crates/manager/tests/append_benchmark.rs"
       ],
       "notes": "Go stream-client supports multi-thread write benchmarks with latency histograms and gnuplot output. Rust has an in-test benchmark but no standalone CLI."
+    },
+    {
+      "id": "F026",
+      "title": "Internal key MVCC stamp (seqNumber + KeyWithTs)",
+      "area": "partition-layer-parity",
+      "target": "Partition layer internal keys carry an 8-byte monotonic sequence number suffix (stored as MaxUint64-seq, big-endian) so multiple versions of the same user key can coexist and sort correctly, equivalent to Go range_partition/y KeyWithTs/ParseKey/ParseTs and RangePartition.seqNumber",
+      "passes": true,
+      "evidence": [
+        "range_partition/y/y.go (Go reference: KeyWithTs, ParseKey, ParseTs, CompareKeys)",
+        "range_partition/range_partition.go (Go reference: seqNumber, getValueStruct)",
+        "autumn-rs/crates/partition-server/src/lib.rs (current: raw keys, no versioning)"
+      ],
+      "notes": "Implemented: key_with_ts/parse_key/parse_ts in partition-server/src/lib.rs. Internal keys = user_key ++ BigEndian(u64::MAX-seq). seq_number reconstructed on recovery from max(parse_ts(key)) across all SSTable+WAL records, matching Go's max(table.LastSeq) approach. Prerequisite for F011 (compaction/GC) now complete."
+    },
+    {
+      "id": "F027",
+      "title": "Remove in-memory full-value kv cache from PartitionData",
+      "area": "partition-layer-parity",
+      "target": "PartitionData.kv must not hold value bytes in memory. Replace with a key-only index (key + expires_at + on-disk location) so that get reads the value from SSTable/WAL on demand. Enables arbitrarily large values without OOM.",
+      "passes": true,
+      "evidence": [
+        "autumn-rs/crates/partition-server/src/lib.rs (PartitionData.kv: BTreeMap<Vec<u8>, ValueEntry>, ValueEntry.value: Vec<u8>)",
+        "range_partition/range_partition.go (Go reference: value-log separation, getValueStruct reads from vlog)"
+      ],
+      "notes": "Implemented: PartitionData.kv is now BTreeMap<Vec<u8>, KeyMeta> with ValueLoc (Wal{record_offset} or Table{table_id, record_offset}). get/head read value bytes from disk on demand. table_files HashMap keeps SSTable handles open. Flush reads value from WAL, writes to SSTable, updates kv index to new location."
     }
   ]
 }

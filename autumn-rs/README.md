@@ -232,13 +232,22 @@ $AC head mykey
 $AC ls --prefix ""
 # Expected: "mykey" in output
 
+# Stream-put a large file (uses gRPC client-streaming)
+dd if=/dev/urandom of=/tmp/big-val.bin bs=1024 count=100 2>/dev/null
+$AC streamput bigkey /tmp/big-val.bin
+# Expected: "ok (102400 bytes)"
+
+# Verify stream-put via get
+$AC head bigkey
+# Expected: "key: bigkey, length: 102400"
+
 # Delete the key
 $AC del mykey
 # Expected: "ok"
 
 # Verify deletion
 $AC get mykey
-# Expected: empty output (key not found)
+# Expected: "key not found" (exit code 2)
 ```
 
 ## Binary reference
@@ -253,7 +262,7 @@ $AC get mykey
 
 `autumn-stream-cli` subcommands: `register-node`, `create-stream`, `stream-info`, `append`, `read`
 
-`autumn-client` subcommands: `bootstrap`, `put`, `get`, `del`, `head`, `ls`, `split`, `info`
+`autumn-client` subcommands: `bootstrap`, `put`, `streamput`, `get`, `del`, `head`, `ls`, `split`, `info`
 
 ## Notes
 

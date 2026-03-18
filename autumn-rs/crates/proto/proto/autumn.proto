@@ -292,6 +292,20 @@ message SplitPartRequest {
 
 message SplitPartResponse {}
 
+message StreamPutRequestHeader {
+  bytes key = 1;
+  uint32 len_of_value = 2;
+  uint64 expires_at = 3;
+  uint64 part_id = 4;
+}
+
+message StreamPutRequest {
+  oneof data {
+    StreamPutRequestHeader header = 1;
+    bytes payload = 2;
+  }
+}
+
 message AppendRequestHeader {
   uint64 extent_id = 1;
   uint64 eversion = 2;
@@ -458,6 +472,7 @@ service PartitionKv {
   rpc Head(HeadRequest) returns (HeadResponse);
   rpc Range(RangeRequest) returns (RangeResponse);
   rpc SplitPart(SplitPartRequest) returns (SplitPartResponse);
+  rpc StreamPut(stream StreamPutRequest) returns (PutResponse);
 }
 
 service ExtentService {
