@@ -210,6 +210,122 @@
         "autumn-rs/crates/manager/src/lib.rs (new_with_etcd, replay_from_etcd)"
       ],
       "notes": "Validated: write data → kill manager → restart with --etcd → stream-info returns same extent/replica layout → read returns correct data. Without --etcd falls back to in-memory mode with a WARN log."
+    },
+    {
+      "id": "F017",
+      "title": "autumn-ps partition server binary",
+      "area": "partition-layer-parity",
+      "target": "Standalone partition-server process with gRPC service, etcd-based partition watching/locking, cron-scheduled maintenance (GC/compaction), equivalent to Go cmd/autumn-ps",
+      "passes": true,
+      "evidence": [
+        "cmd/autumn-ps/main.go (Go reference)",
+        "partition_server/ps.go (Go reference)",
+        "autumn-rs/crates/partition-server/src/lib.rs",
+        "autumn-rs/crates/server/src/bin/partition_server.rs"
+      ],
+      "notes": "Binary created with --psid/--port/--manager/--data/--advertise flags. Registers with manager, syncs regions, serves PartitionKv gRPC. Missing vs Go: etcd session/lock, cron GC/compact, REST gateway."
+    },
+    {
+      "id": "F018",
+      "title": "autumn-client admin CLI",
+      "area": "developer-experience",
+      "target": "Admin CLI with subcommands: bootstrap, put, get, del, head, ls (range), split, gc, forcegc, compact, info, wbench, rbench, format, equivalent to Go cmd/autumn-client",
+      "passes": true,
+      "evidence": [
+        "cmd/autumn-client/main.go (Go reference, 989 lines)",
+        "autumn-rs/crates/server/src/bin/autumn_client.rs"
+      ],
+      "notes": "Core subcommands implemented: bootstrap, put, get, del, head, ls, split, info. Routes requests via manager GetRegions (with ps_details). Missing vs Go: gc, forcegc, compact, wbench, rbench, streamput, format, plot."
+    },
+    {
+      "id": "F019",
+      "title": "Partition Manager complete implementation",
+      "area": "partition-layer-parity",
+      "target": "Partition allocation policy, PS node registration with load tracking, region assignment/rebalancing, etcd region watch, equivalent to Go manager/partition_manager",
+      "passes": false,
+      "evidence": [
+        "manager/partition_manager/pm.go (Go reference)",
+        "manager/partition_manager/policy.go (Go reference)",
+        "autumn-rs/crates/manager/src/lib.rs"
+      ],
+      "notes": "Rust has basic PartitionManagerService RPCs (RegisterPs, UpsertPartition, GetRegions) but lacks allocation policy, region watch dispatch, and PS load balancing."
+    },
+    {
+      "id": "F020",
+      "title": "gRPC connection pool with health check",
+      "area": "foundation",
+      "target": "Per-address gRPC connection pool with keep-alive heartbeat and lazy creation, equivalent to Go conn/pool.go",
+      "passes": false,
+      "evidence": [
+        "conn/pool.go (Go reference)",
+        "autumn-rs/crates/manager/src/lib.rs",
+        "autumn-rs/crates/stream/src/client.rs"
+      ],
+      "notes": "Rust creates ad-hoc gRPC clients per call. Go has a shared pool with heartbeat-based health checking."
+    },
+    {
+      "id": "F021",
+      "title": "Multi-disk support and disk format",
+      "area": "stream-layer-parity",
+      "target": "Extent node supports multiple disks with UUID identification, disk formatting command, per-disk extent placement, equivalent to Go node/diskfs.go and autumn-client format",
+      "passes": false,
+      "evidence": [
+        "node/diskfs.go (Go reference)",
+        "node/node.go (Go reference, diskFSs map)",
+        "cmd/autumn-client/main.go (Go format subcommand)",
+        "autumn-rs/crates/stream/src/extent_node.rs"
+      ],
+      "notes": "Rust extent-node uses a single --data directory. Go supports multiple dirs with disk UUIDs and TOML config generation."
+    },
+    {
+      "id": "F022",
+      "title": "Embedded etcd server in manager",
+      "area": "manager-etcd",
+      "target": "Manager binary can embed and run its own etcd server for single-node or multi-node clusters, equivalent to Go etcd_utils and cmd/autumn-manager",
+      "passes": false,
+      "evidence": [
+        "etcd_utils/etcd.go (Go reference, ServeETCD)",
+        "cmd/autumn-manager/main.go (Go reference)",
+        "autumn-rs/crates/server/src/bin/manager.rs"
+      ],
+      "notes": "Go manager starts embedded etcd with full cluster config (peer URLs, tokens, etc.). Rust manager connects to external etcd via --etcd flag."
+    },
+    {
+      "id": "F023",
+      "title": "gRPC Gateway REST API for partition server",
+      "area": "partition-layer-parity",
+      "target": "REST HTTP endpoints for Get/Head/Range via gRPC-gateway on partition server, equivalent to Go autumn-ps --gateway-listen",
+      "passes": false,
+      "evidence": [
+        "cmd/autumn-ps/main.go (Go reference, gatewayListenURL)",
+        "proto/pspb.proto (Go reference, google.api.http annotations)"
+      ],
+      "notes": "Go pspb.proto has HTTP annotations for Get/Head/Range. Rust proto has no REST gateway support."
+    },
+    {
+      "id": "F024",
+      "title": "Observability: distributed tracing and structured logging",
+      "area": "developer-experience",
+      "target": "Jaeger/OpenTelemetry tracing with configurable sampling, structured logging with level control, equivalent to Go xlog and trace-sampler flags",
+      "passes": false,
+      "evidence": [
+        "xlog/xlog.go (Go reference)",
+        "cmd/autumn-ps/main.go (Go reference, trace-sampler flag)",
+        "cmd/extent-node/main.go (Go reference, TraceSampler config)"
+      ],
+      "notes": "Go has Jaeger tracing integration with per-service sampling rates. Rust uses basic tracing_subscriber with no distributed tracing export."
+    },
+    {
+      "id": "F025",
+      "title": "Stream benchmark CLI tool",
+      "area": "developer-experience",
+      "target": "CLI binary with alloc/wbench/plot subcommands for stream layer performance testing, equivalent to Go cmd/stream-client",
+      "passes": false,
+      "evidence": [
+        "cmd/stream-client/main.go (Go reference, 396 lines)",
+        "autumn-rs/crates/manager/tests/append_benchmark.rs"
+      ],
+      "notes": "Go stream-client supports multi-thread write benchmarks with latency histograms and gnuplot output. Rust has an in-test benchmark but no standalone CLI."
     }
   ]
 }

@@ -227,6 +227,7 @@ message GetRegionsResponse {
   Code code = 1;
   string code_des = 2;
   Regions regions = 3;
+  map<uint64, PsDetail> ps_details = 4;
 }
 
 message PutRequest {

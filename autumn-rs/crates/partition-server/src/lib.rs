@@ -56,6 +56,7 @@ struct PartitionData {
 #[derive(Clone)]
 pub struct PartitionServer {
     ps_id: u64,
+    advertise_addr: Option<String>,
     data_dir: Arc<PathBuf>,
     io: Arc<dyn IoEngine>,
     partitions: Arc<DashMap<u64, Arc<RwLock<PartitionData>>>>,
@@ -69,6 +70,16 @@ impl PartitionServer {
         manager_endpoint: &str,
         data_dir: impl AsRef<Path>,
         io_mode: IoMode,
+    ) -> Result<Self> {
+        Self::connect_with_advertise(ps_id, manager_endpoint, data_dir, io_mode, None).await
+    }
+
+    pub async fn connect_with_advertise(
+        ps_id: u64,
+        manager_endpoint: &str,
+        data_dir: impl AsRef<Path>,
+        io_mode: IoMode,
+        advertise_addr: Option<String>,
     ) -> Result<Self> {
         let endpoint = normalize_endpoint(manager_endpoint)?;
         let channel = Endpoint::from_shared(endpoint.clone())
@@ -86,6 +97,7 @@ impl PartitionServer {
 
         let server = Self {
             ps_id,
+            advertise_addr,
             data_dir: Arc::new(data_dir),
             io,
             partitions: Arc::new(DashMap::new()),
@@ -99,11 +111,15 @@ impl PartitionServer {
     }
 
     async fn register_ps(&self) -> Result<()> {
+        let address = self
+            .advertise_addr
+            .clone()
+            .unwrap_or_else(|| format!("ps-{}", self.ps_id));
         let mut client = self.pm_client.lock().await;
         let _ = client
             .register_ps(Request::new(RegisterPsRequest {
                 ps_id: self.ps_id,
-                address: format!("ps-{}", self.ps_id),
+                address,
             }))
             .await
             .context("register ps")?;

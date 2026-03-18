@@ -162,6 +162,85 @@ Smoke test via script:
 ./scripts/manual_stream_test.sh smoke
 ```
 
+## Manual test: F017 autumn-ps (partition server binary)
+
+Start the full stack (manager + 3 extent nodes + partition server), then verify with `autumn-client`.
+
+```bash
+# Clean up previous runs
+pkill -f autumn-manager-server; pkill -f autumn-extent-node; pkill -f autumn-ps
+
+# Start etcd
+etcd --data-dir /tmp/autumn-etcd \
+     --listen-client-urls http://127.0.0.1:2379 \
+     --advertise-client-urls http://127.0.0.1:2379 &
+sleep 0.5
+
+# Start manager
+./target/debug/autumn-manager-server --port 9001 --etcd 127.0.0.1:2379 &
+sleep 0.5
+
+# Start 3 extent nodes
+./target/debug/autumn-extent-node --port 9101 --disk-id 1 --data /tmp/d1 &
+./target/debug/autumn-extent-node --port 9102 --disk-id 2 --data /tmp/d2 &
+./target/debug/autumn-extent-node --port 9103 --disk-id 3 --data /tmp/d3 &
+sleep 0.5
+
+# Register extent nodes with stream manager
+CLI=./target/debug/autumn-stream-cli
+$CLI register-node --addr 127.0.0.1:9101 --disk disk-1
+$CLI register-node --addr 127.0.0.1:9102 --disk disk-2
+$CLI register-node --addr 127.0.0.1:9103 --disk disk-3
+
+# Start partition server (psid must be non-zero)
+./target/debug/autumn-ps --psid 1 --port 9201 --manager 127.0.0.1:9001 \
+  --data /tmp/autumn-ps --advertise 127.0.0.1:9201 &
+sleep 1
+```
+
+Expected: autumn-ps logs `autumn-ps ready, serving on 0.0.0.0:9201`.
+
+## Manual test: F018 autumn-client (admin CLI)
+
+Continue from the autumn-ps setup above:
+
+```bash
+AC=./target/debug/autumn-client
+
+# Bootstrap: create log/row/meta streams and initial partition
+$AC bootstrap --replication 3+0
+# Expected: "bootstrap succeeded: partition <ID> (log=<N>, row=<N>, meta=<N>)"
+
+# Show cluster info
+$AC info
+# Expected: shows Nodes, Streams, Partitions sections
+
+# Put a value
+echo "hello autumn" > /tmp/test-val.txt
+$AC put mykey /tmp/test-val.txt
+# Expected: "ok"
+
+# Get the value back
+$AC get mykey
+# Expected: prints "hello autumn"
+
+# Head (metadata)
+$AC head mykey
+# Expected: "key: mykey, length: 13"
+
+# List keys
+$AC ls --prefix ""
+# Expected: "mykey" in output
+
+# Delete the key
+$AC del mykey
+# Expected: "ok"
+
+# Verify deletion
+$AC get mykey
+# Expected: empty output (key not found)
+```
+
 ## Binary reference
 
 | Binary | Default port | Key flags |
@@ -169,8 +248,12 @@ Smoke test via script:
 | `autumn-manager-server` | 9001 | `--port`, `--etcd` |
 | `autumn-extent-node` | 9101 | `--port`, `--disk-id`, `--data`, `--manager` |
 | `autumn-stream-cli` | — | `--manager`, subcommands below |
+| `autumn-ps` | 9201 | `--psid` (required), `--port`, `--manager`, `--data`, `--advertise` |
+| `autumn-client` | — | `--manager`, subcommands below |
 
 `autumn-stream-cli` subcommands: `register-node`, `create-stream`, `stream-info`, `append`, `read`
+
+`autumn-client` subcommands: `bootstrap`, `put`, `get`, `del`, `head`, `ls`, `split`, `info`
 
 ## Notes
 

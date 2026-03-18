@@ -132,6 +132,7 @@ dependencies = [
  "anyhow",
  "autumn-io-engine",
  "autumn-manager",
+ "autumn-partition-server",
  "autumn-proto",
  "autumn-stream",
  "tokio",

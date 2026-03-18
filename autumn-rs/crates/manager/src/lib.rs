@@ -21,7 +21,7 @@ use autumn_proto::autumn::{
     CheckCommitLengthRequest, CheckCommitLengthResponse, Code, CreateStreamRequest,
     CreateStreamResponse, DfRequest, Empty, ExtentInfo, ExtentInfoRequest, ExtentInfoResponse,
     GetRegionsResponse, MultiModifySplitRequest, MultiModifySplitResponse, NodeInfo,
-    NodesInfoResponse, PunchHolesRequest, PunchHolesResponse, ReAvaliRequest, RecoveryTask,
+    NodesInfoResponse, PsDetail, PunchHolesRequest, PunchHolesResponse, ReAvaliRequest, RecoveryTask,
     RecoveryTaskStatus, RegionInfo, Regions, RegisterNodeRequest, RegisterNodeResponse,
     RegisterPsRequest, RegisterPsResponse, RequireRecoveryRequest, StatusResponse,
     StreamAllocExtentRequest, StreamAllocExtentResponse, StreamInfo, StreamInfoRequest,
@@ -2094,12 +2094,26 @@ impl PartitionManagerService for AutumnManager {
 
     async fn get_regions(&self, _: Request<Empty>) -> Result<Response<GetRegionsResponse>, Status> {
         let s = self.store.inner.read();
+        let ps_details = s
+            .ps_nodes
+            .iter()
+            .map(|(&ps_id, addr)| {
+                (
+                    ps_id,
+                    PsDetail {
+                        ps_id,
+                        address: addr.clone(),
+                    },
+                )
+            })
+            .collect();
         Ok(Response::new(GetRegionsResponse {
             code: Code::Ok as i32,
             code_des: String::new(),
             regions: Some(Regions {
                 regions: s.regions.clone().into_iter().collect(),
             }),
+            ps_details,
         }))
     }
 }
