@@ -13,6 +13,10 @@ use autumn_proto::autumn::{PartitionMeta, Range};
 use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
 
+fn is_not_found(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::NotFound
+}
+
 fn normalize(addr: &str) -> String {
     if addr.starts_with("http://") || addr.starts_with("https://") {
         addr.to_string()
@@ -436,29 +440,42 @@ async fn main() -> Result<()> {
         Command::Get { key } => {
             let (part_id, ps_addr) = client.resolve_key(key.as_bytes()).await?;
             let ps = client.get_ps_client(&ps_addr).await?;
-            let resp = ps
+            match ps
                 .get(Request::new(GetRequest {
                     key: key.into_bytes(),
                     part_id,
                 }))
                 .await
-                .context("get")?
-                .into_inner();
-            // Write raw value to stdout
-            use std::io::Write;
-            std::io::stdout().write_all(&resp.value)?;
+            {
+                Ok(resp) => {
+                    use std::io::Write;
+                    std::io::stdout().write_all(&resp.into_inner().value)?;
+                }
+                Err(s) if is_not_found(&s) => {
+                    eprintln!("key not found");
+                    std::process::exit(2);
+                }
+                Err(s) => return Err(s).context("get"),
+            }
         }
 
         Command::Del { key } => {
             let (part_id, ps_addr) = client.resolve_key(key.as_bytes()).await?;
             let ps = client.get_ps_client(&ps_addr).await?;
-            ps.delete(Request::new(DeleteRequest {
-                key: key.into_bytes(),
-                part_id,
-            }))
-            .await
-            .context("delete")?;
-            println!("ok");
+            match ps
+                .delete(Request::new(DeleteRequest {
+                    key: key.into_bytes(),
+                    part_id,
+                }))
+                .await
+            {
+                Ok(_) => println!("ok"),
+                Err(s) if is_not_found(&s) => {
+                    eprintln!("key not found");
+                    std::process::exit(2);
+                }
+                Err(s) => return Err(s).context("delete"),
+            }
         }
 
         Command::Head { key } => {
