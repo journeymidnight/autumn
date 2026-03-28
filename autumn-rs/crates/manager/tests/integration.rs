@@ -1069,3 +1069,245 @@ async fn f029_compaction_merges_small_tables() {
     ps_task.abort();
     mgr_task.abort();
 }
+
+// ---------------------------------------------------------------------------
+// F031: value log separation tests
+// ---------------------------------------------------------------------------
+
+/// F031: large values (> 4KB) are stored in logStream; Get returns correct bytes.
+/// Small values (<= 4KB) stay inline. Both are readable without restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f031_large_value_stored_in_log_stream() {
+    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) =
+        setup_infra_f030(107).await;
+
+    let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
+        .await.expect("connect sm");
+    let log_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
+        .await.expect("create log stream").into_inner().stream.expect("log stream").stream_id;
+    let row_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
+        .await.expect("create row stream").into_inner().stream.expect("row stream").stream_id;
+    let meta_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
+        .await.expect("create meta stream").into_inner().stream.expect("meta stream").stream_id;
+
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let ps = PartitionServer::connect(51, &endpoint, data_dir.path(), IoMode::Standard)
+        .await.expect("connect ps");
+    let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
+        .await.expect("connect pm");
+    pm.upsert_partition(Request::new(UpsertPartitionRequest {
+        meta: Some(PartitionMeta {
+            log_stream, row_stream, meta_stream,
+            part_id: 701,
+            rg: Some(Range { start_key: b"a".to_vec(), end_key: b"z".to_vec() }),
+        }),
+    })).await.expect("upsert partition");
+    ps.sync_regions_once().await.expect("sync regions");
+
+    let ps_addr = pick_addr();
+    let ps_task = tokio::spawn(ps.clone().serve(ps_addr));
+    sleep(Duration::from_millis(120)).await;
+
+    let mut kv = PartitionKvClient::connect(format!("http://{}", ps_addr))
+        .await.expect("connect kv");
+
+    // Large value: 8 KB > VALUE_THROTTLE (4 KB) — stored in logStream.
+    let large_val: Vec<u8> = (0u8..=255).cycle().take(8 * 1024).collect();
+    kv.put(Request::new(PutRequest {
+        key: b"large-key".to_vec(),
+        value: large_val.clone(),
+        expires_at: 0,
+        part_id: 701,
+    })).await.expect("put large value");
+
+    // Small value: 2 KB <= VALUE_THROTTLE — stays inline.
+    let small_val = vec![b'S'; 2 * 1024];
+    kv.put(Request::new(PutRequest {
+        key: b"small-key".to_vec(),
+        value: small_val.clone(),
+        expires_at: 0,
+        part_id: 701,
+    })).await.expect("put small value");
+
+    let got_large = kv.get(Request::new(GetRequest { key: b"large-key".to_vec(), part_id: 701 }))
+        .await.expect("get large").into_inner();
+    assert_eq!(got_large.value, large_val, "large value must roundtrip via logStream");
+
+    let got_small = kv.get(Request::new(GetRequest { key: b"small-key".to_vec(), part_id: 701 }))
+        .await.expect("get small").into_inner();
+    assert_eq!(got_small.value, small_val, "small value must roundtrip inline");
+
+    n1_task.abort();
+    n2_task.abort();
+    ps_task.abort();
+    mgr_task.abort();
+}
+
+/// F031: after restart, large values stored in logStream are recovered.
+/// A value that was flushed to SST (SST has a ValuePointer record) must be
+/// readable after restart by following the pointer to logStream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f031_recovery_replays_log_stream() {
+    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) =
+        setup_infra_f030(109).await;
+
+    let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
+        .await.expect("connect sm");
+    let log_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
+        .await.expect("create log stream").into_inner().stream.expect("log stream").stream_id;
+    let row_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
+        .await.expect("create row stream").into_inner().stream.expect("row stream").stream_id;
+    let meta_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
+        .await.expect("create meta stream").into_inner().stream.expect("meta stream").stream_id;
+
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
+        .await.expect("connect pm");
+    pm.upsert_partition(Request::new(UpsertPartitionRequest {
+        meta: Some(PartitionMeta {
+            log_stream, row_stream, meta_stream,
+            part_id: 711,
+            rg: Some(Range { start_key: b"a".to_vec(), end_key: b"z".to_vec() }),
+        }),
+    })).await.expect("upsert partition");
+
+    // First PS: write a large value + filler to trigger flush, then a small WAL-only key.
+    let ps1 = PartitionServer::connect(52, &endpoint, data_dir.path(), IoMode::Standard)
+        .await.expect("connect ps1");
+    ps1.sync_regions_once().await.expect("sync regions");
+    let ps1_addr = pick_addr();
+    let ps1_task = tokio::spawn(ps1.serve(ps1_addr));
+    sleep(Duration::from_millis(120)).await;
+
+    let mut kv1 = PartitionKvClient::connect(format!("http://{}", ps1_addr))
+        .await.expect("connect kv1");
+
+    let large_val: Vec<u8> = (0u8..=255).cycle().take(8 * 1024).collect();
+    kv1.put(Request::new(PutRequest {
+        key: b"b-large".to_vec(),
+        value: large_val.clone(),
+        expires_at: 0,
+        part_id: 711,
+    })).await.expect("put large");
+
+    // Filler triggers flush so the SST gets a ValuePointer record for b-large.
+    kv1.put(Request::new(PutRequest {
+        key: b"b-filler".to_vec(),
+        value: vec![b'F'; 300 * 1024],
+        expires_at: 0,
+        part_id: 711,
+    })).await.expect("put filler");
+    sleep(Duration::from_millis(500)).await; // wait for background flush
+
+    kv1.put(Request::new(PutRequest {
+        key: b"b-wal-small".to_vec(),
+        value: b"small-wal".to_vec(),
+        expires_at: 0,
+        part_id: 711,
+    })).await.expect("put small wal");
+
+    ps1_task.abort();
+    sleep(Duration::from_millis(120)).await;
+
+    // Second PS: recover.
+    let ps2 = PartitionServer::connect(52, &endpoint, data_dir.path(), IoMode::Standard)
+        .await.expect("connect ps2");
+    ps2.sync_regions_once().await.expect("resync");
+    let ps2_addr = pick_addr();
+    let ps2_task = tokio::spawn(ps2.serve(ps2_addr));
+    sleep(Duration::from_millis(120)).await;
+
+    let mut kv2 = PartitionKvClient::connect(format!("http://{}", ps2_addr))
+        .await.expect("connect kv2");
+
+    // Large value recovered via SST ValuePointer → logStream read.
+    let got_large = kv2.get(Request::new(GetRequest { key: b"b-large".to_vec(), part_id: 711 }))
+        .await.expect("get large after restart").into_inner();
+    assert_eq!(got_large.value, large_val, "large value must survive restart via logStream");
+
+    // Small WAL key recovered from local WAL.
+    let got_small = kv2.get(Request::new(GetRequest { key: b"b-wal-small".to_vec(), part_id: 711 }))
+        .await.expect("get small after restart").into_inner();
+    assert_eq!(got_small.value, b"small-wal", "small WAL key must survive restart");
+
+    n1_task.abort();
+    n2_task.abort();
+    ps2_task.abort();
+    mgr_task.abort();
+}
+
+/// F031: compaction preserves ValuePointer entries — large values remain
+/// readable after compaction merges the SSTable that contains the pointer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f031_compaction_preserves_value_pointers() {
+    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) =
+        setup_infra_f030(111).await;
+
+    let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
+        .await.expect("connect sm");
+    let log_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
+        .await.expect("create log stream").into_inner().stream.expect("log stream").stream_id;
+    let row_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
+        .await.expect("create row stream").into_inner().stream.expect("row stream").stream_id;
+    let meta_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
+        .await.expect("create meta stream").into_inner().stream.expect("meta stream").stream_id;
+
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let ps = PartitionServer::connect(53, &endpoint, data_dir.path(), IoMode::Standard)
+        .await.expect("connect ps");
+    let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
+        .await.expect("connect pm");
+    pm.upsert_partition(Request::new(UpsertPartitionRequest {
+        meta: Some(PartitionMeta {
+            log_stream, row_stream, meta_stream,
+            part_id: 721,
+            rg: Some(Range { start_key: b"a".to_vec(), end_key: b"z".to_vec() }),
+        }),
+    })).await.expect("upsert partition");
+    ps.sync_regions_once().await.expect("sync regions");
+
+    let ps_addr = pick_addr();
+    let ps_task = tokio::spawn(ps.clone().serve(ps_addr));
+    sleep(Duration::from_millis(120)).await;
+
+    let mut kv = PartitionKvClient::connect(format!("http://{}", ps_addr))
+        .await.expect("connect kv");
+
+    let large_val: Vec<u8> = (0u8..=255).cycle().take(8 * 1024).collect();
+
+    // Write 3 rounds of large + filler to produce 3 SSTables with ValuePointers.
+    for i in 0..3u8 {
+        kv.put(Request::new(PutRequest {
+            key: format!("c-large-{}", i).into_bytes(),
+            value: large_val.clone(),
+            expires_at: 0,
+            part_id: 721,
+        })).await.expect("put large");
+        kv.put(Request::new(PutRequest {
+            key: format!("c-fill-{}", i).into_bytes(),
+            value: vec![b'F'; 300 * 1024],
+            expires_at: 0,
+            part_id: 721,
+        })).await.expect("put filler");
+        sleep(Duration::from_millis(400)).await; // wait for flush
+    }
+
+    // Trigger major compaction.
+    ps.trigger_major_compact(721);
+    sleep(Duration::from_millis(800)).await;
+
+    // All large values must still be readable after compaction.
+    for i in 0..3u8 {
+        let got = kv.get(Request::new(GetRequest {
+            key: format!("c-large-{}", i).into_bytes(),
+            part_id: 721,
+        })).await.expect("get large after compact").into_inner();
+        assert_eq!(got.value, large_val,
+            "large value c-large-{} must survive compaction", i);
+    }
+
+    n1_task.abort();
+    n2_task.abort();
+    ps_task.abort();
+    mgr_task.abort();
+}

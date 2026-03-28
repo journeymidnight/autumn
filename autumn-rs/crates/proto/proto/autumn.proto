@@ -29,6 +29,8 @@ message Location {
 
 message TableLocations {
   repeated Location locs = 1;
+  uint64 vp_extent_id = 2;
+  uint32 vp_offset = 3;
 }
 
 message DiskInfo {

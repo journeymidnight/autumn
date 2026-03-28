@@ -73,6 +73,9 @@ enum ValueLoc {
     /// Value is in an in-memory WAL snapshot held by an immutable memtable
     /// (F028: set when rotating active → imm so the WAL can be truncated).
     Buffer { buf: Arc<Vec<u8>>, record_offset: u64 },
+    /// Value is stored in logStream (F031). The kv index stores the 16-byte
+    /// ValuePointer; actual value bytes are read from logStream on demand.
+    ValueLog { vp: ValuePointer },
 }
 
 /// In-memory index entry – no value bytes stored (F027).
@@ -155,6 +158,49 @@ impl TableMeta {
     }
 }
 
+// ---------------------------------------------------------------------------
+// F031 – Value log separation
+// ---------------------------------------------------------------------------
+
+/// Values larger than this threshold are stored in logStream, not inline in SSTables.
+/// Mirrors Go's `ValueThrottle = 4 << 10`.
+const VALUE_THROTTLE: usize = 4 * 1024;
+
+/// Byte size of an encoded ValuePointer (extent_id:8 + offset:4 + len:4).
+const VALUE_POINTER_SIZE: usize = 16;
+
+/// Flag bit OR'd with the op byte in SSTable records to indicate that the
+/// "value" field holds a 16-byte ValuePointer, not the actual value bytes.
+/// Mirrors Go's `BitValuePointer = 1 << 1`.
+const OP_VALUE_POINTER: u8 = 0x80;
+
+/// Pointer into logStream for a large value (F031).
+/// Encoded as 16 bytes little-endian: [extent_id:8][offset:4][len:4].
+#[derive(Debug, Clone, Copy)]
+struct ValuePointer {
+    extent_id: u64,
+    offset: u32,
+    len: u32,
+}
+
+impl ValuePointer {
+    fn encode(&self) -> [u8; VALUE_POINTER_SIZE] {
+        let mut buf = [0u8; VALUE_POINTER_SIZE];
+        buf[0..8].copy_from_slice(&self.extent_id.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.offset.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.len.to_le_bytes());
+        buf
+    }
+
+    fn decode(buf: &[u8]) -> Self {
+        Self {
+            extent_id: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            offset: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            len: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+        }
+    }
+}
+
 // Compaction constants (mirrors Go's Option + DefaultPickupPolicy defaults)
 const MAX_SKIP_LIST: u64 = 64 * 1024 * 1024; // 64 MB
 const COMPACT_RATIO: f64 = 0.5;
@@ -187,9 +233,14 @@ struct PartitionData {
     sst_cache: HashMap<(u64, u32), Arc<Vec<u8>>>,
     /// hasOverlap: set to 1 when split produces overlapping keys, cleared by major compaction.
     has_overlap: Arc<AtomicU32>,
-    /// Local WAL file (kept until F031 wires logStream).
+    /// Local WAL file for durability of all writes.
     log_file: Arc<dyn IoFile>,
     log_len: u64,
+    /// Value-log head: the tail position in logStream up to which all large-value
+    /// writes have been durably appended (F031). Persisted in metaStream via
+    /// TableLocations so recovery knows where to replay from.
+    vp_extent_id: u64,
+    vp_offset: u32,
 }
 
 impl PartitionData {
@@ -224,6 +275,11 @@ impl PartitionData {
                     return Err(anyhow!("buffer read out of range"));
                 }
                 Ok(buf[value_offset..end].to_vec())
+            }
+            ValueLoc::ValueLog { .. } => {
+                // Large values in logStream must be read via read_value_from_log
+                // (needs StreamClient access). This path should not be reached.
+                Err(anyhow!("ValueLog reads require stream_client — use read_value_from_log"))
             }
         }
     }
@@ -503,6 +559,29 @@ impl PartitionServer {
     }
 
     // -----------------------------------------------------------------------
+    // F031 – logStream value read
+    // -----------------------------------------------------------------------
+
+    /// Read the value of a large-value entry from logStream.
+    /// Called by the Get handler after releasing the partition read lock.
+    async fn read_value_from_log(
+        vp: &ValuePointer,
+        stream_client: &Arc<Mutex<StreamClient>>,
+    ) -> Result<Vec<u8>> {
+        let (data, _) = {
+            let mut sc = stream_client.lock().await;
+            sc.read_blocks_from_extent(vp.extent_id, vp.offset, 1, false).await?
+        };
+        // The block is an encoded record: [op:1][key_len:4][val_len:4][expires_at:8][key][value]
+        let records = Self::decode_records_full(&data);
+        records
+            .into_iter()
+            .next()
+            .map(|(_op, _key, value, _expires_at)| value)
+            .ok_or_else(|| anyhow!("failed to decode logStream block at extent={} offset={}", vp.extent_id, vp.offset))
+    }
+
+    // -----------------------------------------------------------------------
     // metaStream persistence (F030)
     // -----------------------------------------------------------------------
 
@@ -513,6 +592,8 @@ impl PartitionServer {
         &self,
         meta_stream_id: u64,
         tables: &[TableMeta],
+        vp_extent_id: u64,
+        vp_offset: u32,
     ) -> Result<()> {
         let locs_proto = TableLocations {
             locs: tables
@@ -522,6 +603,8 @@ impl PartitionServer {
                     offset: t.offset,
                 })
                 .collect(),
+            vp_extent_id,
+            vp_offset,
         };
         let data = locs_proto.encode_to_vec();
         let mut sc = self.stream_client.lock().await;
@@ -554,6 +637,8 @@ impl PartitionServer {
         let mut sst_cache: HashMap<(u64, u32), Arc<Vec<u8>>> = HashMap::new();
         let mut tables: Vec<TableMeta> = Vec::new();
         let mut max_seq: u64 = 0;
+        let mut recovered_vp_eid: u64 = 0;
+        let mut recovered_vp_off: u32 = 0;
 
         // Step 1: Read metaStream to get the last checkpoint of table locations.
         let meta_block = {
@@ -564,6 +649,10 @@ impl PartitionServer {
         if let Some(meta_bytes) = meta_block {
             let locations = TableLocations::decode(meta_bytes.as_slice())
                 .context("decode TableLocations from metaStream")?;
+
+            // Restore vhead from the checkpoint.
+            recovered_vp_eid = locations.vp_extent_id;
+            recovered_vp_off = locations.vp_offset;
 
             // Step 2: For each SSTable location, read bytes from rowStream.
             for loc in locations.locs {
@@ -591,18 +680,36 @@ impl PartitionServer {
                     let ts = parse_ts(&key);
                     if ts > max_seq { max_seq = ts; }
                     if ts > tbl_last_seq { tbl_last_seq = ts; }
-                    Self::apply_record_meta(
-                        &mut kv,
-                        op,
-                        key,
-                        value_len,
-                        expires_at,
-                        ValueLoc::Stream {
-                            extent_id: sst_loc.0,
-                            table_offset: sst_loc.1,
-                            record_offset,
-                        },
-                    );
+
+                    // F031: if OP_VALUE_POINTER flag is set, the "value" field in
+                    // the SST holds a 16-byte ValuePointer, not the actual value.
+                    if op & OP_VALUE_POINTER != 0 {
+                        let vo = (record_offset + RECORD_HEADER_SIZE + key.len() as u64) as usize;
+                        if vo + VALUE_POINTER_SIZE <= sst_arc.len() {
+                            let vp = ValuePointer::decode(&sst_arc[vo..vo + VALUE_POINTER_SIZE]);
+                            Self::apply_record_meta(
+                                &mut kv,
+                                op & !OP_VALUE_POINTER, // strip flag for apply (op=1)
+                                key,
+                                vp.len,
+                                expires_at,
+                                ValueLoc::ValueLog { vp },
+                            );
+                        }
+                    } else {
+                        Self::apply_record_meta(
+                            &mut kv,
+                            op,
+                            key,
+                            value_len,
+                            expires_at,
+                            ValueLoc::Stream {
+                                extent_id: sst_loc.0,
+                                table_offset: sst_loc.1,
+                                record_offset,
+                            },
+                        );
+                    }
                 }
 
                 let estimated_size = sst_arc.len() as u64;
@@ -614,9 +721,58 @@ impl PartitionServer {
                     last_seq: tbl_last_seq,
                 });
             }
+
+            // Step 2b: Replay logStream from vhead to recover large-value entries
+            // that were written to logStream but not yet flushed to an SSTable.
+            if recovered_vp_eid > 0 {
+                let stream_info = {
+                    let mut sc = self.stream_client.lock().await;
+                    sc.get_stream_info(log_stream_id).await?
+                };
+                for eid in stream_info.extent_ids {
+                    if eid < recovered_vp_eid {
+                        continue;
+                    }
+                    let start_offset = if eid == recovered_vp_eid { recovered_vp_off } else { 0 };
+                    let (data, block_sizes) = {
+                        let mut sc = self.stream_client.lock().await;
+                        match sc.read_blocks_from_extent(eid, start_offset, 0, false).await {
+                            Ok(r) => r,
+                            Err(_) => continue, // extent may not exist yet
+                        }
+                    };
+                    let mut block_cursor: usize = 0;
+                    let mut offset_in_extent = start_offset;
+                    for bsize in block_sizes {
+                        let block = &data[block_cursor..block_cursor + bsize as usize];
+                        for (op, key, value_len, expires_at, _rec_off) in
+                            Self::decode_record_metas(block)
+                        {
+                            let ts = parse_ts(&key);
+                            if ts > max_seq { max_seq = ts; }
+                            let vp = ValuePointer {
+                                extent_id: eid,
+                                offset: offset_in_extent,
+                                len: value_len,
+                            };
+                            Self::apply_record_meta(
+                                &mut kv,
+                                op & 0x7F,
+                                key,
+                                value_len,
+                                expires_at,
+                                ValueLoc::ValueLog { vp },
+                            );
+                        }
+                        block_cursor += bsize as usize;
+                        offset_in_extent += bsize;
+                    }
+                }
+            }
         }
 
-        // Step 3: Replay local WAL on top of SSTable state.
+        // Step 3: Replay local WAL on top of SSTable + logStream state.
+        // WAL entries (small values, or pre-rotation state) take precedence.
         if wal_len > 0 {
             let wal_bytes = log_file.read_at(0, wal_len as usize).await?;
             for (op, key, value_len, expires_at, record_offset) in
@@ -664,6 +820,8 @@ impl PartitionServer {
             has_overlap: has_overlap.clone(),
             log_file,
             log_len: wal_len,
+            vp_extent_id: recovered_vp_eid,
+            vp_offset: recovered_vp_off,
         }));
 
         // Spawn per-partition background flush task (F028).
@@ -798,6 +956,15 @@ impl PartitionServer {
 
             if meta.deleted {
                 sst_bytes.extend_from_slice(&Self::encode_record(2, internal_key, &[], 0));
+            } else if let ValueLoc::ValueLog { vp } = &meta.loc {
+                // Large value in logStream: write the 16-byte pointer into the SSTable
+                // with the OP_VALUE_POINTER flag so recovery knows to rebuild ValueLog loc.
+                sst_bytes.extend_from_slice(&Self::encode_record(
+                    1 | OP_VALUE_POINTER,
+                    internal_key,
+                    &vp.encode(),
+                    meta.expires_at,
+                ));
             } else {
                 let value = Self::read_from_loc(&meta.loc, meta.internal_key_len, meta.value_len)?;
                 sst_bytes.extend_from_slice(&Self::encode_record(
@@ -828,7 +995,7 @@ impl PartitionServer {
             last_seq,
         });
 
-        self.save_table_locs_raw(part.meta_stream_id, &part.tables).await?;
+        self.save_table_locs_raw(part.meta_stream_id, &part.tables, part.vp_extent_id, part.vp_offset).await?;
         Ok(true)
     }
 
@@ -859,6 +1026,8 @@ impl PartitionServer {
             if let Some(meta) = kv.get_mut(internal_key) {
                 // Only update entries that still point to the buffer (not
                 // overwritten by a newer version after rotation).
+                // ValueLog entries keep their logStream pointer; do not replace
+                // with a Stream loc pointing at the SSTable value-pointer bytes.
                 if matches!(&meta.loc, ValueLoc::Buffer { .. }) {
                     meta.loc = ValueLoc::Stream {
                         extent_id,
@@ -896,16 +1065,16 @@ impl PartitionServer {
         &self,
         part: &Arc<RwLock<PartitionData>>,
     ) -> Result<bool> {
-        // Phase 1 (write lock, very brief): peek imm + capture stream IDs.
-        let (imm_mem, row_stream_id, meta_stream_id) = {
+        // Phase 1 (read lock, very brief): peek imm + capture stream IDs + vhead.
+        let (imm_mem, row_stream_id, meta_stream_id, snap_vp_extent_id, snap_vp_offset) = {
             let guard = part.read().await;
             let Some(imm_mem) = guard.imm.front().cloned() else {
                 return Ok(false);
             };
-            (imm_mem, guard.row_stream_id, guard.meta_stream_id)
+            (imm_mem, guard.row_stream_id, guard.meta_stream_id, guard.vp_extent_id, guard.vp_offset)
         };
 
-        // Phase 2 (no lock): build SSTable from in-memory Buffer locs,
+        // Phase 2 (no lock): build SSTable from in-memory Buffer / ValueLog locs,
         //                     then append to rowStream.
         let mut sst_bytes = Vec::new();
         let mut new_locs: Vec<(Vec<u8>, u64)> = Vec::new();
@@ -920,6 +1089,14 @@ impl PartitionServer {
 
             if meta.deleted {
                 sst_bytes.extend_from_slice(&Self::encode_record(2, internal_key, &[], 0));
+            } else if let ValueLoc::ValueLog { vp } = &meta.loc {
+                // Large value: write 16-byte pointer with OP_VALUE_POINTER flag.
+                sst_bytes.extend_from_slice(&Self::encode_record(
+                    1 | OP_VALUE_POINTER,
+                    internal_key,
+                    &vp.encode(),
+                    meta.expires_at,
+                ));
             } else {
                 let value = Self::read_from_loc(&meta.loc, meta.internal_key_len, meta.value_len)?;
                 sst_bytes.extend_from_slice(&Self::encode_record(
@@ -941,7 +1118,7 @@ impl PartitionServer {
         let sst_bytes_arc = Arc::new(sst_bytes);
 
         // Phase 3 (write lock, brief): update kv index + tables.
-        let tables_snapshot = {
+        let (tables_snapshot, vp_eid, vp_off) = {
             let mut guard = part.write().await;
             Self::apply_sst_locs_stream(&mut guard.kv, sst_loc, &new_locs);
             guard.sst_cache.insert(sst_loc, sst_bytes_arc);
@@ -952,11 +1129,15 @@ impl PartitionServer {
                 last_seq,
             });
             guard.imm.pop_front();
-            guard.tables.clone()
+            // Use the most current vhead (may have advanced since Phase 1 if
+            // concurrent puts added more large values).
+            let veid = guard.vp_extent_id.max(snap_vp_extent_id);
+            let voff = if veid == guard.vp_extent_id { guard.vp_offset } else { snap_vp_offset };
+            (guard.tables.clone(), veid, voff)
         };
 
         // Save tables to metaStream outside the write lock.
-        self.save_table_locs_raw(meta_stream_id, &tables_snapshot).await?;
+        self.save_table_locs_raw(meta_stream_id, &tables_snapshot, vp_eid, vp_off).await?;
 
         Ok(true)
     }
@@ -1124,7 +1305,7 @@ impl PartitionServer {
 
         // ── Step 1: Read all records from selected tables (outside lock) ──────
         // Collect raw bytes from sst_cache while holding only a read lock.
-        let (sst_data, row_stream_id, meta_stream_id) = {
+        let (sst_data, row_stream_id, meta_stream_id, compact_vp_eid, compact_vp_off) = {
             let guard = part.read().await;
             let mut data: Vec<(TableMeta, Arc<Vec<u8>>)> = Vec::new();
             for t in &tbls {
@@ -1132,7 +1313,7 @@ impl PartitionServer {
                     data.push((t.clone(), bytes.clone()));
                 }
             }
-            (data, guard.row_stream_id, guard.meta_stream_id)
+            (data, guard.row_stream_id, guard.meta_stream_id, guard.vp_extent_id, guard.vp_offset)
         };
 
         if sst_data.is_empty() {
@@ -1169,10 +1350,11 @@ impl PartitionServer {
                         continue; // expired
                     }
                 }
-                // Read the actual value bytes.
+                // Read the actual value bytes (or 16-byte ValuePointer for large values).
                 let vo = (record_offset + RECORD_HEADER_SIZE + ikey.len() as u64) as usize;
                 let end = vo + value_len as usize;
-                if op == 1 && end <= sst_bytes.len() {
+                // op & 0x7F == 1 covers both inline (op=1) and value-pointer (op=0x81).
+                if op & 0x7F == 1 && end <= sst_bytes.len() {
                     let value = sst_bytes[vo..end].to_vec();
                     merged.insert(ikey, (op, value, expires_at));
                 } else if op == 2 {
@@ -1188,12 +1370,14 @@ impl PartitionServer {
 
         if merged.is_empty() {
             // All entries were dropped; still need to remove the old tables.
-            let tables_snapshot = {
+            let (tables_snapshot, vp_eid, vp_off) = {
                 let mut guard = part.write().await;
                 guard.tables.retain(|t| !compact_keys.contains(&t.loc()));
-                guard.tables.clone()
+                let veid = guard.vp_extent_id.max(compact_vp_eid);
+                let voff = if veid == guard.vp_extent_id { guard.vp_offset } else { compact_vp_off };
+                (guard.tables.clone(), veid, voff)
             };
-            self.save_table_locs_raw(meta_stream_id, &tables_snapshot).await?;
+            self.save_table_locs_raw(meta_stream_id, &tables_snapshot, vp_eid, vp_off).await?;
             return Ok(true);
         }
 
@@ -1249,7 +1433,7 @@ impl PartitionServer {
         }
 
         // ── Step 5: Atomically update kv + tables (write lock) ────────────────
-        let tables_snapshot = {
+        let (tables_snapshot, final_vp_eid, final_vp_off) = {
             let mut guard = part.write().await;
 
             // Remove old tables from the list.
@@ -1263,6 +1447,7 @@ impl PartitionServer {
             for (tbl_meta, sst_arc, chunk_locs) in &new_tables {
                 let sst_loc = tbl_meta.loc();
                 // Update kv entries that pointed to any compacted table.
+                // ValueLog entries are skipped (Stream guard).
                 for (internal_key, sst_record_offset) in chunk_locs {
                     if let Some(meta) = guard.kv.get_mut(internal_key) {
                         if let ValueLoc::Stream { extent_id, table_offset, .. } = &meta.loc {
@@ -1290,11 +1475,13 @@ impl PartitionServer {
                 guard.tables.push(tbl_meta.clone());
             }
 
-            guard.tables.clone()
+            let veid = guard.vp_extent_id.max(compact_vp_eid);
+            let voff = if veid == guard.vp_extent_id { guard.vp_offset } else { compact_vp_off };
+            (guard.tables.clone(), veid, voff)
         };
 
         // ── Step 6: Persist table list ────────────────────────────────────────
-        self.save_table_locs_raw(meta_stream_id, &tables_snapshot).await?;
+        self.save_table_locs_raw(meta_stream_id, &tables_snapshot, final_vp_eid, final_vp_off).await?;
 
         Ok(true)
     }
@@ -1515,17 +1702,40 @@ impl PartitionKv for PartitionServer {
         let seq = part.seq_number;
         let internal_key = key_with_ts(&req.key, seq);
 
-        // Append to WAL (with value bytes).
+        // Append to WAL for durability (all writes, regardless of size).
         let record_offset = Self::append_log(&mut part, 1, &internal_key, &req.value, req.expires_at)
             .await
             .map_err(internal_to_status)?;
+
+        // For large values (> VALUE_THROTTLE), also append to logStream so that
+        // after WAL truncation (on rotation) the value remains readable.
+        let loc = if req.value.len() > VALUE_THROTTLE {
+            let log_entry = Self::encode_record(1, &internal_key, &req.value, req.expires_at);
+            let result = {
+                let mut sc = self.stream_client.lock().await;
+                sc.append(part.log_stream_id, &log_entry, true)
+                    .await
+                    .map_err(internal_to_status)?
+            };
+            let vp = ValuePointer {
+                extent_id: result.extent_id,
+                offset: result.offset,
+                len: req.value.len() as u32,
+            };
+            // Advance vhead to the tail of the append.
+            part.vp_extent_id = result.extent_id;
+            part.vp_offset = result.end;
+            ValueLoc::ValueLog { vp }
+        } else {
+            ValueLoc::Wal { record_offset }
+        };
 
         let meta = KeyMeta {
             expires_at: req.expires_at,
             deleted: false,
             internal_key_len: internal_key.len() as u32,
             value_len: req.value.len() as u32,
-            loc: ValueLoc::Wal { record_offset },
+            loc,
         };
 
         let write_size = (req.key.len() + req.value.len() + 32) as u64;
@@ -1561,10 +1771,20 @@ impl PartitionKv for PartitionServer {
             return Err(Status::not_found("key not found"));
         }
 
-        let value = part
-            .read_value(meta)
-            .await
-            .map_err(internal_to_status)?;
+        // If the value lives in logStream, we must drop the partition read lock
+        // before locking the stream_client to avoid holding two locks simultaneously.
+        let value = if let ValueLoc::ValueLog { vp } = &meta.loc {
+            let vp = *vp;
+            drop(part);
+            Self::read_value_from_log(&vp, &self.stream_client)
+                .await
+                .map_err(internal_to_status)?
+        } else {
+            part
+                .read_value(meta)
+                .await
+                .map_err(internal_to_status)?
+        };
 
         Ok(Response::new(GetResponse {
             key: req.key,
@@ -1947,6 +2167,27 @@ mod tests {
         assert_eq!(parse_ts(&k1), 1);
         assert_eq!(parse_ts(&k2), 2);
         assert_eq!(parse_ts(&k3), 100);
+    }
+
+    #[test]
+    fn value_pointer_encode_decode_roundtrip() {
+        let vp = ValuePointer { extent_id: 0xDEADBEEF_CAFEBABE, offset: 0x1234_5678, len: 0xABCD_EF01 };
+        let encoded = vp.encode();
+        assert_eq!(encoded.len(), VALUE_POINTER_SIZE);
+        let decoded = ValuePointer::decode(&encoded);
+        assert_eq!(decoded.extent_id, vp.extent_id);
+        assert_eq!(decoded.offset, vp.offset);
+        assert_eq!(decoded.len, vp.len);
+    }
+
+    #[test]
+    fn op_value_pointer_flag() {
+        // Flag is the high bit; stripping it restores the base op.
+        assert_eq!(1u8 | OP_VALUE_POINTER, 0x81);
+        assert_eq!(0x81u8 & !OP_VALUE_POINTER, 1u8);
+        assert_ne!(0x81u8 & OP_VALUE_POINTER, 0);
+        // Regular op=1 does not have the flag.
+        assert_eq!(1u8 & OP_VALUE_POINTER, 0);
     }
 
 }
