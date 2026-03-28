@@ -152,6 +152,7 @@ Note: service package is `autumn.v1`, not `autumn`.
 
 ```bash
 cargo test -p autumn-stream --test extent_append_semantics -- --nocapture
+cargo test -p autumn-stream --test extent_restart_recovery -- --nocapture
 cargo test -p autumn-manager --test integration -- --nocapture
 cargo test -p autumn-partition-server -- --nocapture
 ```
@@ -160,6 +161,40 @@ Smoke test via script:
 
 ```bash
 ./scripts/manual_stream_test.sh smoke
+```
+
+## Manual test: F034 extent node metadata persistence (restart recovery)
+
+Verify that extent metadata (`sealed_length`, `eversion`, `last_revision`) survives a node restart. Each extent writes a `extent-{id}.meta` sidecar file on alloc, seal, recovery, and revision change. The node scans data dir on startup to reload all extents.
+
+```bash
+# Start extent node
+./target/debug/autumn-extent-node --port 9101 --disk-id 1 --data /tmp/d1 &
+sleep 0.5
+
+# Alloc and append to extent 5001
+grpcurl -plaintext -d '{"extent_id":5001}' 127.0.0.1:9101 autumn.ExtentService/AllocExtent
+# expects: "diskId": "1"
+
+# Check meta sidecar file was created
+ls /tmp/d1/extent-5001.meta
+# expects: file exists (40 bytes)
+
+# Kill and restart
+pkill -f autumn-extent-node
+sleep 0.3
+./target/debug/autumn-extent-node --port 9101 --disk-id 1 --data /tmp/d1 &
+sleep 0.5
+
+# Commit length shows extent was reloaded
+grpcurl -plaintext -d '{"extent_id":5001,"revision":0}' 127.0.0.1:9101 autumn.ExtentService/CommitLength
+# expects: code=OK, length=0 (or whatever was written)
+```
+
+Automated test:
+```bash
+cargo test -p autumn-stream --test extent_restart_recovery -- --nocapture
+# expects: 3 tests pass (commit_length, revision, writable-after-restart)
 ```
 
 ## Manual test: F017 autumn-ps (partition server binary)

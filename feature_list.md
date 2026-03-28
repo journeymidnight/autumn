@@ -59,8 +59,8 @@
 ### F034 · Extent node metadata persistence
 - **Target:** Extent metadata (block boundaries, sealed state, eversion, revision) survives node restart. Equivalent to Go xattr (EXTENTMETA, XATTRSEAL, REV) + two-level directory hash.
 - **Evidence:** `node/node.go` · `node/diskfs.go` (pathName hash, LoadExtents) · `autumn-rs/crates/stream/src/extent_node.rs`
-- **Notes:** Current Rust: block_sizes/sealed_length/eversion in-memory only, lost on restart. Critical for restart recovery without data loss. Independent of partition layer.
-- **passes:** false
+- **Notes:** Implemented with per-extent `extent-{id}.meta` sidecar (40 bytes: magic+extent_id+sealed_length+eversion+last_revision). Written on alloc/seal/recovery/revision-change only — zero overhead on append path. block_sizes not persisted (partition layer concern). `load_extents()` scans data dir on startup. 3 integration tests pass.
+- **passes:** true
 
 ### F011 · Go range_partition advanced storage behaviors (umbrella)
 - **Target:** Compaction/GC/value-log/maintenance lifecycle equivalent to Go range_partition.

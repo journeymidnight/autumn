@@ -71,9 +71,12 @@ pub struct ExtentNode {
 }
 
 impl ExtentNode {
+    const META_MAGIC: &'static [u8; 8] = b"EXTMETA\0";
+    const META_SIZE: usize = 40;
+
     pub async fn new(config: ExtentNodeConfig) -> Result<Self> {
         tokio::fs::create_dir_all(&config.data_dir).await?;
-        Ok(Self {
+        let node = Self {
             extents: Arc::new(DashMap::new()),
             io: build_engine(config.io_mode)?,
             disk_id: config.disk_id,
@@ -81,11 +84,102 @@ impl ExtentNode {
             manager_endpoint: config.manager_endpoint,
             recovery_done: Arc::new(Mutex::new(Vec::new())),
             recovery_inflight: Arc::new(DashMap::new()),
-        })
+        };
+        node.load_extents().await?;
+        Ok(node)
     }
 
     fn extent_path(&self, extent_id: u64) -> PathBuf {
         self.data_dir.join(format!("extent-{extent_id}.dat"))
+    }
+
+    fn meta_path(&self, extent_id: u64) -> PathBuf {
+        self.data_dir.join(format!("extent-{extent_id}.meta"))
+    }
+
+    async fn save_meta(&self, extent_id: u64, entry: &ExtentEntry) -> Result<(), Status> {
+        let sealed_length = entry.sealed_length.load(Ordering::SeqCst);
+        let eversion = entry.eversion.load(Ordering::SeqCst);
+        let last_revision = entry.last_revision.load(Ordering::SeqCst);
+
+        let mut buf = [0u8; Self::META_SIZE];
+        buf[0..8].copy_from_slice(Self::META_MAGIC);
+        buf[8..16].copy_from_slice(&extent_id.to_le_bytes());
+        buf[16..24].copy_from_slice(&sealed_length.to_le_bytes());
+        buf[24..32].copy_from_slice(&eversion.to_le_bytes());
+        buf[32..40].copy_from_slice(&last_revision.to_le_bytes());
+
+        tokio::fs::write(self.meta_path(extent_id), &buf)
+            .await
+            .map_err(|e| Status::internal(format!("save meta for extent {extent_id}: {e}")))?;
+        Ok(())
+    }
+
+    fn parse_meta(buf: &[u8], extent_id: u64) -> Option<(u64, u64, i64)> {
+        if buf.len() < Self::META_SIZE {
+            return None;
+        }
+        if &buf[0..8] != Self::META_MAGIC {
+            return None;
+        }
+        let eid = u64::from_le_bytes(buf[8..16].try_into().ok()?);
+        if eid != extent_id {
+            return None;
+        }
+        let sealed_length = u64::from_le_bytes(buf[16..24].try_into().ok()?);
+        let eversion = u64::from_le_bytes(buf[24..32].try_into().ok()?);
+        let last_revision = i64::from_le_bytes(buf[32..40].try_into().ok()?);
+        Some((sealed_length, eversion, last_revision))
+    }
+
+    pub async fn load_extents(&self) -> Result<()> {
+        let mut dir = tokio::fs::read_dir(&*self.data_dir).await?;
+        while let Some(entry) = dir.next_entry().await? {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("extent-") || !name.ends_with(".dat") {
+                continue;
+            }
+            let id_str = &name["extent-".len()..name.len() - ".dat".len()];
+            let extent_id: u64 = match id_str.parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            let path = self.extent_path(extent_id);
+            let file = match self.io.create(&path).await {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!("load_extents: cannot open extent {extent_id}: {e}");
+                    continue;
+                }
+            };
+            let len = file.len().await.unwrap_or(0);
+
+            let (sealed_length, eversion, last_revision) =
+                match tokio::fs::read(self.meta_path(extent_id)).await {
+                    Ok(buf) => Self::parse_meta(&buf, extent_id).unwrap_or((0, 1, 0)),
+                    Err(_) => (0, 1, 0),
+                };
+
+            self.extents.insert(
+                extent_id,
+                Arc::new(ExtentEntry {
+                    file,
+                    len: AtomicU64::new(len),
+                    write_lock: Mutex::new(()),
+                    block_sizes: Mutex::new(Vec::new()),
+                    eversion: AtomicU64::new(eversion),
+                    sealed_length: AtomicU64::new(sealed_length),
+                    avali: AtomicU32::new(if sealed_length > 0 { 1 } else { 0 }),
+                    last_revision: AtomicI64::new(last_revision),
+                }),
+            );
+            tracing::info!(
+                "loaded extent {extent_id}: len={len}, sealed_length={sealed_length}, eversion={eversion}"
+            );
+        }
+        Ok(())
     }
 
     pub async fn serve(self, addr: SocketAddr) -> Result<()> {
@@ -210,12 +304,15 @@ impl ExtentNode {
             .collect())
     }
 
-    fn apply_extent_meta(extent: &ExtentEntry, ex: &ExtentInfo) {
+    /// Apply extent metadata from manager. Returns true if sealed_length changed from 0 to nonzero.
+    fn apply_extent_meta(extent: &ExtentEntry, ex: &ExtentInfo) -> bool {
+        let old_sealed = extent.sealed_length.load(Ordering::SeqCst);
         extent.eversion.store(ex.eversion, Ordering::SeqCst);
         extent
             .sealed_length
             .store(ex.sealed_length, Ordering::SeqCst);
         extent.avali.store(ex.avali, Ordering::SeqCst);
+        old_sealed == 0 && ex.sealed_length > 0
     }
 
     async fn truncate_to_commit(extent: &Arc<ExtentEntry>, commit: u32) -> Result<(), Status> {
@@ -374,6 +471,9 @@ impl ExtentNode {
         let mut sizes = extent.block_sizes.lock().await;
         sizes.clear();
         sizes.extend(block_sizes);
+        drop(sizes);
+
+        let _ = self.save_meta(task.extent_id, &extent).await;
 
         Ok(RecoveryTaskStatus {
             task: Some(task),
@@ -421,6 +521,9 @@ impl ExtentService for ExtentNode {
             }),
         );
 
+        let entry = self.get_extent(req.extent_id).await?;
+        self.save_meta(req.extent_id, &entry).await?;
+
         Ok(Response::new(AllocExtentResponse {
             code: Code::Ok as i32,
             code_des: String::new(),
@@ -454,7 +557,10 @@ impl ExtentService for ExtentNode {
         let header = header.ok_or_else(|| Status::invalid_argument("append header missing"))?;
         let extent = self.get_extent(header.extent_id).await?;
         if let Some(ex) = self.extent_info_from_manager(header.extent_id).await? {
-            Self::apply_extent_meta(&extent, &ex);
+            let sealed_changed = Self::apply_extent_meta(&extent, &ex);
+            if sealed_changed {
+                let _ = self.save_meta(header.extent_id, &extent).await;
+            }
             if ex.eversion > header.eversion {
                 return Ok(Response::new(Self::precondition_response(format!(
                     "extent {} eversion too low: got {}, expect >= {}",
@@ -506,7 +612,8 @@ impl ExtentService for ExtentNode {
                 header.revision, last_revision
             ))));
         }
-        if header.revision > last_revision {
+        let revision_changed = header.revision > last_revision;
+        if revision_changed {
             extent
                 .last_revision
                 .store(header.revision, Ordering::SeqCst);
@@ -559,6 +666,10 @@ impl ExtentService for ExtentNode {
         let end = start + payload.len() as u64;
         extent.len.store(end, Ordering::SeqCst);
 
+        if revision_changed {
+            let _ = self.save_meta(header.extent_id, &extent).await;
+        }
+
         Ok(Response::new(AppendResponse {
             code: Code::Ok as i32,
             code_des: String::new(),
@@ -574,7 +685,10 @@ impl ExtentService for ExtentNode {
         let req = request.into_inner();
         let extent = self.get_extent(req.extent_id).await?;
         if let Some(ex) = self.extent_info_from_manager(req.extent_id).await? {
-            Self::apply_extent_meta(&extent, &ex);
+            let sealed_changed = Self::apply_extent_meta(&extent, &ex);
+            if sealed_changed {
+                let _ = self.save_meta(req.extent_id, &extent).await;
+            }
             if req.eversion > 0 && req.eversion < ex.eversion {
                 return Err(Status::failed_precondition(format!(
                     "extent {} eversion too low: got {}, expect >= {}",
@@ -688,7 +802,10 @@ impl ExtentService for ExtentNode {
                 }));
             }
         };
-        Self::apply_extent_meta(&extent, &extent_info);
+        let sealed_changed = Self::apply_extent_meta(&extent, &extent_info);
+        if sealed_changed {
+            let _ = self.save_meta(req.extent_id, &extent).await;
+        }
 
         if req.eversion < extent_info.eversion {
             return Ok(Response::new(ReAvaliResponse {
@@ -750,6 +867,9 @@ impl ExtentService for ExtentNode {
         let mut sizes = extent.block_sizes.lock().await;
         sizes.clear();
         sizes.extend(block_sizes);
+        drop(sizes);
+
+        let _ = self.save_meta(req.extent_id, &extent).await;
 
         Ok(Response::new(ReAvaliResponse {
             code: Code::Ok as i32,
@@ -765,7 +885,10 @@ impl ExtentService for ExtentNode {
         let extent = self.get_extent(req.extent_id).await?;
         let mut logical_len = extent.len.load(Ordering::SeqCst);
         if let Some(ex) = self.extent_info_from_manager(req.extent_id).await? {
-            Self::apply_extent_meta(&extent, &ex);
+            let sealed_changed = Self::apply_extent_meta(&extent, &ex);
+            if sealed_changed {
+                let _ = self.save_meta(req.extent_id, &extent).await;
+            }
             if req.eversion < ex.eversion {
                 return Err(Status::failed_precondition(format!(
                     "eversion too low: got {}, expect >= {}",
@@ -960,6 +1083,7 @@ impl ExtentService for ExtentNode {
             }
             if req.revision > last {
                 entry.last_revision.store(req.revision, Ordering::SeqCst);
+                let _ = self.save_meta(req.extent_id, &entry).await;
             }
         }
         let len = entry.len.load(Ordering::SeqCst);

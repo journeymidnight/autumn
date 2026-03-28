@@ -1,48 +1,22 @@
-Date: 2026-03-17
+Date: 2026-03-27
 TaskStatus: completed
-Task scope: F026 (MVCC internal key), F027 (remove in-memory value cache), F018 streamput补全
+Task scope: F034 – Extent node metadata persistence
 
 Current summary:
-- F026: partition-server 内部 key 现在带 8 字节 MVCC 序号后缀 (u64::MAX - seq, big-endian)。
-  key_with_ts / parse_key / parse_ts 已实现，等价于 Go 的 y.KeyWithTs/ParseKey/ParseTs。
-  PartitionData 持有 seq_number，每次 put/delete 单调递增。
-  seq_number 持久化在 .state 文件中并在恢复时从数据中重建最大值。
-- F027: PartitionData.kv 改为 BTreeMap<Vec<u8>, KeyMeta>，KeyMeta 只存
-  expires_at/deleted/internal_key_len/value_len/ValueLoc（WAL offset 或 Table id+offset）。
-  get/head 从磁盘按需读取 value bytes。flush 从 WAL 读 value 写入 SSTable 并更新 index。
-  table_files HashMap 保持 SSTable 句柄打开。
-- F018: 新增 StreamPut gRPC client-streaming RPC（proto + partition-server 实现 + autumn-client streamput 子命令）。
+  Implemented per-extent sidecar file `extent-{id}.meta` (40 bytes, binary LE):
+  magic(8) + extent_id(8) + sealed_length(8) + eversion(8) + last_revision(8).
+  Written on: alloc_extent, seal event (via apply_extent_meta), run_recovery_task,
+  re_avali, revision change in append/commit_length.
+  Zero overhead on normal append path.
+  block_sizes intentionally not persisted — partition layer owns block-level semantics.
+  load_extents() scans data dir for extent-*.dat on startup, restores all extents.
+  3 integration tests pass: restart_preserves_commit_length, restart_preserves_meta_fields,
+  restart_extent_remains_writable.
+  Existing tests unchanged (5 total pass).
 
-What is already implemented (high confidence):
-- Proto + gRPC 服务骨架可用（stream/partition/extent + StreamPut）。
-- IO engine: Standard + Blocking 后端可用。
-- Manager 核心流控：register/create/info/check_commit/alloc/punch/truncate/split。
-- ExtentNode 核心 API：append/read/copy/recovery/re_avali/df/heartbeat/commit。
-- StreamClient 写路径与流操作接口。
-- PartitionServer KV API + split + flush + table/WAL replay 恢复。
-- MVCC internal key (F026) + key-only index (F027)。
-- 独立进程 binary: manager, extent-node, stream-cli, autumn-ps, autumn-client。
-- etcd 持久化。
-
-Main gaps to full Go->Rust migration:
-- F010: 缺少 Batch/Maintenance API。
-- F011: 缺少 compaction/GC/value-log 等高级存储行为。
-- F012: 未见完整 Rust EC 模块。
-- F019: Partition Manager 缺少分配策略/负载均衡。
-- F020: 缺少 gRPC 连接池。
-- F021: 缺少多磁盘支持。
-- F023: 缺少 REST gateway。
-- F024: 缺少分布式 tracing。
-- F025: 缺少 stream benchmark CLI。
+Main gaps:
+  None for F034.
 
 Next steps:
-1) F011: 实现 partition layer compaction/GC（依赖 F026/F027 已完成）。
-2) F010: 补 Batch/Maintenance API。
-3) F012: 设计并实现 EC 编解码与恢复闭环。
-
-Handover note:
-- MVCC key 工具函数在 partition-server/src/lib.rs 顶部 (key_with_ts/parse_key/parse_ts)。
-- KeyMeta + ValueLoc 结构体替代了旧的 ValueEntry。
-- persist state 格式新增第 6 字段 seq_number（向后兼容旧格式）。
-- StreamPut proto: StreamPutRequestHeader + StreamPutRequest (oneof header/payload)。
-- autumn-client streamput 子命令使用 tokio-stream 发送分块消息。
+  F030 – Three-stream model with metaStream persistence (partition layer)
+  F029 – Compaction engine with merge iterator
