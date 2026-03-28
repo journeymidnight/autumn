@@ -1,26 +1,27 @@
-Date: 2026-03-27
+Date: 2026-03-28
 TaskStatus: completed
-Task scope: F029 – Compaction engine with merge iterator
+Task scope: F031 – Value log separation for large values
 
 Current summary:
-  Implemented size-tiered compaction engine in Rust partition server.
-  - TableMeta struct: tracks extent_id, offset, estimated_size, last_seq per SSTable.
-  - DefaultPickupPolicy: headRatio=0.3 (head extent truncation), compactRatio=0.5 (size-tiered), n=5 max tables.
-  - do_compact: reads selected tables from sst_cache, merges entries (newest-seq wins via BTreeMap order),
-    drops deleted/expired in major mode, splits output into ≤2×MAX_SKIP_LIST chunks, appends to rowStream,
-    atomically updates kv index + tables list, persists to metaStream.
-  - background_compact_loop: random 10-20s timer for minor compaction, bounded channel for major compaction.
-  - trigger_major_compact(part_id): public API to trigger major compaction.
-  - All 8 integration tests pass, including new f029_compaction_merges_small_tables test.
-
-  Also fixed: extent_node.rs append path - removed per-append RPC to manager (now only RPC on version mismatch),
-  cached manager gRPC channel with tokio::sync::OnceCell.
+  Implemented WiscKey-style key-value separation in the Rust partition server.
+  - ValuePointer struct: 16-byte LE encoding (extent_id:8, offset:4, len:4).
+  - ValueLoc::ValueLog variant added to in-memory index.
+  - VALUE_THROTTLE = 4KB: values > 4KB go to logStream, smaller values stay inline.
+  - OP_VALUE_POINTER (0x80): flag bit OR'd with op=1 in SSTable records to mark pointer entries.
+  - Write path: large values appended to logStream after WAL write; vp_extent_id/vp_offset (vhead) updated.
+  - Read path: read_value_from_log fetches block from logStream via StreamClient.
+  - Flush path (locked + async): ValueLog entries write 16-byte vp.encode() with OP_VALUE_POINTER op.
+  - Compaction: op & 0x7F == 1 reads value-or-pointer bytes; pointer bytes carried through as-is; ValueLog kv entries not overwritten to Stream.
+  - Recovery: vp_extent_id/vp_offset read from TableLocations proto; SST records with OP_VALUE_POINTER restore ValueLog locs with real value_len from vp.len; logStream replayed from vhead to recover unflushed large-value entries; WAL replay on top.
+  - Proto: TableLocations.vp_extent_id/vp_offset added (fields 2/3, backward-compatible).
+  - 4 unit tests (encode/decode roundtrip, flag constants) + 3 integration tests pass.
+  - All 11 integration tests pass.
 
 Main gaps:
-  No discard tracking (F033 GC) - compaction does not accumulate discard maps for value log extents.
-  logStream integration deferred to F031.
+  No GC for logStream (F033) – compaction does not accumulate discard maps.
+  WAL still records full large value (short-lived; truncated on rotation).
 
 Next steps:
-  F031 – logStream (value log) integration
   F032 – SSTable bloom filter, prefix compression, block cache
   F033 – GC with discard tracking (depends on F029 discard maps, F031 value log)
+  F037 – Partition split with overlap detection and major compaction
