@@ -1,24 +1,26 @@
 Date: 2026-03-27
 TaskStatus: completed
-Task scope: F030 – Three-stream model with metaStream persistence
+Task scope: F029 – Compaction engine with merge iterator
 
 Current summary:
-  Wired rowStream + metaStream into Rust partition server.
-  - Proto: added Location, TableLocations messages; RegionInfo now has log_stream/row_stream/meta_stream fields.
-  - StreamClient: added get_stream_info, read_blocks_from_extent, read_last_block, acquire_owner_lock, multi_modify_split.
-  - Manager: rebalance_regions populates stream IDs from PartitionMeta into RegionInfo.
-  - PartitionServer: replaced sm_client with StreamClient; PartitionData now has stream IDs, table_locs, sst_cache.
-  - ValueLoc::Stream { extent_id, table_offset, record_offset } replaces ValueLoc::Table.
-  - Flush writes SSTable to rowStream (append), then saves TableLocations proto to metaStream (truncates old extents).
-  - Recovery: reads metaStream last block → decodes TableLocations → reads each SST from rowStream → replays local WAL.
-  - logStream: local WAL still used (logStream deferred to F031).
-  - Split path: uses stream_client.commit_length().max(1) for all three streams.
-  - 2 new integration tests pass: f030_flush_writes_sst_to_row_stream, f030_recovery_from_meta_and_row_streams.
-  - All 7 integration tests pass.
+  Implemented size-tiered compaction engine in Rust partition server.
+  - TableMeta struct: tracks extent_id, offset, estimated_size, last_seq per SSTable.
+  - DefaultPickupPolicy: headRatio=0.3 (head extent truncation), compactRatio=0.5 (size-tiered), n=5 max tables.
+  - do_compact: reads selected tables from sst_cache, merges entries (newest-seq wins via BTreeMap order),
+    drops deleted/expired in major mode, splits output into ≤2×MAX_SKIP_LIST chunks, appends to rowStream,
+    atomically updates kv index + tables list, persists to metaStream.
+  - background_compact_loop: random 10-20s timer for minor compaction, bounded channel for major compaction.
+  - trigger_major_compact(part_id): public API to trigger major compaction.
+  - All 8 integration tests pass, including new f029_compaction_merges_small_tables test.
+
+  Also fixed: extent_node.rs append path - removed per-append RPC to manager (now only RPC on version mismatch),
+  cached manager gRPC channel with tokio::sync::OnceCell.
 
 Main gaps:
-  None for F030. logStream integration deferred to F031.
+  No discard tracking (F033 GC) - compaction does not accumulate discard maps for value log extents.
+  logStream integration deferred to F031.
 
 Next steps:
-  F029 – Compaction engine with merge iterator
   F031 – logStream (value log) integration
+  F032 – SSTable bloom filter, prefix compression, block cache
+  F033 – GC with discard tracking (depends on F029 discard maps, F031 value log)

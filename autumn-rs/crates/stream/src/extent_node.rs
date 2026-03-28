@@ -19,7 +19,7 @@ use autumn_proto::autumn::{
     RequireRecoveryResponse,
 };
 use dashmap::DashMap;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, OnceCell};
 use tokio::time::{interval, Duration};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -66,6 +66,7 @@ pub struct ExtentNode {
     disk_id: u64,
     data_dir: Arc<PathBuf>,
     manager_endpoint: Option<String>,
+    manager_channel: Arc<OnceCell<tonic::transport::Channel>>,
     recovery_done: Arc<Mutex<Vec<RecoveryTaskStatus>>>,
     recovery_inflight: Arc<DashMap<u64, RecoveryTask>>,
 }
@@ -82,6 +83,7 @@ impl ExtentNode {
             disk_id: config.disk_id,
             data_dir: Arc::new(config.data_dir),
             manager_endpoint: config.manager_endpoint,
+            manager_channel: Arc::new(OnceCell::new()),
             recovery_done: Arc::new(Mutex::new(Vec::new())),
             recovery_inflight: Arc::new(DashMap::new()),
         };
@@ -260,13 +262,23 @@ impl ExtentNode {
     async fn manager_client(
         &self,
     ) -> Result<StreamManagerServiceClient<tonic::transport::Channel>, Status> {
-        let manager = self
+        let endpoint = self
             .manager_endpoint
-            .clone()
+            .as_ref()
             .ok_or_else(|| Status::failed_precondition("manager endpoint is not configured"))?;
-        StreamManagerServiceClient::connect(Self::normalize_endpoint(&manager))
-            .await
-            .map_err(|e| Status::unavailable(e.to_string()))
+        let normalized = Self::normalize_endpoint(endpoint);
+        let channel = self
+            .manager_channel
+            .get_or_try_init(|| async {
+                tonic::transport::Channel::from_shared(normalized)
+                    .map_err(|e| Status::invalid_argument(e.to_string()))?
+                    .connect()
+                    .await
+                    .map_err(|e| Status::unavailable(e.to_string()))
+            })
+            .await?
+            .clone();
+        Ok(StreamManagerServiceClient::new(channel))
     }
 
     async fn extent_info_from_manager(&self, extent_id: u64) -> Result<Option<ExtentInfo>, Status> {
@@ -556,25 +568,36 @@ impl ExtentService for ExtentNode {
 
         let header = header.ok_or_else(|| Status::invalid_argument("append header missing"))?;
         let extent = self.get_extent(header.extent_id).await?;
-        if let Some(ex) = self.extent_info_from_manager(header.extent_id).await? {
-            let sealed_changed = Self::apply_extent_meta(&extent, &ex);
-            if sealed_changed {
-                let _ = self.save_meta(header.extent_id, &extent).await;
-            }
-            if ex.eversion > header.eversion {
-                return Ok(Response::new(Self::precondition_response(format!(
-                    "extent {} eversion too low: got {}, expect >= {}",
-                    header.extent_id, header.eversion, ex.eversion
-                ))));
-            }
-            if ex.sealed_length > 0 || ex.avali > 0 {
-                return Ok(Response::new(Self::precondition_response(format!(
-                    "extent {} is sealed",
-                    header.extent_id
-                ))));
+
+        // Only fetch from manager when local eversion is behind what the client expects.
+        // In the common case (eversions match) we trust local atomics -- no RPC needed.
+        let local_eversion = extent.eversion.load(Ordering::SeqCst);
+        if header.eversion > local_eversion {
+            match self.extent_info_from_manager(header.extent_id).await? {
+                Some(ex) => {
+                    let sealed_changed = Self::apply_extent_meta(&extent, &ex);
+                    if sealed_changed {
+                        let _ = self.save_meta(header.extent_id, &extent).await;
+                    }
+                }
+                None => {
+                    // Manager unreachable but we know local state is stale -- reject.
+                    return Err(Status::unavailable(format!(
+                        "cannot verify extent {} version: manager unreachable",
+                        header.extent_id
+                    )));
+                }
             }
         }
 
+        // Validate eversion and sealed state from local atomics.
+        let local_eversion = extent.eversion.load(Ordering::SeqCst);
+        if local_eversion > header.eversion {
+            return Ok(Response::new(Self::precondition_response(format!(
+                "extent {} eversion too low: got {}, expect >= {}",
+                header.extent_id, header.eversion, local_eversion
+            ))));
+        }
         if extent.sealed_length.load(Ordering::SeqCst) > 0
             || extent.avali.load(Ordering::SeqCst) > 0
         {

@@ -973,3 +973,99 @@ async fn f030_recovery_from_meta_and_row_streams() {
     ps2_task.abort();
     mgr_task.abort();
 }
+
+/// F029: compaction merges multiple small SSTables into one.
+///
+/// Test steps:
+/// 1. Write enough data to produce at least 3 separate SSTables (each flush
+///    produces one SSTable; we write 3 × 300 KB to exceed FLUSH_MEM_BYTES each time).
+/// 2. Trigger a major compaction via `trigger_major_compact`.
+/// 3. Verify all keys are still readable after compaction.
+/// 4. Verify the number of SSTables decreased (merged into fewer tables).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f029_compaction_merges_small_tables() {
+    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) =
+        setup_infra_f030(105).await;
+
+    let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
+        .await.expect("connect sm");
+    let log_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
+        .await.expect("create log stream").into_inner().stream.expect("log stream").stream_id;
+    let row_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
+        .await.expect("create row stream").into_inner().stream.expect("row stream").stream_id;
+    let meta_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
+        .await.expect("create meta stream").into_inner().stream.expect("meta stream").stream_id;
+
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let ps = PartitionServer::connect(43, &endpoint, data_dir.path(), IoMode::Standard)
+        .await.expect("connect ps");
+    let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
+        .await.expect("connect pm");
+    pm.upsert_partition(Request::new(UpsertPartitionRequest {
+        meta: Some(PartitionMeta {
+            log_stream, row_stream, meta_stream,
+            part_id: 621,
+            rg: Some(Range { start_key: b"a".to_vec(), end_key: b"z".to_vec() }),
+        }),
+    })).await.expect("upsert partition");
+    ps.sync_regions_once().await.expect("sync regions");
+
+    let ps_addr = pick_addr();
+    let ps_task = tokio::spawn(ps.clone().serve(ps_addr));
+    sleep(Duration::from_millis(120)).await;
+
+    let mut kv = PartitionKvClient::connect(format!("http://{}", ps_addr))
+        .await.expect("connect kv");
+
+    // Write 3 large values, each triggering a separate flush.
+    for i in 0u8..3 {
+        kv.put(Request::new(PutRequest {
+            key: format!("key-{:02}", i).into_bytes(),
+            value: vec![b'A' + i; 300 * 1024],
+            expires_at: 0,
+            part_id: 621,
+        })).await.expect("put large key");
+        sleep(Duration::from_millis(400)).await; // wait for background flush
+    }
+
+    // Verify we have 3 SSTables in metaStream before compaction.
+    let mut sc = StreamClient::connect(&endpoint, "test-f029".to_string(), 128 * 1024 * 1024)
+        .await.expect("stream client");
+    let meta_bytes_before = sc.read_last_block(meta_stream).await.expect("read meta")
+        .expect("meta block must exist");
+    let locs_before = TableLocations::decode(meta_bytes_before.as_slice())
+        .expect("decode TableLocations");
+    assert!(locs_before.locs.len() >= 2,
+        "expected at least 2 SSTables before compaction, got {}",
+        locs_before.locs.len());
+
+    // Trigger major compaction (non-blocking send to bounded channel).
+    ps.trigger_major_compact(621);
+    sleep(Duration::from_millis(800)).await; // wait for compaction to complete
+
+    // All keys must still be readable after compaction.
+    for i in 0u8..3 {
+        let resp = kv.get(Request::new(GetRequest {
+            key: format!("key-{:02}", i).into_bytes(),
+            part_id: 621,
+        })).await.expect("get after compact").into_inner();
+        assert_eq!(resp.value.len(), 300 * 1024,
+            "key-{:02} must be readable after compaction", i);
+        assert!(resp.value.iter().all(|&b| b == b'A' + i),
+            "key-{:02} value bytes must match", i);
+    }
+
+    // After major compaction the number of SSTables should have decreased.
+    let meta_bytes_after = sc.read_last_block(meta_stream).await.expect("read meta after compact")
+        .expect("meta block must exist after compact");
+    let locs_after = TableLocations::decode(meta_bytes_after.as_slice())
+        .expect("decode TableLocations after compact");
+    assert!(locs_after.locs.len() < locs_before.locs.len(),
+        "compaction should reduce SSTable count: before={} after={}",
+        locs_before.locs.len(), locs_after.locs.len());
+
+    n1_task.abort();
+    n2_task.abort();
+    ps_task.abort();
+    mgr_task.abort();
+}

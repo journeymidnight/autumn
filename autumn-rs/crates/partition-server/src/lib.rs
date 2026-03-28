@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -132,6 +132,35 @@ impl Memtable {
 //   [op:1][key_len:4 LE][val_len:4 LE][expires_at:8 LE][key bytes][value bytes]
 const RECORD_HEADER_SIZE: u64 = 1 + 4 + 4 + 8; // 17 bytes
 
+// ---------------------------------------------------------------------------
+// SSTable metadata (F029)
+// ---------------------------------------------------------------------------
+
+/// Per-table metadata needed by the compaction policy.
+/// Mirrors Go's `table.Table` fields used in `DefaultPickupPolicy`.
+#[derive(Clone, Debug)]
+struct TableMeta {
+    /// Location in rowStream (extent_id, block offset).
+    extent_id: u64,
+    offset: u32,
+    /// Raw byte size of the SSTable (used as EstimatedSize in the policy).
+    estimated_size: u64,
+    /// Maximum MVCC sequence number among all entries in this table.
+    last_seq: u64,
+}
+
+impl TableMeta {
+    fn loc(&self) -> (u64, u32) {
+        (self.extent_id, self.offset)
+    }
+}
+
+// Compaction constants (mirrors Go's Option + DefaultPickupPolicy defaults)
+const MAX_SKIP_LIST: u64 = 64 * 1024 * 1024; // 64 MB
+const COMPACT_RATIO: f64 = 0.5;
+const HEAD_RATIO: f64 = 0.3;
+const COMPACT_N: usize = 5; // max tables per minor compaction
+
 struct PartitionData {
     part_id: u64,
     rg: Range,
@@ -145,15 +174,19 @@ struct PartitionData {
     imm: VecDeque<Arc<Memtable>>,
     /// Signals the background flush task when `imm` is non-empty (F028).
     flush_tx: mpsc::UnboundedSender<()>,
+    /// Triggers a major compaction (compacts all tables).
+    compact_tx: mpsc::Sender<bool>,
     seq_number: u64,
     /// Stream IDs for the three-stream model (F030).
     log_stream_id: u64,
     row_stream_id: u64,
     meta_stream_id: u64,
-    /// Ordered list of SSTable locations in rowStream (F030).
-    table_locs: Vec<(u64, u32)>,
+    /// Ordered list of SSTables with metadata for compaction policy (F029).
+    tables: Vec<TableMeta>,
     /// In-memory cache of SSTable bytes keyed by (extent_id, offset) (F030).
     sst_cache: HashMap<(u64, u32), Arc<Vec<u8>>>,
+    /// hasOverlap: set to 1 when split produces overlapping keys, cleared by major compaction.
+    has_overlap: Arc<AtomicU32>,
     /// Local WAL file (kept until F031 wires logStream).
     log_file: Arc<dyn IoFile>,
     log_len: u64,
@@ -473,20 +506,20 @@ impl PartitionServer {
     // metaStream persistence (F030)
     // -----------------------------------------------------------------------
 
-    /// Persist the current table_locs list to metaStream.
+    /// Persist the current tables list to metaStream.
     /// Must NOT be called while holding the PartitionData write lock if
     /// the StreamClient Mutex is already locked elsewhere (deadlock prevention).
     async fn save_table_locs_raw(
         &self,
         meta_stream_id: u64,
-        table_locs: &[(u64, u32)],
+        tables: &[TableMeta],
     ) -> Result<()> {
         let locs_proto = TableLocations {
-            locs: table_locs
+            locs: tables
                 .iter()
-                .map(|(eid, off)| Location {
-                    extent_id: *eid,
-                    offset: *off,
+                .map(|t| Location {
+                    extent_id: t.extent_id,
+                    offset: t.offset,
                 })
                 .collect(),
         };
@@ -519,7 +552,7 @@ impl PartitionServer {
 
         let mut kv = BTreeMap::new();
         let mut sst_cache: HashMap<(u64, u32), Arc<Vec<u8>>> = HashMap::new();
-        let mut table_locs: Vec<(u64, u32)> = Vec::new();
+        let mut tables: Vec<TableMeta> = Vec::new();
         let mut max_seq: u64 = 0;
 
         // Step 1: Read metaStream to get the last checkpoint of table locations.
@@ -550,14 +583,14 @@ impl PartitionServer {
 
                 let sst_loc = (loc.extent_id, loc.offset);
                 let sst_arc = Arc::new(sst_bytes);
+                let mut tbl_last_seq: u64 = 0;
 
                 for (op, key, value_len, expires_at, record_offset) in
                     Self::decode_record_metas(&sst_arc)
                 {
                     let ts = parse_ts(&key);
-                    if ts > max_seq {
-                        max_seq = ts;
-                    }
+                    if ts > max_seq { max_seq = ts; }
+                    if ts > tbl_last_seq { tbl_last_seq = ts; }
                     Self::apply_record_meta(
                         &mut kv,
                         op,
@@ -572,8 +605,14 @@ impl PartitionServer {
                     );
                 }
 
+                let estimated_size = sst_arc.len() as u64;
                 sst_cache.insert(sst_loc, sst_arc);
-                table_locs.push(sst_loc);
+                tables.push(TableMeta {
+                    extent_id: loc.extent_id,
+                    offset: loc.offset,
+                    estimated_size,
+                    last_seq: tbl_last_seq,
+                });
             }
         }
 
@@ -603,6 +642,10 @@ impl PartitionServer {
 
         // Background flush channel (F028): unbounded so rotate never blocks.
         let (flush_tx, flush_rx) = mpsc::unbounded_channel::<()>();
+        // Background compaction channel (F029): bounded(1) so major trigger is non-blocking.
+        let (compact_tx, compact_rx) = mpsc::channel::<bool>(1);
+
+        let has_overlap = Arc::new(AtomicU32::new(0));
 
         let part = Arc::new(RwLock::new(PartitionData {
             part_id,
@@ -611,20 +654,31 @@ impl PartitionServer {
             active: Memtable::new(),
             imm: VecDeque::new(),
             flush_tx,
+            compact_tx,
             seq_number,
             log_stream_id,
             row_stream_id,
             meta_stream_id,
-            table_locs,
+            tables,
             sst_cache,
+            has_overlap: has_overlap.clone(),
             log_file,
             log_len: wal_len,
         }));
 
         // Spawn per-partition background flush task (F028).
-        let part_weak = Arc::downgrade(&part);
-        let server_clone = self.clone();
-        tokio::spawn(Self::background_flush_loop(server_clone, part_weak, flush_rx));
+        {
+            let part_weak = Arc::downgrade(&part);
+            let server_clone = self.clone();
+            tokio::spawn(Self::background_flush_loop(server_clone, part_weak, flush_rx));
+        }
+
+        // Spawn per-partition background compaction task (F029).
+        {
+            let part_weak = Arc::downgrade(&part);
+            let server_clone = self.clone();
+            tokio::spawn(Self::background_compact_loop(server_clone, part_weak, compact_rx, has_overlap));
+        }
 
         Ok(part)
     }
@@ -733,11 +787,14 @@ impl PartitionServer {
 
         let mut sst_bytes = Vec::new();
         let mut new_locs: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut last_seq: u64 = 0;
 
         for entry in imm_mem.data.iter() {
             let internal_key = entry.key();
             let meta = entry.value();
             let sst_record_offset = sst_bytes.len() as u64;
+            let ts = parse_ts(internal_key);
+            if ts > last_seq { last_seq = ts; }
 
             if meta.deleted {
                 sst_bytes.extend_from_slice(&Self::encode_record(2, internal_key, &[], 0));
@@ -759,13 +816,19 @@ impl PartitionServer {
             sc.append(part.row_stream_id, &sst_bytes, true).await?
         };
         let sst_loc = (result.extent_id, result.offset);
+        let estimated_size = sst_bytes.len() as u64;
         let sst_bytes_arc = Arc::new(sst_bytes);
 
         Self::apply_sst_locs_stream(&mut part.kv, sst_loc, &new_locs);
         part.sst_cache.insert(sst_loc, sst_bytes_arc);
-        part.table_locs.push(sst_loc);
+        part.tables.push(TableMeta {
+            extent_id: result.extent_id,
+            offset: result.offset,
+            estimated_size,
+            last_seq,
+        });
 
-        self.save_table_locs_raw(part.meta_stream_id, &part.table_locs).await?;
+        self.save_table_locs_raw(part.meta_stream_id, &part.tables).await?;
         Ok(true)
     }
 
@@ -846,11 +909,14 @@ impl PartitionServer {
         //                     then append to rowStream.
         let mut sst_bytes = Vec::new();
         let mut new_locs: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut last_seq: u64 = 0;
 
         for entry in imm_mem.data.iter() {
             let internal_key = entry.key();
             let meta = entry.value();
             let sst_record_offset = sst_bytes.len() as u64;
+            let ts = parse_ts(internal_key);
+            if ts > last_seq { last_seq = ts; }
 
             if meta.deleted {
                 sst_bytes.extend_from_slice(&Self::encode_record(2, internal_key, &[], 0));
@@ -871,25 +937,368 @@ impl PartitionServer {
             sc.append(row_stream_id, &sst_bytes, true).await?
         };
         let sst_loc = (result.extent_id, result.offset);
+        let estimated_size = sst_bytes.len() as u64;
         let sst_bytes_arc = Arc::new(sst_bytes);
 
-        // Phase 3 (write lock, brief): update kv index + table_locs.
-        let table_locs = {
+        // Phase 3 (write lock, brief): update kv index + tables.
+        let tables_snapshot = {
             let mut guard = part.write().await;
             Self::apply_sst_locs_stream(&mut guard.kv, sst_loc, &new_locs);
             guard.sst_cache.insert(sst_loc, sst_bytes_arc);
-            guard.table_locs.push(sst_loc);
+            guard.tables.push(TableMeta {
+                extent_id: result.extent_id,
+                offset: result.offset,
+                estimated_size,
+                last_seq,
+            });
             guard.imm.pop_front();
-            guard.table_locs.clone()
+            guard.tables.clone()
         };
 
-        // Save table_locs to metaStream outside the write lock.
-        self.save_table_locs_raw(meta_stream_id, &table_locs).await?;
+        // Save tables to metaStream outside the write lock.
+        self.save_table_locs_raw(meta_stream_id, &tables_snapshot).await?;
 
         Ok(true)
     }
 
     /// Per-partition background task: drains the imm queue whenever signalled.
+    // -----------------------------------------------------------------------
+    // F029 – Compaction engine
+    // -----------------------------------------------------------------------
+    //
+    // Policy: DefaultPickupPolicy (size-tiered, mirrors Go implementation).
+    //   Rule 1 (head rule): if tables on the first extent sum to < headRatio *
+    //     total, compact all tables on that extent (allows stream truncation).
+    //   Rule 2 (size ratio): compact adjacent small tables (< compactRatio *
+    //     MAX_SKIP_LIST) so that write amplification stays bounded.
+    //
+    // Execution: do_compact reads selected tables from sst_cache, merges entries
+    //   (BTreeMap order = newest-seq-first for same user key), optionally drops
+    //   deleted/expired entries (major compaction only), writes a new SSTable,
+    //   and atomically replaces old table entries in `tables` + `kv`.
+    // -----------------------------------------------------------------------
+
+    /// Pick tables to compact following Go's DefaultPickupPolicy.
+    /// Returns `(selected_tables, truncate_extent_id)`.
+    /// `truncate_extent_id` is non-zero only when the head rule fires and the
+    /// caller should call `row_stream.truncate(truncate_extent_id)` afterwards.
+    fn pickup_tables(tables: &[TableMeta], max_capacity: u64) -> (Vec<TableMeta>, u64) {
+        if tables.len() < 2 {
+            return (vec![], 0);
+        }
+
+        // ── Rule 1: head extent truncation ──────────────────────────────────
+        let total_size: u64 = tables.iter().map(|t| t.estimated_size).sum();
+        let head_extent = tables[0].extent_id;
+
+        let head_size: u64 = tables
+            .iter()
+            .filter(|t| t.extent_id == head_extent)
+            .map(|t| t.estimated_size)
+            .sum();
+
+        let head_threshold = (HEAD_RATIO * total_size as f64).round() as u64;
+
+        if head_size < head_threshold {
+            // Collect all tables on head_extent (up to COMPACT_N).
+            let chosen: Vec<TableMeta> = tables
+                .iter()
+                .filter(|t| t.extent_id == head_extent)
+                .take(COMPACT_N)
+                .cloned()
+                .collect();
+
+            // Find the truncate ID = extent_id of the first table NOT on head_extent.
+            let truncate_id = tables
+                .iter()
+                .find(|t| t.extent_id != head_extent)
+                .map(|t| t.extent_id)
+                .unwrap_or(0);
+
+            // Sort both by last_seq then merge to fill "holes" (contiguous order).
+            let mut tbls_sorted = tables.to_vec();
+            tbls_sorted.sort_by_key(|t| t.last_seq);
+            let mut chosen_sorted = chosen.clone();
+            chosen_sorted.sort_by_key(|t| t.last_seq);
+
+            if chosen_sorted.is_empty() {
+                return (vec![], 0);
+            }
+
+            let start_seq = chosen_sorted[0].last_seq;
+            let start_idx = tbls_sorted.partition_point(|t| t.last_seq < start_seq);
+
+            let mut compact_tbls: Vec<TableMeta> = Vec::new();
+            let mut ci = 0usize;
+            let mut ti = start_idx;
+            while ti < tbls_sorted.len() && ci < chosen_sorted.len() && compact_tbls.len() < COMPACT_N {
+                if tbls_sorted[ti].last_seq < chosen_sorted[ci].last_seq {
+                    compact_tbls.push(tbls_sorted[ti].clone());
+                    ti += 1;
+                } else if tbls_sorted[ti].last_seq == chosen_sorted[ci].last_seq {
+                    compact_tbls.push(tbls_sorted[ti].clone());
+                    ti += 1;
+                    ci += 1;
+                } else {
+                    break;
+                }
+            }
+
+            // Only return truncate_id if we covered all chosen tables.
+            if ci == chosen_sorted.len() && compact_tbls.len() >= 2 {
+                return (compact_tbls, truncate_id);
+            }
+            if compact_tbls.len() >= 2 {
+                return (compact_tbls, 0);
+            }
+            return (vec![], 0);
+        }
+
+        // ── Rule 2: size-tiered compaction ──────────────────────────────────
+        let mut tbls_sorted = tables.to_vec();
+        tbls_sorted.sort_by_key(|t| t.last_seq);
+
+        let throttle = (COMPACT_RATIO * MAX_SKIP_LIST as f64).round() as u64;
+        let mut compact_tbls: Vec<TableMeta> = Vec::new();
+
+        let mut i = 0usize;
+        while i < tbls_sorted.len() {
+            while i < tbls_sorted.len()
+                && tbls_sorted[i].estimated_size < throttle
+                && compact_tbls.len() < COMPACT_N
+            {
+                // Include the previous table (merge into older, larger tables).
+                if i > 0
+                    && compact_tbls.is_empty()
+                    && tbls_sorted[i].estimated_size + tbls_sorted[i - 1].estimated_size
+                        < max_capacity
+                {
+                    compact_tbls.push(tbls_sorted[i - 1].clone());
+                }
+                compact_tbls.push(tbls_sorted[i].clone());
+                i += 1;
+            }
+
+            if !compact_tbls.is_empty() {
+                if compact_tbls.len() == 1 {
+                    // Corner case: try to pair with the next table.
+                    if i < tbls_sorted.len()
+                        && compact_tbls[0].estimated_size + tbls_sorted[i].estimated_size
+                            < max_capacity
+                    {
+                        compact_tbls.push(tbls_sorted[i].clone());
+                    } else {
+                        compact_tbls.clear();
+                        i += 1;
+                        continue;
+                    }
+                }
+                break;
+            }
+            i += 1;
+        }
+
+        if compact_tbls.len() >= 2 {
+            return (compact_tbls, 0);
+        }
+        (vec![], 0)
+    }
+
+    /// Compact the given tables into one or more new SSTables.
+    ///
+    /// In `major` mode, deleted and expired entries are dropped entirely.
+    /// Returns `true` if at least one new SSTable was written.
+    async fn do_compact(
+        &self,
+        part: &Arc<RwLock<PartitionData>>,
+        tbls: Vec<TableMeta>,
+        major: bool,
+    ) -> Result<bool> {
+        if tbls.len() < 2 {
+            return Ok(false);
+        }
+
+        // Build the set of table keys being compacted.
+        let compact_keys: std::collections::HashSet<(u64, u32)> =
+            tbls.iter().map(|t| t.loc()).collect();
+
+        // ── Step 1: Read all records from selected tables (outside lock) ──────
+        // Collect raw bytes from sst_cache while holding only a read lock.
+        let (sst_data, row_stream_id, meta_stream_id) = {
+            let guard = part.read().await;
+            let mut data: Vec<(TableMeta, Arc<Vec<u8>>)> = Vec::new();
+            for t in &tbls {
+                if let Some(bytes) = guard.sst_cache.get(&t.loc()) {
+                    data.push((t.clone(), bytes.clone()));
+                }
+            }
+            (data, guard.row_stream_id, guard.meta_stream_id)
+        };
+
+        if sst_data.is_empty() {
+            return Ok(false);
+        }
+
+        // ── Step 2: Merge entries via BTreeMap (newest-seq wins) ─────────────
+        // Sort tables by last_seq descending so that when we insert into a
+        // BTreeMap keyed by internal_key, the last writer (newest seq) wins.
+        // Since internal keys include the seq suffix (higher seq = smaller
+        // suffix = sorts first), the BTreeMap already deduplicates correctly.
+        // We iterate in last_seq descending order so we see newer versions first.
+        let mut merged: BTreeMap<Vec<u8>, (u8, Vec<u8>, u64)> = BTreeMap::new(); // ikey → (op, value, expires_at)
+
+        let now = now_secs();
+        let mut sorted_data = sst_data;
+        sorted_data.sort_by(|a, b| b.0.last_seq.cmp(&a.0.last_seq)); // newest first
+
+        for (_tbl_meta, sst_bytes) in &sorted_data {
+            let records = Self::decode_record_metas(sst_bytes);
+            for (op, ikey, value_len, expires_at, record_offset) in records {
+                // Skip if we already have a newer version of this exact internal key.
+                if merged.contains_key(&ikey) {
+                    continue;
+                }
+                // In major mode, drop tombstones and expired entries.
+                if major {
+                    if op == 2 {
+                        // tombstone
+                        merged.insert(ikey, (op, Vec::new(), 0));
+                        continue;
+                    }
+                    if expires_at > 0 && expires_at <= now {
+                        continue; // expired
+                    }
+                }
+                // Read the actual value bytes.
+                let vo = (record_offset + RECORD_HEADER_SIZE + ikey.len() as u64) as usize;
+                let end = vo + value_len as usize;
+                if op == 1 && end <= sst_bytes.len() {
+                    let value = sst_bytes[vo..end].to_vec();
+                    merged.insert(ikey, (op, value, expires_at));
+                } else if op == 2 {
+                    merged.insert(ikey, (op, Vec::new(), 0));
+                }
+            }
+        }
+
+        // In major mode, drop tombstones from the merged output.
+        if major {
+            merged.retain(|_, (op, _, _)| *op != 2);
+        }
+
+        if merged.is_empty() {
+            // All entries were dropped; still need to remove the old tables.
+            let tables_snapshot = {
+                let mut guard = part.write().await;
+                guard.tables.retain(|t| !compact_keys.contains(&t.loc()));
+                guard.tables.clone()
+            };
+            self.save_table_locs_raw(meta_stream_id, &tables_snapshot).await?;
+            return Ok(true);
+        }
+
+        // ── Step 3: Build new SSTable bytes ───────────────────────────────────
+        // Split into chunks of at most 2 * MAX_SKIP_LIST (matches Go's capacity).
+        let max_chunk = 2 * MAX_SKIP_LIST as usize;
+        let mut chunks: Vec<(Vec<u8>, Vec<(Vec<u8>, u64)>, u64)> = Vec::new(); // (sst_bytes, locs, last_seq)
+
+        let mut sst_bytes: Vec<u8> = Vec::new();
+        let mut new_locs: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut chunk_last_seq: u64 = 0;
+
+        for (ikey, (op, value, expires_at)) in &merged {
+            let ts = parse_ts(ikey);
+            if ts > chunk_last_seq { chunk_last_seq = ts; }
+
+            let record = Self::encode_record(*op, ikey, value, *expires_at);
+            if sst_bytes.len() + record.len() > max_chunk && !sst_bytes.is_empty() {
+                chunks.push((
+                    std::mem::take(&mut sst_bytes),
+                    std::mem::take(&mut new_locs),
+                    chunk_last_seq,
+                ));
+                chunk_last_seq = ts;
+            }
+            let offset = sst_bytes.len() as u64;
+            sst_bytes.extend_from_slice(&record);
+            new_locs.push((ikey.clone(), offset));
+        }
+        if !sst_bytes.is_empty() {
+            chunks.push((sst_bytes, new_locs, chunk_last_seq));
+        }
+
+        // ── Step 4: Append each chunk to rowStream ────────────────────────────
+        let mut new_tables: Vec<(TableMeta, Arc<Vec<u8>>, Vec<(Vec<u8>, u64)>)> = Vec::new();
+        for (chunk_bytes, chunk_locs, chunk_last_seq) in chunks {
+            let result = {
+                let mut sc = self.stream_client.lock().await;
+                sc.append(row_stream_id, &chunk_bytes, true).await?
+            };
+            let estimated_size = chunk_bytes.len() as u64;
+            let sst_arc = Arc::new(chunk_bytes);
+            new_tables.push((
+                TableMeta {
+                    extent_id: result.extent_id,
+                    offset: result.offset,
+                    estimated_size,
+                    last_seq: chunk_last_seq,
+                },
+                sst_arc,
+                chunk_locs,
+            ));
+        }
+
+        // ── Step 5: Atomically update kv + tables (write lock) ────────────────
+        let tables_snapshot = {
+            let mut guard = part.write().await;
+
+            // Remove old tables from the list.
+            guard.tables.retain(|t| !compact_keys.contains(&t.loc()));
+            // Remove old SST bytes from cache.
+            for key in &compact_keys {
+                guard.sst_cache.remove(key);
+            }
+
+            // Add new tables + update kv locs.
+            for (tbl_meta, sst_arc, chunk_locs) in &new_tables {
+                let sst_loc = tbl_meta.loc();
+                // Update kv entries that pointed to any compacted table.
+                for (internal_key, sst_record_offset) in chunk_locs {
+                    if let Some(meta) = guard.kv.get_mut(internal_key) {
+                        if let ValueLoc::Stream { extent_id, table_offset, .. } = &meta.loc {
+                            if compact_keys.contains(&(*extent_id, *table_offset)) {
+                                meta.loc = ValueLoc::Stream {
+                                    extent_id: sst_loc.0,
+                                    table_offset: sst_loc.1,
+                                    record_offset: *sst_record_offset,
+                                };
+                            }
+                        }
+                    }
+                }
+                // Remove kv entries that were dropped (major compaction only).
+                if major {
+                    guard.kv.retain(|_k, meta| {
+                        if let ValueLoc::Stream { extent_id, table_offset, .. } = &meta.loc {
+                            !compact_keys.contains(&(*extent_id, *table_offset))
+                        } else {
+                            true
+                        }
+                    });
+                }
+                guard.sst_cache.insert(sst_loc, sst_arc.clone());
+                guard.tables.push(tbl_meta.clone());
+            }
+
+            guard.tables.clone()
+        };
+
+        // ── Step 6: Persist table list ────────────────────────────────────────
+        self.save_table_locs_raw(meta_stream_id, &tables_snapshot).await?;
+
+        Ok(true)
+    }
+
     async fn background_flush_loop(
         server: PartitionServer,
         part_weak: std::sync::Weak<RwLock<PartitionData>>,
@@ -906,6 +1315,90 @@ impl PartitionServer {
                     Err(e) => {
                         tracing::error!("background imm flush error: {e}");
                         break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Background compaction task per partition (F029).
+    ///
+    /// Runs minor compaction on a random 10-20s timer.
+    /// Runs major compaction when triggered via `compact_tx.send(true)`.
+    async fn background_compact_loop(
+        server: PartitionServer,
+        part_weak: std::sync::Weak<RwLock<PartitionData>>,
+        mut compact_rx: mpsc::Receiver<bool>,
+        has_overlap: Arc<AtomicU32>,
+    ) {
+        use tokio::time::Instant;
+
+        // Random interval: 10-20 seconds (mirrors Go's RandomTicker).
+        fn random_compact_delay() -> Duration {
+            let millis = 10_000u64 + (rand_u64() % 10_000);
+            Duration::from_millis(millis)
+        }
+
+        let mut next_minor = Instant::now() + random_compact_delay();
+
+        loop {
+            tokio::select! {
+                // Major compaction triggered externally.
+                maybe = compact_rx.recv() => {
+                    if maybe.is_none() { break; }
+                    let Some(part) = part_weak.upgrade() else { break; };
+
+                    let tbls = {
+                        let guard = part.read().await;
+                        guard.tables.clone()
+                    };
+                    if tbls.len() < 1 { continue; }
+
+                    // Truncate up to the last table's extent after major compaction.
+                    let last_extent_id = tbls.last().map(|t| t.extent_id).unwrap_or(0);
+
+                    match server.do_compact(&part, tbls, true).await {
+                        Ok(_) => {
+                            has_overlap.store(0, Ordering::SeqCst);
+                            if last_extent_id != 0 {
+                                let row_stream_id = part.read().await.row_stream_id;
+                                let mut sc = server.stream_client.lock().await;
+                                if let Err(e) = sc.truncate(row_stream_id, last_extent_id).await {
+                                    tracing::warn!("major compaction truncate error: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => tracing::error!("major compaction error: {e}"),
+                    }
+                }
+
+                // Minor compaction on random timer.
+                _ = tokio::time::sleep_until(next_minor) => {
+                    next_minor = Instant::now() + random_compact_delay();
+
+                    let Some(part) = part_weak.upgrade() else { break; };
+
+                    let tbls = {
+                        let guard = part.read().await;
+                        guard.tables.clone()
+                    };
+
+                    let (compact_tbls, truncate_id) =
+                        Self::pickup_tables(&tbls, 2 * MAX_SKIP_LIST);
+
+                    if compact_tbls.len() < 2 { continue; }
+
+                    match server.do_compact(&part, compact_tbls, false).await {
+                        Ok(_) => {
+                            if truncate_id != 0 {
+                                let row_stream_id = part.read().await.row_stream_id;
+                                let mut sc = server.stream_client.lock().await;
+                                if let Err(e) = sc.truncate(row_stream_id, truncate_id).await {
+                                    tracing::warn!("minor compaction truncate error: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => tracing::error!("minor compaction error: {e}"),
                     }
                 }
             }
@@ -932,6 +1425,17 @@ impl PartitionServer {
             .remove(&part_id)
             .map(|(_, part)| part)
             .ok_or_else(|| anyhow!("part {part_id} not found"))
+    }
+
+    /// Trigger a major compaction for a partition. Non-blocking (drops message
+    /// if a compaction is already queued).
+    pub fn trigger_major_compact(&self, part_id: u64) {
+        if let Some(part) = self.partitions.get(&part_id) {
+            let guard = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(part.read())
+            });
+            let _ = guard.compact_tx.try_send(true);
+        }
     }
 
     pub async fn sync_regions_once(&self) -> Result<()> {
@@ -1389,6 +1893,19 @@ fn part_lookup_to_status(part_id: u64, err: anyhow::Error) -> Status {
     } else {
         Status::internal(msg)
     }
+}
+
+/// Simple pseudo-random u64 using the current time as seed.
+/// Good enough for jittering compaction intervals.
+fn rand_u64() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64
+        ^ std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
 }
 
 fn now_secs() -> u64 {
