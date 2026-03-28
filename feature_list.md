@@ -41,8 +41,8 @@
 ### F028 · LSM flush pipeline with immutable memtable queue
 - **Target:** Async flush pipeline: active memtable → immutable memtable queue → background flush to SSTable via rowStream. Write path does not block on flush. Equivalent to Go `doWrites/ensureRoomForWrite/flushMemtable`.
 - **Evidence:** `range_partition/range_partition.go` (writeCh, flushChan, imm) · `autumn-rs/crates/partition-server/src/lib.rs`
-- **Notes:** Current Rust: single DashMap memtable, flush is synchronous. Go: buffered writeCh → doWrites() → imm queue → async flushMemtable(). Depends on F036.
-- **passes:** false
+- **Notes:** Implemented. ValueLoc::Buffer carries in-memory WAL snapshot so WAL can be truncated at rotation time. rotate_active_locked + flush_one_imm_async + background_flush_loop. Write path calls maybe_rotate_locked (fast). Split path calls flush_memtable_locked (sync drain).
+- **passes:** true
 
 ### F030 · Three-stream model with metaStream persistence
 - **Target:** Partition uses three streams: logStream (value log), rowStream (SSTables), metaStream (table registry + GC state + vhead). Recovery reads metaStream to locate tables then replays logStream from vhead.

@@ -1,14 +1,17 @@
 Date: 2026-03-27
 TaskStatus: completed
-Task scope: F036 (skiplist-based memtable)
+Task scope: F036 (skiplist memtable) + F028 (immutable memtable queue + background flush)
 
 Current summary:
-- F036: PartitionData.mem_ops BTreeMap<Vec<u8>, KeyMeta> + mem_bytes u64
-  replaced by active: Memtable (crossbeam_skiplist::SkipMap + AtomicU64 bytes).
-  Memtable API: new() / insert(key, meta, size) / is_empty() / len() / mem_bytes().
-  Flush iterates skiplist entries (collected to Vec to allow async I/O).
-  After flush, active = Memtable::new() (skiplist has no clear()).
-  All 3 partition-server unit tests pass, full workspace builds clean.
+- F036: active: Memtable (crossbeam_skiplist::SkipMap + AtomicU64 bytes) replaces
+  old BTreeMap mem_ops + mem_bytes. Committed: 781316f.
+- F028: ValueLoc gains Buffer{Arc<Vec<u8>>, record_offset} variant.
+  rotate_active_locked: WAL snapshot → Buffer locs, truncate WAL to 0.
+  flush_one_imm_async: lock-free SST write (Phase 2), brief write lock
+  for kv index update (Phase 3). background_flush_loop: per-partition
+  tokio task via Weak<RwLock<PartitionData>>, exits when partition removed.
+  maybe_rotate_locked: fast write path (no SST blocking).
+  flush_memtable_locked: synchronous drain for split path. Committed: fbe23ee.
 
 What is already implemented (high confidence):
 - Proto + gRPC 服务骨架可用（stream/partition/extent + StreamPut）。
@@ -20,15 +23,16 @@ What is already implemented (high confidence):
 - MVCC internal key (F026) + key-only index (F027)。
 - 独立进程 binary: manager, extent-node, stream-cli, autumn-ps, autumn-client。
 - etcd 持久化 (F016)。
-- Skiplist memtable (F036): crossbeam-skiplist SkipMap, 已提交。
+- Skiplist memtable (F036): crossbeam-skiplist SkipMap。
+- Immutable memtable queue + background flush (F028): ValueLoc::Buffer,
+  rotate_active_locked, flush_one_imm_async, background_flush_loop。
 
 Main gaps to full Go->Rust migration:
-- F028: LSM flush pipeline (immutable memtable queue + background flush). Depends on F036 (done).
-- F030: Three-stream model (metaStream persistence). Depends on F028.
-- F029: Compaction engine with merge iterator. Depends on F036+F028.
+- F030: Three-stream model (metaStream persistence). Depends on F028 (done).
+- F029: Compaction engine with merge iterator. Depends on F036+F028 (both done).
 - F034: Extent node metadata persistence (independent, restart recovery).
 - F010: 缺少 Batch/Maintenance API。
-- F011: 缺少 compaction/GC/value-log 等高级存储行为。
+- F011: 缺少 compaction/GC/value-log 等高级存储行为（总伞）。
 - F012: 未见完整 Rust EC 模块。
 - F019: Partition Manager 缺少分配策略/负载均衡。
 - F020: 缺少 gRPC 连接池。
@@ -38,15 +42,17 @@ Main gaps to full Go->Rust migration:
 - F025: 缺少 stream benchmark CLI。
 
 Next steps:
-1) F028: Implement immutable memtable queue + async background flush.
-   - Add imm: Vec<Arc<Memtable>> to PartitionData.
-   - Rotate active → imm when full (hold write lock briefly for rotation only).
-   - Background flush task reads from imm queue, creates SSTable, updates kv index.
-2) F034: Extent node metadata persistence (independent, can be done in parallel).
-3) F030: Three-stream model after F028 is done.
+1) F034: Extent node metadata persistence (independent, high value for correctness).
+   - Persist block_sizes / sealed_length / eversion in xattr-equivalent on disk.
+   - Or: write metadata sidecar file alongside extent data file.
+2) F030: Three-stream model (logStream / rowStream / metaStream).
+   - Currently PartitionData uses local files, not streams.
+   - Migrate to autumn stream layer for persistence.
+3) F029: Compaction engine (depends on F028 done, F029 is next big P0).
 
 Handover note:
-- Memtable struct at partition-server/src/lib.rs (after KeyMeta, before RECORD_HEADER_SIZE).
-- active: Memtable field replaces old mem_ops + mem_bytes.
-- flush_memtable_locked: collects entries from skiplist to Vec before async I/O.
-- Replacing the active memtable after flush: part.active = Memtable::new().
+- ValueLoc::Buffer lives in partition-server/src/lib.rs (after ValueLoc::Table).
+- rotate_active_locked / flush_one_imm_async / background_flush_loop / maybe_rotate_locked
+  all in partition-server/src/lib.rs.
+- background task uses Weak<RwLock<PartitionData>>, spawned in open_partition.
+- flush_tx (mpsc::UnboundedSender<()>) lives in PartitionData; task exits when dropped.
