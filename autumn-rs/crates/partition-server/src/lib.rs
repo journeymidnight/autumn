@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use crossbeam_skiplist::SkipMap;
 use autumn_io_engine::{build_engine, IoEngine, IoFile, IoMode};
 use autumn_proto::autumn::partition_kv_server::{PartitionKv, PartitionKvServer};
 use autumn_proto::autumn::partition_manager_service_client::PartitionManagerServiceClient;
@@ -80,6 +82,47 @@ struct KeyMeta {
     loc: ValueLoc,
 }
 
+// ---------------------------------------------------------------------------
+// Skiplist-backed memtable (F036)
+//
+// Uses crossbeam-skiplist for lock-free concurrent reads and sorted iteration.
+// The PartitionData write-lock still serialises writers; the skiplist gives us
+// sorted iteration at O(log N) and a clean abstraction for F028 (immutable
+// memtable queue).
+// ---------------------------------------------------------------------------
+
+struct Memtable {
+    data: SkipMap<Vec<u8>, KeyMeta>,
+    bytes: AtomicU64,
+}
+
+impl Memtable {
+    fn new() -> Self {
+        Self {
+            data: SkipMap::new(),
+            bytes: AtomicU64::new(0),
+        }
+    }
+
+    /// Insert `key` → `meta` and add `size` bytes to the accounting total.
+    fn insert(&self, key: Vec<u8>, meta: KeyMeta, size: u64) {
+        self.data.insert(key, meta);
+        self.bytes.fetch_add(size, Ordering::Relaxed);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    fn mem_bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+}
+
 // Record wire format (unchanged):
 //   [op:1][key_len:4 LE][val_len:4 LE][expires_at:8 LE][key bytes][value bytes]
 const RECORD_HEADER_SIZE: u64 = 1 + 4 + 4 + 8; // 17 bytes
@@ -103,9 +146,8 @@ struct PartitionData {
     rg: Range,
     /// Internal-key → metadata index. Keys include the 8-byte MVCC suffix.
     kv: BTreeMap<Vec<u8>, KeyMeta>,
-    /// Operations since last flush (for SSTable write). Same key format.
-    mem_ops: BTreeMap<Vec<u8>, KeyMeta>,
-    mem_bytes: u64,
+    /// Active (writable) skiplist memtable – unflushed operations (F036).
+    active: Memtable,
     seq_number: u64,
     table_ids: Vec<u64>,
     next_table_id: u64,
@@ -622,8 +664,7 @@ impl PartitionServer {
             part_id,
             rg,
             kv,
-            mem_ops: BTreeMap::new(),
-            mem_bytes: 0,
+            active: Memtable::new(),
             seq_number,
             table_ids: table_ids.clone(),
             next_table_id: state.next_table_id.max(max_table_id.saturating_add(1)),
@@ -661,7 +702,7 @@ impl PartitionServer {
     // -----------------------------------------------------------------------
 
     async fn flush_memtable_locked(&self, part: &mut PartitionData) -> Result<bool> {
-        if part.mem_ops.is_empty() {
+        if part.active.is_empty() {
             return Ok(false);
         }
 
@@ -681,7 +722,16 @@ impl PartitionServer {
         let mut sst_bytes = Vec::new();
         let mut new_locs: Vec<(Vec<u8>, u64, u32)> = Vec::new(); // (internal_key, sst_record_offset, value_len)
 
-        for (internal_key, meta) in &part.mem_ops {
+        // Collect entries from the skiplist into a local vec so we can do
+        // async I/O without holding a borrow on `part.active.data`.
+        let mem_entries: Vec<(Vec<u8>, KeyMeta)> = part
+            .active
+            .data
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+
+        for (internal_key, meta) in &mem_entries {
             let sst_record_offset = sst_bytes.len() as u64;
 
             if meta.deleted {
@@ -755,8 +805,8 @@ impl PartitionServer {
 
         self.save_persist_state(part).await?;
 
-        part.mem_ops.clear();
-        part.mem_bytes = 0;
+        // Replace active memtable with a fresh empty one.
+        part.active = Memtable::new();
 
         part.log_file.truncate(0).await?;
         part.log_file.sync_all().await?;
@@ -767,7 +817,7 @@ impl PartitionServer {
     }
 
     async fn maybe_flush_locked(&self, part: &mut PartitionData) -> Result<()> {
-        if part.mem_bytes >= FLUSH_MEM_BYTES || part.mem_ops.len() >= FLUSH_MEM_OPS {
+        if part.active.mem_bytes() >= FLUSH_MEM_BYTES || part.active.len() >= FLUSH_MEM_OPS {
             let _ = self.flush_memtable_locked(part).await?;
         }
         Ok(())
@@ -880,11 +930,9 @@ impl PartitionKv for PartitionServer {
             loc: ValueLoc::Wal { record_offset },
         };
 
+        let write_size = (req.key.len() + req.value.len() + 32) as u64;
         part.kv.insert(internal_key.clone(), meta.clone());
-        part.mem_ops.insert(internal_key.clone(), meta);
-        part.mem_bytes = part
-            .mem_bytes
-            .saturating_add((req.key.len() + req.value.len() + 32) as u64);
+        part.active.insert(internal_key.clone(), meta, write_size);
 
         self.maybe_flush_locked(&mut part)
             .await
@@ -957,9 +1005,9 @@ impl PartitionKv for PartitionServer {
             loc: ValueLoc::Wal { record_offset },
         };
 
+        let write_size = (req.key.len() + 32) as u64;
         part.kv.insert(internal_key.clone(), meta.clone());
-        part.mem_ops.insert(internal_key.clone(), meta);
-        part.mem_bytes = part.mem_bytes.saturating_add((req.key.len() + 32) as u64);
+        part.active.insert(internal_key.clone(), meta, write_size);
 
         self.maybe_flush_locked(&mut part)
             .await
