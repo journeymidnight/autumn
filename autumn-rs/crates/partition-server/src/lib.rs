@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,7 +18,7 @@ use autumn_proto::autumn::{
     StreamPutRequest,
 };
 use dashmap::DashMap;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tonic::transport::{Channel, Endpoint, Server};
 use tonic::{Request, Response, Status};
 
@@ -59,15 +59,18 @@ fn parse_ts(internal_key: &[u8]) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Value location – where to read value bytes from disk (F027)
+// Value location – where to read value bytes from disk (F027/F028)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum ValueLoc {
     /// Value is in the WAL file at the given record offset.
     Wal { record_offset: u64 },
     /// Value is in SSTable `table_id` at the given record offset.
     Table { table_id: u64, record_offset: u64 },
+    /// Value is in an in-memory WAL snapshot held by an immutable memtable
+    /// (F028: set when rotating active → imm so the WAL can be truncated).
+    Buffer { buf: Arc<Vec<u8>>, record_offset: u64 },
 }
 
 /// In-memory index entry – no value bytes stored (F027).
@@ -148,6 +151,12 @@ struct PartitionData {
     kv: BTreeMap<Vec<u8>, KeyMeta>,
     /// Active (writable) skiplist memtable – unflushed operations (F036).
     active: Memtable,
+    /// Immutable memtables queued for background flush (F028).
+    /// Each carries an in-memory WAL snapshot (`ValueLoc::Buffer`) so the
+    /// active WAL file can be truncated immediately after rotation.
+    imm: VecDeque<Arc<Memtable>>,
+    /// Signals the background flush task when `imm` is non-empty (F028).
+    flush_tx: mpsc::UnboundedSender<()>,
     seq_number: u64,
     table_ids: Vec<u64>,
     next_table_id: u64,
@@ -161,26 +170,34 @@ struct PartitionData {
 }
 
 impl PartitionData {
-    /// Read value bytes from disk given a KeyMeta.
+    /// Read value bytes from disk (or in-memory buffer) given a KeyMeta.
     async fn read_value(&self, meta: &KeyMeta) -> Result<Vec<u8>> {
         if meta.deleted || meta.value_len == 0 {
             return Ok(Vec::new());
         }
-        let (file, record_offset): (Arc<dyn IoFile>, u64) = match meta.loc {
-            ValueLoc::Wal { record_offset } => (self.log_file.clone(), record_offset),
-            ValueLoc::Table {
-                table_id,
-                record_offset,
-            } => {
+        match &meta.loc {
+            ValueLoc::Wal { record_offset } => {
+                let value_offset = record_offset + RECORD_HEADER_SIZE + meta.internal_key_len as u64;
+                self.log_file.read_at(value_offset, meta.value_len as usize).await
+            }
+            ValueLoc::Table { table_id, record_offset } => {
                 let f = self
                     .table_files
-                    .get(&table_id)
+                    .get(table_id)
                     .ok_or_else(|| anyhow!("table {} file not open", table_id))?;
-                (f.clone(), record_offset)
+                let value_offset = record_offset + RECORD_HEADER_SIZE + meta.internal_key_len as u64;
+                f.read_at(value_offset, meta.value_len as usize).await
             }
-        };
-        let value_offset = record_offset + RECORD_HEADER_SIZE + meta.internal_key_len as u64;
-        file.read_at(value_offset, meta.value_len as usize).await
+            ValueLoc::Buffer { buf, record_offset } => {
+                // Value is in the in-memory WAL snapshot (imm flush in progress).
+                let value_offset = (record_offset + RECORD_HEADER_SIZE + meta.internal_key_len as u64) as usize;
+                let end = value_offset + meta.value_len as usize;
+                if end > buf.len() {
+                    return Err(anyhow!("buffer read out of range"));
+                }
+                Ok(buf[value_offset..end].to_vec())
+            }
+        }
     }
 
     /// Find the latest live version for a user key. Returns `None` if the
@@ -660,11 +677,16 @@ impl PartitionServer {
         // seq_number is reconstructed purely from data (like Go's max table.LastSeq).
         let seq_number = max_seq_from_data;
 
-        Ok(Arc::new(RwLock::new(PartitionData {
+        // Background flush channel (F028): unbounded so rotate never blocks.
+        let (flush_tx, flush_rx) = mpsc::unbounded_channel::<()>();
+
+        let part = Arc::new(RwLock::new(PartitionData {
             part_id,
             rg,
             kv,
             active: Memtable::new(),
+            imm: VecDeque::new(),
+            flush_tx,
             seq_number,
             table_ids: table_ids.clone(),
             next_table_id: state.next_table_id.max(max_table_id.saturating_add(1)),
@@ -674,7 +696,14 @@ impl PartitionServer {
             log_file,
             log_len: wal_len,
             table_files,
-        })))
+        }));
+
+        // Spawn per-partition background flush task (F028).
+        let part_weak = Arc::downgrade(&part);
+        let server_clone = self.clone();
+        tokio::spawn(Self::background_flush_loop(server_clone, part_weak, flush_rx));
+
+        Ok(part)
     }
 
     // -----------------------------------------------------------------------
@@ -698,100 +727,121 @@ impl PartitionServer {
     }
 
     // -----------------------------------------------------------------------
-    // Flush memtable → SSTable
+    // F028 – Immutable memtable queue + background flush pipeline
+    // -----------------------------------------------------------------------
+    //
+    // Write path: put/delete → active → rotate_active_locked (when full) → imm
+    //             The write lock is released immediately after rotation.
+    //
+    // Flush path: background_flush_loop → flush_one_imm_async (lock-free SST
+    //             write, brief write lock only for kv index update).
+    //
+    // Split path: flush_memtable_locked (synchronous drain, lock held).
     // -----------------------------------------------------------------------
 
-    async fn flush_memtable_locked(&self, part: &mut PartitionData) -> Result<bool> {
+    /// Rotate the active memtable into the immutable queue.
+    ///
+    /// Reads current WAL bytes into an `Arc<Vec<u8>>` buffer and rewrites all
+    /// `ValueLoc::Wal` entries to `ValueLoc::Buffer` so the WAL file can be
+    /// truncated to zero immediately (new writes start at offset 0 again).
+    async fn rotate_active_locked(&self, part: &mut PartitionData) -> Result<()> {
         if part.active.is_empty() {
-            return Ok(false);
+            return Ok(());
         }
 
-        let table_id = part.next_table_id;
-        part.next_table_id = part.next_table_id.saturating_add(1);
-        let table_path = self.part_table_path(part.part_id, table_id);
-        let table_file = self.io.create(&table_path).await?;
-
-        // We need to read value bytes from WAL and write them into the SSTable.
-        // Read WAL bytes once.
-        let wal_bytes = if part.log_len > 0 {
+        // Snapshot the WAL into memory.
+        let wal_buf: Arc<Vec<u8>> = Arc::new(if part.log_len > 0 {
             part.log_file.read_at(0, part.log_len as usize).await?
         } else {
             Vec::new()
-        };
+        });
 
-        let mut sst_bytes = Vec::new();
-        let mut new_locs: Vec<(Vec<u8>, u64, u32)> = Vec::new(); // (internal_key, sst_record_offset, value_len)
-
-        // Collect entries from the skiplist into a local vec so we can do
-        // async I/O without holding a borrow on `part.active.data`.
-        let mem_entries: Vec<(Vec<u8>, KeyMeta)> = part
+        // Build the frozen Memtable: same keys but Wal locs → Buffer locs.
+        let frozen = Memtable::new();
+        let entries: Vec<(Vec<u8>, KeyMeta)> = part
             .active
             .data
             .iter()
             .map(|e| (e.key().clone(), e.value().clone()))
             .collect();
 
-        for (internal_key, meta) in &mem_entries {
+        for (internal_key, meta) in entries {
+            let new_meta = if let ValueLoc::Wal { record_offset } = meta.loc {
+                // Mirror the change into the kv index so in-flight reads work.
+                if let Some(kv_meta) = part.kv.get_mut(&internal_key) {
+                    kv_meta.loc = ValueLoc::Buffer {
+                        buf: wal_buf.clone(),
+                        record_offset,
+                    };
+                }
+                KeyMeta {
+                    loc: ValueLoc::Buffer {
+                        buf: wal_buf.clone(),
+                        record_offset,
+                    },
+                    ..meta
+                }
+            } else {
+                meta
+            };
+            let size = new_meta.internal_key_len as u64 + new_meta.value_len as u64 + 32;
+            frozen.insert(internal_key, new_meta, size);
+        }
+
+        part.imm.push_back(Arc::new(frozen));
+        part.active = Memtable::new();
+
+        // Truncate WAL – new writes will start at offset 0.
+        part.log_file.truncate(0).await?;
+        part.log_file.sync_all().await?;
+        part.log_len = 0;
+
+        // Wake up the background flush task.
+        let _ = part.flush_tx.send(());
+
+        Ok(())
+    }
+
+    /// Flush one immutable memtable to an SSTable while holding the write lock.
+    /// Used by the synchronous split path.
+    async fn flush_one_imm_locked(&self, part: &mut PartitionData) -> Result<bool> {
+        let Some(imm_mem) = part.imm.pop_front() else {
+            return Ok(false);
+        };
+
+        let table_id = part.next_table_id;
+        part.next_table_id = part.next_table_id.saturating_add(1);
+        let table_path = self.part_table_path(part.part_id, table_id);
+        let table_file = self.io.create(&table_path).await?;
+
+        let mut sst_bytes = Vec::new();
+        let mut new_locs: Vec<(Vec<u8>, u64)> = Vec::new();
+
+        for entry in imm_mem.data.iter() {
+            let internal_key = entry.key();
+            let meta = entry.value();
             let sst_record_offset = sst_bytes.len() as u64;
 
             if meta.deleted {
-                sst_bytes
-                    .extend_from_slice(&Self::encode_record(2, internal_key, &[], 0));
-                new_locs.push((internal_key.clone(), sst_record_offset, 0));
+                sst_bytes.extend_from_slice(&Self::encode_record(2, internal_key, &[], 0));
             } else {
-                // Read value from WAL.
-                let value = match meta.loc {
-                    ValueLoc::Wal { record_offset } => {
-                        let value_offset =
-                            record_offset + RECORD_HEADER_SIZE + meta.internal_key_len as u64;
-                        let end = value_offset + meta.value_len as u64;
-                        if (end as usize) <= wal_bytes.len() {
-                            wal_bytes[value_offset as usize..end as usize].to_vec()
-                        } else {
-                            part.log_file
-                                .read_at(value_offset, meta.value_len as usize)
-                                .await?
-                        }
-                    }
-                    ValueLoc::Table {
-                        table_id: tid,
-                        record_offset,
-                    } => {
-                        let f = part
-                            .table_files
-                            .get(&tid)
-                            .ok_or_else(|| anyhow!("table {} not open", tid))?;
-                        let value_offset =
-                            record_offset + RECORD_HEADER_SIZE + meta.internal_key_len as u64;
-                        f.read_at(value_offset, meta.value_len as usize).await?
-                    }
-                };
+                let value = Self::read_from_loc(&meta.loc, meta.internal_key_len, meta.value_len)?;
                 sst_bytes.extend_from_slice(&Self::encode_record(
                     1,
                     internal_key,
                     &value,
                     meta.expires_at,
                 ));
-                new_locs.push((internal_key.clone(), sst_record_offset, meta.value_len));
             }
+            new_locs.push((internal_key.clone(), sst_record_offset));
         }
 
         table_file.write_at(0, &sst_bytes).await?;
         table_file.sync_all().await?;
 
-        // Update kv index to point to the new SSTable.
-        for (internal_key, sst_record_offset, _value_len) in &new_locs {
-            if let Some(meta) = part.kv.get_mut(internal_key) {
-                meta.loc = ValueLoc::Table {
-                    table_id,
-                    record_offset: *sst_record_offset,
-                };
-            }
-        }
+        Self::apply_sst_locs(&mut part.kv, table_id, &new_locs);
 
-        // Keep table file open for future reads.
         part.table_files.insert(table_id, table_file);
-
         part.row_end = part.row_end.saturating_add(sst_bytes.len() as u64);
         part.table_ids.push(table_id);
         let manifest_len = part
@@ -804,23 +854,153 @@ impl PartitionServer {
         part.meta_end = part.meta_end.saturating_add(manifest_len as u64);
 
         self.save_persist_state(part).await?;
-
-        // Replace active memtable with a fresh empty one.
-        part.active = Memtable::new();
-
-        part.log_file.truncate(0).await?;
-        part.log_file.sync_all().await?;
-        part.log_len = 0;
-
-        self.save_persist_state(part).await?;
         Ok(true)
     }
 
-    async fn maybe_flush_locked(&self, part: &mut PartitionData) -> Result<()> {
+    /// Read value bytes synchronously from a `ValueLoc::Buffer`.
+    /// Only called for imm entries where values are in-memory.
+    fn read_from_loc(loc: &ValueLoc, key_len: u32, value_len: u32) -> Result<Vec<u8>> {
+        match loc {
+            ValueLoc::Buffer { buf, record_offset } => {
+                let vo = (record_offset + RECORD_HEADER_SIZE + key_len as u64) as usize;
+                let end = vo + value_len as usize;
+                if end > buf.len() {
+                    return Err(anyhow!("buffer read out of range (vo={vo} end={end} len={})", buf.len()));
+                }
+                Ok(buf[vo..end].to_vec())
+            }
+            _ => Err(anyhow!("expected Buffer loc in imm flush, got {:?}", loc)),
+        }
+    }
+
+    /// Update kv index entries to point to a newly created SSTable.
+    fn apply_sst_locs(
+        kv: &mut BTreeMap<Vec<u8>, KeyMeta>,
+        table_id: u64,
+        locs: &[(Vec<u8>, u64)],
+    ) {
+        for (internal_key, sst_record_offset) in locs {
+            if let Some(meta) = kv.get_mut(internal_key) {
+                // Only update entries that still point to the buffer (not
+                // overwritten by a newer version after rotation).
+                if matches!(&meta.loc, ValueLoc::Buffer { .. }) {
+                    meta.loc = ValueLoc::Table {
+                        table_id,
+                        record_offset: *sst_record_offset,
+                    };
+                }
+            }
+        }
+    }
+
+    /// Synchronous flush path used by split: rotate active → imm, then drain
+    /// all imm entries with the write lock held throughout.
+    async fn flush_memtable_locked(&self, part: &mut PartitionData) -> Result<bool> {
+        self.rotate_active_locked(part).await?;
+        let mut any = false;
+        while self.flush_one_imm_locked(part).await? {
+            any = true;
+        }
+        Ok(any)
+    }
+
+    /// Fast write-path helper: rotate active into imm if it exceeds the flush
+    /// threshold.  The actual SSTable write is handled by the background task.
+    async fn maybe_rotate_locked(&self, part: &mut PartitionData) -> Result<()> {
         if part.active.mem_bytes() >= FLUSH_MEM_BYTES || part.active.len() >= FLUSH_MEM_OPS {
-            let _ = self.flush_memtable_locked(part).await?;
+            self.rotate_active_locked(part).await?;
         }
         Ok(())
+    }
+
+    /// Background flush of one imm entry: SSTable write outside the lock,
+    /// then a brief write lock for kv index + metadata update.
+    async fn flush_one_imm_async(
+        &self,
+        part: &Arc<RwLock<PartitionData>>,
+    ) -> Result<bool> {
+        // Phase 1 (write lock, very brief): claim a table_id + peek imm.
+        let (imm_mem, part_id, table_id) = {
+            let mut guard = part.write().await;
+            let Some(imm_mem) = guard.imm.front().cloned() else {
+                return Ok(false);
+            };
+            let table_id = guard.next_table_id;
+            guard.next_table_id = guard.next_table_id.saturating_add(1);
+            (imm_mem, guard.part_id, table_id)
+        };
+
+        // Phase 2 (no lock): build SSTable from in-memory Buffer locs.
+        let mut sst_bytes = Vec::new();
+        let mut new_locs: Vec<(Vec<u8>, u64)> = Vec::new();
+
+        for entry in imm_mem.data.iter() {
+            let internal_key = entry.key();
+            let meta = entry.value();
+            let sst_record_offset = sst_bytes.len() as u64;
+
+            if meta.deleted {
+                sst_bytes.extend_from_slice(&Self::encode_record(2, internal_key, &[], 0));
+            } else {
+                let value = Self::read_from_loc(&meta.loc, meta.internal_key_len, meta.value_len)?;
+                sst_bytes.extend_from_slice(&Self::encode_record(
+                    1,
+                    internal_key,
+                    &value,
+                    meta.expires_at,
+                ));
+            }
+            new_locs.push((internal_key.clone(), sst_record_offset));
+        }
+
+        let table_path = self.part_table_path(part_id, table_id);
+        let table_file = self.io.create(&table_path).await?;
+        table_file.write_at(0, &sst_bytes).await?;
+        table_file.sync_all().await?;
+
+        // Phase 3 (write lock, brief): update kv index + metadata.
+        {
+            let mut guard = part.write().await;
+            Self::apply_sst_locs(&mut guard.kv, table_id, &new_locs);
+            guard.table_files.insert(table_id, table_file);
+            guard.row_end = guard.row_end.saturating_add(sst_bytes.len() as u64);
+            guard.table_ids.push(table_id);
+            let manifest_len = guard
+                .table_ids
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+                .len();
+            guard.meta_end = guard.meta_end.saturating_add(manifest_len as u64);
+            guard.imm.pop_front();
+            self.save_persist_state(&guard).await?;
+        }
+
+        Ok(true)
+    }
+
+    /// Per-partition background task: drains the imm queue whenever signalled.
+    async fn background_flush_loop(
+        server: PartitionServer,
+        part_weak: std::sync::Weak<RwLock<PartitionData>>,
+        mut flush_rx: mpsc::UnboundedReceiver<()>,
+    ) {
+        while flush_rx.recv().await.is_some() {
+            let Some(part) = part_weak.upgrade() else {
+                break; // Partition was removed.
+            };
+            loop {
+                match server.flush_one_imm_async(&part).await {
+                    Ok(true) => continue,
+                    Ok(false) => break,
+                    Err(e) => {
+                        tracing::error!("background imm flush error: {e}");
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     async fn get_partition_or_sync(&self, part_id: u64) -> Result<Arc<RwLock<PartitionData>>> {
@@ -934,7 +1114,7 @@ impl PartitionKv for PartitionServer {
         part.kv.insert(internal_key.clone(), meta.clone());
         part.active.insert(internal_key.clone(), meta, write_size);
 
-        self.maybe_flush_locked(&mut part)
+        self.maybe_rotate_locked(&mut part)
             .await
             .map_err(internal_to_status)?;
 
@@ -1009,7 +1189,7 @@ impl PartitionKv for PartitionServer {
         part.kv.insert(internal_key.clone(), meta.clone());
         part.active.insert(internal_key.clone(), meta, write_size);
 
-        self.maybe_flush_locked(&mut part)
+        self.maybe_rotate_locked(&mut part)
             .await
             .map_err(internal_to_status)?;
 
