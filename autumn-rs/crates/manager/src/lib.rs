@@ -501,6 +501,9 @@ impl AutumnManager {
                         rg: meta.rg.clone(),
                         part_id,
                         ps_id,
+                        log_stream: meta.log_stream,
+                        row_stream: meta.row_stream,
+                        meta_stream: meta.meta_stream,
                     },
                 );
             }

@@ -7,16 +7,17 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use crossbeam_skiplist::SkipMap;
+use prost::Message as _;
 use autumn_io_engine::{build_engine, IoEngine, IoFile, IoMode};
 use autumn_proto::autumn::partition_kv_server::{PartitionKv, PartitionKvServer};
 use autumn_proto::autumn::partition_manager_service_client::PartitionManagerServiceClient;
-use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
 use autumn_proto::autumn::{
-    AcquireOwnerLockRequest, Code, DeleteRequest, DeleteResponse, Empty, GetRequest, GetResponse,
-    HeadInfo, HeadRequest, HeadResponse, MultiModifySplitRequest, PutRequest, PutResponse, Range,
-    RangeRequest, RangeResponse, RegisterPsRequest, SplitPartRequest, SplitPartResponse,
-    StreamPutRequest,
+    Code, DeleteRequest, DeleteResponse, Empty, GetRequest, GetResponse, HeadInfo, HeadRequest,
+    HeadResponse, Location, MultiModifySplitRequest, PutRequest, PutResponse, Range, RangeRequest,
+    RangeResponse, RegisterPsRequest, SplitPartRequest, SplitPartResponse, StreamPutRequest,
+    TableLocations,
 };
+use autumn_stream::StreamClient;
 use dashmap::DashMap;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tonic::transport::{Channel, Endpoint, Server};
@@ -66,8 +67,9 @@ fn parse_ts(internal_key: &[u8]) -> u64 {
 enum ValueLoc {
     /// Value is in the WAL file at the given record offset.
     Wal { record_offset: u64 },
-    /// Value is in SSTable `table_id` at the given record offset.
-    Table { table_id: u64, record_offset: u64 },
+    /// Value is in a stream-backed SSTable block at (extent_id, table_offset)
+    /// within rowStream, at byte record_offset within that block.
+    Stream { extent_id: u64, table_offset: u32, record_offset: u64 },
     /// Value is in an in-memory WAL snapshot held by an immutable memtable
     /// (F028: set when rotating active → imm so the WAL can be truncated).
     Buffer { buf: Arc<Vec<u8>>, record_offset: u64 },
@@ -130,20 +132,6 @@ impl Memtable {
 //   [op:1][key_len:4 LE][val_len:4 LE][expires_at:8 LE][key bytes][value bytes]
 const RECORD_HEADER_SIZE: u64 = 1 + 4 + 4 + 8; // 17 bytes
 
-#[derive(Debug, Default, Clone)]
-struct PartitionPersistState {
-    next_table_id: u64,
-    log_end: u64,
-    row_end: u64,
-    meta_end: u64,
-    wal_len: u64,
-    table_ids: Vec<u64>,
-}
-// NOTE: seq_number is NOT persisted in state file.
-// It is reconstructed from data on recovery by taking max(parse_ts(key))
-// across all SSTable and WAL records, matching Go's approach where
-// seqNumber is recovered from max(table.LastSeq) across all tables.
-
 struct PartitionData {
     part_id: u64,
     rg: Range,
@@ -158,15 +146,17 @@ struct PartitionData {
     /// Signals the background flush task when `imm` is non-empty (F028).
     flush_tx: mpsc::UnboundedSender<()>,
     seq_number: u64,
-    table_ids: Vec<u64>,
-    next_table_id: u64,
-    log_end: u64,
-    row_end: u64,
-    meta_end: u64,
+    /// Stream IDs for the three-stream model (F030).
+    log_stream_id: u64,
+    row_stream_id: u64,
+    meta_stream_id: u64,
+    /// Ordered list of SSTable locations in rowStream (F030).
+    table_locs: Vec<(u64, u32)>,
+    /// In-memory cache of SSTable bytes keyed by (extent_id, offset) (F030).
+    sst_cache: HashMap<(u64, u32), Arc<Vec<u8>>>,
+    /// Local WAL file (kept until F031 wires logStream).
     log_file: Arc<dyn IoFile>,
     log_len: u64,
-    /// Open SSTable file handles for on-demand value reads.
-    table_files: HashMap<u64, Arc<dyn IoFile>>,
 }
 
 impl PartitionData {
@@ -180,13 +170,18 @@ impl PartitionData {
                 let value_offset = record_offset + RECORD_HEADER_SIZE + meta.internal_key_len as u64;
                 self.log_file.read_at(value_offset, meta.value_len as usize).await
             }
-            ValueLoc::Table { table_id, record_offset } => {
-                let f = self
-                    .table_files
-                    .get(table_id)
-                    .ok_or_else(|| anyhow!("table {} file not open", table_id))?;
-                let value_offset = record_offset + RECORD_HEADER_SIZE + meta.internal_key_len as u64;
-                f.read_at(value_offset, meta.value_len as usize).await
+            ValueLoc::Stream { extent_id, table_offset, record_offset } => {
+                let sst = self
+                    .sst_cache
+                    .get(&(*extent_id, *table_offset))
+                    .ok_or_else(|| anyhow!("SST ({},{}) not in cache", extent_id, table_offset))?;
+                let value_offset =
+                    (record_offset + RECORD_HEADER_SIZE + meta.internal_key_len as u64) as usize;
+                let end = value_offset + meta.value_len as usize;
+                if end > sst.len() {
+                    return Err(anyhow!("SST read out of range"));
+                }
+                Ok(sst[value_offset..end].to_vec())
             }
             ValueLoc::Buffer { buf, record_offset } => {
                 // Value is in the in-memory WAL snapshot (imm flush in progress).
@@ -245,7 +240,7 @@ pub struct PartitionServer {
     io: Arc<dyn IoEngine>,
     partitions: Arc<DashMap<u64, Arc<RwLock<PartitionData>>>>,
     pm_client: Arc<Mutex<PartitionManagerServiceClient<Channel>>>,
-    sm_client: Arc<Mutex<StreamManagerServiceClient<Channel>>>,
+    stream_client: Arc<Mutex<StreamClient>>,
 }
 
 impl PartitionServer {
@@ -272,8 +267,9 @@ impl PartitionServer {
             .await
             .with_context(|| format!("connect manager endpoint {endpoint}"))?;
 
-        let pm_client = PartitionManagerServiceClient::new(channel.clone());
-        let sm_client = StreamManagerServiceClient::new(channel);
+        let pm_client = PartitionManagerServiceClient::new(channel);
+        let owner_key = format!("ps-{ps_id}");
+        let sc = StreamClient::connect(manager_endpoint, owner_key, 128 * 1024 * 1024).await?;
 
         let io = build_engine(io_mode)?;
         let data_dir = data_dir.as_ref().to_path_buf();
@@ -286,7 +282,7 @@ impl PartitionServer {
             io,
             partitions: Arc::new(DashMap::new()),
             pm_client: Arc::new(Mutex::new(pm_client)),
-            sm_client: Arc::new(Mutex::new(sm_client)),
+            stream_client: Arc::new(Mutex::new(sc)),
         };
 
         server.register_ps().await?;
@@ -322,40 +318,6 @@ impl PartitionServer {
 
     fn part_log_path(&self, part_id: u64) -> PathBuf {
         self.data_dir.join(format!("part-{part_id}.wal"))
-    }
-
-    fn part_state_path(&self, part_id: u64) -> PathBuf {
-        self.data_dir.join(format!("part-{part_id}.state"))
-    }
-
-    fn part_table_path(&self, part_id: u64, table_id: u64) -> PathBuf {
-        self.data_dir
-            .join(format!("part-{part_id}-table-{table_id}.sst"))
-    }
-
-    async fn table_ids_on_disk(&self, part_id: u64) -> Result<Vec<u64>> {
-        let prefix = format!("part-{part_id}-table-");
-        let mut out = Vec::new();
-        let mut dir = tokio::fs::read_dir(self.data_dir.as_path())
-            .await
-            .context("read partition data dir")?;
-        while let Some(entry) = dir.next_entry().await? {
-            let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
-                continue;
-            };
-            let Some(raw) = name.strip_prefix(&prefix) else {
-                continue;
-            };
-            let Some(raw) = raw.strip_suffix(".sst") else {
-                continue;
-            };
-            if let Ok(id) = raw.parse::<u64>() {
-                out.push(id);
-            }
-        }
-        out.sort_unstable();
-        out.dedup();
-        Ok(out)
     }
 
     // -----------------------------------------------------------------------
@@ -508,152 +470,122 @@ impl PartitionServer {
     }
 
     // -----------------------------------------------------------------------
-    // Persist state – now includes seq_number (F026).
-    // Format line 1: next_table_id log_end row_end meta_end wal_len seq_number
-    // Format line 2: comma-separated table ids
+    // metaStream persistence (F030)
     // -----------------------------------------------------------------------
 
-    fn encode_persist_state(state: &PartitionPersistState) -> String {
-        let mut s = format!(
-            "{} {} {} {} {}\n",
-            state.next_table_id,
-            state.log_end,
-            state.row_end,
-            state.meta_end,
-            state.wal_len,
-        );
-        if state.table_ids.is_empty() {
-            s.push('\n');
-            return s;
-        }
-        s.push_str(
-            &state
-                .table_ids
+    /// Persist the current table_locs list to metaStream.
+    /// Must NOT be called while holding the PartitionData write lock if
+    /// the StreamClient Mutex is already locked elsewhere (deadlock prevention).
+    async fn save_table_locs_raw(
+        &self,
+        meta_stream_id: u64,
+        table_locs: &[(u64, u32)],
+    ) -> Result<()> {
+        let locs_proto = TableLocations {
+            locs: table_locs
                 .iter()
-                .map(|v| v.to_string())
-                .collect::<Vec<_>>()
-                .join(","),
-        );
-        s.push('\n');
-        s
-    }
-
-    fn decode_persist_state(raw: &str) -> PartitionPersistState {
-        let mut lines = raw.lines();
-        let header = lines.next().unwrap_or_default();
-        if header.is_empty() {
-            return PartitionPersistState::default();
-        }
-        let parts = header.split_whitespace().collect::<Vec<_>>();
-        if parts.len() < 4 {
-            return PartitionPersistState::default();
-        }
-        let mut state = PartitionPersistState {
-            next_table_id: parts[0].parse::<u64>().unwrap_or(0),
-            log_end: parts[1].parse::<u64>().unwrap_or(0),
-            row_end: parts[2].parse::<u64>().unwrap_or(0),
-            meta_end: parts[3].parse::<u64>().unwrap_or(0),
-            wal_len: parts
-                .get(4)
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(0),
-            table_ids: Vec::new(),
+                .map(|(eid, off)| Location {
+                    extent_id: *eid,
+                    offset: *off,
+                })
+                .collect(),
         };
-        let ids = lines.next().unwrap_or_default().trim();
-        if !ids.is_empty() {
-            for token in ids.split(',') {
-                if let Ok(v) = token.parse::<u64>() {
-                    state.table_ids.push(v);
-                }
-            }
+        let data = locs_proto.encode_to_vec();
+        let mut sc = self.stream_client.lock().await;
+        sc.append(meta_stream_id, &data, true).await?;
+        // Keep only the latest meta extent (discard older ones like Go).
+        let info = sc.get_stream_info(meta_stream_id).await?;
+        if info.extent_ids.len() > 1 {
+            let last = *info.extent_ids.last().unwrap();
+            sc.truncate(meta_stream_id, last).await?;
         }
-        state
-    }
-
-    async fn load_persist_state(&self, part_id: u64) -> Result<PartitionPersistState> {
-        let path = self.part_state_path(part_id);
-        if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
-            return Ok(PartitionPersistState::default());
-        }
-        let raw = tokio::fs::read_to_string(path).await?;
-        Ok(Self::decode_persist_state(&raw))
-    }
-
-    async fn save_persist_state(&self, part: &PartitionData) -> Result<()> {
-        let state = PartitionPersistState {
-            next_table_id: part.next_table_id,
-            log_end: part.log_end,
-            row_end: part.row_end,
-            meta_end: part.meta_end,
-            wal_len: part.log_len,
-            table_ids: part.table_ids.clone(),
-        };
-        let raw = Self::encode_persist_state(&state);
-        tokio::fs::write(self.part_state_path(part.part_id), raw.as_bytes()).await?;
         Ok(())
     }
 
     // -----------------------------------------------------------------------
-    // Open / recover a partition – loads SSTables + WAL, builds key-only index.
+    // Open / recover a partition – reads metaStream + rowStream + local WAL.
     // -----------------------------------------------------------------------
 
-    async fn open_partition(&self, part_id: u64, rg: Range) -> Result<Arc<RwLock<PartitionData>>> {
-        let state = self.load_persist_state(part_id).await?;
+    async fn open_partition(
+        &self,
+        part_id: u64,
+        rg: Range,
+        log_stream_id: u64,
+        row_stream_id: u64,
+        meta_stream_id: u64,
+    ) -> Result<Arc<RwLock<PartitionData>>> {
         let log_file = self.io.create(&self.part_log_path(part_id)).await?;
         let wal_len = log_file.len().await?;
 
-        let mut table_ids = state.table_ids.clone();
-        table_ids.extend(self.table_ids_on_disk(part_id).await?);
-        table_ids.sort_unstable();
-        table_ids.dedup();
-
         let mut kv = BTreeMap::new();
-        let mut table_bytes_total = 0u64;
-        let mut table_files: HashMap<u64, Arc<dyn IoFile>> = HashMap::new();
-        let mut max_seq_from_data: u64 = 0;
+        let mut sst_cache: HashMap<(u64, u32), Arc<Vec<u8>>> = HashMap::new();
+        let mut table_locs: Vec<(u64, u32)> = Vec::new();
+        let mut max_seq: u64 = 0;
 
-        for &table_id in &table_ids {
-            let table_path = self.part_table_path(part_id, table_id);
-            if !tokio::fs::try_exists(&table_path).await.unwrap_or(false) {
-                continue;
-            }
-            let table_file = self.io.open(&table_path).await?;
-            let table_len = table_file.len().await?;
-            if table_len == 0 {
-                continue;
-            }
-            let table_bytes = table_file.read_at(0, table_len as usize).await?;
-            for (op, key, value_len, expires_at, record_offset) in
-                Self::decode_record_metas(&table_bytes)
-            {
-                let ts = parse_ts(&key);
-                if ts > max_seq_from_data {
-                    max_seq_from_data = ts;
+        // Step 1: Read metaStream to get the last checkpoint of table locations.
+        let meta_block = {
+            let mut sc = self.stream_client.lock().await;
+            sc.read_last_block(meta_stream_id).await?
+        };
+
+        if let Some(meta_bytes) = meta_block {
+            let locations = TableLocations::decode(meta_bytes.as_slice())
+                .context("decode TableLocations from metaStream")?;
+
+            // Step 2: For each SSTable location, read bytes from rowStream.
+            for loc in locations.locs {
+                let sst_bytes = {
+                    let mut sc = self.stream_client.lock().await;
+                    let (data, _) = sc
+                        .read_blocks_from_extent(loc.extent_id, loc.offset, 1, false)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "read SST from rowStream extent={} offset={}",
+                                loc.extent_id, loc.offset
+                            )
+                        })?;
+                    data
+                };
+
+                let sst_loc = (loc.extent_id, loc.offset);
+                let sst_arc = Arc::new(sst_bytes);
+
+                for (op, key, value_len, expires_at, record_offset) in
+                    Self::decode_record_metas(&sst_arc)
+                {
+                    let ts = parse_ts(&key);
+                    if ts > max_seq {
+                        max_seq = ts;
+                    }
+                    Self::apply_record_meta(
+                        &mut kv,
+                        op,
+                        key,
+                        value_len,
+                        expires_at,
+                        ValueLoc::Stream {
+                            extent_id: sst_loc.0,
+                            table_offset: sst_loc.1,
+                            record_offset,
+                        },
+                    );
                 }
-                Self::apply_record_meta(
-                    &mut kv,
-                    op,
-                    key,
-                    value_len,
-                    expires_at,
-                    ValueLoc::Table {
-                        table_id,
-                        record_offset,
-                    },
-                );
+
+                sst_cache.insert(sst_loc, sst_arc);
+                table_locs.push(sst_loc);
             }
-            table_bytes_total = table_bytes_total.saturating_add(table_len);
-            table_files.insert(table_id, table_file);
         }
 
+        // Step 3: Replay local WAL on top of SSTable state.
         if wal_len > 0 {
             let wal_bytes = log_file.read_at(0, wal_len as usize).await?;
             for (op, key, value_len, expires_at, record_offset) in
                 Self::decode_record_metas(&wal_bytes)
             {
                 let ts = parse_ts(&key);
-                if ts > max_seq_from_data {
-                    max_seq_from_data = ts;
+                if ts > max_seq {
+                    max_seq = ts;
                 }
                 Self::apply_record_meta(
                     &mut kv,
@@ -666,16 +598,8 @@ impl PartitionServer {
             }
         }
 
-        let max_table_id = table_ids.iter().max().copied().unwrap_or(0);
-        let manifest_len = table_ids
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-            .len() as u64;
-        let unaccounted_wal = wal_len.saturating_sub(state.wal_len);
-        // seq_number is reconstructed purely from data (like Go's max table.LastSeq).
-        let seq_number = max_seq_from_data;
+        // seq_number reconstructed from data (like Go's max table.LastSeq).
+        let seq_number = max_seq;
 
         // Background flush channel (F028): unbounded so rotate never blocks.
         let (flush_tx, flush_rx) = mpsc::unbounded_channel::<()>();
@@ -688,14 +612,13 @@ impl PartitionServer {
             imm: VecDeque::new(),
             flush_tx,
             seq_number,
-            table_ids: table_ids.clone(),
-            next_table_id: state.next_table_id.max(max_table_id.saturating_add(1)),
-            log_end: state.log_end.saturating_add(unaccounted_wal),
-            row_end: state.row_end.max(table_bytes_total),
-            meta_end: state.meta_end.max(manifest_len),
+            log_stream_id,
+            row_stream_id,
+            meta_stream_id,
+            table_locs,
+            sst_cache,
             log_file,
             log_len: wal_len,
-            table_files,
         }));
 
         // Spawn per-partition background flush task (F028).
@@ -722,7 +645,6 @@ impl PartitionServer {
         part.log_file.write_at(part.log_len, &buf).await?;
         part.log_file.sync_all().await?;
         part.log_len += buf.len() as u64;
-        part.log_end += buf.len() as u64;
         Ok(record_offset)
     }
 
@@ -809,11 +731,6 @@ impl PartitionServer {
             return Ok(false);
         };
 
-        let table_id = part.next_table_id;
-        part.next_table_id = part.next_table_id.saturating_add(1);
-        let table_path = self.part_table_path(part.part_id, table_id);
-        let table_file = self.io.create(&table_path).await?;
-
         let mut sst_bytes = Vec::new();
         let mut new_locs: Vec<(Vec<u8>, u64)> = Vec::new();
 
@@ -836,24 +753,19 @@ impl PartitionServer {
             new_locs.push((internal_key.clone(), sst_record_offset));
         }
 
-        table_file.write_at(0, &sst_bytes).await?;
-        table_file.sync_all().await?;
+        // Append SSTable to rowStream.
+        let result = {
+            let mut sc = self.stream_client.lock().await;
+            sc.append(part.row_stream_id, &sst_bytes, true).await?
+        };
+        let sst_loc = (result.extent_id, result.offset);
+        let sst_bytes_arc = Arc::new(sst_bytes);
 
-        Self::apply_sst_locs(&mut part.kv, table_id, &new_locs);
+        Self::apply_sst_locs_stream(&mut part.kv, sst_loc, &new_locs);
+        part.sst_cache.insert(sst_loc, sst_bytes_arc);
+        part.table_locs.push(sst_loc);
 
-        part.table_files.insert(table_id, table_file);
-        part.row_end = part.row_end.saturating_add(sst_bytes.len() as u64);
-        part.table_ids.push(table_id);
-        let manifest_len = part
-            .table_ids
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-            .len();
-        part.meta_end = part.meta_end.saturating_add(manifest_len as u64);
-
-        self.save_persist_state(part).await?;
+        self.save_table_locs_raw(part.meta_stream_id, &part.table_locs).await?;
         Ok(true)
     }
 
@@ -873,19 +785,21 @@ impl PartitionServer {
         }
     }
 
-    /// Update kv index entries to point to a newly created SSTable.
-    fn apply_sst_locs(
+    /// Update kv index entries to point to a newly created stream-backed SSTable.
+    fn apply_sst_locs_stream(
         kv: &mut BTreeMap<Vec<u8>, KeyMeta>,
-        table_id: u64,
+        sst_loc: (u64, u32),
         locs: &[(Vec<u8>, u64)],
     ) {
+        let (extent_id, table_offset) = sst_loc;
         for (internal_key, sst_record_offset) in locs {
             if let Some(meta) = kv.get_mut(internal_key) {
                 // Only update entries that still point to the buffer (not
                 // overwritten by a newer version after rotation).
                 if matches!(&meta.loc, ValueLoc::Buffer { .. }) {
-                    meta.loc = ValueLoc::Table {
-                        table_id,
+                    meta.loc = ValueLoc::Stream {
+                        extent_id,
+                        table_offset,
                         record_offset: *sst_record_offset,
                     };
                 }
@@ -919,18 +833,17 @@ impl PartitionServer {
         &self,
         part: &Arc<RwLock<PartitionData>>,
     ) -> Result<bool> {
-        // Phase 1 (write lock, very brief): claim a table_id + peek imm.
-        let (imm_mem, part_id, table_id) = {
-            let mut guard = part.write().await;
+        // Phase 1 (write lock, very brief): peek imm + capture stream IDs.
+        let (imm_mem, row_stream_id, meta_stream_id) = {
+            let guard = part.read().await;
             let Some(imm_mem) = guard.imm.front().cloned() else {
                 return Ok(false);
             };
-            let table_id = guard.next_table_id;
-            guard.next_table_id = guard.next_table_id.saturating_add(1);
-            (imm_mem, guard.part_id, table_id)
+            (imm_mem, guard.row_stream_id, guard.meta_stream_id)
         };
 
-        // Phase 2 (no lock): build SSTable from in-memory Buffer locs.
+        // Phase 2 (no lock): build SSTable from in-memory Buffer locs,
+        //                     then append to rowStream.
         let mut sst_bytes = Vec::new();
         let mut new_locs: Vec<(Vec<u8>, u64)> = Vec::new();
 
@@ -953,29 +866,25 @@ impl PartitionServer {
             new_locs.push((internal_key.clone(), sst_record_offset));
         }
 
-        let table_path = self.part_table_path(part_id, table_id);
-        let table_file = self.io.create(&table_path).await?;
-        table_file.write_at(0, &sst_bytes).await?;
-        table_file.sync_all().await?;
+        let result = {
+            let mut sc = self.stream_client.lock().await;
+            sc.append(row_stream_id, &sst_bytes, true).await?
+        };
+        let sst_loc = (result.extent_id, result.offset);
+        let sst_bytes_arc = Arc::new(sst_bytes);
 
-        // Phase 3 (write lock, brief): update kv index + metadata.
-        {
+        // Phase 3 (write lock, brief): update kv index + table_locs.
+        let table_locs = {
             let mut guard = part.write().await;
-            Self::apply_sst_locs(&mut guard.kv, table_id, &new_locs);
-            guard.table_files.insert(table_id, table_file);
-            guard.row_end = guard.row_end.saturating_add(sst_bytes.len() as u64);
-            guard.table_ids.push(table_id);
-            let manifest_len = guard
-                .table_ids
-                .iter()
-                .map(|v| v.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-                .len();
-            guard.meta_end = guard.meta_end.saturating_add(manifest_len as u64);
+            Self::apply_sst_locs_stream(&mut guard.kv, sst_loc, &new_locs);
+            guard.sst_cache.insert(sst_loc, sst_bytes_arc);
+            guard.table_locs.push(sst_loc);
             guard.imm.pop_front();
-            self.save_persist_state(&guard).await?;
-        }
+            guard.table_locs.clone()
+        };
+
+        // Save table_locs to metaStream outside the write lock.
+        self.save_table_locs_raw(meta_stream_id, &table_locs).await?;
 
         Ok(true)
     }
@@ -1038,11 +947,14 @@ impl PartitionServer {
         }
 
         let regions = resp.regions.unwrap_or_default().regions;
-        let mut wanted = BTreeMap::new();
+        let mut wanted: BTreeMap<u64, (Range, u64, u64, u64)> = BTreeMap::new();
         for (part_id, region) in regions {
             if region.ps_id == self.ps_id {
                 if let Some(rg) = region.rg {
-                    wanted.insert(part_id, rg);
+                    wanted.insert(
+                        part_id,
+                        (rg, region.log_stream, region.row_stream, region.meta_stream),
+                    );
                 }
             }
         }
@@ -1054,11 +966,13 @@ impl PartitionServer {
             }
         }
 
-        for (part_id, rg) in wanted {
+        for (part_id, (rg, log_stream_id, row_stream_id, meta_stream_id)) in wanted {
             if self.partitions.contains_key(&part_id) {
                 continue;
             }
-            let part = self.open_partition(part_id, rg).await?;
+            let part = self
+                .open_partition(part_id, rg, log_stream_id, row_stream_id, meta_stream_id)
+                .await?;
             self.partitions.insert(part_id, part);
         }
 
@@ -1318,20 +1232,30 @@ impl PartitionKv for PartitionServer {
         }
 
         let mid = user_keys[user_keys.len() / 2].clone();
-        let log_end = part.log_end.min(u32::MAX as u64) as u32;
-        let row_end = part.row_end.min(u32::MAX as u64) as u32;
-        let meta_end = part.meta_end.min(u32::MAX as u64) as u32;
+        let (log_stream_id, row_stream_id, meta_stream_id) =
+            (part.log_stream_id, part.row_stream_id, part.meta_stream_id);
         drop(part);
 
+        // Sealed lengths must be >= 1 so duplicate_stream actually seals
+        // the source stream extents.  For streams with no data (e.g. log_stream
+        // is unused until F031), we pass 1 to force sealing.
+        let (log_end, row_end, meta_end) = {
+            let mut sc = self.stream_client.lock().await;
+            let l = sc.commit_length(log_stream_id).await.unwrap_or(0).max(1);
+            let r = sc.commit_length(row_stream_id).await.unwrap_or(0).max(1);
+            let m = sc.commit_length(meta_stream_id).await.unwrap_or(0).max(1);
+            (l, r, m)
+        };
+
         let owner_key = format!("split/{}", req.part_id);
-        let mut sm_client = self.sm_client.lock().await;
-        let lock_res = match sm_client
-            .acquire_owner_lock(Request::new(AcquireOwnerLockRequest {
-                owner_key: owner_key.clone(),
-            }))
+        let lock_res = match self
+            .stream_client
+            .lock()
+            .await
+            .acquire_owner_lock(owner_key.clone())
             .await
         {
-            Ok(v) => v.into_inner(),
+            Ok(v) => v,
             Err(err) => {
                 self.partitions.insert(req.part_id, p.clone());
                 return Err(internal_to_status(err));
@@ -1346,8 +1270,11 @@ impl PartitionKv for PartitionServer {
         let mut split_err = String::new();
         let mut backoff = Duration::from_millis(100);
         for _ in 0..8 {
-            let res = match sm_client
-                .multi_modify_split(Request::new(MultiModifySplitRequest {
+            let res = match self
+                .stream_client
+                .lock()
+                .await
+                .multi_modify_split(MultiModifySplitRequest {
                     part_id: req.part_id,
                     mid_key: mid.clone(),
                     owner_key: owner_key.clone(),
@@ -1355,10 +1282,10 @@ impl PartitionKv for PartitionServer {
                     log_stream_sealed_length: log_end,
                     row_stream_sealed_length: row_end,
                     meta_stream_sealed_length: meta_end,
-                }))
+                })
                 .await
             {
-                Ok(v) => v.into_inner(),
+                Ok(v) => v,
                 Err(err) => {
                     split_err = err.to_string();
                     tokio::time::sleep(backoff).await;
@@ -1378,7 +1305,6 @@ impl PartitionKv for PartitionServer {
             tokio::time::sleep(backoff).await;
             backoff = backoff.saturating_mul(2).min(Duration::from_secs(2));
         }
-        drop(sm_client);
 
         if !split_ok {
             self.partitions.insert(req.part_id, p.clone());
@@ -1506,20 +1432,4 @@ mod tests {
         assert_eq!(parse_ts(&k3), 100);
     }
 
-    #[test]
-    fn persist_state_roundtrip() {
-        let state = PartitionPersistState {
-            next_table_id: 5,
-            log_end: 100,
-            row_end: 200,
-            meta_end: 50,
-            wal_len: 80,
-            table_ids: vec![1, 2, 3],
-        };
-        let encoded = PartitionServer::encode_persist_state(&state);
-        let decoded = PartitionServer::decode_persist_state(&encoded);
-        assert_eq!(decoded.next_table_id, 5);
-        assert_eq!(decoded.wal_len, 80);
-        assert_eq!(decoded.table_ids, vec![1, 2, 3]);
-    }
 }

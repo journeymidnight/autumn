@@ -4,9 +4,11 @@ use anyhow::{anyhow, Context, Result};
 use autumn_proto::autumn::extent_service_client::ExtentServiceClient;
 use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
 use autumn_proto::autumn::{
-    append_request, AcquireOwnerLockRequest, AppendRequest, AppendRequestHeader,
-    CheckCommitLengthRequest, Code, CommitLengthRequest, ExtentInfo, NodesInfoResponse,
-    PunchHolesRequest, StreamAllocExtentRequest, StreamInfo, StreamInfoRequest, TruncateRequest,
+    append_request, read_blocks_response, AcquireOwnerLockRequest, AcquireOwnerLockResponse,
+    AppendRequest, AppendRequestHeader, CheckCommitLengthRequest, Code, CommitLengthRequest,
+    ExtentInfo, ExtentInfoRequest, MultiModifySplitRequest, MultiModifySplitResponse,
+    NodesInfoResponse, PunchHolesRequest, ReadBlockResponseHeader, ReadBlocksRequest,
+    StreamAllocExtentRequest, StreamInfo, StreamInfoRequest, TruncateRequest,
 };
 use tokio_stream::iter;
 use tonic::transport::Channel;
@@ -459,6 +461,148 @@ impl StreamClient {
         }
         resp.updated_stream_info
             .context("updated_stream_info missing")
+    }
+
+    /// Return the StreamInfo for the given stream (extent ID list, etc.).
+    pub async fn get_stream_info(&mut self, stream_id: u64) -> Result<StreamInfo> {
+        let resp = self
+            .manager
+            .stream_info(Request::new(StreamInfoRequest {
+                stream_ids: vec![stream_id],
+            }))
+            .await?
+            .into_inner();
+        if resp.code != Code::Ok as i32 {
+            return Err(anyhow!("stream_info failed: {}", resp.code_des));
+        }
+        resp.streams
+            .get(&stream_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("stream {} not in stream_info response", stream_id))
+    }
+
+    /// Read blocks from a specific extent starting at the given byte offset.
+    /// Returns (raw_payload_bytes, block_sizes).
+    /// Pass `num_of_blocks=0` to read all blocks from offset onwards.
+    /// Pass `only_last_block=true` to read only the last block (ignores offset/num_of_blocks).
+    pub async fn read_blocks_from_extent(
+        &mut self,
+        extent_id: u64,
+        offset: u32,
+        num_of_blocks: u32,
+        only_last_block: bool,
+    ) -> Result<(Vec<u8>, Vec<u32>)> {
+        let resp = self
+            .manager
+            .extent_info(Request::new(ExtentInfoRequest { extent_id }))
+            .await?
+            .into_inner();
+        if resp.code != Code::Ok as i32 {
+            return Err(anyhow!("extent_info failed: {}", resp.code_des));
+        }
+        let ex = resp.ex_info.context("extent_info missing ex_info")?;
+        let addrs = self.replica_addrs_for_extent(&ex).await?;
+
+        let mut last_err = anyhow!("no replicas for extent {}", extent_id);
+        for addr in &addrs {
+            let mut stream = {
+                let client = self.extent_client(addr).await?;
+                match client
+                    .read_blocks(Request::new(ReadBlocksRequest {
+                        extent_id,
+                        offset,
+                        num_of_blocks,
+                        eversion: 0,
+                        only_last_block,
+                    }))
+                    .await
+                {
+                    Ok(r) => r.into_inner(),
+                    Err(e) => {
+                        last_err = anyhow!(e);
+                        continue;
+                    }
+                }
+            };
+
+            let mut header: Option<ReadBlockResponseHeader> = None;
+            let mut payload = Vec::new();
+            let mut read_ok = true;
+            loop {
+                match stream.message().await {
+                    Ok(Some(msg)) => match msg.data {
+                        Some(read_blocks_response::Data::Header(h)) => {
+                            if h.code != Code::Ok as i32 {
+                                last_err = anyhow!("read_blocks error: {}", h.code_des);
+                                read_ok = false;
+                                break;
+                            }
+                            header = Some(h);
+                        }
+                        Some(read_blocks_response::Data::Payload(p)) => {
+                            payload.extend_from_slice(&p);
+                        }
+                        None => {}
+                    },
+                    Ok(None) => break,
+                    Err(e) => {
+                        last_err = anyhow!(e);
+                        read_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !read_ok {
+                continue;
+            }
+            let header = match header {
+                Some(h) => h,
+                None => {
+                    last_err = anyhow!("read_blocks: missing header from {}", addr);
+                    continue;
+                }
+            };
+            return Ok((payload, header.block_sizes));
+        }
+        Err(last_err)
+    }
+
+    /// Read the last block from the last non-empty extent of the given stream.
+    /// Returns `None` if the stream has no blocks.
+    pub async fn read_last_block(&mut self, stream_id: u64) -> Result<Option<Vec<u8>>> {
+        let info = self.get_stream_info(stream_id).await?;
+        for &eid in info.extent_ids.iter().rev() {
+            let (payload, block_sizes) =
+                self.read_blocks_from_extent(eid, 0, 0, true).await?;
+            if !block_sizes.is_empty() {
+                return Ok(Some(payload));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Acquire an owner lock with the given key; returns the response (code + revision).
+    pub async fn acquire_owner_lock(
+        &mut self,
+        owner_key: String,
+    ) -> Result<AcquireOwnerLockResponse> {
+        Ok(self
+            .manager
+            .acquire_owner_lock(Request::new(AcquireOwnerLockRequest { owner_key }))
+            .await?
+            .into_inner())
+    }
+
+    /// Call MultiModifySplit on the stream manager.
+    pub async fn multi_modify_split(
+        &mut self,
+        req: MultiModifySplitRequest,
+    ) -> Result<MultiModifySplitResponse> {
+        Ok(self
+            .manager
+            .multi_modify_split(Request::new(req))
+            .await?
+            .into_inner())
     }
 }
 

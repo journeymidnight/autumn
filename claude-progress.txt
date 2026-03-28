@@ -1,22 +1,24 @@
 Date: 2026-03-27
 TaskStatus: completed
-Task scope: F034 – Extent node metadata persistence
+Task scope: F030 – Three-stream model with metaStream persistence
 
 Current summary:
-  Implemented per-extent sidecar file `extent-{id}.meta` (40 bytes, binary LE):
-  magic(8) + extent_id(8) + sealed_length(8) + eversion(8) + last_revision(8).
-  Written on: alloc_extent, seal event (via apply_extent_meta), run_recovery_task,
-  re_avali, revision change in append/commit_length.
-  Zero overhead on normal append path.
-  block_sizes intentionally not persisted — partition layer owns block-level semantics.
-  load_extents() scans data dir for extent-*.dat on startup, restores all extents.
-  3 integration tests pass: restart_preserves_commit_length, restart_preserves_meta_fields,
-  restart_extent_remains_writable.
-  Existing tests unchanged (5 total pass).
+  Wired rowStream + metaStream into Rust partition server.
+  - Proto: added Location, TableLocations messages; RegionInfo now has log_stream/row_stream/meta_stream fields.
+  - StreamClient: added get_stream_info, read_blocks_from_extent, read_last_block, acquire_owner_lock, multi_modify_split.
+  - Manager: rebalance_regions populates stream IDs from PartitionMeta into RegionInfo.
+  - PartitionServer: replaced sm_client with StreamClient; PartitionData now has stream IDs, table_locs, sst_cache.
+  - ValueLoc::Stream { extent_id, table_offset, record_offset } replaces ValueLoc::Table.
+  - Flush writes SSTable to rowStream (append), then saves TableLocations proto to metaStream (truncates old extents).
+  - Recovery: reads metaStream last block → decodes TableLocations → reads each SST from rowStream → replays local WAL.
+  - logStream: local WAL still used (logStream deferred to F031).
+  - Split path: uses stream_client.commit_length().max(1) for all three streams.
+  - 2 new integration tests pass: f030_flush_writes_sst_to_row_stream, f030_recovery_from_meta_and_row_streams.
+  - All 7 integration tests pass.
 
 Main gaps:
-  None for F034.
+  None for F030. logStream integration deferred to F031.
 
 Next steps:
-  F030 – Three-stream model with metaStream persistence (partition layer)
   F029 – Compaction engine with merge iterator
+  F031 – logStream (value log) integration

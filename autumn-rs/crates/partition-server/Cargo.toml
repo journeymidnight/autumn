@@ -10,12 +10,14 @@ async-trait.workspace = true
 crossbeam-skiplist.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true
+prost.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 autumn-common = { path = "../common" }
 autumn-proto = { path = "../proto" }
 autumn-io-engine = { path = "../io-engine" }
+autumn-stream = { path = "../stream" }
 
 [dev-dependencies]
 tempfile = "3"

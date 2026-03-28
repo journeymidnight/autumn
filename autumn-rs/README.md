@@ -163,6 +163,18 @@ Smoke test via script:
 ./scripts/manual_stream_test.sh smoke
 ```
 
+## Manual test: F030 Three-stream model with metaStream persistence
+
+Verify that after a flush, the SSTable is stored in rowStream and metaStream holds a `TableLocations` checkpoint. On restart, the partition server recovers by reading metaStream → rowStream SSTs → local WAL.
+
+```bash
+# Automated integration tests (spin up real infra internally):
+cargo test -p autumn-manager --test integration f030 -- --nocapture
+# expects: f030_flush_writes_sst_to_row_stream and f030_recovery_from_meta_and_row_streams both pass
+```
+
+For full manual verification, start the stack with `autumn-client bootstrap` (creates log/row/meta streams automatically), put a 300KB+ value to trigger flush, then restart `autumn-ps` and verify the value is still readable.
+
 ## Manual test: F034 extent node metadata persistence (restart recovery)
 
 Verify that extent metadata (`sealed_length`, `eversion`, `last_revision`) survives a node restart. Each extent writes a `extent-{id}.meta` sidecar file on alloc, seal, recovery, and revision change. The node scans data dir on startup to reload all extents.

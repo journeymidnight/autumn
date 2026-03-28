@@ -22,6 +22,15 @@ message Range {
   bytes end_key = 2;
 }
 
+message Location {
+  uint64 extent_id = 1;
+  uint32 offset = 2;
+}
+
+message TableLocations {
+  repeated Location locs = 1;
+}
+
 message DiskInfo {
   uint64 disk_id = 1;
   bool online = 2;
@@ -193,6 +202,9 @@ message RegionInfo {
   Range rg = 1;
   uint64 part_id = 2;
   uint64 ps_id = 3;
+  uint64 log_stream = 4;
+  uint64 row_stream = 5;
+  uint64 meta_stream = 6;
 }
 
 message Regions {

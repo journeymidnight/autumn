@@ -47,8 +47,8 @@
 ### F030 · Three-stream model with metaStream persistence
 - **Target:** Partition uses three streams: logStream (value log), rowStream (SSTables), metaStream (table registry + GC state + vhead). Recovery reads metaStream to locate tables then replays logStream from vhead.
 - **Evidence:** `range_partition/range_partition.go` (logStream, rowStream, metaStream) · `autumn-rs/crates/partition-server/src/lib.rs`
-- **Notes:** Rust PartitionMeta defines log/row/meta stream IDs but only uses a single stream path. Go persists table Location list + vhead + discards to metaStream on every flush/compaction.
-- **passes:** false
+- **Notes:** rowStream + metaStream fully wired. logStream deferred to F031 (local WAL still used). TableLocations proto checkpointed to metaStream on every flush; old extents truncated. Recovery: metaStream → SST from rowStream → local WAL replay. Integration tests: f030_flush_writes_sst_to_row_stream, f030_recovery_from_meta_and_row_streams (both pass).
+- **passes:** true
 
 ### F029 · Compaction engine with merge iterator
 - **Target:** Size-tiered compaction policy (DefaultPickupPolicy: head rule + size ratio rule) merging SSTables via binary-tree merge iterator, eliminating dead/expired keys, truncating consumed extents.

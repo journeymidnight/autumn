@@ -10,8 +10,10 @@ use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceCli
 use autumn_proto::autumn::{
     read_blocks_response, AcquireOwnerLockRequest, Code, CreateStreamRequest, Empty, GetRequest,
     PartitionMeta, PutRequest, Range, ReadBlocksRequest, RegisterNodeRequest, SplitPartRequest,
-    StreamAllocExtentRequest, StreamInfoRequest, TruncateRequest, UpsertPartitionRequest,
+    StreamAllocExtentRequest, StreamInfoRequest, TableLocations, TruncateRequest,
+    UpsertPartitionRequest,
 };
+use prost::Message as _;
 use autumn_stream::{ExtentNode, ExtentNodeConfig, StreamClient};
 use partition_server::PartitionServer;
 use tokio::time::sleep;
@@ -776,5 +778,198 @@ async fn stream_append_and_read_blocks_flow() {
 
     n1_task.abort();
     n2_task.abort();
+    mgr_task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// F030: three-stream model tests
+// ---------------------------------------------------------------------------
+
+/// Helper: spin up manager + 2 extent nodes using dynamic ports.
+async fn setup_infra_f030(node_id_base: u64) -> (
+    String,
+    tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+    tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+    tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
+    let manager = AutumnManager::new();
+    let mgr_addr = pick_addr();
+    let mgr_task = tokio::spawn(manager.serve(mgr_addr));
+    sleep(Duration::from_millis(120)).await;
+
+    let endpoint = format!("http://{}", mgr_addr);
+    let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
+        .await
+        .expect("connect sm");
+
+    let n1_sock = pick_addr();
+    let n2_sock = pick_addr();
+    let n1_dir = tempfile::tempdir().expect("n1 tempdir");
+    let n2_dir = tempfile::tempdir().expect("n2 tempdir");
+
+    let n1 = ExtentNode::new(ExtentNodeConfig::new(n1_dir.path().to_path_buf(), IoMode::Standard, node_id_base))
+        .await.expect("node1");
+    let n2 = ExtentNode::new(ExtentNodeConfig::new(n2_dir.path().to_path_buf(), IoMode::Standard, node_id_base + 1))
+        .await.expect("node2");
+    let n1_task = tokio::spawn(n1.serve(n1_sock));
+    let n2_task = tokio::spawn(n2.serve(n2_sock));
+    sleep(Duration::from_millis(120)).await;
+
+    sm.register_node(Request::new(RegisterNodeRequest {
+        addr: n1_sock.to_string(),
+        disk_uuids: vec![format!("disk-f030-{}", node_id_base)],
+    })).await.expect("register n1");
+    sm.register_node(Request::new(RegisterNodeRequest {
+        addr: n2_sock.to_string(),
+        disk_uuids: vec![format!("disk-f030-{}", node_id_base + 1)],
+    })).await.expect("register n2");
+
+    (endpoint, n1_task, n2_task, mgr_task, n1_dir, n2_dir)
+}
+
+/// F030: after a flush, rowStream has an SSTable block and metaStream has
+/// a valid TableLocations protobuf pointing to that SSTable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f030_flush_writes_sst_to_row_stream() {
+    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) =
+        setup_infra_f030(101).await;
+
+    let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
+        .await.expect("connect sm");
+    let log_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
+        .await.expect("create log stream").into_inner().stream.expect("log stream").stream_id;
+    let row_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
+        .await.expect("create row stream").into_inner().stream.expect("row stream").stream_id;
+    let meta_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
+        .await.expect("create meta stream").into_inner().stream.expect("meta stream").stream_id;
+
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let ps = PartitionServer::connect(41, &endpoint, data_dir.path(), IoMode::Standard)
+        .await.expect("connect ps");
+    let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
+        .await.expect("connect pm");
+    pm.upsert_partition(Request::new(UpsertPartitionRequest {
+        meta: Some(PartitionMeta {
+            log_stream, row_stream, meta_stream,
+            part_id: 601,
+            rg: Some(Range { start_key: b"a".to_vec(), end_key: b"z".to_vec() }),
+        }),
+    })).await.expect("upsert partition");
+    ps.sync_regions_once().await.expect("sync regions");
+
+    let ps_addr = pick_addr();
+    let ps_task = tokio::spawn(ps.clone().serve(ps_addr));
+    sleep(Duration::from_millis(120)).await;
+
+    let mut kv = PartitionKvClient::connect(format!("http://{}", ps_addr))
+        .await.expect("connect kv");
+
+    // 300 KB put triggers flush (FLUSH_MEM_BYTES = 256 KB).
+    kv.put(Request::new(PutRequest {
+        key: b"a-big".to_vec(),
+        value: vec![b'X'; 300 * 1024],
+        expires_at: 0,
+        part_id: 601,
+    })).await.expect("put big");
+    sleep(Duration::from_millis(300)).await; // wait for background flush
+
+    let mut sc = StreamClient::connect(&endpoint, "test-f030-flush".to_string(), 128 * 1024 * 1024)
+        .await.expect("stream client");
+
+    // rowStream: last block is the SSTable.
+    let sst = sc.read_last_block(row_stream).await.expect("read_last_block rowStream");
+    assert!(sst.is_some(), "rowStream must have an SSTable block after flush");
+    assert!(!sst.unwrap().is_empty(), "SSTable block must not be empty");
+
+    // metaStream: last block is a TableLocations proto with one entry.
+    let meta_bytes = sc.read_last_block(meta_stream).await.expect("read_last_block metaStream");
+    assert!(meta_bytes.is_some(), "metaStream must have a TableLocations block");
+    let locs = TableLocations::decode(meta_bytes.unwrap().as_slice())
+        .expect("decode TableLocations");
+    assert_eq!(locs.locs.len(), 1, "TableLocations must list exactly one SSTable");
+
+    n1_task.abort();
+    n2_task.abort();
+    ps_task.abort();
+    mgr_task.abort();
+}
+
+/// F030: full restart recovery reads from metaStream + rowStream (stream-backed SST),
+/// then replays the local WAL on top.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f030_recovery_from_meta_and_row_streams() {
+    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) =
+        setup_infra_f030(103).await;
+
+    let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
+        .await.expect("connect sm");
+    let log_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
+        .await.expect("create log stream").into_inner().stream.expect("log stream").stream_id;
+    let row_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
+        .await.expect("create row stream").into_inner().stream.expect("row stream").stream_id;
+    let meta_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
+        .await.expect("create meta stream").into_inner().stream.expect("meta stream").stream_id;
+
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
+        .await.expect("connect pm");
+    pm.upsert_partition(Request::new(UpsertPartitionRequest {
+        meta: Some(PartitionMeta {
+            log_stream, row_stream, meta_stream,
+            part_id: 611,
+            rg: Some(Range { start_key: b"a".to_vec(), end_key: b"z".to_vec() }),
+        }),
+    })).await.expect("upsert partition");
+
+    // First PS: write one flushed key + one WAL-only key.
+    let ps1 = PartitionServer::connect(42, &endpoint, data_dir.path(), IoMode::Standard)
+        .await.expect("connect ps1");
+    ps1.sync_regions_once().await.expect("sync regions");
+    let ps1_addr = pick_addr();
+    let ps1_task = tokio::spawn(ps1.serve(ps1_addr));
+    sleep(Duration::from_millis(120)).await;
+
+    let mut kv1 = PartitionKvClient::connect(format!("http://{}", ps1_addr))
+        .await.expect("connect kv1");
+    kv1.put(Request::new(PutRequest {
+        key: b"a-streamed".to_vec(),
+        value: vec![b'S'; 300 * 1024], // triggers flush
+        expires_at: 0,
+        part_id: 611,
+    })).await.expect("put streamed");
+    sleep(Duration::from_millis(300)).await; // wait for bg flush
+    kv1.put(Request::new(PutRequest {
+        key: b"a-wal-only".to_vec(),
+        value: b"small".to_vec(),
+        expires_at: 0,
+        part_id: 611,
+    })).await.expect("put wal-only");
+    ps1_task.abort();
+    sleep(Duration::from_millis(120)).await;
+
+    // Second PS: recover – reads metaStream → SST from rowStream → local WAL.
+    let ps2 = PartitionServer::connect(42, &endpoint, data_dir.path(), IoMode::Standard)
+        .await.expect("connect ps2");
+    ps2.sync_regions_once().await.expect("resync regions");
+    let ps2_addr = pick_addr();
+    let ps2_task = tokio::spawn(ps2.serve(ps2_addr));
+    sleep(Duration::from_millis(120)).await;
+
+    let mut kv2 = PartitionKvClient::connect(format!("http://{}", ps2_addr))
+        .await.expect("connect kv2");
+
+    let v1 = kv2.get(Request::new(GetRequest { key: b"a-streamed".to_vec(), part_id: 611 }))
+        .await.expect("get streamed").into_inner();
+    assert_eq!(v1.value.len(), 300 * 1024, "stream-backed SST key survives restart");
+
+    let v2 = kv2.get(Request::new(GetRequest { key: b"a-wal-only".to_vec(), part_id: 611 }))
+        .await.expect("get wal-only").into_inner();
+    assert_eq!(v2.value, b"small", "WAL-only key survives restart");
+
+    n1_task.abort();
+    n2_task.abort();
+    ps2_task.abort();
     mgr_task.abort();
 }
