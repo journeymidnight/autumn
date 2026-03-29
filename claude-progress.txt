@@ -1,25 +1,26 @@
 Date: 2026-03-28
 TaskStatus: completed
-Task scope: F031 – Value log separation for large values
+Task scope: F038 – Remove block_sizes from stream layer (simplify to pure byte store)
 
 Current summary:
-  Implemented WiscKey-style key-value separation in the Rust partition server.
-  - ValuePointer struct: 16-byte LE encoding (extent_id:8, offset:4, len:4).
-  - ValueLoc::ValueLog variant added to in-memory index.
-  - VALUE_THROTTLE = 4KB: values > 4KB go to logStream, smaller values stay inline.
-  - OP_VALUE_POINTER (0x80): flag bit OR'd with op=1 in SSTable records to mark pointer entries.
-  - Write path: large values appended to logStream after WAL write; vp_extent_id/vp_offset (vhead) updated.
-  - Read path: read_value_from_log fetches block from logStream via StreamClient.
-  - Flush path (locked + async): ValueLog entries write 16-byte vp.encode() with OP_VALUE_POINTER op.
-  - Compaction: op & 0x7F == 1 reads value-or-pointer bytes; pointer bytes carried through as-is; ValueLog kv entries not overwritten to Stream.
-  - Recovery: vp_extent_id/vp_offset read from TableLocations proto; SST records with OP_VALUE_POINTER restore ValueLog locs with real value_len from vp.len; logStream replayed from vhead to recover unflushed large-value entries; WAL replay on top.
-  - Proto: TableLocations.vp_extent_id/vp_offset added (fields 2/3, backward-compatible).
-  - 4 unit tests (encode/decode roundtrip, flag constants) + 3 integration tests pass.
-  - All 11 integration tests pass.
+  Removed block_sizes from stream layer; stream is now a pure byte store.
+  - ExtentEntry.block_sizes (Mutex<Vec<u32>>) removed entirely.
+  - normalize_block_sizes() deleted.
+  - truncate_to_commit() simplified to byte-granular file.truncate(commit).
+  - Proto: AppendRequestHeader.blocks removed (reserved 6); AppendResponse.offsets → offset (single u32).
+  - Proto: ReadBlocksRequest/Response renamed to ReadBytesRequest/Response; num_of_blocks→length; block_sizes/offsets removed.
+  - Proto: Location.len added (u32) for SST byte-range reads.
+  - StreamClient: append_payload/batch returns single AppendResult; AppendBatchResult removed.
+  - StreamClient: read_blocks_from_extent → read_bytes_from_extent(extent_id, offset, length).
+  - StreamClient: read_last_block → read_last_extent_data (reads entire last non-empty extent).
+  - Partition server: TableMeta.len field; save_table_locs_raw uses length-delimited encoding.
+  - Partition server: metaStream read uses decode_last_table_locations() walker for length-delimited entries.
+  - Partition server: logStream replay replaced block iteration with full extent read + decode_record_metas.
+  - Partition server: read_value_from_log accepts record_len computed from KeyMeta at call site.
+  - All tests pass (stream, manager integration, partition-server).
 
 Main gaps:
-  No GC for logStream (F033) – compaction does not accumulate discard maps.
-  WAL still records full large value (short-lived; truncated on rotation).
+  None for F038.
 
 Next steps:
   F032 – SSTable bloom filter, prefix compression, block cache

@@ -26,21 +26,21 @@ fn append_requests(
     revision: i64,
     blocks: &[&[u8]],
 ) -> Vec<AppendRequest> {
-    let mut reqs = Vec::with_capacity(1 + blocks.len());
-    reqs.push(AppendRequest {
-        data: Some(append_request::Data::Header(AppendRequestHeader {
-            extent_id,
-            eversion,
-            commit,
-            revision,
-            must_sync: true,
-            blocks: blocks.iter().map(|b| b.len() as u32).collect(),
-        })),
-    });
-    reqs.extend(blocks.iter().map(|b| AppendRequest {
-        data: Some(append_request::Data::Payload((*b).to_vec())),
-    }));
-    reqs
+    let payload: Vec<u8> = blocks.iter().flat_map(|b| b.iter().copied()).collect();
+    vec![
+        AppendRequest {
+            data: Some(append_request::Data::Header(AppendRequestHeader {
+                extent_id,
+                eversion,
+                commit,
+                revision,
+                must_sync: true,
+            })),
+        },
+        AppendRequest {
+            data: Some(append_request::Data::Payload(payload)),
+        },
+    ]
 }
 
 /// Start a node, return (task handle, client).

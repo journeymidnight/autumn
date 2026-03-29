@@ -8,8 +8,8 @@ use autumn_proto::autumn::partition_kv_client::PartitionKvClient;
 use autumn_proto::autumn::partition_manager_service_client::PartitionManagerServiceClient;
 use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
 use autumn_proto::autumn::{
-    read_blocks_response, AcquireOwnerLockRequest, Code, CreateStreamRequest, Empty, GetRequest,
-    PartitionMeta, PutRequest, Range, ReadBlocksRequest, RegisterNodeRequest, SplitPartRequest,
+    read_bytes_response, AcquireOwnerLockRequest, Code, CreateStreamRequest, Empty, GetRequest,
+    PartitionMeta, PutRequest, Range, ReadBytesRequest, RegisterNodeRequest, SplitPartRequest,
     StreamAllocExtentRequest, StreamInfoRequest, TableLocations, TruncateRequest,
     UpsertPartitionRequest,
 };
@@ -18,6 +18,30 @@ use autumn_stream::{ExtentNode, ExtentNodeConfig, StreamClient};
 use partition_server::PartitionServer;
 use tokio::time::sleep;
 use tonic::Request;
+
+fn decode_last_table_locations(data: &[u8]) -> TableLocations {
+    use prost::Message as _;
+    let mut last: Option<TableLocations> = None;
+    let mut buf = data;
+    while !buf.is_empty() {
+        match TableLocations::decode_length_delimited(buf) {
+            Ok(locs) => {
+                match prost::decode_length_delimiter(buf) {
+                    Ok(msg_len) => {
+                        let prefix = prost::length_delimiter_len(msg_len);
+                        let total = prefix + msg_len;
+                        if total > buf.len() { break; }
+                        buf = &buf[total..];
+                        last = Some(locs);
+                    }
+                    Err(_) => break,
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    last.unwrap_or_else(|| TableLocations::decode(data).expect("fallback decode"))
+}
 
 fn pick_addr() -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -577,9 +601,8 @@ async fn stream_append_commit_punchhole_truncate_flow() {
         .append_batch(stream_id, &first_batch, true)
         .await
         .expect("batch append 1");
-    assert_eq!(b1.offsets.len(), 2);
-    assert_eq!(b1.offsets[0], 0);
-    assert_eq!(b1.offsets[1], 5);
+    // append_batch returns single AppendResult (start of whole payload)
+    assert_eq!(b1.offset, 0);
     let _a3 = client
         .append(stream_id, b"z", true)
         .await
@@ -683,7 +706,7 @@ async fn stream_append_and_read_blocks_flow() {
         .append_batch(stream_id, &batch, true)
         .await
         .expect("append batch");
-    assert_eq!(wr.offsets, vec![0, 5]);
+    assert_eq!(wr.offset, 0);
     let wr2 = client
         .append(stream_id, b"!", true)
         .await
@@ -718,63 +741,58 @@ async fn stream_append_and_read_blocks_flow() {
         .await
         .expect("connect extent node");
 
+    // Read all bytes from the extent (offset=0, length=0 means read to end)
     let mut rb = extent
-        .read_blocks(Request::new(ReadBlocksRequest {
+        .read_bytes(Request::new(ReadBytesRequest {
             extent_id,
             offset: 0,
-            num_of_blocks: 0,
+            length: 0,
             eversion: ex.eversion,
-            only_last_block: false,
         }))
         .await
-        .expect("read blocks")
+        .expect("read bytes")
         .into_inner();
 
     let mut header = None;
-    let mut payloads = Vec::new();
+    let mut payload_buf = Vec::new();
     while let Some(msg) = rb.message().await.expect("stream message") {
         match msg.data {
-            Some(read_blocks_response::Data::Header(h)) => header = Some(h),
-            Some(read_blocks_response::Data::Payload(p)) => payloads.push(p),
+            Some(read_bytes_response::Data::Header(h)) => header = Some(h),
+            Some(read_bytes_response::Data::Payload(p)) => payload_buf.extend_from_slice(&p),
             None => {}
         }
     }
 
     let h = header.expect("header");
     assert_eq!(h.code, Code::Ok as i32);
-    assert_eq!(h.offsets, vec![0, 5, 10]);
-    assert_eq!(h.block_sizes, vec![5, 5, 1]);
-    assert_eq!(
-        payloads,
-        vec![b"hello".to_vec(), b"world".to_vec(), b"!".to_vec()]
-    );
+    assert_eq!(h.end, 11); // "hello" + "world" + "!" = 11 bytes
+    assert_eq!(payload_buf, b"helloworld!");
 
+    // Read just the last byte ("!") via byte-range read (offset=10, length=1)
     let mut rb_last = extent
-        .read_blocks(Request::new(ReadBlocksRequest {
+        .read_bytes(Request::new(ReadBytesRequest {
             extent_id,
-            offset: 0,
-            num_of_blocks: 0,
+            offset: 10,
+            length: 1,
             eversion: ex.eversion,
-            only_last_block: true,
         }))
         .await
-        .expect("read last block")
+        .expect("read last byte")
         .into_inner();
 
     let mut last_header = None;
-    let mut last_payloads = Vec::new();
+    let mut last_payload = Vec::new();
     while let Some(msg) = rb_last.message().await.expect("stream message") {
         match msg.data {
-            Some(read_blocks_response::Data::Header(h)) => last_header = Some(h),
-            Some(read_blocks_response::Data::Payload(p)) => last_payloads.push(p),
+            Some(read_bytes_response::Data::Header(h)) => last_header = Some(h),
+            Some(read_bytes_response::Data::Payload(p)) => last_payload.extend_from_slice(&p),
             None => {}
         }
     }
     let lh = last_header.expect("last header");
     assert_eq!(lh.code, Code::Ok as i32);
-    assert_eq!(lh.offsets, vec![10]);
-    assert_eq!(lh.block_sizes, vec![1]);
-    assert_eq!(last_payloads, vec![b"!".to_vec()]);
+    assert_eq!(lh.end, 11);
+    assert_eq!(last_payload, b"!".to_vec());
 
     n1_task.abort();
     n2_task.abort();
@@ -879,15 +897,15 @@ async fn f030_flush_writes_sst_to_row_stream() {
         .await.expect("stream client");
 
     // rowStream: last block is the SSTable.
-    let sst = sc.read_last_block(row_stream).await.expect("read_last_block rowStream");
-    assert!(sst.is_some(), "rowStream must have an SSTable block after flush");
-    assert!(!sst.unwrap().is_empty(), "SSTable block must not be empty");
+    let sst = sc.read_last_extent_data(row_stream).await.expect("read_last_extent_data rowStream");
+    assert!(sst.is_some(), "rowStream must have SSTable data after flush");
+    assert!(!sst.unwrap().is_empty(), "SSTable data must not be empty");
 
-    // metaStream: last block is a TableLocations proto with one entry.
-    let meta_bytes = sc.read_last_block(meta_stream).await.expect("read_last_block metaStream");
-    assert!(meta_bytes.is_some(), "metaStream must have a TableLocations block");
-    let locs = TableLocations::decode(meta_bytes.unwrap().as_slice())
-        .expect("decode TableLocations");
+    // metaStream: last extent has a length-delimited TableLocations proto.
+    let meta_bytes = sc.read_last_extent_data(meta_stream).await.expect("read_last_extent_data metaStream");
+    assert!(meta_bytes.is_some(), "metaStream must have a TableLocations entry");
+    let raw = meta_bytes.unwrap();
+    let locs = decode_last_table_locations(raw.as_slice());
     assert_eq!(locs.locs.len(), 1, "TableLocations must list exactly one SSTable");
 
     n1_task.abort();
@@ -1031,10 +1049,9 @@ async fn f029_compaction_merges_small_tables() {
     // Verify we have 3 SSTables in metaStream before compaction.
     let mut sc = StreamClient::connect(&endpoint, "test-f029".to_string(), 128 * 1024 * 1024)
         .await.expect("stream client");
-    let meta_bytes_before = sc.read_last_block(meta_stream).await.expect("read meta")
-        .expect("meta block must exist");
-    let locs_before = TableLocations::decode(meta_bytes_before.as_slice())
-        .expect("decode TableLocations");
+    let meta_bytes_before = sc.read_last_extent_data(meta_stream).await.expect("read meta")
+        .expect("meta data must exist");
+    let locs_before = decode_last_table_locations(&meta_bytes_before);
     assert!(locs_before.locs.len() >= 2,
         "expected at least 2 SSTables before compaction, got {}",
         locs_before.locs.len());
@@ -1056,10 +1073,9 @@ async fn f029_compaction_merges_small_tables() {
     }
 
     // After major compaction the number of SSTables should have decreased.
-    let meta_bytes_after = sc.read_last_block(meta_stream).await.expect("read meta after compact")
-        .expect("meta block must exist after compact");
-    let locs_after = TableLocations::decode(meta_bytes_after.as_slice())
-        .expect("decode TableLocations after compact");
+    let meta_bytes_after = sc.read_last_extent_data(meta_stream).await.expect("read meta after compact")
+        .expect("meta data must exist after compact");
+    let locs_after = decode_last_table_locations(&meta_bytes_after);
     assert!(locs_after.locs.len() < locs_before.locs.len(),
         "compaction should reduce SSTable count: before={} after={}",
         locs_before.locs.len(), locs_after.locs.len());

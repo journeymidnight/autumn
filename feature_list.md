@@ -1,6 +1,6 @@
 # autumn go→rust feature list
 
-**Last updated:** 2026-03-17
+**Last updated:** 2026-03-28
 
 **Rules:** `passes` and `notes` are the only mutable fields after a feature is created.
 
@@ -31,6 +31,12 @@
 ---
 
 ## P0 — Core Architecture (correctness & data safety)
+
+### F038 · Remove block_sizes from stream layer (simplify to pure byte store)
+- **Target:** Stream layer becomes a pure byte read/write layer: `append(bytes) → (extent_id, offset, end)` and `read(extent_id, offset, len) → bytes`. Remove `block_sizes: Mutex<Vec<u32>>` from `ExtentEntry`, remove `blocks` field from `AppendRequestHeader`, change `ReadBlocks` RPC to take `(offset, len)` instead of `(offset, num_blocks)`. Block/record boundaries are entirely the upper layer's concern.
+- **Evidence:** `autumn-rs/crates/stream/src/extent_node.rs` (ExtentEntry, normalize_block_sizes, truncate_to_commit, read_blocks) · `autumn-rs/crates/stream/src/client.rs` (read_blocks_from_extent, append_payload) · `autumn-rs/crates/proto/proto/autumn.proto` (AppendRequestHeader.blocks, ReadBlockResponseHeader.block_sizes) · `autumn-rs/crates/partition-server/src/lib.rs` (read_blocks_from_extent call sites)
+- **Notes:** Motivation: block_sizes is in-memory only in Rust (not persisted), lost on restart, requires fragile normalize_block_sizes() fallback and replica-copy during recovery. Go avoids this because its on-disk format is CRC-framed (self-describing boundaries). Rust record format is already self-framing ([op:1][key_len:4][val_len:4][expires_at:8][key][value]), so upper layer can parse records from raw bytes without block boundary hints. Changes: (1) remove ExtentEntry.block_sizes; (2) AppendRequestHeader drops blocks field; (3) ReadBlocksRequest becomes (extent_id, offset, length) byte-range read; (4) ReadBlockResponseHeader drops block_sizes/offsets, returns raw bytes; (5) StreamClient API: read_blocks_from_extent → read_bytes(extent_id, offset, len); (6) partition server call sites updated to use byte-range reads and parse records with decode_record_metas directly; (7) read_last_block replaced with a pattern that stores the last-append offset in the caller.
+- **passes:** true
 
 ### F036 · Skiplist-based memtable with arena allocation
 - **Target:** Memtable backed by concurrent skiplist with arena-based allocation and reference counting, supporting efficient sorted iteration for flush and range queries. Equivalent to Go `range_partition/skiplist`.

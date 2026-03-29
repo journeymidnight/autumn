@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use crossbeam_skiplist::SkipMap;
-use prost::Message as _;
 use autumn_io_engine::{build_engine, IoEngine, IoFile, IoMode};
 use autumn_proto::autumn::partition_kv_server::{PartitionKv, PartitionKvServer};
 use autumn_proto::autumn::partition_manager_service_client::PartitionManagerServiceClient;
@@ -143,9 +142,11 @@ const RECORD_HEADER_SIZE: u64 = 1 + 4 + 4 + 8; // 17 bytes
 /// Mirrors Go's `table.Table` fields used in `DefaultPickupPolicy`.
 #[derive(Clone, Debug)]
 struct TableMeta {
-    /// Location in rowStream (extent_id, block offset).
+    /// Location in rowStream (extent_id, byte offset).
     extent_id: u64,
     offset: u32,
+    /// Byte length of the SSTable in the stream.
+    len: u32,
     /// Raw byte size of the SSTable (used as EstimatedSize in the policy).
     estimated_size: u64,
     /// Maximum MVCC sequence number among all entries in this table.
@@ -564,26 +565,63 @@ impl PartitionServer {
 
     /// Read the value of a large-value entry from logStream.
     /// Called by the Get handler after releasing the partition read lock.
+    /// `record_len` = RECORD_HEADER_SIZE + internal_key_len + value_len (exact bytes to read).
     async fn read_value_from_log(
         vp: &ValuePointer,
+        record_len: u32,
         stream_client: &Arc<Mutex<StreamClient>>,
     ) -> Result<Vec<u8>> {
-        let (data, _) = {
+        let (data, _end) = {
             let mut sc = stream_client.lock().await;
-            sc.read_blocks_from_extent(vp.extent_id, vp.offset, 1, false).await?
+            sc.read_bytes_from_extent(vp.extent_id, vp.offset, record_len).await?
         };
-        // The block is an encoded record: [op:1][key_len:4][val_len:4][expires_at:8][key][value]
+        // The record is: [op:1][key_len:4][val_len:4][expires_at:8][key][value]
         let records = Self::decode_records_full(&data);
         records
             .into_iter()
             .next()
             .map(|(_op, _key, value, _expires_at)| value)
-            .ok_or_else(|| anyhow!("failed to decode logStream block at extent={} offset={}", vp.extent_id, vp.offset))
+            .ok_or_else(|| anyhow!("failed to decode logStream record at extent={} offset={}", vp.extent_id, vp.offset))
     }
 
     // -----------------------------------------------------------------------
     // metaStream persistence (F030)
     // -----------------------------------------------------------------------
+
+    /// Decode the last valid TableLocations entry from a metaStream extent.
+    /// Entries are encoded with `encode_length_delimited` (varint len prefix).
+    /// Falls back to raw proto decode for old unframed data.
+    fn decode_last_table_locations(data: &[u8]) -> Result<TableLocations> {
+        use prost::Message as _;
+        // Try length-delimited: walk forward, collect all successful decodes, return last.
+        let mut last: Option<TableLocations> = None;
+        let mut buf = data;
+        while !buf.is_empty() {
+            match TableLocations::decode_length_delimited(buf) {
+                Ok(locs) => {
+                    // Advance buf by peeking at the varint length prefix manually.
+                    // decode_length_delimited consumes from a &[u8] Buf - we need to
+                    // advance manually. Use prost::decode_length_delimiter.
+                    match prost::decode_length_delimiter(buf) {
+                        Ok(msg_len) => {
+                            let prefix_len = prost::length_delimiter_len(msg_len);
+                            let total = prefix_len + msg_len;
+                            if total > buf.len() { break; }
+                            buf = &buf[total..];
+                            last = Some(locs);
+                        }
+                        Err(_) => break,
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if let Some(locs) = last {
+            return Ok(locs);
+        }
+        // Fallback: old unframed data — decode entire extent as a single proto.
+        TableLocations::decode(data).map_err(|e| anyhow!("decode TableLocations: {e}"))
+    }
 
     /// Persist the current tables list to metaStream.
     /// Must NOT be called while holding the PartitionData write lock if
@@ -595,18 +633,20 @@ impl PartitionServer {
         vp_extent_id: u64,
         vp_offset: u32,
     ) -> Result<()> {
+        use prost::Message as _;
         let locs_proto = TableLocations {
             locs: tables
                 .iter()
                 .map(|t| Location {
                     extent_id: t.extent_id,
                     offset: t.offset,
+                    len: t.len,
                 })
                 .collect(),
             vp_extent_id,
             vp_offset,
         };
-        let data = locs_proto.encode_to_vec();
+        let data = locs_proto.encode_length_delimited_to_vec();
         let mut sc = self.stream_client.lock().await;
         sc.append(meta_stream_id, &data, true).await?;
         // Keep only the latest meta extent (discard older ones like Go).
@@ -641,13 +681,16 @@ impl PartitionServer {
         let mut recovered_vp_off: u32 = 0;
 
         // Step 1: Read metaStream to get the last checkpoint of table locations.
-        let meta_block = {
+        // metaStream entries are length-delimited proto (varint len + bytes).
+        // Walk forward and use the last valid entry.
+        let meta_bytes_opt = {
             let mut sc = self.stream_client.lock().await;
-            sc.read_last_block(meta_stream_id).await?
+            sc.read_last_extent_data(meta_stream_id).await?
         };
 
-        if let Some(meta_bytes) = meta_block {
-            let locations = TableLocations::decode(meta_bytes.as_slice())
+        if let Some(meta_bytes) = meta_bytes_opt {
+            // Parse all length-delimited TableLocations entries; use the last one.
+            let locations = Self::decode_last_table_locations(&meta_bytes)
                 .context("decode TableLocations from metaStream")?;
 
             // Restore vhead from the checkpoint.
@@ -658,8 +701,9 @@ impl PartitionServer {
             for loc in locations.locs {
                 let sst_bytes = {
                     let mut sc = self.stream_client.lock().await;
-                    let (data, _) = sc
-                        .read_blocks_from_extent(loc.extent_id, loc.offset, 1, false)
+                    // length=0 means read to end (backward compat for old loc.len==0)
+                    let (data, _end) = sc
+                        .read_bytes_from_extent(loc.extent_id, loc.offset, loc.len)
                         .await
                         .with_context(|| {
                             format!(
@@ -717,6 +761,7 @@ impl PartitionServer {
                 tables.push(TableMeta {
                     extent_id: loc.extent_id,
                     offset: loc.offset,
+                    len: estimated_size as u32,
                     estimated_size,
                     last_seq: tbl_last_seq,
                 });
@@ -734,38 +779,31 @@ impl PartitionServer {
                         continue;
                     }
                     let start_offset = if eid == recovered_vp_eid { recovered_vp_off } else { 0 };
-                    let (data, block_sizes) = {
+                    let (data, _end) = {
                         let mut sc = self.stream_client.lock().await;
-                        match sc.read_blocks_from_extent(eid, start_offset, 0, false).await {
+                        match sc.read_bytes_from_extent(eid, start_offset, 0).await {
                             Ok(r) => r,
                             Err(_) => continue, // extent may not exist yet
                         }
                     };
-                    let mut block_cursor: usize = 0;
-                    let mut offset_in_extent = start_offset;
-                    for bsize in block_sizes {
-                        let block = &data[block_cursor..block_cursor + bsize as usize];
-                        for (op, key, value_len, expires_at, _rec_off) in
-                            Self::decode_record_metas(block)
-                        {
-                            let ts = parse_ts(&key);
-                            if ts > max_seq { max_seq = ts; }
-                            let vp = ValuePointer {
-                                extent_id: eid,
-                                offset: offset_in_extent,
-                                len: value_len,
-                            };
-                            Self::apply_record_meta(
-                                &mut kv,
-                                op & 0x7F,
-                                key,
-                                value_len,
-                                expires_at,
-                                ValueLoc::ValueLog { vp },
-                            );
-                        }
-                        block_cursor += bsize as usize;
-                        offset_in_extent += bsize;
+                    for (op, key, value_len, expires_at, rec_off) in
+                        Self::decode_record_metas(&data)
+                    {
+                        let ts = parse_ts(&key);
+                        if ts > max_seq { max_seq = ts; }
+                        let vp = ValuePointer {
+                            extent_id: eid,
+                            offset: start_offset + rec_off as u32,
+                            len: value_len,
+                        };
+                        Self::apply_record_meta(
+                            &mut kv,
+                            op & 0x7F,
+                            key,
+                            value_len,
+                            expires_at,
+                            ValueLoc::ValueLog { vp },
+                        );
                     }
                 }
             }
@@ -991,6 +1029,7 @@ impl PartitionServer {
         part.tables.push(TableMeta {
             extent_id: result.extent_id,
             offset: result.offset,
+            len: result.end - result.offset,
             estimated_size,
             last_seq,
         });
@@ -1125,6 +1164,7 @@ impl PartitionServer {
             guard.tables.push(TableMeta {
                 extent_id: result.extent_id,
                 offset: result.offset,
+                len: result.end - result.offset,
                 estimated_size,
                 last_seq,
             });
@@ -1424,6 +1464,7 @@ impl PartitionServer {
                 TableMeta {
                     extent_id: result.extent_id,
                     offset: result.offset,
+                    len: result.end - result.offset,
                     estimated_size,
                     last_seq: chunk_last_seq,
                 },
@@ -1775,8 +1816,9 @@ impl PartitionKv for PartitionServer {
         // before locking the stream_client to avoid holding two locks simultaneously.
         let value = if let ValueLoc::ValueLog { vp } = &meta.loc {
             let vp = *vp;
+            let record_len = RECORD_HEADER_SIZE as u32 + meta.internal_key_len + meta.value_len;
             drop(part);
-            Self::read_value_from_log(&vp, &self.stream_client)
+            Self::read_value_from_log(&vp, record_len, &self.stream_client)
                 .await
                 .map_err(internal_to_status)?
         } else {

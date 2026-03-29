@@ -26,21 +26,21 @@ fn append_requests(
     revision: i64,
     blocks: &[&[u8]],
 ) -> Vec<AppendRequest> {
-    let mut reqs = Vec::with_capacity(1 + blocks.len());
-    reqs.push(AppendRequest {
-        data: Some(append_request::Data::Header(AppendRequestHeader {
-            extent_id,
-            eversion,
-            commit,
-            revision,
-            must_sync: true,
-            blocks: blocks.iter().map(|b| b.len() as u32).collect(),
-        })),
-    });
-    reqs.extend(blocks.iter().map(|b| AppendRequest {
-        data: Some(append_request::Data::Payload((*b).to_vec())),
-    }));
-    reqs
+    let payload: Vec<u8> = blocks.iter().flat_map(|b| b.iter().copied()).collect();
+    vec![
+        AppendRequest {
+            data: Some(append_request::Data::Header(AppendRequestHeader {
+                extent_id,
+                eversion,
+                commit,
+                revision,
+                must_sync: true,
+            })),
+        },
+        AppendRequest {
+            data: Some(append_request::Data::Payload(payload)),
+        },
+    ]
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -102,7 +102,9 @@ async fn append_rejects_stale_revision() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn append_rejects_unaligned_commit_truncate_as_precondition() {
+async fn append_with_mid_byte_commit_truncates_and_succeeds() {
+    // F038: block_sizes removed; truncate is byte-granular, no alignment check.
+    // commit=6 truncates the file to 6 bytes, then appends the new payload.
     let node_dir = tempfile::tempdir().expect("node tempdir");
     let node = ExtentNode::new(ExtentNodeConfig::new(
         node_dir.path().to_path_buf(),
@@ -139,7 +141,8 @@ async fn append_rejects_unaligned_commit_truncate_as_precondition() {
     assert_eq!(first.code, Code::Ok as i32);
     assert_eq!(first.end, 10);
 
-    let unaligned = client
+    // commit=6 truncates to 6 bytes (byte-granular), then appends "!" → end=7
+    let partial = client
         .append(Request::new(iter(append_requests(
             1002,
             1,
@@ -148,14 +151,10 @@ async fn append_rejects_unaligned_commit_truncate_as_precondition() {
             &[b"!".as_slice()],
         ))))
         .await
-        .expect("append with unaligned commit should return response")
+        .expect("append with mid-byte commit")
         .into_inner();
-    assert_eq!(unaligned.code, Code::PreconditionFailed as i32);
-    assert!(
-        unaligned.code_des.contains("not aligned to block boundary"),
-        "unexpected error: {}",
-        unaligned.code_des
-    );
+    assert_eq!(partial.code, Code::Ok as i32, "mid-byte commit should succeed: {}", partial.code_des);
+    assert_eq!(partial.end, 7, "truncated to 6 then appended 1 byte → end=7");
 
     let commit = client
         .commit_length(Request::new(CommitLengthRequest {
@@ -166,7 +165,7 @@ async fn append_rejects_unaligned_commit_truncate_as_precondition() {
         .expect("commit length")
         .into_inner();
     assert_eq!(commit.code, Code::Ok as i32);
-    assert_eq!(commit.length, 10);
+    assert_eq!(commit.length, 7);
 
     node_task.abort();
 }

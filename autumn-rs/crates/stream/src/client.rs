@@ -4,10 +4,10 @@ use anyhow::{anyhow, Context, Result};
 use autumn_proto::autumn::extent_service_client::ExtentServiceClient;
 use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
 use autumn_proto::autumn::{
-    append_request, read_blocks_response, AcquireOwnerLockRequest, AcquireOwnerLockResponse,
+    append_request, read_bytes_response, AcquireOwnerLockRequest, AcquireOwnerLockResponse,
     AppendRequest, AppendRequestHeader, CheckCommitLengthRequest, Code, CommitLengthRequest,
     ExtentInfo, ExtentInfoRequest, MultiModifySplitRequest, MultiModifySplitResponse,
-    NodesInfoResponse, PunchHolesRequest, ReadBlockResponseHeader, ReadBlocksRequest,
+    NodesInfoResponse, PunchHolesRequest, ReadBytesRequest, ReadBytesResponseHeader,
     StreamAllocExtentRequest, StreamInfo, StreamInfoRequest, TruncateRequest,
 };
 use tokio_stream::iter;
@@ -21,12 +21,6 @@ pub struct AppendResult {
     pub end: u32,
 }
 
-#[derive(Debug, Clone)]
-pub struct AppendBatchResult {
-    pub extent_id: u64,
-    pub offsets: Vec<u32>,
-    pub end: u32,
-}
 
 #[derive(Clone)]
 pub struct StreamClient {
@@ -229,9 +223,8 @@ impl StreamClient {
         &mut self,
         stream_id: u64,
         payload: Vec<u8>,
-        blocks: Vec<u32>,
         must_sync: bool,
-    ) -> Result<AppendBatchResult> {
+    ) -> Result<AppendResult> {
         let mut retry = 0usize;
         loop {
             let tail = self.stream_tail(stream_id).await?;
@@ -246,7 +239,6 @@ impl StreamClient {
                         commit,
                         revision,
                         must_sync,
-                        blocks: blocks.clone(),
                     })),
                 },
                 AppendRequest {
@@ -280,7 +272,7 @@ impl StreamClient {
                 }
 
                 if let Some(first) = &first_resp {
-                    if inner.offsets != first.offsets || inner.end != first.end {
+                    if inner.offset != first.offset || inner.end != first.end {
                         append_error = Some(anyhow!(
                             "replica append offset mismatch on extent {}",
                             tail.extent.extent_id
@@ -313,9 +305,9 @@ impl StreamClient {
                 let _ = self.cache_stream_tail(stream_id, new_tail).await?;
             }
 
-            return Ok(AppendBatchResult {
+            return Ok(AppendResult {
                 extent_id: tail.extent.extent_id,
-                offsets: appended.offsets,
+                offset: appended.offset,
                 end: appended.end,
             });
         }
@@ -352,12 +344,11 @@ impl StreamClient {
         block: &[u8],
         count: usize,
         must_sync: bool,
-    ) -> Result<AppendBatchResult> {
+    ) -> Result<AppendResult> {
         if count == 0 {
             return Err(anyhow!("append_batch_repeated requires count > 0"));
         }
 
-        let block_len = u32::try_from(block.len()).map_err(|_| anyhow!("block too large"))?;
         let total = block
             .len()
             .checked_mul(count)
@@ -368,9 +359,7 @@ impl StreamClient {
             payload.extend_from_slice(block);
         }
 
-        let blocks = vec![block_len; count];
-        self.append_payload(stream_id, payload, blocks, must_sync)
-            .await
+        self.append_payload(stream_id, payload, must_sync).await
     }
 
     pub async fn append_batch(
@@ -378,28 +367,21 @@ impl StreamClient {
         stream_id: u64,
         blocks: &[&[u8]],
         must_sync: bool,
-    ) -> Result<AppendBatchResult> {
+    ) -> Result<AppendResult> {
         if blocks.is_empty() {
             return Err(anyhow!("append_batch requires at least one block"));
         }
 
-        let mut sizes = Vec::with_capacity(blocks.len());
-        let mut total = 0usize;
-        for b in blocks {
-            let len_u32 = u32::try_from(b.len()).map_err(|_| anyhow!("block too large"))?;
-            sizes.push(len_u32);
-            total = total
-                .checked_add(b.len())
-                .ok_or_else(|| anyhow!("append payload too large"))?;
-        }
+        let total = blocks.iter().try_fold(0usize, |acc, b| {
+            acc.checked_add(b.len()).ok_or_else(|| anyhow!("append payload too large"))
+        })?;
 
         let mut payload = Vec::with_capacity(total);
         for b in blocks {
             payload.extend_from_slice(b);
         }
 
-        self.append_payload(stream_id, payload, sizes, must_sync)
-            .await
+        self.append_payload(stream_id, payload, must_sync).await
     }
 
     pub async fn append(
@@ -408,15 +390,7 @@ impl StreamClient {
         payload: &[u8],
         must_sync: bool,
     ) -> Result<AppendResult> {
-        let batch = self
-            .append_batch_repeated(stream_id, payload, 1, must_sync)
-            .await?;
-        let offset = batch.offsets.first().copied().unwrap_or(0);
-        Ok(AppendResult {
-            extent_id: batch.extent_id,
-            offset,
-            end: batch.end,
-        })
+        self.append_payload(stream_id, payload.to_vec(), must_sync).await
     }
 
     pub async fn commit_length(&mut self, stream_id: u64) -> Result<u32> {
@@ -481,17 +455,15 @@ impl StreamClient {
             .ok_or_else(|| anyhow!("stream {} not in stream_info response", stream_id))
     }
 
-    /// Read blocks from a specific extent starting at the given byte offset.
-    /// Returns (raw_payload_bytes, block_sizes).
-    /// Pass `num_of_blocks=0` to read all blocks from offset onwards.
-    /// Pass `only_last_block=true` to read only the last block (ignores offset/num_of_blocks).
-    pub async fn read_blocks_from_extent(
+    /// Read bytes from a specific extent.
+    /// Returns (payload_bytes, end) where end is the total extent length.
+    /// Pass `length=0` to read from offset to the end of the extent.
+    pub async fn read_bytes_from_extent(
         &mut self,
         extent_id: u64,
         offset: u32,
-        num_of_blocks: u32,
-        only_last_block: bool,
-    ) -> Result<(Vec<u8>, Vec<u32>)> {
+        length: u32,
+    ) -> Result<(Vec<u8>, u32)> {
         let resp = self
             .manager
             .extent_info(Request::new(ExtentInfoRequest { extent_id }))
@@ -508,12 +480,11 @@ impl StreamClient {
             let mut stream = {
                 let client = self.extent_client(addr).await?;
                 match client
-                    .read_blocks(Request::new(ReadBlocksRequest {
+                    .read_bytes(Request::new(ReadBytesRequest {
                         extent_id,
                         offset,
-                        num_of_blocks,
+                        length,
                         eversion: 0,
-                        only_last_block,
                     }))
                     .await
                 {
@@ -525,21 +496,21 @@ impl StreamClient {
                 }
             };
 
-            let mut header: Option<ReadBlockResponseHeader> = None;
+            let mut header: Option<ReadBytesResponseHeader> = None;
             let mut payload = Vec::new();
             let mut read_ok = true;
             loop {
                 match stream.message().await {
                     Ok(Some(msg)) => match msg.data {
-                        Some(read_blocks_response::Data::Header(h)) => {
+                        Some(read_bytes_response::Data::Header(h)) => {
                             if h.code != Code::Ok as i32 {
-                                last_err = anyhow!("read_blocks error: {}", h.code_des);
+                                last_err = anyhow!("read_bytes error: {}", h.code_des);
                                 read_ok = false;
                                 break;
                             }
                             header = Some(h);
                         }
-                        Some(read_blocks_response::Data::Payload(p)) => {
+                        Some(read_bytes_response::Data::Payload(p)) => {
                             payload.extend_from_slice(&p);
                         }
                         None => {}
@@ -558,23 +529,22 @@ impl StreamClient {
             let header = match header {
                 Some(h) => h,
                 None => {
-                    last_err = anyhow!("read_blocks: missing header from {}", addr);
+                    last_err = anyhow!("read_bytes: missing header from {}", addr);
                     continue;
                 }
             };
-            return Ok((payload, header.block_sizes));
+            return Ok((payload, header.end));
         }
         Err(last_err)
     }
 
-    /// Read the last block from the last non-empty extent of the given stream.
-    /// Returns `None` if the stream has no blocks.
-    pub async fn read_last_block(&mut self, stream_id: u64) -> Result<Option<Vec<u8>>> {
+    /// Read all bytes from the last non-empty extent of the given stream.
+    /// Returns None if the stream has no data.
+    pub async fn read_last_extent_data(&mut self, stream_id: u64) -> Result<Option<Vec<u8>>> {
         let info = self.get_stream_info(stream_id).await?;
         for &eid in info.extent_ids.iter().rev() {
-            let (payload, block_sizes) =
-                self.read_blocks_from_extent(eid, 0, 0, true).await?;
-            if !block_sizes.is_empty() {
+            let (payload, _end) = self.read_bytes_from_extent(eid, 0, 0).await?;
+            if !payload.is_empty() {
                 return Ok(Some(payload));
             }
         }

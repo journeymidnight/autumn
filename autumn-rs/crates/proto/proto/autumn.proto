@@ -25,6 +25,7 @@ message Range {
 message Location {
   uint64 extent_id = 1;
   uint32 offset = 2;
+  uint32 len = 3;
 }
 
 message TableLocations {
@@ -326,7 +327,7 @@ message AppendRequestHeader {
   uint32 commit = 3;
   int64 revision = 4;
   bool must_sync = 5;
-  repeated uint32 blocks = 6;
+  reserved 6;
 }
 
 message AppendRequest {
@@ -339,29 +340,29 @@ message AppendRequest {
 message AppendResponse {
   Code code = 1;
   string code_des = 2;
-  repeated uint32 offsets = 3;
+  uint32 offset = 3;
   uint32 end = 4;
 }
 
-message ReadBlocksRequest {
+message ReadBytesRequest {
   uint64 extent_id = 1;
   uint32 offset = 2;
-  uint32 num_of_blocks = 3;
+  uint32 length = 3;
   uint64 eversion = 4;
-  bool only_last_block = 5;
+  reserved 5;
 }
 
-message ReadBlockResponseHeader {
+message ReadBytesResponseHeader {
   Code code = 1;
   string code_des = 2;
-  repeated uint32 offsets = 3;
+  reserved 3;
   uint32 end = 4;
-  repeated uint32 block_sizes = 5;
+  reserved 5;
 }
 
-message ReadBlocksResponse {
+message ReadBytesResponse {
   oneof data {
-    ReadBlockResponseHeader header = 1;
+    ReadBytesResponseHeader header = 1;
     bytes payload = 2;
   }
 }
@@ -491,7 +492,7 @@ service PartitionKv {
 
 service ExtentService {
   rpc Append(stream AppendRequest) returns (AppendResponse);
-  rpc ReadBlocks(ReadBlocksRequest) returns (stream ReadBlocksResponse);
+  rpc ReadBytes(ReadBytesRequest) returns (stream ReadBytesResponse);
   rpc ReAvali(ReAvaliRequest) returns (ReAvaliResponse);
   rpc CopyExtent(CopyExtentRequest) returns (stream CopyExtentResponse);
   rpc Df(DfRequest) returns (DfResponse);

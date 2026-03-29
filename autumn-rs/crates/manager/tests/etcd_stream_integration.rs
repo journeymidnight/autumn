@@ -8,8 +8,8 @@ use autumn_manager::AutumnManager;
 use autumn_proto::autumn::extent_service_client::ExtentServiceClient;
 use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
 use autumn_proto::autumn::{
-    read_blocks_response, AcquireOwnerLockRequest, CheckCommitLengthRequest, Code,
-    CreateStreamRequest, ExtentInfoRequest, ReadBlocksRequest, RegisterNodeRequest,
+    read_bytes_response, AcquireOwnerLockRequest, CheckCommitLengthRequest, Code,
+    CreateStreamRequest, ExtentInfoRequest, ReadBytesRequest, RegisterNodeRequest,
     StreamAllocExtentRequest, StreamInfo, StreamInfoRequest,
 };
 use autumn_stream::{ExtentNode, ExtentNodeConfig, StreamClient};
@@ -495,12 +495,11 @@ async fn etcd_replicated_append_and_recovery_flow() {
         .await
         .expect("connect recovered node");
     let mut rb = copied
-        .read_blocks(Request::new(ReadBlocksRequest {
+        .read_bytes(Request::new(ReadBytesRequest {
             extent_id: sealed_extent_id,
             offset: 0,
-            num_of_blocks: 0,
+            length: 0, // read all
             eversion: replaced.eversion,
-            only_last_block: false,
         }))
         .await
         .expect("read recovered extent")
@@ -508,7 +507,7 @@ async fn etcd_replicated_append_and_recovery_flow() {
 
     let mut payload = Vec::new();
     while let Some(msg) = rb.message().await.expect("stream msg") {
-        if let Some(read_blocks_response::Data::Payload(p)) = msg.data {
+        if let Some(read_bytes_response::Data::Payload(p)) = msg.data {
             payload.extend_from_slice(&p);
         }
     }

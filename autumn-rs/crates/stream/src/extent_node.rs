@@ -14,9 +14,8 @@ use autumn_proto::autumn::{
     AllocExtentRequest, AllocExtentResponse, AppendRequest, AppendRequestHeader, AppendResponse,
     Code, CommitLengthRequest, CommitLengthResponse, CopyExtentRequest, CopyExtentResponse,
     CopyResponseHeader, Df, DfRequest, DfResponse, Empty, ExtentInfo, ExtentInfoRequest, Payload,
-    ReAvaliRequest, ReAvaliResponse, ReadBlockResponseHeader, ReadBlocksRequest,
-    ReadBlocksResponse, RecoveryTask, RecoveryTaskStatus, RequireRecoveryRequest,
-    RequireRecoveryResponse,
+    ReAvaliRequest, ReAvaliResponse, ReadBytesRequest, ReadBytesResponse, ReadBytesResponseHeader,
+    RecoveryTask, RecoveryTaskStatus, RequireRecoveryRequest, RequireRecoveryResponse,
 };
 use dashmap::DashMap;
 use tokio::sync::{mpsc, Mutex, OnceCell};
@@ -52,7 +51,6 @@ struct ExtentEntry {
     file: Arc<dyn IoFile>,
     len: AtomicU64,
     write_lock: Mutex<()>,
-    block_sizes: Mutex<Vec<u32>>,
     eversion: AtomicU64,
     sealed_length: AtomicU64,
     avali: AtomicU32,
@@ -170,7 +168,6 @@ impl ExtentNode {
                     file,
                     len: AtomicU64::new(len),
                     write_lock: Mutex::new(()),
-                    block_sizes: Mutex::new(Vec::new()),
                     eversion: AtomicU64::new(eversion),
                     sealed_length: AtomicU64::new(sealed_length),
                     avali: AtomicU32::new(if sealed_length > 0 { 1 } else { 0 }),
@@ -221,7 +218,6 @@ impl ExtentNode {
                 file,
                 len: AtomicU64::new(len),
                 write_lock: Mutex::new(()),
-                block_sizes: Mutex::new(Vec::new()),
                 eversion: AtomicU64::new(1),
                 sealed_length: AtomicU64::new(0),
                 avali: AtomicU32::new(0),
@@ -243,20 +239,9 @@ impl ExtentNode {
         AppendResponse {
             code: Code::PreconditionFailed as i32,
             code_des: code_des.into(),
-            offsets: Vec::new(),
+            offset: 0,
             end: 0,
         }
-    }
-
-    fn normalize_block_sizes(block_sizes: Vec<u32>, len: usize) -> Vec<u32> {
-        if len == 0 {
-            return Vec::new();
-        }
-        let total: usize = block_sizes.iter().map(|v| *v as usize).sum();
-        if total == len && !block_sizes.is_empty() {
-            return block_sizes;
-        }
-        vec![len as u32]
     }
 
     async fn manager_client(
@@ -328,24 +313,6 @@ impl ExtentNode {
     }
 
     async fn truncate_to_commit(extent: &Arc<ExtentEntry>, commit: u32) -> Result<(), Status> {
-        let mut bs = extent.block_sizes.lock().await;
-        let mut idx = 0usize;
-        let mut cur = 0u32;
-        while idx < bs.len() {
-            let next = cur.saturating_add(bs[idx]);
-            if next > commit {
-                break;
-            }
-            cur = next;
-            idx += 1;
-        }
-        if cur != commit {
-            return Err(Status::failed_precondition(format!(
-                "commit {} is not aligned to block boundary",
-                commit
-            )));
-        }
-        bs.truncate(idx);
         extent
             .file
             .truncate(commit as u64)
@@ -355,56 +322,55 @@ impl ExtentNode {
         Ok(())
     }
 
-    async fn copy_blocks_from_source(
+    async fn copy_bytes_from_source(
         source_addr: &str,
         extent_id: u64,
         eversion: u64,
-    ) -> Result<(Vec<u8>, Vec<u32>), Status> {
+    ) -> Result<Vec<u8>, Status> {
         let mut source_client = ExtentServiceClient::connect(Self::normalize_endpoint(source_addr))
             .await
             .map_err(|e| Status::unavailable(e.to_string()))?;
 
         let mut rb = source_client
-            .read_blocks(Request::new(ReadBlocksRequest {
+            .read_bytes(Request::new(ReadBytesRequest {
                 extent_id,
                 offset: 0,
-                num_of_blocks: 0,
+                length: 0,
                 eversion,
-                only_last_block: false,
             }))
             .await
             .map_err(|e| Status::unavailable(e.to_string()))?
             .into_inner();
 
-        let mut header: Option<ReadBlockResponseHeader> = None;
+        let mut header: Option<ReadBytesResponseHeader> = None;
         let mut payload = Vec::new();
         while let Some(msg) = rb.message().await? {
             match msg.data {
-                Some(autumn_proto::autumn::read_blocks_response::Data::Header(h)) => {
+                Some(autumn_proto::autumn::read_bytes_response::Data::Header(h)) => {
                     if h.code != Code::Ok as i32 {
                         return Err(Status::failed_precondition(format!(
-                            "read_blocks header error from {source_addr}: {}",
+                            "read_bytes header error from {source_addr}: {}",
                             h.code_des
                         )));
                     }
                     header = Some(h);
                 }
-                Some(autumn_proto::autumn::read_blocks_response::Data::Payload(p)) => {
+                Some(autumn_proto::autumn::read_bytes_response::Data::Payload(p)) => {
                     payload.extend_from_slice(&p);
                 }
                 None => {}
             }
         }
 
-        let header = header.ok_or_else(|| Status::internal("read_blocks missing header"))?;
-        Ok((payload, header.block_sizes))
+        let _ = header.ok_or_else(|| Status::internal("read_bytes missing header"))?;
+        Ok(payload)
     }
 
     async fn fetch_full_extent_from_sources(
         &self,
         extent: &ExtentInfo,
         exclude_node_ids: &[u64],
-    ) -> Result<(Vec<u8>, Vec<u32>), Status> {
+    ) -> Result<Vec<u8>, Status> {
         let nodes = self.nodes_map_from_manager().await?;
         for node_id in extent.replicates.iter().chain(extent.parity.iter()) {
             if exclude_node_ids.contains(node_id) {
@@ -414,12 +380,12 @@ impl ExtentNode {
                 continue;
             };
             let copied =
-                Self::copy_blocks_from_source(addr, extent.extent_id, extent.eversion).await;
-            if let Ok((payload, block_sizes)) = copied {
+                Self::copy_bytes_from_source(addr, extent.extent_id, extent.eversion).await;
+            if let Ok(payload) = copied {
                 if extent.sealed_length > 0 && payload.len() < extent.sealed_length as usize {
                     continue;
                 }
-                return Ok((payload, block_sizes));
+                return Ok(payload);
             }
         }
         Err(Status::failed_precondition(
@@ -445,7 +411,7 @@ impl ExtentNode {
 
     async fn run_recovery_task(&self, task: RecoveryTask) -> Result<RecoveryTaskStatus, Status> {
         let extent_info = self.resolve_recovery_extent(&task).await?;
-        let (payload, block_sizes) = self
+        let payload = self
             .fetch_full_extent_from_sources(&extent_info, &[task.node_id, task.replace_id])
             .await?;
         let payload = if extent_info.sealed_length > 0 {
@@ -453,7 +419,6 @@ impl ExtentNode {
         } else {
             payload
         };
-        let block_sizes = Self::normalize_block_sizes(block_sizes, payload.len());
 
         let extent = self.ensure_extent(task.extent_id).await?;
         let _g = extent.write_lock.lock().await;
@@ -480,10 +445,6 @@ impl ExtentNode {
             .sealed_length
             .store(extent_info.sealed_length, Ordering::SeqCst);
         extent.avali.store(extent_info.avali, Ordering::SeqCst);
-        let mut sizes = extent.block_sizes.lock().await;
-        sizes.clear();
-        sizes.extend(block_sizes);
-        drop(sizes);
 
         let _ = self.save_meta(task.extent_id, &extent).await;
 
@@ -499,7 +460,7 @@ type ResponseStream<T> =
 
 #[tonic::async_trait]
 impl ExtentService for ExtentNode {
-    type ReadBlocksStream = ResponseStream<ReadBlocksResponse>;
+    type ReadBytesStream = ResponseStream<ReadBytesResponse>;
     type CopyExtentStream = ResponseStream<CopyExtentResponse>;
     type HeartbeatStream = ResponseStream<Payload>;
 
@@ -525,7 +486,6 @@ impl ExtentService for ExtentNode {
                 file,
                 len: AtomicU64::new(len),
                 write_lock: Mutex::new(()),
-                block_sizes: Mutex::new(Vec::new()),
                 eversion: AtomicU64::new(1),
                 sealed_length: AtomicU64::new(0),
                 avali: AtomicU32::new(0),
@@ -607,25 +567,6 @@ impl ExtentService for ExtentNode {
             ))));
         }
 
-        let mut blocks = if header.blocks.is_empty() {
-            vec![payload.len() as u32]
-        } else {
-            header.blocks.clone()
-        };
-
-        let sum_blocks: usize = blocks.iter().map(|v| *v as usize).sum();
-        if sum_blocks != payload.len() {
-            if header.blocks.is_empty() && payload.is_empty() {
-                blocks = Vec::new();
-            } else {
-                return Err(Status::invalid_argument(format!(
-                    "sum(blocks)={} != payload_len={}",
-                    sum_blocks,
-                    payload.len()
-                )));
-            }
-        }
-
         let _g = extent.write_lock.lock().await;
 
         let last_revision = extent.last_revision.load(Ordering::SeqCst);
@@ -674,18 +615,7 @@ impl ExtentService for ExtentNode {
                 .map_err(|e| Status::internal(e.to_string()))?;
         }
 
-        let mut offsets = Vec::with_capacity(blocks.len());
-        let mut cursor = start as u32;
-        for b in &blocks {
-            offsets.push(cursor);
-            cursor = cursor.saturating_add(*b);
-        }
-
-        {
-            let mut bs = extent.block_sizes.lock().await;
-            bs.extend_from_slice(&blocks);
-        }
-
+        let start_offset = start as u32;
         let end = start + payload.len() as u64;
         extent.len.store(end, Ordering::SeqCst);
 
@@ -696,15 +626,15 @@ impl ExtentService for ExtentNode {
         Ok(Response::new(AppendResponse {
             code: Code::Ok as i32,
             code_des: String::new(),
-            offsets,
+            offset: start_offset,
             end: end as u32,
         }))
     }
 
-    async fn read_blocks(
+    async fn read_bytes(
         &self,
-        request: Request<ReadBlocksRequest>,
-    ) -> Result<Response<Self::ReadBlocksStream>, Status> {
+        request: Request<ReadBytesRequest>,
+    ) -> Result<Response<Self::ReadBytesStream>, Status> {
         let req = request.into_inner();
         let extent = self.get_extent(req.extent_id).await?;
         if let Some(ex) = self.extent_info_from_manager(req.extent_id).await? {
@@ -728,76 +658,51 @@ impl ExtentService for ExtentNode {
             }
         }
 
-        let end = extent.len.load(Ordering::SeqCst) as u32;
-        let blocks = extent.block_sizes.lock().await.clone();
-
-        let mut block_offsets = Vec::with_capacity(blocks.len());
-        let mut off = 0u32;
-        for b in &blocks {
-            block_offsets.push(off);
-            off = off.saturating_add(*b);
-        }
-
-        let selected: Vec<(u32, u32)> = if req.only_last_block {
-            match (block_offsets.last().copied(), blocks.last().copied()) {
-                (Some(o), Some(s)) => vec![(o, s)],
-                _ => Vec::new(),
-            }
+        let total_len = extent.len.load(Ordering::SeqCst);
+        let end = total_len as u32;
+        let read_offset = req.offset as u64;
+        let read_size = if req.length == 0 {
+            total_len.saturating_sub(read_offset)
         } else {
-            let mut out = Vec::new();
-            let mut started = false;
-            for (idx, o) in block_offsets.iter().enumerate() {
-                if !started && *o < req.offset {
-                    continue;
-                }
-                started = true;
-                out.push((*o, blocks[idx]));
-                if req.num_of_blocks > 0 && out.len() >= req.num_of_blocks as usize {
-                    break;
-                }
-            }
-            out
+            (req.length as u64).min(total_len.saturating_sub(read_offset))
         };
 
-        let header = ReadBlockResponseHeader {
+        let resp_header = ReadBytesResponseHeader {
             code: Code::Ok as i32,
             code_des: String::new(),
-            offsets: selected.iter().map(|(o, _)| *o).collect(),
             end,
-            block_sizes: selected.iter().map(|(_, s)| *s).collect(),
         };
 
         let (tx, rx) = mpsc::channel(16);
         let file = Arc::clone(&extent.file);
         tokio::spawn(async move {
             let _ = tx
-                .send(Ok(ReadBlocksResponse {
-                    data: Some(autumn_proto::autumn::read_blocks_response::Data::Header(
-                        header,
+                .send(Ok(ReadBytesResponse {
+                    data: Some(autumn_proto::autumn::read_bytes_response::Data::Header(
+                        resp_header,
                     )),
                 }))
                 .await;
-            for (offset, size) in selected {
-                match file.read_at(offset as u64, size as usize).await {
+            if read_size > 0 {
+                match file.read_at(read_offset, read_size as usize).await {
                     Ok(buf) => {
                         let _ = tx
-                            .send(Ok(ReadBlocksResponse {
+                            .send(Ok(ReadBytesResponse {
                                 data: Some(
-                                    autumn_proto::autumn::read_blocks_response::Data::Payload(buf),
+                                    autumn_proto::autumn::read_bytes_response::Data::Payload(buf),
                                 ),
                             }))
                             .await;
                     }
                     Err(e) => {
                         let _ = tx.send(Err(Status::internal(e.to_string()))).await;
-                        break;
                     }
                 }
             }
         });
 
         Ok(Response::new(
-            Box::pin(ReceiverStream::new(rx)) as Self::ReadBlocksStream
+            Box::pin(ReceiverStream::new(rx)) as Self::ReadBytesStream
         ))
     }
 
@@ -849,7 +754,7 @@ impl ExtentService for ExtentNode {
         }
 
         let copied = self.fetch_full_extent_from_sources(&extent_info, &[]).await;
-        let (payload, block_sizes) = match copied {
+        let payload = match copied {
             Ok(v) => v,
             Err(err) => {
                 return Ok(Response::new(ReAvaliResponse {
@@ -867,7 +772,6 @@ impl ExtentService for ExtentNode {
             }));
         }
         let payload = payload[..want].to_vec();
-        let block_sizes = Self::normalize_block_sizes(block_sizes, payload.len());
 
         let _g = extent.write_lock.lock().await;
         extent
@@ -886,11 +790,6 @@ impl ExtentService for ExtentNode {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         extent.len.store(payload.len() as u64, Ordering::SeqCst);
-
-        let mut sizes = extent.block_sizes.lock().await;
-        sizes.clear();
-        sizes.extend(block_sizes);
-        drop(sizes);
 
         let _ = self.save_meta(req.extent_id, &extent).await;
 

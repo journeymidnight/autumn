@@ -8,7 +8,7 @@
 ///   create-stream  [--data-shard N]    [--parity-shard N]
 ///   stream-info    --stream-id N
 ///   append         --stream-id N  --data <string>  [--owner-key <key>]
-///   read           --stream-id N  [--num-blocks N]  [--owner-key <key>]
+///   read           --stream-id N  [--length N]  [--owner-key <key>]
 
 use std::collections::HashMap;
 
@@ -16,7 +16,7 @@ use anyhow::{anyhow, Context, Result};
 use autumn_proto::autumn::extent_service_client::ExtentServiceClient;
 use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
 use autumn_proto::autumn::{
-    Code, CreateStreamRequest, Empty, ReadBlocksRequest, RegisterNodeRequest, StreamInfoRequest,
+    Code, CreateStreamRequest, Empty, ReadBytesRequest, RegisterNodeRequest, StreamInfoRequest,
 };
 use autumn_stream::StreamClient;
 use tonic::Request;
@@ -43,7 +43,7 @@ enum Sub {
     CreateStream { data_shard: u32, parity_shard: u32 },
     StreamInfo { stream_id: u64 },
     Append { stream_id: u64, data: String, owner_key: String },
-    Read { stream_id: u64, num_blocks: u32, owner_key: String },
+    Read { stream_id: u64, length: u32, owner_key: String },
 }
 
 fn parse_args() -> Result<Args> {
@@ -121,18 +121,18 @@ fn parse_args() -> Result<Args> {
         }
         "read" => {
             let mut stream_id = 0u64;
-            let mut num_blocks = 0u32;   // 0 = all
+            let mut length = 0u32;   // 0 = all
             let mut owner_key = "cli-owner".to_string();
             while let Some(tok) = it.next() {
                 match tok.as_str() {
-                    "--stream-id"  => stream_id = it.next().context("needs value")?.parse()?,
-                    "--num-blocks" => num_blocks = it.next().context("needs value")?.parse()?,
-                    "--owner-key"  => owner_key  = it.next().context("needs value")?.clone(),
+                    "--stream-id" => stream_id = it.next().context("needs value")?.parse()?,
+                    "--length"    => length    = it.next().context("needs value")?.parse()?,
+                    "--owner-key" => owner_key = it.next().context("needs value")?.clone(),
                     other => return Err(anyhow!("unknown flag: {other}")),
                 }
             }
             if stream_id == 0 { return Err(anyhow!("read requires --stream-id")); }
-            Sub::Read { stream_id, num_blocks, owner_key }
+            Sub::Read { stream_id, length, owner_key }
         }
         other => return Err(anyhow!("unknown subcommand: {other}")),
     };
@@ -207,9 +207,10 @@ async fn cmd_append(manager: &str, stream_id: u64, data: String, owner_key: Stri
 async fn cmd_read(
     manager: &str,
     stream_id: u64,
-    num_blocks: u32,
+    length: u32,
     owner_key: String,
 ) -> Result<()> {
+    let _ = owner_key;
     // 1. get stream info + nodes map
     let mut mgr = StreamManagerServiceClient::connect(normalize(manager)).await?;
 
@@ -268,39 +269,32 @@ async fn cmd_read(
 
         let mut ec = ExtentServiceClient::connect(normalize(&addr)).await?;
         let resp = ec
-            .read_blocks(Request::new(ReadBlocksRequest {
+            .read_bytes(Request::new(ReadBytesRequest {
                 extent_id: *eid,
                 offset: 0,
-                num_of_blocks: if num_blocks == 0 { u32::MAX } else { num_blocks },
-                eversion: 0, // 0 = any version
-                only_last_block: false,
+                length, // 0 = read to end
+                eversion: 0,
             }))
             .await?;
 
         let mut stream_resp = resp.into_inner();
-        let mut block_idx = 0usize;
         let mut payload_buf: Vec<u8> = Vec::new();
 
-        use autumn_proto::autumn::read_blocks_response::Data;
+        use autumn_proto::autumn::read_bytes_response::Data;
         while let Some(msg) = stream_resp.message().await? {
             match msg.data {
                 Some(Data::Header(h)) => {
-                    println!(
-                        "  blocks={} end={} sizes={:?}",
-                        h.block_sizes.len(), h.end, h.block_sizes
-                    );
+                    println!("  end={}", h.end);
                 }
                 Some(Data::Payload(p)) => {
-                    let text = String::from_utf8_lossy(&p);
-                    println!("  block[{}] ({} bytes): {}", block_idx, p.len(), text);
                     total_bytes += p.len();
                     payload_buf.extend_from_slice(&p);
-                    block_idx += 1;
                 }
                 None => {}
             }
         }
-        let _ = payload_buf; // available if caller needs raw bytes
+        let text = String::from_utf8_lossy(&payload_buf);
+        println!("  ({} bytes): {}", payload_buf.len(), text);
     }
 
     println!("---");
@@ -330,8 +324,8 @@ async fn main() -> Result<()> {
             cmd_stream_info(&args.manager, stream_id).await?,
         Sub::Append { stream_id, data, owner_key } =>
             cmd_append(&args.manager, stream_id, data, owner_key).await?,
-        Sub::Read { stream_id, num_blocks, owner_key } =>
-            cmd_read(&args.manager, stream_id, num_blocks, owner_key).await?,
+        Sub::Read { stream_id, length, owner_key } =>
+            cmd_read(&args.manager, stream_id, length, owner_key).await?,
     }
 
     Ok(())
