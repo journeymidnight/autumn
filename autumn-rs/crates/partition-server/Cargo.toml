@@ -18,6 +18,8 @@ autumn-common = { path = "../common" }
 autumn-proto = { path = "../proto" }
 autumn-io-engine = { path = "../io-engine" }
 autumn-stream = { path = "../stream" }
+crc32c.workspace = true
+xxhash-rust.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

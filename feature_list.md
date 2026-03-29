@@ -87,8 +87,8 @@
 ### F032 · SSTable bloom filter, prefix compression, and block cache
 - **Target:** Per-block key prefix compression (overlap/diff encoding), Bloom filter for fast negative lookups, CRC32 checksums, Snappy/ZSTD compression, LRU block cache.
 - **Evidence:** `range_partition/table/table.go` (bf, blockCache) · `range_partition/table/builder.go` · `autumn-rs/crates/partition-server/src/lib.rs`
-- **Notes:** Go: 64KB blocks, key overlap encoding, bloom filter in meta block, Ristretto block cache, CRC32 per block. Rust has basic table write but none of these.
-- **passes:** false
+- **Notes:** Implemented. Block-based SST format (64KB / 1000 entry blocks), prefix compression (overlap+diff_len encoding), bloom filter (xxh3, 1% FPR, double-hashing) in MetaBlock, CRC32C per block + MetaBlock. BTreeMap kv index removed entirely — point lookups search memtable→imm→SSTables newest-first with bloom skip. Range scans via MergeIterator. New sstable/ module: format.rs, bloom.rs, builder.rs, reader.rs, iterator.rs. All 11 unit tests + 11 integration tests pass.
+- **passes:** true
 
 ### F033 · GC with discard tracking and extent punch
 - **Target:** Per-table discard map (extentID → reclaimable bytes) updated during compaction. GC triggers when discard exceeds threshold, punches/truncates logStream extents.

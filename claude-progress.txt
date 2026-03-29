@@ -1,28 +1,37 @@
 Date: 2026-03-28
 TaskStatus: completed
-Task scope: F038 – Remove block_sizes from stream layer (simplify to pure byte store)
+Task scope: F032 – SSTable bloom filter, prefix compression, block-based format, remove BTreeMap
 
 Current summary:
-  Removed block_sizes from stream layer; stream is now a pure byte store.
-  - ExtentEntry.block_sizes (Mutex<Vec<u32>>) removed entirely.
-  - normalize_block_sizes() deleted.
-  - truncate_to_commit() simplified to byte-granular file.truncate(commit).
-  - Proto: AppendRequestHeader.blocks removed (reserved 6); AppendResponse.offsets → offset (single u32).
-  - Proto: ReadBlocksRequest/Response renamed to ReadBytesRequest/Response; num_of_blocks→length; block_sizes/offsets removed.
-  - Proto: Location.len added (u32) for SST byte-range reads.
-  - StreamClient: append_payload/batch returns single AppendResult; AppendBatchResult removed.
-  - StreamClient: read_blocks_from_extent → read_bytes_from_extent(extent_id, offset, length).
-  - StreamClient: read_last_block → read_last_extent_data (reads entire last non-empty extent).
-  - Partition server: TableMeta.len field; save_table_locs_raw uses length-delimited encoding.
-  - Partition server: metaStream read uses decode_last_table_locations() walker for length-delimited entries.
-  - Partition server: logStream replay replaced block iteration with full extent read + decode_record_metas.
-  - Partition server: read_value_from_log accepts record_len computed from KeyMeta at call site.
-  - All tests pass (stream, manager integration, partition-server).
+  Implemented block-based SSTable format, replacing the old flat-record format and
+  the in-memory BTreeMap key index entirely.
+
+  New sstable module (autumn-rs/crates/partition-server/src/sstable/):
+  - format.rs: EntryHeader, BlockOffset, MetaBlock (with CRC32C), DecodedBlock (prefix decompression)
+  - bloom.rs: BloomFilter + BloomFilterBuilder (xxh3, 1% FPR, double-hashing)
+  - builder.rs: SstBuilder (block-based SST construction with prefix compression, 64KB/1000 entry blocks)
+  - reader.rs: SstReader (opens from Arc<Vec<u8>>, parses MetaBlock, reads/verifies blocks)
+  - iterator.rs: BlockIterator, TableIterator, MergeIterator, MemtableIterator
+  - mod.rs: re-exports
+
+  lib.rs complete rewrite:
+  - Removed: BTreeMap kv, ValueLoc enum, KeyMeta struct, sst_cache HashMap,
+    apply_sst_locs_stream, apply_record_meta, decode_record_metas, read_from_loc
+  - New MemEntry { op, value, expires_at } stored directly in SkipMap
+  - Get/Head: lookup_in_memtable + lookup_in_sst (bloom check + block scan) newest-first
+  - Range: MergeIterator over TableIterators + MemtableIterator with user-key dedup
+  - Flush: build_sst_bytes → SstReader::from_bytes → push to sst_readers
+  - Compact: MergeIterator over selected SSTables, SstBuilder for output
+  - Recovery: SstReader::from_bytes per SST, WAL replay into active Memtable
+  - Fixed: large-value write_size uses req.value.len() (not VP size) for flush accounting
+
+  All tests pass:
+  - 11 unit tests (sstable bloom, builder, CRC, iterator, existing partition tests)
+  - 11 integration tests (f030 flush/recovery, f029 compaction, f031 large values, split/recovery)
 
 Main gaps:
-  None for F038.
+  None for F032.
 
 Next steps:
-  F032 – SSTable bloom filter, prefix compression, block cache
   F033 – GC with discard tracking (depends on F029 discard maps, F031 value log)
   F037 – Partition split with overlap detection and major compaction
