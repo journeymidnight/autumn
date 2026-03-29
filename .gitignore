@@ -23,3 +23,4 @@ sm*.db
 /cmd/extent-node/store4/
 /cmd/stream-client/stream-client
 /autumn_clientv1/rust-autumn/target/
+autumn-rs/target/
