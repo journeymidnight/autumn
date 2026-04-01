@@ -1,37 +1,41 @@
-Date: 2026-03-28
+Date: 2026-04-01
 TaskStatus: completed
-Task scope: F032 – SSTable bloom filter, prefix compression, block-based format, remove BTreeMap
+Task scope: F033 – GC with discard tracking and extent punch
 
 Current summary:
-  Implemented block-based SSTable format, replacing the old flat-record format and
-  the in-memory BTreeMap key index entirely.
+  Implemented GC for logStream extents with discard-map tracking.
 
-  New sstable module (autumn-rs/crates/partition-server/src/sstable/):
-  - format.rs: EntryHeader, BlockOffset, MetaBlock (with CRC32C), DecodedBlock (prefix decompression)
-  - bloom.rs: BloomFilter + BloomFilterBuilder (xxh3, 1% FPR, double-hashing)
-  - builder.rs: SstBuilder (block-based SST construction with prefix compression, 64KB/1000 entry blocks)
-  - reader.rs: SstReader (opens from Arc<Vec<u8>>, parses MetaBlock, reads/verifies blocks)
-  - iterator.rs: BlockIterator, TableIterator, MergeIterator, MemtableIterator
-  - mod.rs: re-exports
+  Changes:
+  - sstable/format.rs: MetaBlock gains `discards: HashMap<u64, i64>` (extentID -> reclaimable bytes).
+    Encoded as [count:u32][eid:u64][sz:i64]* after vp_offset. CRC32C covers discard data.
+    Backward compatible: old SSTables (no discard data) decode with empty map.
+  - sstable/builder.rs: SstBuilder gains `set_discards(HashMap<u64, i64>)`, embedded in MetaBlock at finish().
+  - sstable/reader.rs: SstReader gains `discards: HashMap<u64, i64>`, loaded from MetaBlock on open.
+  - stream/client.rs: New `get_extent_info(extent_id) -> Result<ExtentInfo>` public method.
+  - lib.rs:
+    - GcTask enum { Auto, Force { extent_ids } }
+    - PartitionData gets gc_tx: mpsc::Sender<GcTask>
+    - do_compact: initializes discard map from input tables' existing discards;
+      accumulates VP entry discards when deduplicating/dropping; passes discards to last
+      output SstBuilder; validates discards against current logStream extent list.
+    - get_discards(readers) and valid_discard() helpers.
+    - run_gc(server, part, extent_id, sealed_length): reads extent, finds live VP entries
+      (current LSM version still points to this extent), re-writes them to logStream,
+      then punches the extent.
+    - background_gc_loop: periodic (30-60s) + on-demand; aggregates discards from SstReaders,
+      skips last (active) extent, runs GC on extents with >40% discard ratio (MAX_GC_ONCE=3).
+    - trigger_gc(part_id): sends GcTask::Auto to gc_tx.
+    - open_partition: spawns background_gc_loop alongside flush and compact loops.
 
-  lib.rs complete rewrite:
-  - Removed: BTreeMap kv, ValueLoc enum, KeyMeta struct, sst_cache HashMap,
-    apply_sst_locs_stream, apply_record_meta, decode_record_metas, read_from_loc
-  - New MemEntry { op, value, expires_at } stored directly in SkipMap
-  - Get/Head: lookup_in_memtable + lookup_in_sst (bloom check + block scan) newest-first
-  - Range: MergeIterator over TableIterators + MemtableIterator with user-key dedup
-  - Flush: build_sst_bytes → SstReader::from_bytes → push to sst_readers
-  - Compact: MergeIterator over selected SSTables, SstBuilder for output
-  - Recovery: SstReader::from_bytes per SST, WAL replay into active Memtable
-  - Fixed: large-value write_size uses req.value.len() (not VP size) for flush accounting
-
-  All tests pass:
-  - 11 unit tests (sstable bloom, builder, CRC, iterator, existing partition tests)
-  - 11 integration tests (f030 flush/recovery, f029 compaction, f031 large values, split/recovery)
+  Tests:
+  - Unit test: discards_round_trip — set_discards + SstReader.discards round-trips correctly.
+  - Integration test: f033_gc_reclaims_log_stream_extents — overwrites large values, compacts
+    (builds discard maps), triggers GC, verifies all keys still return correct v2 values.
+  - All 12 unit tests + 12 integration tests pass.
 
 Main gaps:
-  None for F032.
+  None for F033.
 
 Next steps:
-  F033 – GC with discard tracking (depends on F029 discard maps, F031 value log)
   F037 – Partition split with overlap detection and major compaction
+  F035 – Extent node WAL for small-write durability

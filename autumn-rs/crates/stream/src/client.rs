@@ -455,6 +455,19 @@ impl StreamClient {
             .ok_or_else(|| anyhow!("stream {} not in stream_info response", stream_id))
     }
 
+    /// Return the ExtentInfo for a given extent (includes sealed_length).
+    pub async fn get_extent_info(&mut self, extent_id: u64) -> Result<ExtentInfo> {
+        let resp = self
+            .manager
+            .extent_info(Request::new(ExtentInfoRequest { extent_id }))
+            .await?
+            .into_inner();
+        if resp.code != Code::Ok as i32 {
+            return Err(anyhow!("extent_info failed: {}", resp.code_des));
+        }
+        resp.ex_info.context("extent_info missing ex_info")
+    }
+
     /// Read bytes from a specific extent.
     /// Returns (payload_bytes, end) where end is the total extent length.
     /// Pass `length=0` to read from offset to the end of the extent.

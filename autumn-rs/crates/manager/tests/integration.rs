@@ -1327,3 +1327,107 @@ async fn f031_compaction_preserves_value_pointers() {
     ps_task.abort();
     mgr_task.abort();
 }
+
+/// F033: GC reclaims logStream extents with >40% dead data.
+/// 1. Write large values (>4KB) for the same keys multiple times, each round triggering a flush.
+///    This creates ValuePointer entries in logStream. Overwrites make old logStream records dead.
+/// 2. Trigger major compaction (builds discard maps in the new SST).
+/// 3. Trigger GC (aggregates discards, runs runGC on high-discard extents).
+/// 4. Verify all current keys are still readable with correct values.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f033_gc_reclaims_log_stream_extents() {
+    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) =
+        setup_infra_f030(117).await;
+
+    let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
+        .await.expect("connect sm");
+    let log_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
+        .await.expect("create log stream").into_inner().stream.expect("log stream").stream_id;
+    let row_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
+        .await.expect("create row stream").into_inner().stream.expect("row stream").stream_id;
+    let meta_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
+        .await.expect("create meta stream").into_inner().stream.expect("meta stream").stream_id;
+
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let ps = PartitionServer::connect(59, &endpoint, data_dir.path(), IoMode::Standard)
+        .await.expect("connect ps");
+    let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
+        .await.expect("connect pm");
+    pm.upsert_partition(Request::new(UpsertPartitionRequest {
+        meta: Some(PartitionMeta {
+            log_stream, row_stream, meta_stream,
+            part_id: 801,
+            rg: Some(Range { start_key: b"a".to_vec(), end_key: b"z".to_vec() }),
+        }),
+    })).await.expect("upsert partition");
+    ps.sync_regions_once().await.expect("sync regions");
+
+    let ps_addr = pick_addr();
+    let ps_task = tokio::spawn(ps.clone().serve(ps_addr));
+    sleep(Duration::from_millis(120)).await;
+
+    let mut kv = PartitionKvClient::connect(format!("http://{}", ps_addr))
+        .await.expect("connect kv");
+
+    // Round 1: write large values for 3 keys, each >4KB so they go to logStream.
+    // Each write also uses a 300KB filler key to trigger flush after this key.
+    let val_v1: Vec<u8> = vec![b'A'; 8 * 1024];
+    for i in 0u8..3 {
+        kv.put(Request::new(PutRequest {
+            key: format!("gc-key-{}", i).into_bytes(),
+            value: val_v1.clone(),
+            expires_at: 0,
+            part_id: 801,
+        })).await.expect("put v1");
+        // Filler to trigger flush.
+        kv.put(Request::new(PutRequest {
+            key: format!("gc-fill-{}", i).into_bytes(),
+            value: vec![b'F'; 300 * 1024],
+            expires_at: 0,
+            part_id: 801,
+        })).await.expect("put filler");
+        sleep(Duration::from_millis(400)).await;
+    }
+
+    // Round 2: overwrite the same keys with new values.
+    // This makes the Round 1 logStream records dead (VP entries now point nowhere current).
+    let val_v2: Vec<u8> = vec![b'B'; 8 * 1024];
+    for i in 0u8..3 {
+        kv.put(Request::new(PutRequest {
+            key: format!("gc-key-{}", i).into_bytes(),
+            value: val_v2.clone(),
+            expires_at: 0,
+            part_id: 801,
+        })).await.expect("put v2");
+        kv.put(Request::new(PutRequest {
+            key: format!("gc-fill2-{}", i).into_bytes(),
+            value: vec![b'G'; 300 * 1024],
+            expires_at: 0,
+            part_id: 801,
+        })).await.expect("put filler2");
+        sleep(Duration::from_millis(400)).await;
+    }
+
+    // Major compaction: merges SSTables and builds discard maps for dead VP entries.
+    ps.trigger_major_compact(801);
+    sleep(Duration::from_millis(1000)).await;
+
+    // Trigger GC: should detect high-discard extents and reclaim them.
+    ps.trigger_gc(801);
+    sleep(Duration::from_millis(1500)).await;
+
+    // All keys must still return the v2 values after GC.
+    for i in 0u8..3 {
+        let resp = kv.get(Request::new(GetRequest {
+            key: format!("gc-key-{}", i).into_bytes(),
+            part_id: 801,
+        })).await.expect("get after gc").into_inner();
+        assert_eq!(resp.value, val_v2,
+            "gc-key-{} must return v2 value after GC", i);
+    }
+
+    n1_task.abort();
+    n2_task.abort();
+    ps_task.abort();
+    mgr_task.abort();
+}

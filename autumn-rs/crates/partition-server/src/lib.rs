@@ -1,6 +1,6 @@
 mod sstable;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -178,6 +178,7 @@ struct PartitionData {
     imm: VecDeque<Arc<Memtable>>,
     flush_tx: mpsc::UnboundedSender<()>,
     compact_tx: mpsc::Sender<bool>,
+    gc_tx: mpsc::Sender<GcTask>,
     seq_number: u64,
     log_stream_id: u64,
     row_stream_id: u64,
@@ -191,6 +192,15 @@ struct PartitionData {
     log_len: u64,
     vp_extent_id: u64,
     vp_offset: u32,
+}
+
+// ---------------------------------------------------------------------------
+// GC task
+// ---------------------------------------------------------------------------
+
+enum GcTask {
+    Auto,
+    Force { extent_ids: Vec<u64> },
 }
 
 // ---------------------------------------------------------------------------
@@ -501,6 +511,7 @@ impl PartitionServer {
         let seq_number = max_seq;
         let (flush_tx, flush_rx) = mpsc::unbounded_channel::<()>();
         let (compact_tx, compact_rx) = mpsc::channel::<bool>(1);
+        let (gc_tx, gc_rx) = mpsc::channel::<GcTask>(1);
         let has_overlap = Arc::new(AtomicU32::new(0));
 
         let part = Arc::new(RwLock::new(PartitionData {
@@ -510,6 +521,7 @@ impl PartitionServer {
             imm: VecDeque::new(),
             flush_tx,
             compact_tx,
+            gc_tx,
             seq_number,
             log_stream_id,
             row_stream_id,
@@ -532,6 +544,11 @@ impl PartitionServer {
             let part_weak = Arc::downgrade(&part);
             let server_clone = self.clone();
             tokio::spawn(Self::background_compact_loop(server_clone, part_weak, compact_rx, has_overlap));
+        }
+        {
+            let part_weak = Arc::downgrade(&part);
+            let server_clone = self.clone();
+            tokio::spawn(Self::background_gc_loop(server_clone, part_weak, gc_rx));
         }
 
         Ok(part)
@@ -812,6 +829,9 @@ impl PartitionServer {
         let mut merge = MergeIterator::new(iters);
         merge.rewind();
 
+        // Initialize discard map from all input tables' existing discards.
+        let mut discards = Self::get_discards(&readers);
+
         // Merge entries: dedup by user key (newest version wins = smallest internal key).
         let now = now_secs();
         let max_chunk = 2 * MAX_SKIP_LIST as usize;
@@ -821,6 +841,14 @@ impl PartitionServer {
         let mut current_size: usize = 0;
         let mut chunk_last_seq: u64 = 0;
         let mut prev_user_key: Option<Vec<u8>> = None;
+
+        // Helper: accumulate discards for a value-pointer entry being dropped.
+        let mut add_discard = |item: &IterItem| {
+            if item.op & OP_VALUE_POINTER != 0 && item.value.len() >= VALUE_POINTER_SIZE {
+                let vp = ValuePointer::decode(&item.value);
+                *discards.entry(vp.extent_id).or_insert(0) += vp.len as i64;
+            }
+        };
 
         while merge.valid() {
             let item = match merge.item() {
@@ -833,6 +861,7 @@ impl PartitionServer {
             // Dedup: skip if same user key (merge iterator already gives us the minimum
             // internal key = newest version for each user key group).
             if prev_user_key.as_deref() == Some(&user_key) {
+                add_discard(&item);
                 merge.next();
                 continue;
             }
@@ -840,8 +869,8 @@ impl PartitionServer {
 
             // In major mode, drop tombstones and expired entries.
             if major {
-                if item.op == 2 { merge.next(); continue; } // tombstone
-                if item.expires_at > 0 && item.expires_at <= now { merge.next(); continue; }
+                if item.op == 2 { add_discard(&item); merge.next(); continue; } // tombstone
+                if item.expires_at > 0 && item.expires_at <= now { add_discard(&item); merge.next(); continue; }
             }
 
             let ts = parse_ts(&item.key);
@@ -861,6 +890,14 @@ impl PartitionServer {
             chunks.push((current_entries, chunk_last_seq));
         }
 
+        // Validate discards: remove extents no longer in the logStream.
+        let log_stream_id = { part.read().await.log_stream_id };
+        let log_extent_ids = {
+            let mut sc = self.stream_client.lock().await;
+            sc.get_stream_info(log_stream_id).await.map(|s| s.extent_ids).unwrap_or_default()
+        };
+        Self::valid_discard(&mut discards, &log_extent_ids);
+
         if chunks.is_empty() {
             // All entries dropped; remove old tables.
             let (tables_snapshot, vp_eid, vp_off) = {
@@ -875,9 +912,14 @@ impl PartitionServer {
         }
 
         // Build and append new SSTables.
+        // Discards are attached to the last output SSTable (matching Go behavior).
+        let last_chunk_idx = chunks.len().saturating_sub(1);
         let mut new_readers: Vec<(TableMeta, Arc<SstReader>)> = Vec::new();
-        for (entries, chunk_last_seq) in chunks {
+        for (chunk_idx, (entries, chunk_last_seq)) in chunks.into_iter().enumerate() {
             let mut b = SstBuilder::new(compact_vp_eid, compact_vp_off);
+            if chunk_idx == last_chunk_idx {
+                b.set_discards(discards.clone());
+            }
             for item in &entries {
                 b.add(&item.key, item.op, &item.value, item.expires_at);
             }
@@ -990,6 +1032,212 @@ impl PartitionServer {
     }
 
     // -----------------------------------------------------------------------
+    // GC helpers + background loop
+    // -----------------------------------------------------------------------
+
+    /// Aggregate discard maps from all given SstReaders.
+    fn get_discards(readers: &[Arc<SstReader>]) -> HashMap<u64, i64> {
+        let mut out: HashMap<u64, i64> = HashMap::new();
+        for r in readers {
+            for (&eid, &sz) in &r.discards {
+                *out.entry(eid).or_insert(0) += sz;
+            }
+        }
+        out
+    }
+
+    /// Remove extents not in `extent_ids` from the discard map.
+    fn valid_discard(discards: &mut HashMap<u64, i64>, extent_ids: &[u64]) {
+        let idx: std::collections::HashSet<u64> = extent_ids.iter().copied().collect();
+        discards.retain(|eid, _| idx.contains(eid));
+    }
+
+    /// GC a single logStream extent: replay its records, re-write live value-pointer
+    /// entries, then punch the extent.
+    async fn run_gc(
+        server: &PartitionServer,
+        part: &Arc<RwLock<PartitionData>>,
+        extent_id: u64,
+        sealed_length: u32,
+    ) -> Result<()> {
+        // Read the whole extent.
+        let (data, _end) = {
+            let mut sc = server.stream_client.lock().await;
+            sc.read_bytes_from_extent(extent_id, 0, sealed_length).await?
+        };
+
+        let records = Self::decode_records_full(&data);
+        let (log_stream_id, rg) = {
+            let g = part.read().await;
+            (g.log_stream_id, g.rg.clone())
+        };
+
+        let mut moved = 0usize;
+        for (op, key, value, expires_at) in records {
+            // Only process value-pointer entries (large values).
+            if op & OP_VALUE_POINTER == 0 { continue; }
+            let user_key = parse_key(&key).to_vec();
+            if !Self::in_range(&rg, &user_key) { continue; }
+
+            // Check if this entry's (extent_id, offset) matches the current live VP.
+            // The ValuePointer we stored in the WAL is the full value; the VP in the
+            // SST tells us the logStream location. We stored `value` = raw user value
+            // in the WAL for large values, so we need to look up the current version
+            // in the LSM.
+            // Look up the current version: (op, value, expires_at).
+            let current: Option<(u8, Vec<u8>, u64)> = {
+                let g = part.read().await;
+                let mem = g.active.seek_user_key(&user_key)
+                    .or_else(|| g.imm.iter().rev().find_map(|m| m.seek_user_key(&user_key)))
+                    .map(|e| (e.op, e.value, e.expires_at));
+                if mem.is_some() {
+                    mem
+                } else {
+                    // Search SSTables newest-first.
+                    let mut found = None;
+                    for r in g.sst_readers.iter().rev() {
+                        if let Some(e) = Self::lookup_in_sst(r, &user_key) {
+                            found = Some(e);
+                            break;
+                        }
+                    }
+                    found
+                }
+            };
+
+            // Determine if the current value still points into this extent.
+            if let Some((cur_op, cur_val, _)) = current {
+                if cur_op & OP_VALUE_POINTER != 0 && cur_val.len() >= VALUE_POINTER_SIZE {
+                    let vp = ValuePointer::decode(&cur_val);
+                    if vp.extent_id == extent_id {
+                        // Live entry: re-write it so it lands in a new logStream extent.
+                        let mut part_guard = part.write().await;
+                        part_guard.seq_number += 1;
+                        let seq = part_guard.seq_number;
+                        let internal_key = key_with_ts(&user_key, seq);
+                        let log_entry = Self::encode_record(1, &internal_key, &value, expires_at);
+                        let result = {
+                            let mut sc = server.stream_client.lock().await;
+                            sc.append(log_stream_id, &log_entry, true).await?
+                        };
+                        let new_vp = ValuePointer { extent_id: result.extent_id, offset: result.offset, len: vp.len };
+                        part_guard.vp_extent_id = result.extent_id;
+                        part_guard.vp_offset = result.end;
+                        let mem_entry = MemEntry { op: 1 | OP_VALUE_POINTER, value: new_vp.encode().to_vec(), expires_at };
+                        let write_size = (user_key.len() + value.len() + 32) as u64;
+                        Self::append_log(&mut part_guard, 1, &internal_key, &value, expires_at).await?;
+                        part_guard.active.insert(internal_key, mem_entry, write_size);
+                        moved += 1;
+                    }
+                }
+            }
+        }
+
+        // Punch this extent.
+        {
+            let mut sc = server.stream_client.lock().await;
+            sc.punch_holes(log_stream_id, vec![extent_id]).await?;
+        }
+        tracing::info!("GC: punched extent {extent_id}, moved {moved} entries");
+        Ok(())
+    }
+
+    async fn background_gc_loop(
+        server: PartitionServer,
+        part_weak: std::sync::Weak<RwLock<PartitionData>>,
+        mut gc_rx: mpsc::Receiver<GcTask>,
+    ) {
+        const MAX_GC_ONCE: usize = 3;
+        const GC_DISCARD_RATIO: f64 = 0.4;
+        fn random_delay() -> Duration {
+            Duration::from_millis(30_000 + rand_u64() % 30_000)
+        }
+        let mut next_auto = tokio::time::Instant::now() + random_delay();
+
+        loop {
+            let task = tokio::select! {
+                maybe = gc_rx.recv() => {
+                    if maybe.is_none() { break; }
+                    maybe.unwrap()
+                }
+                _ = tokio::time::sleep_until(next_auto) => {
+                    next_auto = tokio::time::Instant::now() + random_delay();
+                    GcTask::Auto
+                }
+            };
+
+            let Some(part) = part_weak.upgrade() else { break; };
+
+            let (log_stream_id, readers_snapshot) = {
+                let g = part.read().await;
+                (g.log_stream_id, g.sst_readers.clone())
+            };
+
+            // Get logStream extent list.
+            let stream_info = {
+                let mut sc = server.stream_client.lock().await;
+                match sc.get_stream_info(log_stream_id).await {
+                    Ok(s) => s,
+                    Err(e) => { tracing::warn!("GC get_stream_info: {e}"); continue; }
+                }
+            };
+            let extent_ids = stream_info.extent_ids;
+            if extent_ids.len() < 2 { continue; } // need at least 2 extents (last is active)
+
+            // Sealed extents = all except the last.
+            let sealed_extents = &extent_ids[..extent_ids.len() - 1];
+
+            // Determine which extents to GC.
+            let holes: Vec<u64> = match task {
+                GcTask::Force { extent_ids: ref forced_ids } => {
+                    let idx: std::collections::HashSet<u64> = sealed_extents.iter().copied().collect();
+                    forced_ids.iter().copied().filter(|e| idx.contains(e)).take(MAX_GC_ONCE).collect()
+                }
+                GcTask::Auto => {
+                    let mut discards = Self::get_discards(&readers_snapshot);
+                    Self::valid_discard(&mut discards, sealed_extents);
+
+                    // Sort by most discarded bytes descending, pick up to MAX_GC_ONCE.
+                    let mut candidates: Vec<u64> = discards.keys().copied().collect();
+                    candidates.sort_by(|a, b| discards[b].cmp(&discards[a]));
+
+                    let mut holes = Vec::new();
+                    for eid in candidates.into_iter().take(MAX_GC_ONCE) {
+                        let sealed_length = {
+                            let mut sc = server.stream_client.lock().await;
+                            match sc.get_extent_info(eid).await {
+                                Ok(info) => info.sealed_length as u32,
+                                Err(e) => { tracing::warn!("GC extent_info {eid}: {e}"); continue; }
+                            }
+                        };
+                        if sealed_length == 0 { continue; }
+                        let ratio = discards[&eid] as f64 / sealed_length as f64;
+                        if ratio > GC_DISCARD_RATIO {
+                            holes.push(eid);
+                        }
+                    }
+                    holes
+                }
+            };
+
+            if holes.is_empty() { continue; }
+
+            for eid in holes {
+                let sealed_length = {
+                    let mut sc = server.stream_client.lock().await;
+                    match sc.get_extent_info(eid).await {
+                        Ok(info) => info.sealed_length as u32,
+                        Err(e) => { tracing::warn!("GC extent_info {eid}: {e}"); continue; }
+                    }
+                };
+                if let Err(e) = Self::run_gc(&server, &part, eid, sealed_length).await {
+                    tracing::error!("GC run_gc extent {eid}: {e}");
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Partition management helpers
     // -----------------------------------------------------------------------
 
@@ -1013,6 +1261,15 @@ impl PartitionServer {
                 tokio::runtime::Handle::current().block_on(part.read())
             });
             let _ = guard.compact_tx.try_send(true);
+        }
+    }
+
+    pub fn trigger_gc(&self, part_id: u64) {
+        if let Some(part) = self.partitions.get(&part_id) {
+            let guard = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(part.read())
+            });
+            let _ = guard.gc_tx.try_send(GcTask::Auto);
         }
     }
 

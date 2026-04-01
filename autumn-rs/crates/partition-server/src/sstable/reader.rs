@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -20,6 +21,7 @@ pub struct SstReader {
     pub vp_extent_id: u64,
     pub vp_offset: u32,
     estimated_size: u64,
+    pub discards: HashMap<u64, i64>,
     /// Byte offset of the first block within `data` (= 0, the SSTable starts at the beginning).
     sst_base: u32,
 }
@@ -83,6 +85,7 @@ impl SstReader {
             vp_extent_id: meta.vp_extent_id,
             vp_offset: meta.vp_offset,
             estimated_size: meta.estimated_size,
+            discards: meta.discards,
             sst_base: sst_base as u32,
             data,
         })

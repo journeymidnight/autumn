@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{anyhow, Result};
 
 pub const BLOCK_SIZE_TARGET: usize = 64 * 1024; // 64 KB
@@ -68,6 +70,9 @@ pub struct MetaBlock {
     pub seq_num: u64,
     pub vp_extent_id: u64,
     pub vp_offset: u32,
+    /// Per-logStream-extent discard stats: extentID -> reclaimable bytes.
+    /// Persisted in rowStream as part of the SSTable MetaBlock.
+    pub discards: HashMap<u64, i64>,
 }
 
 impl MetaBlock {
@@ -94,6 +99,12 @@ impl MetaBlock {
         buf.extend_from_slice(&self.vp_extent_id.to_le_bytes());
         buf.extend_from_slice(&self.vp_offset.to_le_bytes());
         buf.push(0u8); // compression_type = None
+        // Discard map: [count: u32 LE][extent_id: u64 LE][size: i64 LE] * count
+        buf.extend_from_slice(&(self.discards.len() as u32).to_le_bytes());
+        for (&eid, &sz) in &self.discards {
+            buf.extend_from_slice(&eid.to_le_bytes());
+            buf.extend_from_slice(&sz.to_le_bytes());
+        }
         // CRC32C covers everything above
         let crc = crc32c::crc32c(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
@@ -143,9 +154,20 @@ impl MetaBlock {
         let vp_extent_id = read_u64(payload, &mut c)?;
         let vp_offset = read_u32(payload, &mut c)?;
         // skip compression_type byte
+        c += 1;
+        // Discard map (optional — old SSTs without discards will have nothing left to read)
+        let mut discards = HashMap::new();
+        if c + 4 <= payload.len() {
+            let discard_count = read_u32(payload, &mut c)? as usize;
+            for _ in 0..discard_count {
+                let eid = read_u64(payload, &mut c)?;
+                let sz = read_i64(payload, &mut c)?;
+                discards.insert(eid, sz);
+            }
+        }
 
         Ok(MetaBlock { block_offsets, bloom_data, smallest_key, biggest_key,
-                       estimated_size, seq_num, vp_extent_id, vp_offset })
+                       estimated_size, seq_num, vp_extent_id, vp_offset, discards })
     }
 }
 
@@ -264,6 +286,13 @@ fn read_u32(data: &[u8], c: &mut usize) -> Result<u32> {
 fn read_u64(data: &[u8], c: &mut usize) -> Result<u64> {
     if *c + 8 > data.len() { return Err(anyhow!("MetaBlock: truncated at u64 offset={c}")); }
     let v = u64::from_le_bytes(data[*c..*c+8].try_into().unwrap());
+    *c += 8;
+    Ok(v)
+}
+
+fn read_i64(data: &[u8], c: &mut usize) -> Result<i64> {
+    if *c + 8 > data.len() { return Err(anyhow!("MetaBlock: truncated at i64 offset={c}")); }
+    let v = i64::from_le_bytes(data[*c..*c+8].try_into().unwrap());
     *c += 8;
     Ok(v)
 }

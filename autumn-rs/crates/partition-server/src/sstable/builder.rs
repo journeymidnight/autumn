@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use super::bloom::BloomFilterBuilder;
 use super::format::{
     BlockOffset, EntryHeader, MetaBlock, BLOCK_SIZE_TARGET, ENTRY_VALUE_HEADER,
@@ -42,6 +44,8 @@ pub struct SstBuilder {
     smallest_key: Vec<u8>,
     biggest_key: Vec<u8>,
     total_raw_bytes: u64,
+    /// Discard stats to embed in MetaBlock (set via set_discards before finish()).
+    discards: HashMap<u64, i64>,
 }
 
 impl SstBuilder {
@@ -61,7 +65,14 @@ impl SstBuilder {
             smallest_key: Vec::new(),
             biggest_key: Vec::new(),
             total_raw_bytes: 0,
+            discards: HashMap::new(),
         }
+    }
+
+    /// Set the discard map to embed in this SSTable's MetaBlock.
+    /// Should be called before `finish()`.
+    pub fn set_discards(&mut self, discards: HashMap<u64, i64>) {
+        self.discards = discards;
     }
 
     /// Add one entry to the SSTable.
@@ -150,6 +161,7 @@ impl SstBuilder {
             seq_num: self.seq_num,
             vp_extent_id: self.vp_extent_id,
             vp_offset: self.vp_offset,
+            discards: self.discards,
         };
         let meta_bytes = meta.encode();
         let meta_len = meta_bytes.len() as u32;
@@ -267,5 +279,21 @@ mod tests {
         // Trying to read the first block should produce a CRC error
         let result = reader.read_block(0);
         assert!(result.is_err(), "expected CRC error");
+    }
+
+    #[test]
+    fn discards_round_trip() {
+        let mut b = SstBuilder::new(42, 100);
+        b.add(&ikey(b"key", 1), 1, b"val", 0);
+        let mut discards = HashMap::new();
+        discards.insert(10u64, 500i64);
+        discards.insert(20u64, 1024i64);
+        b.set_discards(discards.clone());
+        let data = b.finish();
+
+        let reader = SstReader::from_bytes(std::sync::Arc::new(data)).expect("reader");
+        assert_eq!(reader.discards.get(&10), Some(&500i64));
+        assert_eq!(reader.discards.get(&20), Some(&1024i64));
+        assert_eq!(reader.discards.len(), 2);
     }
 }

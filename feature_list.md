@@ -93,8 +93,8 @@
 ### F033 · GC with discard tracking and extent punch
 - **Target:** Per-table discard map (extentID → reclaimable bytes) updated during compaction. GC triggers when discard exceeds threshold, punches/truncates logStream extents.
 - **Evidence:** `range_partition/compaction.go` (Discards map, ValidDiscard) · `range_partition/range_partition.go` (gcRunChan) · `autumn-rs/crates/partition-server/src/lib.rs`
-- **Notes:** Go: each Table carries Discards map[uint64]int64. GC calls stream PunchHoles/Truncate. Depends on F029.
-- **passes:** false
+- **Notes:** Implemented. discards: HashMap<u64,i64> stored in SSTable MetaBlock (rowStream) — no separate stream. do_compact accumulates discards for dropped VP entries, validates against logStream extent list, attaches to last output SST. background_gc_loop: periodic 30-60s + trigger_gc(); aggregates discards from all SstReaders, runs runGC on extents with >40% dead ratio (MAX_GC_ONCE=3). runGC re-writes live VP entries to current logStream then punches old extent. get_extent_info() added to StreamClient. 12 unit tests + 12 integration tests pass.
+- **passes:** true
 
 ### F035 · Extent node WAL for small-write durability
 - **Target:** Rotating WAL (250MB max) with record framing (4KB block-aligned). MustSync small writes (<2MB) go to WAL(sync) + extent(async) in parallel.
