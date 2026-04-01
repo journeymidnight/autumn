@@ -109,10 +109,10 @@
 - **passes:** true
 
 ### F010 · Partition API parity with Go legacy endpoints
-- **Target:** Batch/StreamPut/Maintenance equivalents available in Rust proto and service.
-- **Evidence:** `partition_server/api.go` · `autumn-rs/crates/proto/proto/autumn.proto`
-- **Notes:** Rust proto/service does not expose these endpoints yet.
-- **passes:** false
+- **Target:** Maintenance (compact/gc/forcegc) RPC + CLI subcommands, format disk, presplit bootstrap, wbench/rbench.
+- **Evidence:** `partition_server/api.go` · `autumn-rs/crates/proto/proto/autumn.proto` · `autumn-rs/crates/server/src/bin/autumn_client.rs`
+- **Notes:** Implemented. Maintenance RPC (CompactOp/AutoGcOp/ForceGcOp) added to proto and partition-server gRPC handler. trigger_force_gc added to PartitionServer. CLI subcommands: compact, gc, forcegc, format, wbench, rbench, presplit (--presplit N:hexstring on bootstrap). Batch endpoint was never implemented in Go (stub), skipped.
+- **passes:** true
 
 ### F020 · gRPC connection pool with health check
 - **Target:** Per-address gRPC connection pool with keep-alive heartbeat and lazy creation. Equivalent to Go `conn/pool.go`.

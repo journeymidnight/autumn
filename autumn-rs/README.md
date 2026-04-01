@@ -256,7 +256,11 @@ AC=./target/debug/autumn-client
 
 # Bootstrap: create log/row/meta streams and initial partition
 $AC bootstrap --replication 3+0
-# Expected: "bootstrap succeeded: partition <ID> (log=<N>, row=<N>, meta=<N>)"
+# Expected: "bootstrap succeeded: 1 partition(s)"
+
+# Bootstrap with pre-split into 4 partitions (hexstring key space)
+$AC bootstrap --replication 3+0 --presplit 4:hexstring
+# Expected: "bootstrap succeeded: 4 partition(s)"
 
 # Show cluster info
 $AC info
@@ -295,6 +299,48 @@ $AC del mykey
 # Verify deletion
 $AC get mykey
 # Expected: "key not found" (exit code 2)
+
+# Maintenance: trigger major compaction on partition (get PARTID from 'info')
+PARTID=$($AC info | grep "part " | awk '{print $2}' | head -1 | tr -d ':')
+$AC compact $PARTID
+# Expected: "compact triggered for partition <PARTID>"
+
+# Maintenance: trigger auto GC on partition
+$AC gc $PARTID
+# Expected: "gc triggered for partition <PARTID>"
+
+# Maintenance: force GC of specific extents (get extent IDs from 'info')
+$AC forcegc $PARTID 1 2
+# Expected: "forcegc triggered for partition <PARTID>, extents=[1, 2]"
+
+# Write benchmark (4 threads, 10 seconds, 8KB values)
+$AC wbench --threads 4 --duration 10 --size 8192
+# Expected: summary with ops/sec, throughput, p50/p95/p99 latency
+# Writes write_result.json
+
+# Read benchmark using keys from write_result.json
+$AC rbench --threads 40 --duration 10 write_result.json
+# Expected: summary with read throughput stats
+```
+
+## Manual test: F010 format disk
+
+```bash
+AC=./target/debug/autumn-client
+
+# Format a new disk directory and register with manager
+$AC --manager 127.0.0.1:9001 format \
+  --listen 127.0.0.1:9104 \
+  --advertise 127.0.0.1:9104 \
+  /tmp/new-disk
+# Expected: "formatted /tmp/new-disk: disk_uuid=<UUID>"
+# Expected: "node registered: node_id=<N>"
+# Expected: writes /tmp/new-disk/node_id and /tmp/new-disk/disk_id files
+
+# Then start the extent node using the registered info
+./target/debug/autumn-extent-node --port 9104 \
+  --disk-id $(cat /tmp/new-disk/disk_id) \
+  --data /tmp/new-disk
 ```
 
 ## Binary reference
@@ -309,7 +355,7 @@ $AC get mykey
 
 `autumn-stream-cli` subcommands: `register-node`, `create-stream`, `stream-info`, `append`, `read`
 
-`autumn-client` subcommands: `bootstrap`, `put`, `streamput`, `get`, `del`, `head`, `ls`, `split`, `info`
+`autumn-client` subcommands: `bootstrap [--presplit N:hexstring]`, `put`, `streamput`, `get`, `del`, `head`, `ls`, `split`, `compact`, `gc`, `forcegc`, `format`, `wbench`, `rbench`, `info`
 
 ## Notes
 

@@ -1,43 +1,45 @@
 Date: 2026-04-01
 TaskStatus: completed
-Task scope: F037 – Partition split with overlap detection and major compaction
+Task scope: F010 – Partition API parity with Go legacy endpoints
 
 Current summary:
-  Implemented F037: overlap detection on partition open, split rejection when overlap exists,
-  out-of-range key filtering in compaction, and range-scan filtering when overlap is present.
+  Implemented F010: Maintenance RPC + CLI parity with Go autumn-client.
+
+  Changes in autumn-rs/crates/proto/proto/autumn.proto:
+  - Added CompactOp, AutoGcOp, ForceGcOp, MaintenanceRequest, MaintenanceResponse messages.
+  - Added Maintenance RPC to PartitionKv service.
 
   Changes in autumn-rs/crates/partition-server/src/lib.rs:
-  - open_partition: after loading each SstReader, check smallest_key/biggest_key against
-    partition range via parse_key() + in_range(). Set detected_overlap=true if any key is
-    out of range. Initialize has_overlap AtomicU32 with 1 if detected_overlap.
-  - split_part: check has_overlap before expensive unique_user_keys_async; return
-    FAILED_PRECONDITION if overlap exists ("cannot split: partition has overlapping keys,
-    run major compaction first").
-  - do_compact: capture partition range (rg) alongside readers; after dedup but before
-    major-mode tombstone filter, skip keys outside partition range (add to discard map).
-    Applies to both major and minor compaction. Changed minimum table count from 2 to 0
-    (empty guard only); background_compact_loop skips major compaction if < 2 tables AND
-    no overlap (allows single-table major compaction to clean up overlapping keys).
-  - range(): load check_overlap + part_rg before the merge loop; skip keys outside
-    partition range when check_overlap is true.
-  - Added has_overlap(part_id) public helper for testing.
+  - trigger_major_compact(part_id) -> Result<(), &'static str>  (was void)
+  - trigger_gc(part_id) -> Result<(), &'static str>             (was void)
+  - trigger_force_gc(part_id, extent_ids) -> Result<(), &'static str>  (new)
+  - maintenance() gRPC handler: dispatches oneof op to trigger_* methods.
 
-  Tests:
-  - Integration test: f037_overlap_detected_after_split_and_cleared_by_compaction
-    1. Creates partition [a, z), writes keys in "a*" and "y*" ranges (with large fillers
-       to trigger flushes → SSTables cover full [a, z) range).
-    2. Splits partition → creates two children sharing the parent's SSTables.
-    3. Verifies both children detect overlap (has_overlap=true).
-    4. Verifies split_part on overlapping partition returns FAILED_PRECONDITION.
-    5. Verifies range scan on left child returns only in-range keys.
-    6. Triggers major compaction on left child.
-    7. Verifies has_overlap cleared and all in-range keys still readable.
-  - All 12 unit tests + 13 integration tests pass.
+  Changes in autumn-rs/crates/server/src/bin/autumn_client.rs:
+  - compact <PARTID>: trigger major compaction via Maintenance RPC
+  - gc <PARTID>: trigger auto GC via Maintenance RPC
+  - forcegc <PARTID> <EXTID>...: force GC specific extents
+  - format --listen --advertise <DIR>...: format disk dirs, RegisterNode, write node_id/disk_id
+  - wbench [--threads] [--duration] [--size]: concurrent write benchmark + write_result.json
+  - rbench [--threads] [--duration] <RESULT_FILE>: concurrent read benchmark
+  - bootstrap: add --presplit N:hexstring to create N pre-split partitions (hex_split_ranges)
+
+  Dependencies added to autumn-rs/crates/server/Cargo.toml:
+  - serde, serde_json (bench JSON output)
+  - rand (not actually used yet; reserved for future random key gen)
+  - uuid (format disk UUID marker)
+
+  Documentation updated:
+  - autumn-rs/crates/proto/CLAUDE.md: Maintenance RPC entry in PartitionKv table
+  - autumn-rs/crates/partition-server/CLAUDE.md: trigger_force_gc, trigger_major_compact notes
+  - autumn-rs/crates/server/CLAUDE.md: full command table updated
+  - autumn-rs/README.md: F010/F018 test sections with new CLI examples
+
+  Tests: cargo test --workspace passes (12 unit + 13 integration).
 
 Main gaps:
-  None for F037.
+  Batch API intentionally skipped (was never implemented in Go either - stub only).
 
 Next steps:
   F035 – Extent node WAL for small-write durability
-  F010 – Partition API parity with Go legacy endpoints
   F020 – gRPC connection pool with health check

@@ -480,6 +480,21 @@ service PartitionManagerService {
   rpc GetRegions(Empty) returns (GetRegionsResponse);
 }
 
+message CompactOp {}
+message AutoGcOp {}
+message ForceGcOp {
+  repeated uint64 extent_ids = 1;
+}
+message MaintenanceRequest {
+  uint64 part_id = 1;
+  oneof op {
+    CompactOp compact = 2;
+    AutoGcOp auto_gc = 3;
+    ForceGcOp force_gc = 4;
+  }
+}
+message MaintenanceResponse {}
+
 service PartitionKv {
   rpc Put(PutRequest) returns (PutResponse);
   rpc Get(GetRequest) returns (GetResponse);
@@ -488,6 +503,7 @@ service PartitionKv {
   rpc Range(RangeRequest) returns (RangeResponse);
   rpc SplitPart(SplitPartRequest) returns (SplitPartResponse);
   rpc StreamPut(stream StreamPutRequest) returns (PutResponse);
+  rpc Maintenance(MaintenanceRequest) returns (MaintenanceResponse);
 }
 
 service ExtentService {

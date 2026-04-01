@@ -1,0 +1,43 @@
+[package]
+name = "autumn-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "autumn-manager-server"
+path = "src/bin/manager.rs"
+
+[[bin]]
+name = "autumn-extent-node"
+path = "src/bin/extent_node.rs"
+
+[[bin]]
+name = "autumn-stream-cli"
+path = "src/bin/stream_cli.rs"
+
+[[bin]]
+name = "autumn-ps"
+path = "src/bin/partition_server.rs"
+
+[[bin]]
+name = "autumn-client"
+path = "src/bin/autumn_client.rs"
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tonic.workspace = true
+tonic-reflection = "0.11"
+autumn-manager = { path = "../manager" }
+autumn-stream = { path = "../stream" }
+autumn-io-engine = { path = "../io-engine" }
+autumn-proto = { path = "../proto" }
+autumn-partition-server = { path = "../partition-server" }
+tokio-stream = "0.1"
+serde = { workspace = true }
+serde_json = "1"
+rand = "0.8"
+uuid.workspace = true

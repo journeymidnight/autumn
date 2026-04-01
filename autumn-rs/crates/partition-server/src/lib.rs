@@ -14,9 +14,9 @@ use autumn_proto::autumn::partition_kv_server::{PartitionKv, PartitionKvServer};
 use autumn_proto::autumn::partition_manager_service_client::PartitionManagerServiceClient;
 use autumn_proto::autumn::{
     Code, DeleteRequest, DeleteResponse, Empty, GetRequest, GetResponse, HeadInfo, HeadRequest,
-    HeadResponse, Location, MultiModifySplitRequest, PutRequest, PutResponse, Range, RangeRequest,
-    RangeResponse, RegisterPsRequest, SplitPartRequest, SplitPartResponse, StreamPutRequest,
-    TableLocations,
+    HeadResponse, Location, MaintenanceRequest, MaintenanceResponse, MultiModifySplitRequest,
+    PutRequest, PutResponse, Range, RangeRequest, RangeResponse, RegisterPsRequest,
+    SplitPartRequest, SplitPartResponse, StreamPutRequest, TableLocations,
 };
 use autumn_stream::StreamClient;
 use dashmap::DashMap;
@@ -1284,21 +1284,36 @@ impl PartitionServer {
         false
     }
 
-    pub fn trigger_major_compact(&self, part_id: u64) {
+    pub fn trigger_major_compact(&self, part_id: u64) -> Result<(), &'static str> {
         if let Some(part) = self.partitions.get(&part_id) {
             let guard = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(part.read())
             });
-            let _ = guard.compact_tx.try_send(true);
+            guard.compact_tx.try_send(true).map_err(|_| "major compaction busy")
+        } else {
+            Err("no such partition")
         }
     }
 
-    pub fn trigger_gc(&self, part_id: u64) {
+    pub fn trigger_gc(&self, part_id: u64) -> Result<(), &'static str> {
         if let Some(part) = self.partitions.get(&part_id) {
             let guard = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(part.read())
             });
-            let _ = guard.gc_tx.try_send(GcTask::Auto);
+            guard.gc_tx.try_send(GcTask::Auto).map_err(|_| "gc busy")
+        } else {
+            Err("no such partition")
+        }
+    }
+
+    pub fn trigger_force_gc(&self, part_id: u64, extent_ids: Vec<u64>) -> Result<(), &'static str> {
+        if let Some(part) = self.partitions.get(&part_id) {
+            let guard = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(part.read())
+            });
+            guard.gc_tx.try_send(GcTask::Force { extent_ids }).map_err(|_| "gc busy")
+        } else {
+            Err("no such partition")
         }
     }
 
@@ -1807,6 +1822,33 @@ impl PartitionKv for PartitionServer {
             return Err(Status::invalid_argument(format!("payload {} bytes, header declared {}", value.len(), expected_len)));
         }
         self.put(Request::new(PutRequest { key: header.key.clone(), value, expires_at: header.expires_at, part_id: header.part_id })).await
+    }
+
+    async fn maintenance(
+        &self,
+        request: Request<MaintenanceRequest>,
+    ) -> Result<Response<MaintenanceResponse>, Status> {
+        use autumn_proto::autumn::maintenance_request::Op;
+        let req = request.into_inner();
+        let part_id = req.part_id;
+        match req.op {
+            Some(Op::Compact(_)) => {
+                self.trigger_major_compact(part_id)
+                    .map_err(|e| Status::unavailable(e))?;
+            }
+            Some(Op::AutoGc(_)) => {
+                self.trigger_gc(part_id)
+                    .map_err(|e| Status::unavailable(e))?;
+            }
+            Some(Op::ForceGc(op)) => {
+                self.trigger_force_gc(part_id, op.extent_ids)
+                    .map_err(|e| Status::unavailable(e))?;
+            }
+            None => {
+                return Err(Status::invalid_argument("missing op"));
+            }
+        }
+        Ok(Response::new(MaintenanceResponse {}))
     }
 }
 

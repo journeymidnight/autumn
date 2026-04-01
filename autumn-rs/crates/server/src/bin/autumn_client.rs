@@ -1,16 +1,20 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use autumn_proto::autumn::partition_kv_client::PartitionKvClient;
 use autumn_proto::autumn::partition_manager_service_client::PartitionManagerServiceClient;
 use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
 use autumn_proto::autumn::{
-    CreateStreamRequest, DeleteRequest, Empty, GetRequest, HeadRequest, NodesInfoResponse,
-    PutRequest, RangeRequest, RegionInfo, SplitPartRequest, StreamInfoRequest,
-    StreamPutRequest, StreamPutRequestHeader,
-    UpsertPartitionRequest,
+    AutoGcOp, CompactOp, CreateStreamRequest, DeleteRequest, Empty, ForceGcOp, GetRequest,
+    HeadRequest, MaintenanceRequest, NodesInfoResponse, PutRequest, RangeRequest, RegionInfo,
+    RegisterNodeRequest, SplitPartRequest, StreamInfoRequest, StreamPutRequest,
+    StreamPutRequestHeader, UpsertPartitionRequest,
 };
 use autumn_proto::autumn::{PartitionMeta, Range};
+use serde::{Deserialize, Serialize};
 use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
 
@@ -64,10 +68,7 @@ impl ClusterClient {
         Ok(self.ps_conns.get_mut(&addr).unwrap())
     }
 
-    async fn resolve_key(
-        &mut self,
-        key: &[u8],
-    ) -> Result<(u64, String)> {
+    async fn resolve_key(&mut self, key: &[u8]) -> Result<(u64, String)> {
         let resp = self
             .pm
             .get_regions(Request::new(Empty {}))
@@ -85,8 +86,7 @@ impl ClusterClient {
                 .map(|r| r.start_key.clone())
                 .unwrap_or_default()
                 .cmp(
-                    &b.1
-                        .rg
+                    &b.1.rg
                         .as_ref()
                         .map(|r| r.start_key.clone())
                         .unwrap_or_default(),
@@ -110,10 +110,7 @@ impl ClusterClient {
         bail!("key is out of range")
     }
 
-    async fn resolve_part_id(
-        &mut self,
-        part_id: u64,
-    ) -> Result<String> {
+    async fn resolve_part_id(&mut self, part_id: u64) -> Result<String> {
         let resp = self
             .pm
             .get_regions(Request::new(Empty {}))
@@ -133,11 +130,79 @@ impl ClusterClient {
             .ok_or_else(|| anyhow!("PS {} address not found", region.ps_id))?;
         Ok(addr)
     }
+
+    /// Return sorted (part_id, ps_addr) for all partitions, to distribute bench load.
+    async fn all_partitions(&mut self) -> Result<Vec<(u64, String)>> {
+        let resp = self
+            .pm
+            .get_regions(Request::new(Empty {}))
+            .await
+            .context("get regions")?
+            .into_inner();
+
+        let regions = resp.regions.unwrap_or_default().regions;
+        let ps_details = resp.ps_details;
+
+        let mut result = Vec::new();
+        for (part_id, region) in regions {
+            let addr = ps_details
+                .get(&region.ps_id)
+                .map(|d| d.address.clone())
+                .unwrap_or_default();
+            result.push((part_id, addr));
+        }
+        result.sort_by_key(|(pid, _)| *pid);
+        Ok(result)
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Hex presplit algorithm
+// ---------------------------------------------------------------------------
+
+/// Split the u32 hex key space [0x00000000, 0xFFFFFFFF] into `n` equal parts.
+/// Returns a list of (start_key_bytes, end_key_bytes) pairs suitable for partition ranges.
+/// The first range has empty start (unbounded) and the last has empty end (unbounded).
+fn hex_split_ranges(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+    if n <= 1 {
+        return vec![(vec![], vec![])];
+    }
+    let start: u64 = 0x00000000;
+    let end: u64 = 0xFFFFFFFF;
+    let size = (end - start) / n as u64;
+
+    let mut split_points: Vec<Vec<u8>> = Vec::new();
+    for i in 1..n {
+        let point = start + size * i as u64;
+        let hex_str = format!("{:08x}", point);
+        split_points.push(hex_str.into_bytes());
+    }
+
+    let mut ranges = Vec::new();
+    for i in 0..n {
+        let start_key = if i == 0 {
+            vec![]
+        } else {
+            split_points[i - 1].clone()
+        };
+        let end_key = if i == n - 1 {
+            vec![]
+        } else {
+            split_points[i].clone()
+        };
+        ranges.push((start_key, end_key));
+    }
+    ranges
+}
+
+// ---------------------------------------------------------------------------
+// Command definitions
+// ---------------------------------------------------------------------------
 
 enum Command {
     Bootstrap {
         replication: String,
+        presplit: String,
     },
     Put {
         key: String,
@@ -164,6 +229,31 @@ enum Command {
     Split {
         part_id: u64,
     },
+    Compact {
+        part_id: u64,
+    },
+    Gc {
+        part_id: u64,
+    },
+    ForceGc {
+        part_id: u64,
+        extent_ids: Vec<u64>,
+    },
+    Format {
+        listen: String,
+        advertise: String,
+        dirs: Vec<String>,
+    },
+    WBench {
+        threads: usize,
+        duration_secs: u64,
+        value_size: usize,
+    },
+    RBench {
+        threads: usize,
+        duration_secs: u64,
+        result_file: String,
+    },
     Info,
 }
 
@@ -176,7 +266,8 @@ fn usage() -> ! {
     eprintln!("Usage: autumn-client --manager <ADDR> <COMMAND>");
     eprintln!();
     eprintln!("Commands:");
-    eprintln!("  bootstrap [--replication 3+0]     Create initial partition");
+    eprintln!("  bootstrap [--replication 3+0] [--presplit 1:normal|N:hexstring]");
+    eprintln!("                                    Create initial partition(s)");
     eprintln!("  put <KEY> <FILE>                  Put key with value from file");
     eprintln!("  streamput <KEY> <FILE>             Stream-put large file in chunks");
     eprintln!("  get <KEY>                         Get value for key");
@@ -184,6 +275,15 @@ fn usage() -> ! {
     eprintln!("  head <KEY>                        Get key metadata (size)");
     eprintln!("  ls [--prefix P] [--start S] [--limit N]  List keys");
     eprintln!("  split <PARTID>                    Split partition");
+    eprintln!("  compact <PARTID>                  Trigger major compaction");
+    eprintln!("  gc <PARTID>                       Trigger auto GC");
+    eprintln!("  forcegc <PARTID> <EXTID>...       Force GC specific extents");
+    eprintln!("  format --listen <ADDR> --advertise <ADDR> <DIR>...");
+    eprintln!("                                    Format disks and register node");
+    eprintln!("  wbench [--threads 4] [--duration 10] [--size 8192]");
+    eprintln!("                                    Write benchmark");
+    eprintln!("  rbench [--threads 40] [--duration 10] <RESULT_FILE>");
+    eprintln!("                                    Read benchmark");
     eprintln!("  info                              Show cluster info");
     std::process::exit(1);
 }
@@ -216,17 +316,25 @@ fn parse_args() -> Args {
     let command = match subcmd {
         "bootstrap" => {
             let mut replication = String::from("3+0");
+            let mut presplit = String::from("1:normal");
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--replication" => {
                         i += 1;
                         replication = raw[i].clone();
                     }
+                    "--presplit" => {
+                        i += 1;
+                        presplit = raw[i].clone();
+                    }
                     _ => break,
                 }
                 i += 1;
             }
-            Command::Bootstrap { replication }
+            Command::Bootstrap {
+                replication,
+                presplit,
+            }
         }
         "put" => {
             if i + 1 >= raw.len() {
@@ -314,6 +422,129 @@ fn parse_args() -> Args {
                 part_id: raw[i].parse().expect("PARTID must be a number"),
             }
         }
+        "compact" => {
+            if i >= raw.len() {
+                eprintln!("compact requires <PARTID>");
+                std::process::exit(1);
+            }
+            Command::Compact {
+                part_id: raw[i].parse().expect("PARTID must be a number"),
+            }
+        }
+        "gc" => {
+            if i >= raw.len() {
+                eprintln!("gc requires <PARTID>");
+                std::process::exit(1);
+            }
+            Command::Gc {
+                part_id: raw[i].parse().expect("PARTID must be a number"),
+            }
+        }
+        "forcegc" => {
+            if i >= raw.len() {
+                eprintln!("forcegc requires <PARTID> <EXTID>...");
+                std::process::exit(1);
+            }
+            let part_id: u64 = raw[i].parse().expect("PARTID must be a number");
+            i += 1;
+            let mut extent_ids = Vec::new();
+            while i < raw.len() {
+                extent_ids.push(raw[i].parse::<u64>().expect("EXTID must be a number"));
+                i += 1;
+            }
+            if extent_ids.is_empty() {
+                eprintln!("forcegc requires at least one <EXTID>");
+                std::process::exit(1);
+            }
+            Command::ForceGc {
+                part_id,
+                extent_ids,
+            }
+        }
+        "format" => {
+            let mut listen = String::new();
+            let mut advertise = String::new();
+            let mut dirs = Vec::new();
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--listen" => {
+                        i += 1;
+                        listen = raw[i].clone();
+                    }
+                    "--advertise" => {
+                        i += 1;
+                        advertise = raw[i].clone();
+                    }
+                    _ => dirs.push(raw[i].clone()),
+                }
+                i += 1;
+            }
+            if listen.is_empty() || advertise.is_empty() || dirs.is_empty() {
+                eprintln!("format requires --listen <ADDR> --advertise <ADDR> <DIR>...");
+                std::process::exit(1);
+            }
+            Command::Format {
+                listen,
+                advertise,
+                dirs,
+            }
+        }
+        "wbench" => {
+            let mut threads: usize = 4;
+            let mut duration_secs: u64 = 10;
+            let mut value_size: usize = 8192;
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--threads" | "-t" => {
+                        i += 1;
+                        threads = raw[i].parse().expect("--threads must be a number");
+                    }
+                    "--duration" | "-d" => {
+                        i += 1;
+                        duration_secs = raw[i].parse().expect("--duration must be a number");
+                    }
+                    "--size" | "-s" => {
+                        i += 1;
+                        value_size = raw[i].parse().expect("--size must be a number");
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            Command::WBench {
+                threads,
+                duration_secs,
+                value_size,
+            }
+        }
+        "rbench" => {
+            let mut threads: usize = 40;
+            let mut duration_secs: u64 = 10;
+            let mut result_file = String::new();
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--threads" | "-t" => {
+                        i += 1;
+                        threads = raw[i].parse().expect("--threads must be a number");
+                    }
+                    "--duration" | "-d" => {
+                        i += 1;
+                        duration_secs = raw[i].parse().expect("--duration must be a number");
+                    }
+                    _ => result_file = raw[i].clone(),
+                }
+                i += 1;
+            }
+            if result_file.is_empty() {
+                eprintln!("rbench requires <RESULT_FILE>");
+                std::process::exit(1);
+            }
+            Command::RBench {
+                threads,
+                duration_secs,
+                result_file,
+            }
+        }
         "info" => Command::Info,
         other => {
             eprintln!("unknown command: {other}");
@@ -334,6 +565,98 @@ fn parse_replication(s: &str) -> Result<(u32, u32)> {
     Ok((data, parity))
 }
 
+// ---------------------------------------------------------------------------
+// Benchmark helpers
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize)]
+struct BenchResult {
+    key: String,
+    start_time: f64,
+    elapsed: f64,
+}
+
+struct LatencyHist {
+    samples_ms: Vec<f64>,
+}
+
+impl LatencyHist {
+    fn new() -> Self {
+        Self { samples_ms: Vec::new() }
+    }
+
+    fn record(&mut self, elapsed: Duration) {
+        self.samples_ms.push(elapsed.as_secs_f64() * 1000.0);
+    }
+
+    fn percentile(&mut self, p: f64) -> f64 {
+        if self.samples_ms.is_empty() {
+            return 0.0;
+        }
+        self.samples_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let idx = ((p / 100.0) * self.samples_ms.len() as f64) as usize;
+        self.samples_ms[idx.min(self.samples_ms.len() - 1)]
+    }
+}
+
+fn print_bench_summary(
+    label: &str,
+    threads: usize,
+    value_size: usize,
+    elapsed: Duration,
+    total_ops: u64,
+    latencies: &mut LatencyHist,
+) {
+    let secs = elapsed.as_secs_f64();
+    let total_bytes = total_ops as f64 * value_size as f64;
+    println!("\nSummary");
+    println!("Threads         : {threads}");
+    if value_size > 0 {
+        println!("Value size      : {value_size} bytes");
+    }
+    println!("Time taken      : {:.3} seconds", secs);
+    println!("Complete ops    : {total_ops}");
+    println!(
+        "Total data      : {:.2} MB",
+        total_bytes / 1024.0 / 1024.0
+    );
+    println!("Ops/sec         : {:.2}", total_ops as f64 / secs);
+    println!(
+        "Throughput/sec  : {:.2} MB/s",
+        total_bytes / 1024.0 / 1024.0 / secs
+    );
+    println!(
+        "{} latency p50={:.2}ms p95={:.2}ms p99={:.2}ms",
+        label,
+        latencies.percentile(50.0),
+        latencies.percentile(95.0),
+        latencies.percentile(99.0),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Format helpers
+// ---------------------------------------------------------------------------
+
+fn format_disk(dir: &str) -> Result<String> {
+    // Create 256 hash subdirectories 00..ff
+    for byte in 0u8..=255 {
+        let subdir = format!("{}/{:02x}", dir, byte);
+        std::fs::create_dir_all(&subdir)
+            .with_context(|| format!("create hash subdir {subdir}"))?;
+    }
+    // Generate UUID marker file
+    let disk_uuid = uuid::Uuid::new_v4().to_string();
+    let marker_path = format!("{}/{}", dir, disk_uuid);
+    std::fs::File::create(&marker_path)
+        .with_context(|| format!("create UUID marker {marker_path}"))?;
+    Ok(disk_uuid)
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -347,92 +670,105 @@ async fn main() -> Result<()> {
     let mut client = ClusterClient::connect(&args.manager).await?;
 
     match args.command {
-        Command::Bootstrap { replication } => {
+        Command::Bootstrap {
+            replication,
+            presplit,
+        } => {
             let (data_shard, parity_shard) = parse_replication(&replication)?;
 
-            // Create 3 streams: log, row, meta
-            let log_resp = client
-                .sm
-                .create_stream(Request::new(CreateStreamRequest {
-                    data_shard,
-                    parity_shard,
-                }))
-                .await
-                .context("create log stream")?
-                .into_inner();
-            let log_stream_id = log_resp
-                .stream
-                .as_ref()
-                .map(|s| s.stream_id)
-                .unwrap_or(0);
-            println!("log stream {} created [{data_shard}+{parity_shard}]", log_stream_id);
-
-            let row_resp = client
-                .sm
-                .create_stream(Request::new(CreateStreamRequest {
-                    data_shard,
-                    parity_shard,
-                }))
-                .await
-                .context("create row stream")?
-                .into_inner();
-            let row_stream_id = row_resp
-                .stream
-                .as_ref()
-                .map(|s| s.stream_id)
-                .unwrap_or(0);
-            println!("row stream {} created [{data_shard}+{parity_shard}]", row_stream_id);
-
-            let meta_resp = client
-                .sm
-                .create_stream(Request::new(CreateStreamRequest {
-                    data_shard,
-                    parity_shard: 0,
-                }))
-                .await
-                .context("create meta stream")?
-                .into_inner();
-            let meta_stream_id = meta_resp
-                .stream
-                .as_ref()
-                .map(|s| s.stream_id)
-                .unwrap_or(0);
-            println!("meta stream {} created [{data_shard}+0]", meta_stream_id);
-
-            // Allocate a partition ID (use a simple approach: timestamp-based)
-            let part_id = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-
-            let meta = PartitionMeta {
-                log_stream: log_stream_id,
-                row_stream: row_stream_id,
-                meta_stream: meta_stream_id,
-                part_id,
-                rg: Some(Range {
-                    start_key: Vec::new(),
-                    end_key: Vec::new(),
-                }),
+            // Parse presplit: "1:normal" or "N:hexstring"
+            let ranges: Vec<(Vec<u8>, Vec<u8>)> = {
+                let parts: Vec<&str> = presplit.splitn(2, ':').collect();
+                let n: usize = parts[0].parse().unwrap_or(1);
+                let kind = parts.get(1).copied().unwrap_or("normal");
+                match kind {
+                    "hexstring" => hex_split_ranges(n),
+                    _ => vec![(vec![], vec![])],
+                }
             };
 
-            let resp = client
-                .pm
-                .upsert_partition(Request::new(UpsertPartitionRequest {
-                    meta: Some(meta),
-                }))
-                .await
-                .context("upsert partition")?
-                .into_inner();
+            for (idx, (start_key, end_key)) in ranges.iter().enumerate() {
+                // Create 3 streams per partition: log, row, meta
+                let log_resp = client
+                    .sm
+                    .create_stream(Request::new(CreateStreamRequest {
+                        data_shard,
+                        parity_shard,
+                    }))
+                    .await
+                    .context("create log stream")?
+                    .into_inner();
+                let log_stream_id = log_resp.stream.as_ref().map(|s| s.stream_id).unwrap_or(0);
 
-            if resp.code != 0 {
-                bail!("bootstrap failed: {}", resp.code_des);
+                let row_resp = client
+                    .sm
+                    .create_stream(Request::new(CreateStreamRequest {
+                        data_shard,
+                        parity_shard,
+                    }))
+                    .await
+                    .context("create row stream")?
+                    .into_inner();
+                let row_stream_id = row_resp.stream.as_ref().map(|s| s.stream_id).unwrap_or(0);
+
+                let meta_resp = client
+                    .sm
+                    .create_stream(Request::new(CreateStreamRequest {
+                        data_shard,
+                        parity_shard: 0,
+                    }))
+                    .await
+                    .context("create meta stream")?
+                    .into_inner();
+                let meta_stream_id =
+                    meta_resp.stream.as_ref().map(|s| s.stream_id).unwrap_or(0);
+
+                let part_id = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64
+                    + idx as u64;
+
+                let meta = PartitionMeta {
+                    log_stream: log_stream_id,
+                    row_stream: row_stream_id,
+                    meta_stream: meta_stream_id,
+                    part_id,
+                    rg: Some(Range {
+                        start_key: start_key.clone(),
+                        end_key: end_key.clone(),
+                    }),
+                };
+
+                let resp = client
+                    .pm
+                    .upsert_partition(Request::new(UpsertPartitionRequest {
+                        meta: Some(meta),
+                    }))
+                    .await
+                    .context("upsert partition")?
+                    .into_inner();
+
+                if resp.code != 0 {
+                    bail!("bootstrap partition {} failed: {}", idx, resp.code_des);
+                }
+
+                let start_s = if start_key.is_empty() {
+                    String::from("\"\"")
+                } else {
+                    String::from_utf8_lossy(start_key).to_string()
+                };
+                let end_s = if end_key.is_empty() {
+                    String::from("\"\"")
+                } else {
+                    String::from_utf8_lossy(end_key).to_string()
+                };
+                println!(
+                    "partition {} created: id={} log={} row={} meta={} range=[{}..{})",
+                    idx, part_id, log_stream_id, row_stream_id, meta_stream_id, start_s, end_s
+                );
             }
-
-            println!(
-                "bootstrap succeeded: partition {} (log={}, row={}, meta={})",
-                part_id, log_stream_id, row_stream_id, meta_stream_id
-            );
+            println!("bootstrap succeeded: {} partition(s)", ranges.len());
         }
 
         Command::Put { key, file } => {
@@ -460,7 +796,6 @@ async fn main() -> Result<()> {
             let (part_id, ps_addr) = client.resolve_key(key.as_bytes()).await?;
             let ps = client.get_ps_client(&ps_addr).await?;
 
-            // Build the streaming request: header then payload chunks.
             let key_bytes = key.into_bytes();
             let file_bytes = tokio::fs::read(&file)
                 .await
@@ -597,8 +932,328 @@ async fn main() -> Result<()> {
             println!("split ok");
         }
 
+        Command::Compact { part_id } => {
+            let ps_addr = client.resolve_part_id(part_id).await?;
+            let ps = client.get_ps_client(&ps_addr).await?;
+            ps.maintenance(Request::new(MaintenanceRequest {
+                part_id,
+                op: Some(autumn_proto::autumn::maintenance_request::Op::Compact(
+                    CompactOp {},
+                )),
+            }))
+            .await
+            .context("compact")?;
+            println!("compact triggered for partition {part_id}");
+        }
+
+        Command::Gc { part_id } => {
+            let ps_addr = client.resolve_part_id(part_id).await?;
+            let ps = client.get_ps_client(&ps_addr).await?;
+            ps.maintenance(Request::new(MaintenanceRequest {
+                part_id,
+                op: Some(autumn_proto::autumn::maintenance_request::Op::AutoGc(
+                    AutoGcOp {},
+                )),
+            }))
+            .await
+            .context("gc")?;
+            println!("gc triggered for partition {part_id}");
+        }
+
+        Command::ForceGc {
+            part_id,
+            extent_ids,
+        } => {
+            let ps_addr = client.resolve_part_id(part_id).await?;
+            let ps = client.get_ps_client(&ps_addr).await?;
+            ps.maintenance(Request::new(MaintenanceRequest {
+                part_id,
+                op: Some(autumn_proto::autumn::maintenance_request::Op::ForceGc(
+                    ForceGcOp {
+                        extent_ids: extent_ids.clone(),
+                    },
+                )),
+            }))
+            .await
+            .context("forcegc")?;
+            println!("forcegc triggered for partition {part_id}, extents={extent_ids:?}");
+        }
+
+        Command::Format {
+            listen,
+            advertise,
+            dirs,
+        } => {
+            // Format each disk directory
+            let mut disk_uuids = Vec::new();
+            for dir in &dirs {
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("create dir {dir}"))?;
+                let uuid = format_disk(dir)?;
+                println!("formatted {dir}: disk_uuid={uuid}");
+                disk_uuids.push(uuid);
+            }
+
+            // Register the node with the stream manager
+            let resp = client
+                .sm
+                .register_node(Request::new(RegisterNodeRequest {
+                    addr: advertise.clone(),
+                    disk_uuids: disk_uuids.clone(),
+                }))
+                .await
+                .context("register node")?
+                .into_inner();
+
+            let node_id = resp.node_id;
+            println!("node registered: node_id={node_id}");
+
+            // Write node_id and disk_id files into each directory
+            for (dir, disk_uuid) in dirs.iter().zip(disk_uuids.iter()) {
+                let disk_id = resp.disk_uuids.get(disk_uuid).copied().unwrap_or(0);
+                std::fs::write(format!("{dir}/node_id"), node_id.to_string())
+                    .with_context(|| format!("write node_id in {dir}"))?;
+                std::fs::write(format!("{dir}/disk_id"), disk_id.to_string())
+                    .with_context(|| format!("write disk_id in {dir}"))?;
+                println!("  {dir}: node_id={node_id}, disk_id={disk_id}");
+            }
+            println!("\nFormat complete.");
+            println!("listen={listen}, advertise={advertise}");
+            println!("Start the extent node with:");
+            println!(
+                "  autumn-extent-node --port {} --manager {} --data {}",
+                listen.split(':').last().unwrap_or("9101"),
+                args.manager,
+                dirs.join(",")
+            );
+        }
+
+        Command::WBench {
+            threads,
+            duration_secs,
+            value_size,
+        } => {
+            // Gather partition list for routing
+            let partitions = client.all_partitions().await?;
+            if partitions.is_empty() {
+                bail!("no partitions found, run bootstrap first");
+            }
+            let partitions = Arc::new(partitions);
+            let manager_addr = Arc::new(args.manager.clone());
+
+            let deadline = Arc::new(std::time::SystemTime::now()
+                + Duration::from_secs(duration_secs));
+            let total_ops = Arc::new(AtomicU64::new(0));
+            let total_errors = Arc::new(AtomicU64::new(0));
+            let bench_start = Instant::now();
+
+            // Shared result buffer per thread (collect samples)
+            let results: Arc<tokio::sync::Mutex<Vec<BenchResult>>> =
+                Arc::new(tokio::sync::Mutex::new(Vec::new()));
+            let latencies: Arc<tokio::sync::Mutex<Vec<f64>>> =
+                Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+            let mut handles = Vec::new();
+            for tid in 0..threads {
+                let partitions = Arc::clone(&partitions);
+                let manager_addr = Arc::clone(&manager_addr);
+                let deadline = Arc::clone(&deadline);
+                let total_ops = Arc::clone(&total_ops);
+                let total_errors = Arc::clone(&total_errors);
+                let results = Arc::clone(&results);
+                let latencies = Arc::clone(&latencies);
+                let value_bytes: Vec<u8> = (0..value_size).map(|i| (i % 256) as u8).collect();
+
+                let handle = tokio::spawn(async move {
+                    let mut cc = match ClusterClient::connect(&manager_addr).await {
+                        Ok(c) => c,
+                        Err(e) => { eprintln!("thread {tid} connect error: {e}"); return; }
+                    };
+                    let mut seq: u64 = 0;
+                    // Cycle through partitions
+                    let num_parts = partitions.len();
+                    loop {
+                        if std::time::SystemTime::now() >= *deadline {
+                            break;
+                        }
+                        let (part_id, ps_addr) = &partitions[tid % num_parts];
+                        let key = format!("bench_{}_{}", tid, seq);
+                        seq += 1;
+
+                        let ps = match cc.get_ps_client(ps_addr).await {
+                            Ok(ps) => ps,
+                            Err(_) => { total_errors.fetch_add(1, Ordering::Relaxed); continue; }
+                        };
+                        let t0 = Instant::now();
+                        let op_start =
+                            bench_start.elapsed().as_secs_f64();
+                        let res = ps.put(Request::new(PutRequest {
+                            key: key.as_bytes().to_vec(),
+                            value: value_bytes.clone(),
+                            expires_at: 0,
+                            part_id: *part_id,
+                        })).await;
+                        let elapsed = t0.elapsed();
+
+                        match res {
+                            Ok(_) => {
+                                total_ops.fetch_add(1, Ordering::Relaxed);
+                                let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
+                                latencies.lock().await.push(elapsed_ms);
+                                results.lock().await.push(BenchResult {
+                                    key: key.clone(),
+                                    start_time: op_start,
+                                    elapsed: elapsed.as_secs_f64(),
+                                });
+                            }
+                            Err(_) => { total_errors.fetch_add(1, Ordering::Relaxed); }
+                        }
+                    }
+                });
+                handles.push(handle);
+            }
+
+            // Print live progress
+            let total_ops_clone = Arc::clone(&total_ops);
+            let progress = tokio::spawn(async move {
+                let mut last = 0u64;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let cur = total_ops_clone.load(Ordering::Relaxed);
+                    eprint!("\rops/s={}", cur - last);
+                    last = cur;
+                }
+            });
+
+            for h in handles { h.await.ok(); }
+            progress.abort();
+            eprintln!();
+
+            let elapsed = bench_start.elapsed();
+            let ops = total_ops.load(Ordering::Relaxed);
+            let errs = total_errors.load(Ordering::Relaxed);
+            if errs > 0 { eprintln!("errors: {errs}"); }
+
+            let mut lat_guard = latencies.lock().await;
+            let mut hist = LatencyHist::new();
+            hist.samples_ms = lat_guard.drain(..).collect();
+            print_bench_summary("Write", threads, value_size, elapsed, ops, &mut hist);
+
+            let results_guard = results.lock().await;
+            let json = serde_json::to_string_pretty(&*results_guard)?;
+            tokio::fs::write("write_result.json", json).await?;
+            println!("results written to write_result.json");
+        }
+
+        Command::RBench {
+            threads,
+            duration_secs,
+            result_file,
+        } => {
+            // Load keys from write_result.json
+            let json = tokio::fs::read_to_string(&result_file)
+                .await
+                .with_context(|| format!("read {result_file}"))?;
+            let write_results: Vec<BenchResult> = serde_json::from_str(&json)
+                .context("parse result file")?;
+            let keys: Vec<String> = write_results.into_iter().map(|r| r.key).collect();
+            if keys.is_empty() {
+                bail!("no keys in result file");
+            }
+
+            let keys = Arc::new(keys);
+            let manager_addr = Arc::new(args.manager.clone());
+            let deadline = Arc::new(std::time::SystemTime::now()
+                + Duration::from_secs(duration_secs));
+            let total_ops = Arc::new(AtomicU64::new(0));
+            let total_errors = Arc::new(AtomicU64::new(0));
+            let bench_start = Instant::now();
+            let latencies: Arc<tokio::sync::Mutex<Vec<f64>>> =
+                Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+            let mut handles = Vec::new();
+            let keys_per_thread = (keys.len() + threads - 1) / threads;
+
+            for tid in 0..threads {
+                let keys = Arc::clone(&keys);
+                let manager_addr = Arc::clone(&manager_addr);
+                let deadline = Arc::clone(&deadline);
+                let total_ops = Arc::clone(&total_ops);
+                let total_errors = Arc::clone(&total_errors);
+                let latencies = Arc::clone(&latencies);
+
+                let handle = tokio::spawn(async move {
+                    let mut cc = match ClusterClient::connect(&manager_addr).await {
+                        Ok(c) => c,
+                        Err(e) => { eprintln!("thread {tid} connect error: {e}"); return; }
+                    };
+                    let start_idx = tid * keys_per_thread;
+                    let end_idx = (start_idx + keys_per_thread).min(keys.len());
+                    if start_idx >= end_idx { return; }
+                    let my_keys = &keys[start_idx..end_idx];
+                    let mut ki = 0usize;
+
+                    loop {
+                        if std::time::SystemTime::now() >= *deadline {
+                            break;
+                        }
+                        let key = &my_keys[ki % my_keys.len()];
+                        ki += 1;
+
+                        let (part_id, ps_addr) = match cc.resolve_key(key.as_bytes()).await {
+                            Ok(r) => r,
+                            Err(_) => { total_errors.fetch_add(1, Ordering::Relaxed); continue; }
+                        };
+                        let ps = match cc.get_ps_client(&ps_addr).await {
+                            Ok(ps) => ps,
+                            Err(_) => { total_errors.fetch_add(1, Ordering::Relaxed); continue; }
+                        };
+                        let t0 = Instant::now();
+                        let res = ps.get(Request::new(GetRequest {
+                            key: key.as_bytes().to_vec(),
+                            part_id,
+                        })).await;
+                        let elapsed = t0.elapsed();
+
+                        match res {
+                            Ok(_) => {
+                                total_ops.fetch_add(1, Ordering::Relaxed);
+                                latencies.lock().await.push(elapsed.as_secs_f64() * 1000.0);
+                            }
+                            Err(_) => { total_errors.fetch_add(1, Ordering::Relaxed); }
+                        }
+                    }
+                });
+                handles.push(handle);
+            }
+
+            let total_ops_clone = Arc::clone(&total_ops);
+            let progress = tokio::spawn(async move {
+                let mut last = 0u64;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let cur = total_ops_clone.load(Ordering::Relaxed);
+                    eprint!("\rops/s={}", cur - last);
+                    last = cur;
+                }
+            });
+
+            for h in handles { h.await.ok(); }
+            progress.abort();
+            eprintln!();
+
+            let elapsed = bench_start.elapsed();
+            let ops = total_ops.load(Ordering::Relaxed);
+            let errs = total_errors.load(Ordering::Relaxed);
+            if errs > 0 { eprintln!("errors: {errs}"); }
+
+            let mut lat_guard = latencies.lock().await;
+            let mut hist = LatencyHist::new();
+            hist.samples_ms = lat_guard.drain(..).collect();
+            print_bench_summary("Read", threads, 0, elapsed, ops, &mut hist);
+        }
+
         Command::Info => {
-            // Stream/extent info
             let stream_resp = client
                 .sm
                 .stream_info(Request::new(StreamInfoRequest {
