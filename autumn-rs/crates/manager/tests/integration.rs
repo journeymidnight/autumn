@@ -9,8 +9,8 @@ use autumn_proto::autumn::partition_manager_service_client::PartitionManagerServ
 use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
 use autumn_proto::autumn::{
     read_bytes_response, AcquireOwnerLockRequest, Code, CreateStreamRequest, Empty, GetRequest,
-    PartitionMeta, PutRequest, Range, ReadBytesRequest, RegisterNodeRequest, SplitPartRequest,
-    StreamAllocExtentRequest, StreamInfoRequest, TableLocations, TruncateRequest,
+    PartitionMeta, PutRequest, Range, RangeRequest, ReadBytesRequest, RegisterNodeRequest,
+    SplitPartRequest, StreamAllocExtentRequest, StreamInfoRequest, TableLocations, TruncateRequest,
     UpsertPartitionRequest,
 };
 use prost::Message as _;
@@ -1424,6 +1424,153 @@ async fn f033_gc_reclaims_log_stream_extents() {
         })).await.expect("get after gc").into_inner();
         assert_eq!(resp.value, val_v2,
             "gc-key-{} must return v2 value after GC", i);
+    }
+
+    n1_task.abort();
+    n2_task.abort();
+    ps_task.abort();
+    mgr_task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// F037: Partition split with overlap detection and major compaction
+// ---------------------------------------------------------------------------
+
+/// F037: After a split, child partitions inherit parent SSTables covering the
+/// full key range. Both children should detect overlap on open. Split on an
+/// overlapping partition must be rejected. Major compaction clears overlap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f037_overlap_detected_after_split_and_cleared_by_compaction() {
+    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) =
+        setup_infra_f030(119).await;
+
+    let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
+        .await.expect("connect sm");
+    let log_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
+        .await.expect("create log stream").into_inner().stream.expect("log stream").stream_id;
+    let row_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
+        .await.expect("create row stream").into_inner().stream.expect("row stream").stream_id;
+    let meta_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
+        .await.expect("create meta stream").into_inner().stream.expect("meta stream").stream_id;
+
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let ps = PartitionServer::connect(71, &endpoint, data_dir.path(), IoMode::Standard)
+        .await.expect("connect ps");
+    let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
+        .await.expect("connect pm");
+    pm.upsert_partition(Request::new(UpsertPartitionRequest {
+        meta: Some(PartitionMeta {
+            log_stream, row_stream, meta_stream,
+            part_id: 901,
+            rg: Some(Range { start_key: b"a".to_vec(), end_key: b"z".to_vec() }),
+        }),
+    })).await.expect("upsert partition");
+    ps.sync_regions_once().await.expect("sync regions");
+
+    let ps_addr = pick_addr();
+    let ps_task = tokio::spawn(ps.clone().serve(ps_addr));
+    sleep(Duration::from_millis(120)).await;
+
+    let mut kv = PartitionKvClient::connect(format!("http://{}", ps_addr))
+        .await.expect("connect kv");
+
+    // Write keys in the "a*" range and flush them to an SSTable.
+    for i in 0u8..5 {
+        kv.put(Request::new(PutRequest {
+            key: format!("a-key-{:02}", i).into_bytes(),
+            value: format!("val-a-{}", i).into_bytes(),
+            expires_at: 0,
+            part_id: 901,
+        })).await.expect("put a-key");
+    }
+    kv.put(Request::new(PutRequest {
+        key: b"a-filler".to_vec(),
+        value: vec![b'X'; 300 * 1024],
+        expires_at: 0,
+        part_id: 901,
+    })).await.expect("put a-filler");
+    sleep(Duration::from_millis(400)).await;
+
+    // Write keys in the "y*" range and flush them to a second SSTable.
+    for i in 0u8..5 {
+        kv.put(Request::new(PutRequest {
+            key: format!("y-key-{:02}", i).into_bytes(),
+            value: format!("val-y-{}", i).into_bytes(),
+            expires_at: 0,
+            part_id: 901,
+        })).await.expect("put y-key");
+    }
+    kv.put(Request::new(PutRequest {
+        key: b"y-filler".to_vec(),
+        value: vec![b'Y'; 300 * 1024],
+        expires_at: 0,
+        part_id: 901,
+    })).await.expect("put y-filler");
+    sleep(Duration::from_millis(400)).await;
+
+    // Parent has no overlap before the split.
+    assert!(!ps.has_overlap(901), "parent must not have overlap before split");
+
+    // Split: creates left=[a, mid) and right=[mid, z). Both children inherit the parent's
+    // SSTables which cover the full [a, z) range — both will have overlap on open.
+    kv.split_part(Request::new(SplitPartRequest { part_id: 901 }))
+        .await.expect("initial split must succeed on non-overlapping partition");
+
+    // Sync to open both child partitions on the PS.
+    ps.sync_regions_once().await.expect("sync after split");
+    sleep(Duration::from_millis(300)).await;
+
+    // Find the right child's part_id.
+    let regions_resp = pm.get_regions(Request::new(Empty {}))
+        .await.expect("get_regions").into_inner();
+    let all_part_ids: Vec<u64> = regions_resp
+        .regions.as_ref().expect("regions present").regions
+        .values().map(|r| r.part_id).collect();
+    assert_eq!(all_part_ids.len(), 2, "should have 2 partitions after split");
+    let right_id = *all_part_ids.iter().find(|&&id| id != 901).expect("right child exists");
+
+    // Both children must detect overlap.
+    assert!(ps.has_overlap(901), "left child must detect overlap after split");
+    assert!(ps.has_overlap(right_id), "right child must detect overlap after split");
+
+    // Split on an overlapping partition must be rejected with FAILED_PRECONDITION.
+    let split_err = kv.split_part(Request::new(SplitPartRequest { part_id: 901 }))
+        .await.expect_err("split on overlapping partition must fail");
+    assert_eq!(split_err.code(), tonic::Code::FailedPrecondition,
+        "expected FailedPrecondition, got: {split_err}");
+
+    // Range scan on the left child must only return keys within its range.
+    let left_rg = regions_resp.regions.as_ref().unwrap().regions
+        .values().find(|ri| ri.part_id == 901).unwrap().rg.clone().unwrap();
+    let range_resp = kv.range(Request::new(RangeRequest {
+        part_id: 901,
+        start: b"a".to_vec(),
+        prefix: vec![],
+        limit: 100,
+    })).await.expect("range on left child").into_inner();
+    for key in &range_resp.keys {
+        assert!(key.as_slice() >= left_rg.start_key.as_slice(),
+            "key {:?} must be >= start_key", key);
+        if !left_rg.end_key.is_empty() {
+            assert!(key.as_slice() < left_rg.end_key.as_slice(),
+                "key {:?} must be < end_key {:?}", key, left_rg.end_key);
+        }
+    }
+
+    // Trigger major compaction on the left child to remove out-of-range keys.
+    ps.trigger_major_compact(901);
+    sleep(Duration::from_millis(1000)).await;
+
+    // Overlap must be cleared after major compaction.
+    assert!(!ps.has_overlap(901), "left child overlap must be cleared after major compaction");
+
+    // All in-range keys must still be readable after compaction.
+    for key in &range_resp.keys {
+        let resp = kv.get(Request::new(GetRequest {
+            key: key.clone(),
+            part_id: 901,
+        })).await.expect("get after compaction").into_inner();
+        assert!(!resp.value.is_empty(), "key {:?} must be readable after compaction", key);
     }
 
     n1_task.abort();

@@ -1,41 +1,43 @@
 Date: 2026-04-01
 TaskStatus: completed
-Task scope: F033 – GC with discard tracking and extent punch
+Task scope: F037 – Partition split with overlap detection and major compaction
 
 Current summary:
-  Implemented GC for logStream extents with discard-map tracking.
+  Implemented F037: overlap detection on partition open, split rejection when overlap exists,
+  out-of-range key filtering in compaction, and range-scan filtering when overlap is present.
 
-  Changes:
-  - sstable/format.rs: MetaBlock gains `discards: HashMap<u64, i64>` (extentID -> reclaimable bytes).
-    Encoded as [count:u32][eid:u64][sz:i64]* after vp_offset. CRC32C covers discard data.
-    Backward compatible: old SSTables (no discard data) decode with empty map.
-  - sstable/builder.rs: SstBuilder gains `set_discards(HashMap<u64, i64>)`, embedded in MetaBlock at finish().
-  - sstable/reader.rs: SstReader gains `discards: HashMap<u64, i64>`, loaded from MetaBlock on open.
-  - stream/client.rs: New `get_extent_info(extent_id) -> Result<ExtentInfo>` public method.
-  - lib.rs:
-    - GcTask enum { Auto, Force { extent_ids } }
-    - PartitionData gets gc_tx: mpsc::Sender<GcTask>
-    - do_compact: initializes discard map from input tables' existing discards;
-      accumulates VP entry discards when deduplicating/dropping; passes discards to last
-      output SstBuilder; validates discards against current logStream extent list.
-    - get_discards(readers) and valid_discard() helpers.
-    - run_gc(server, part, extent_id, sealed_length): reads extent, finds live VP entries
-      (current LSM version still points to this extent), re-writes them to logStream,
-      then punches the extent.
-    - background_gc_loop: periodic (30-60s) + on-demand; aggregates discards from SstReaders,
-      skips last (active) extent, runs GC on extents with >40% discard ratio (MAX_GC_ONCE=3).
-    - trigger_gc(part_id): sends GcTask::Auto to gc_tx.
-    - open_partition: spawns background_gc_loop alongside flush and compact loops.
+  Changes in autumn-rs/crates/partition-server/src/lib.rs:
+  - open_partition: after loading each SstReader, check smallest_key/biggest_key against
+    partition range via parse_key() + in_range(). Set detected_overlap=true if any key is
+    out of range. Initialize has_overlap AtomicU32 with 1 if detected_overlap.
+  - split_part: check has_overlap before expensive unique_user_keys_async; return
+    FAILED_PRECONDITION if overlap exists ("cannot split: partition has overlapping keys,
+    run major compaction first").
+  - do_compact: capture partition range (rg) alongside readers; after dedup but before
+    major-mode tombstone filter, skip keys outside partition range (add to discard map).
+    Applies to both major and minor compaction. Changed minimum table count from 2 to 0
+    (empty guard only); background_compact_loop skips major compaction if < 2 tables AND
+    no overlap (allows single-table major compaction to clean up overlapping keys).
+  - range(): load check_overlap + part_rg before the merge loop; skip keys outside
+    partition range when check_overlap is true.
+  - Added has_overlap(part_id) public helper for testing.
 
   Tests:
-  - Unit test: discards_round_trip — set_discards + SstReader.discards round-trips correctly.
-  - Integration test: f033_gc_reclaims_log_stream_extents — overwrites large values, compacts
-    (builds discard maps), triggers GC, verifies all keys still return correct v2 values.
-  - All 12 unit tests + 12 integration tests pass.
+  - Integration test: f037_overlap_detected_after_split_and_cleared_by_compaction
+    1. Creates partition [a, z), writes keys in "a*" and "y*" ranges (with large fillers
+       to trigger flushes → SSTables cover full [a, z) range).
+    2. Splits partition → creates two children sharing the parent's SSTables.
+    3. Verifies both children detect overlap (has_overlap=true).
+    4. Verifies split_part on overlapping partition returns FAILED_PRECONDITION.
+    5. Verifies range scan on left child returns only in-range keys.
+    6. Triggers major compaction on left child.
+    7. Verifies has_overlap cleared and all in-range keys still readable.
+  - All 12 unit tests + 13 integration tests pass.
 
 Main gaps:
-  None for F033.
+  None for F037.
 
 Next steps:
-  F037 – Partition split with overlap detection and major compaction
   F035 – Extent node WAL for small-write durability
+  F010 – Partition API parity with Go legacy endpoints
+  F020 – gRPC connection pool with health check

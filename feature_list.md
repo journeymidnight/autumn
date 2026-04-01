@@ -105,8 +105,8 @@
 ### F037 · Partition split with overlap detection and major compaction
 - **Target:** Split requires major compaction to clear overlapping keys before split is safe. hasOverlap flag blocks split until compaction completes.
 - **Evidence:** `range_partition/range_partition.go` (hasOverlap, majorCompactChan) · `range_partition/compaction.go` · `autumn-rs/crates/partition-server/src/lib.rs`
-- **Notes:** Go: SplitPart sets hasOverlap=1 → triggers majorCompactChan → clears overlap flag. Rust SplitPart exists but lacks this coordination. Depends on F029.
-- **passes:** false
+- **Notes:** Implemented. Overlap detected on open via smallest/biggest key range check. split_part returns FAILED_PRECONDITION when has_overlap=1. do_compact filters out-of-range keys (both major and minor modes). range() skips out-of-range keys when has_overlap is set. Integration test f037_overlap_detected_after_split_and_cleared_by_compaction passes.
+- **passes:** true
 
 ### F010 · Partition API parity with Go legacy endpoints
 - **Target:** Batch/StreamPut/Maintenance equivalents available in Rust proto and service.

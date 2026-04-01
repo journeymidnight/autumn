@@ -391,6 +391,7 @@ impl PartitionServer {
         let mut max_seq: u64 = 0;
         let mut recovered_vp_eid: u64 = 0;
         let mut recovered_vp_off: u32 = 0;
+        let mut detected_overlap = false;
 
         // Step 1: Read metaStream to get last checkpoint.
         let meta_bytes_opt = {
@@ -424,6 +425,15 @@ impl PartitionServer {
 
                 let tbl_last_seq = reader.seq_num();
                 if tbl_last_seq > max_seq { max_seq = tbl_last_seq; }
+
+                // Detect overlap: check if SST contains keys outside partition range.
+                if !detected_overlap {
+                    let sk = parse_key(reader.smallest_key());
+                    let bk = parse_key(reader.biggest_key());
+                    if !Self::in_range(&rg, sk) || !Self::in_range(&rg, bk) {
+                        detected_overlap = true;
+                    }
+                }
 
                 // Restore vp head from SST MetaBlock if newer than checkpoint
                 if reader.vp_extent_id > recovered_vp_eid
@@ -512,7 +522,7 @@ impl PartitionServer {
         let (flush_tx, flush_rx) = mpsc::unbounded_channel::<()>();
         let (compact_tx, compact_rx) = mpsc::channel::<bool>(1);
         let (gc_tx, gc_rx) = mpsc::channel::<GcTask>(1);
-        let has_overlap = Arc::new(AtomicU32::new(0));
+        let has_overlap = Arc::new(AtomicU32::new(if detected_overlap { 1 } else { 0 }));
 
         let part = Arc::new(RwLock::new(PartitionData {
             part_id,
@@ -798,12 +808,12 @@ impl PartitionServer {
         tbls: Vec<TableMeta>,
         major: bool,
     ) -> Result<bool> {
-        if tbls.len() < 2 { return Ok(false); }
+        if tbls.is_empty() { return Ok(false); }
 
         let compact_keys: std::collections::HashSet<(u64, u32)> = tbls.iter().map(|t| t.loc()).collect();
 
-        // Grab SstReaders for selected tables.
-        let (readers, row_stream_id, meta_stream_id, compact_vp_eid, compact_vp_off) = {
+        // Grab SstReaders for selected tables and the partition range for overlap filtering.
+        let (readers, row_stream_id, meta_stream_id, compact_vp_eid, compact_vp_off, rg) = {
             let guard = part.read().await;
             let mut rds: Vec<Arc<SstReader>> = Vec::new();
             for t in &tbls {
@@ -811,7 +821,7 @@ impl PartitionServer {
                     rds.push(guard.sst_readers[idx].clone());
                 }
             }
-            (rds, guard.row_stream_id, guard.meta_stream_id, guard.vp_extent_id, guard.vp_offset)
+            (rds, guard.row_stream_id, guard.meta_stream_id, guard.vp_extent_id, guard.vp_offset, guard.rg.clone())
         };
 
         if readers.is_empty() { return Ok(false); }
@@ -866,6 +876,13 @@ impl PartitionServer {
                 continue;
             }
             prev_user_key = Some(user_key);
+
+            // Filter out-of-range keys (overlap cleanup, applies to all compaction modes).
+            if !Self::in_range(&rg, prev_user_key.as_ref().unwrap()) {
+                add_discard(&item);
+                merge.next();
+                continue;
+            }
 
             // In major mode, drop tombstones and expired entries.
             if major {
@@ -993,6 +1010,8 @@ impl PartitionServer {
                     if maybe.is_none() { break; }
                     let Some(part) = part_weak.upgrade() else { break; };
                     let tbls = { let g = part.read().await; g.tables.clone() };
+                    // Skip major compaction if there's nothing to do (no overlap and < 2 tables).
+                    if tbls.len() < 2 && has_overlap.load(Ordering::SeqCst) == 0 { continue; }
                     let last_extent = tbls.last().map(|t| t.extent_id).unwrap_or(0);
                     match server.do_compact(&part, tbls, true).await {
                         Ok(_) => {
@@ -1253,6 +1272,16 @@ impl PartitionServer {
         self.sync_regions_once().await?;
         self.partitions.remove(&part_id).map(|(_, p)| p)
             .ok_or_else(|| anyhow!("part {part_id} not found"))
+    }
+
+    pub fn has_overlap(&self, part_id: u64) -> bool {
+        if let Some(part) = self.partitions.get(&part_id) {
+            let guard = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(part.read())
+            });
+            return guard.has_overlap.load(Ordering::SeqCst) != 0;
+        }
+        false
     }
 
     pub fn trigger_major_compact(&self, part_id: u64) {
@@ -1593,6 +1622,8 @@ impl PartitionKv for PartitionServer {
         let mut merge = MergeIterator::new(sst_iters);
 
         let now = now_secs();
+        let check_overlap = part.has_overlap.load(Ordering::SeqCst) != 0;
+        let part_rg = part.rg.clone();
         let mut out: Vec<Vec<u8>> = Vec::new();
         let mut last_user_key: Option<Vec<u8>> = None;
 
@@ -1642,6 +1673,8 @@ impl PartitionKv for PartitionServer {
             };
 
             let uk = parse_key(&item.key);
+            // When partition has overlapping keys, skip keys outside the partition range.
+            if check_overlap && !Self::in_range(&part_rg, uk) { continue; }
             if !req.prefix.is_empty() && !uk.starts_with(&req.prefix as &[u8]) { break; }
             if last_user_key.as_deref() == Some(uk) { continue; }
             last_user_key = Some(uk.to_vec());
@@ -1666,6 +1699,15 @@ impl PartitionKv for PartitionServer {
             .map_err(|e| part_lookup_to_status(req.part_id, e))?;
 
         let mut part = p.write().await;
+
+        // Block split if the partition has overlapping keys — must run major compaction first.
+        if part.has_overlap.load(Ordering::SeqCst) != 0 {
+            drop(part);
+            self.partitions.insert(req.part_id, p.clone());
+            return Err(Status::failed_precondition(
+                "cannot split: partition has overlapping keys, run major compaction first"
+            ));
+        }
 
         // Collect unique live user keys.
         let user_keys = Self::unique_user_keys_async(&part, &self.stream_client).await;
