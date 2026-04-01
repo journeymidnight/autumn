@@ -88,11 +88,13 @@ autumn-stream-cli --manager 127.0.0.1:9001 <COMMAND>
 
 | Command | Description |
 |---------|-------------|
-| `register-node --addr <ADDR> --disks <UUID,...>` | Register an extent node |
-| `create-stream [--data N] [--parity M]` | Create a new stream |
-| `stream-info [--streams id,...]` | Show stream/extent metadata |
-| `append --stream <ID> --data <FILE>` | Append file contents to a stream |
-| `read --stream <ID> [--extent <ID>] [--offset N] [--length N]` | Read from stream |
+| `register-node --addr <ADDR> --disk <UUID>` | Register an extent node |
+| `create-stream [--data-shard N] [--parity-shard M]` | Create a new stream |
+| `stream-info [--stream-id N]` | Show stream/extent metadata (omit for all streams) |
+| `append --stream-id <ID> --data <STR>` | Append string data to a stream |
+| `read --stream-id <ID> [--length N]` | Read from stream |
+| `alloc-extent --node <ADDR> --extent-id N` | Pre-create an extent on an extent node |
+| `commit-length --node <ADDR> --extent-id N [--revision N]` | Query current write position of an extent |
 
 ## Startup Ordering
 

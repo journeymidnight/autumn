@@ -6,9 +6,11 @@
 /// Subcommands:
 ///   register-node  --addr <node-addr>  --disk <uuid> [--disk <uuid>...]
 ///   create-stream  [--data-shard N]    [--parity-shard N]
-///   stream-info    --stream-id N
+///   stream-info    [--stream-id N]     (omit to list all streams)
 ///   append         --stream-id N  --data <string>  [--owner-key <key>]
 ///   read           --stream-id N  [--length N]  [--owner-key <key>]
+///   alloc-extent   --node <addr>  --extent-id N
+///   commit-length  --node <addr>  --extent-id N  [--revision N]
 
 use std::collections::HashMap;
 
@@ -16,7 +18,8 @@ use anyhow::{anyhow, Context, Result};
 use autumn_proto::autumn::extent_service_client::ExtentServiceClient;
 use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
 use autumn_proto::autumn::{
-    Code, CreateStreamRequest, Empty, ReadBytesRequest, RegisterNodeRequest, StreamInfoRequest,
+    AllocExtentRequest, Code, CommitLengthRequest, CreateStreamRequest, Empty, ReadBytesRequest,
+    RegisterNodeRequest, StreamInfoRequest,
 };
 use autumn_stream::StreamClient;
 use tonic::Request;
@@ -44,6 +47,8 @@ enum Sub {
     StreamInfo { stream_id: u64 },
     Append { stream_id: u64, data: String, owner_key: String },
     Read { stream_id: u64, length: u32, owner_key: String },
+    AllocExtent { node: String, extent_id: u64 },
+    CommitLength { node: String, extent_id: u64, revision: u64 },
 }
 
 fn parse_args() -> Result<Args> {
@@ -133,6 +138,36 @@ fn parse_args() -> Result<Args> {
             }
             if stream_id == 0 { return Err(anyhow!("read requires --stream-id")); }
             Sub::Read { stream_id, length, owner_key }
+        }
+        "alloc-extent" => {
+            let mut node = String::new();
+            let mut extent_id = 0u64;
+            while let Some(tok) = it.next() {
+                match tok.as_str() {
+                    "--node"      => node      = it.next().context("--node needs a value")?.clone(),
+                    "--extent-id" => extent_id = it.next().context("needs value")?.parse()?,
+                    other => return Err(anyhow!("unknown flag: {other}")),
+                }
+            }
+            if node.is_empty() { return Err(anyhow!("alloc-extent requires --node")); }
+            if extent_id == 0 { return Err(anyhow!("alloc-extent requires --extent-id")); }
+            Sub::AllocExtent { node, extent_id }
+        }
+        "commit-length" => {
+            let mut node = String::new();
+            let mut extent_id = 0u64;
+            let mut revision = 0i64;
+            while let Some(tok) = it.next() {
+                match tok.as_str() {
+                    "--node"      => node      = it.next().context("--node needs a value")?.clone(),
+                    "--extent-id" => extent_id = it.next().context("needs value")?.parse()?,
+                    "--revision"  => revision  = it.next().context("needs value")?.parse::<i64>()?,
+                    other => return Err(anyhow!("unknown flag: {other}")),
+                }
+            }
+            if node.is_empty() { return Err(anyhow!("commit-length requires --node")); }
+            if extent_id == 0 { return Err(anyhow!("commit-length requires --extent-id")); }
+            Sub::CommitLength { node, extent_id, revision: revision as u64 }
         }
         other => return Err(anyhow!("unknown subcommand: {other}")),
     };
@@ -302,6 +337,26 @@ async fn cmd_read(
     Ok(())
 }
 
+async fn cmd_alloc_extent(node: &str, extent_id: u64) -> Result<()> {
+    let mut client = ExtentServiceClient::connect(normalize(node)).await?;
+    let resp = client
+        .alloc_extent(Request::new(AllocExtentRequest { extent_id }))
+        .await?
+        .into_inner();
+    println!("disk_id: {}", resp.disk_id);
+    Ok(())
+}
+
+async fn cmd_commit_length(node: &str, extent_id: u64, revision: u64) -> Result<()> {
+    let mut client = ExtentServiceClient::connect(normalize(node)).await?;
+    let resp = client
+        .commit_length(Request::new(CommitLengthRequest { extent_id, revision: revision as i64 }))
+        .await?
+        .into_inner();
+    println!("length: {}", resp.length);
+    Ok(())
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -326,6 +381,10 @@ async fn main() -> Result<()> {
             cmd_append(&args.manager, stream_id, data, owner_key).await?,
         Sub::Read { stream_id, length, owner_key } =>
             cmd_read(&args.manager, stream_id, length, owner_key).await?,
+        Sub::AllocExtent { node, extent_id } =>
+            cmd_alloc_extent(&node, extent_id).await?,
+        Sub::CommitLength { node, extent_id, revision } =>
+            cmd_commit_length(&node, extent_id, revision).await?,
     }
 
     Ok(())

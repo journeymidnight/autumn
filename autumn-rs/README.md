@@ -7,7 +7,6 @@ Rust rewrite of `autumn` (stream layer + partition layer).
 - Rust toolchain (`cargo`, edition 2021 compatible)
 - `protoc` — `brew install protobuf`
 - `etcd` — `brew install etcd` (required for persistent mode)
-- `grpcurl` — `brew install grpcurl` (optional, for raw gRPC testing)
 
 ## Build
 
@@ -119,34 +118,51 @@ $CLI append --stream-id $SID --data "hello"
 $CLI read   --stream-id $SID
 ```
 
-## Raw gRPC with grpcurl
+## Stream layer management (autumn-stream-cli)
 
-The manager has gRPC reflection enabled; no proto files needed.
+Use `autumn-stream-cli` for low-level stream and extent node management.
 
 ```bash
-# list all services
-grpcurl -plaintext 127.0.0.1:9001 list
+CLI=./target/debug/autumn-stream-cli
 
-# describe a message
-grpcurl -plaintext 127.0.0.1:9001 describe autumn.v1.CreateStreamRequest
+# Register an extent node with the stream manager
+$CLI register-node --addr 127.0.0.1:9101 --disk disk-1
 
-# register a node
-grpcurl -plaintext \
-  -d '{"addr":"127.0.0.1:9101","disk_uuids":["disk-a"]}' \
-  127.0.0.1:9001 autumn.v1.StreamManagerService/RegisterNode
+# Create a stream (3 data shards, 0 parity)
+$CLI create-stream --data-shard 3
 
-# create stream
-grpcurl -plaintext \
-  -d '{"data_shard":3,"parity_shard":0}' \
-  127.0.0.1:9001 autumn.v1.StreamManagerService/CreateStream
+# Show info for all streams
+$CLI stream-info
 
-# stream info
-grpcurl -plaintext \
-  -d '{"stream_ids":[1]}' \
-  127.0.0.1:9001 autumn.v1.StreamManagerService/StreamInfo
+# Show info for specific streams
+$CLI stream-info --streams 1,2,3
+
+# Append data to a stream
+$CLI append --stream-id 1 --data "hello"
+
+# Read from a stream
+$CLI read --stream-id 1
 ```
 
-Note: service package is `autumn.v1`, not `autumn`.
+## Cluster management (autumn-client)
+
+Use `autumn-client` for partition-layer and full cluster management.
+
+```bash
+AC=./target/debug/autumn-client
+
+# Show cluster state (nodes, streams, partitions)
+$AC info
+
+# Format a disk and register an extent node
+$AC format --listen 127.0.0.1:9101 --advertise 127.0.0.1:9101 /tmp/d1
+
+# Bootstrap cluster with single partition
+$AC bootstrap --replication 3+0
+
+# Bootstrap with 4 pre-split partitions (hex key space)
+$AC bootstrap --replication 3+0 --presplit 4:hexstring
+```
 
 ## cargo test (unit / integration)
 
@@ -180,13 +196,15 @@ For full manual verification, start the stack with `autumn-client bootstrap` (cr
 Verify that extent metadata (`sealed_length`, `eversion`, `last_revision`) survives a node restart. Each extent writes a `extent-{id}.meta` sidecar file on alloc, seal, recovery, and revision change. The node scans data dir on startup to reload all extents.
 
 ```bash
+SC=./target/debug/autumn-stream-cli
+
 # Start extent node
 ./target/debug/autumn-extent-node --port 9101 --disk-id 1 --data /tmp/d1 &
 sleep 0.5
 
-# Alloc and append to extent 5001
-grpcurl -plaintext -d '{"extent_id":5001}' 127.0.0.1:9101 autumn.ExtentService/AllocExtent
-# expects: "diskId": "1"
+# Alloc extent 5001 on the extent node directly
+$SC alloc-extent --node 127.0.0.1:9101 --extent-id 5001
+# expects: disk_id: 1
 
 # Check meta sidecar file was created
 ls /tmp/d1/extent-5001.meta
@@ -198,9 +216,9 @@ sleep 0.3
 ./target/debug/autumn-extent-node --port 9101 --disk-id 1 --data /tmp/d1 &
 sleep 0.5
 
-# Commit length shows extent was reloaded
-grpcurl -plaintext -d '{"extent_id":5001,"revision":0}' 127.0.0.1:9101 autumn.ExtentService/CommitLength
-# expects: code=OK, length=0 (or whatever was written)
+# Commit length shows extent was reloaded after restart
+$SC commit-length --node 127.0.0.1:9101 --extent-id 5001 --revision 0
+# expects: length: 0 (or whatever was written)
 ```
 
 Automated test:
@@ -353,7 +371,7 @@ $AC --manager 127.0.0.1:9001 format \
 | `autumn-ps` | 9201 | `--psid` (required), `--port`, `--manager`, `--data`, `--advertise` |
 | `autumn-client` | — | `--manager`, subcommands below |
 
-`autumn-stream-cli` subcommands: `register-node`, `create-stream`, `stream-info`, `append`, `read`
+`autumn-stream-cli` subcommands: `register-node`, `create-stream`, `stream-info`, `append`, `read`, `alloc-extent`, `commit-length`
 
 `autumn-client` subcommands: `bootstrap [--presplit N:hexstring]`, `put`, `streamput`, `get`, `del`, `head`, `ls`, `split`, `compact`, `gc`, `forcegc`, `format`, `wbench`, `rbench`, `info`
 
