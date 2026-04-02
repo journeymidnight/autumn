@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use bytes::{Bytes, BytesMut};
 use futures::future::join_all;
 use autumn_proto::autumn::extent_service_client::ExtentServiceClient;
 use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
@@ -264,7 +264,7 @@ impl StreamClient {
     async fn append_payload(
         &mut self,
         stream_id: u64,
-        payload: Vec<u8>,
+        payload: Bytes,
         must_sync: bool,
     ) -> Result<AppendResult> {
         let mut retry = 0usize;
@@ -286,8 +286,6 @@ impl StreamClient {
                 revision,
                 must_sync,
             };
-            // Share payload across replica tasks without copying.
-            let payload_arc: Arc<Vec<u8>> = Arc::new(payload.clone());
 
             // Pre-resolve all extent clients (requires &mut self, so must be sequential).
             let mut clients: Vec<(String, ExtentServiceClient<Channel>)> =
@@ -298,19 +296,20 @@ impl StreamClient {
             }
 
             // Fan out to all replicas in parallel.
+            // Bytes::clone() is O(1) ref-count bump — no data copy.
             let extent_id = tail.extent.extent_id;
             let handles: Vec<_> = clients
                 .into_iter()
                 .map(|(addr, mut client)| {
                     let hdr = header.clone();
-                    let p = payload_arc.clone();
+                    let p = payload.clone(); // O(1) Bytes clone
                     tokio::spawn(async move {
                         let reqs = vec![
                             AppendRequest {
                                 data: Some(append_request::Data::Header(hdr)),
                             },
                             AppendRequest {
-                                data: Some(append_request::Data::Payload((*p).clone())),
+                                data: Some(append_request::Data::Payload(p)),
                             },
                         ];
                         let resp = client.append(Request::new(iter(reqs))).await;
@@ -436,12 +435,12 @@ impl StreamClient {
             .checked_mul(count)
             .ok_or_else(|| anyhow!("append payload too large"))?;
 
-        let mut payload = Vec::with_capacity(total);
+        let mut payload = BytesMut::with_capacity(total);
         for _ in 0..count {
             payload.extend_from_slice(block);
         }
 
-        self.append_payload(stream_id, payload, must_sync).await
+        self.append_payload(stream_id, payload.freeze(), must_sync).await
     }
 
     pub async fn append_batch(
@@ -458,11 +457,21 @@ impl StreamClient {
             acc.checked_add(b.len()).ok_or_else(|| anyhow!("append payload too large"))
         })?;
 
-        let mut payload = Vec::with_capacity(total);
+        let mut payload = BytesMut::with_capacity(total);
         for b in blocks {
             payload.extend_from_slice(b);
         }
 
+        self.append_payload(stream_id, payload.freeze(), must_sync).await
+    }
+
+    /// Append a pre-built Bytes payload directly (avoids an extra copy).
+    pub async fn append_bytes(
+        &mut self,
+        stream_id: u64,
+        payload: Bytes,
+        must_sync: bool,
+    ) -> Result<AppendResult> {
         self.append_payload(stream_id, payload, must_sync).await
     }
 
@@ -472,7 +481,7 @@ impl StreamClient {
         payload: &[u8],
         must_sync: bool,
     ) -> Result<AppendResult> {
-        self.append_payload(stream_id, payload.to_vec(), must_sync).await
+        self.append_payload(stream_id, Bytes::copy_from_slice(payload), must_sync).await
     }
 
     pub async fn commit_length(&mut self, stream_id: u64) -> Result<u32> {

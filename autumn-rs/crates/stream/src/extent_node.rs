@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
-use autumn_io_engine::{build_engine, IoEngine, IoFile, IoMode};
+use autumn_io_engine::{build_engine, Bytes, IoEngine, IoFile, IoMode};
 use autumn_proto::autumn::extent_service_client::ExtentServiceClient;
 use autumn_proto::autumn::extent_service_server::{ExtentService, ExtentServiceServer};
 use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
@@ -432,9 +432,10 @@ impl ExtentNode {
             .truncate(0)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        let payload_len = payload.len() as u64;
         extent
             .file
-            .write_at(0, &payload)
+            .write_at(0, Bytes::from(payload))
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         extent
@@ -442,7 +443,7 @@ impl ExtentNode {
             .sync_all()
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        extent.len.store(payload.len() as u64, Ordering::SeqCst);
+        extent.len.store(payload_len, Ordering::SeqCst);
         extent
             .eversion
             .store(extent_info.eversion, Ordering::SeqCst);
@@ -514,7 +515,7 @@ impl ExtentService for ExtentNode {
     ) -> Result<Response<AppendResponse>, Status> {
         let mut stream = request.into_inner();
         let mut header: Option<AppendRequestHeader> = None;
-        let mut payload = Vec::new();
+        let mut payload = bytes::BytesMut::new();
 
         while let Some(msg) = stream.message().await? {
             match msg.data {
@@ -530,6 +531,7 @@ impl ExtentService for ExtentNode {
                 None => {}
             }
         }
+        let payload = payload.freeze();
 
         let header = header.ok_or_else(|| Status::invalid_argument("append header missing"))?;
         let extent = self.get_extent(header.extent_id).await?;
@@ -609,7 +611,7 @@ impl ExtentService for ExtentNode {
 
         extent
             .file
-            .write_at(start, &payload)
+            .write_at(start, payload.clone())
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         if header.must_sync {
@@ -687,7 +689,9 @@ impl ExtentService for ExtentNode {
                         if tx
                             .send(Ok(ReadBytesResponse {
                                 data: Some(
-                                    autumn_proto::autumn::read_bytes_response::Data::Payload(buf),
+                                    autumn_proto::autumn::read_bytes_response::Data::Payload(
+                                        Bytes::from(buf),
+                                    ),
                                 ),
                             }))
                             .await
@@ -774,7 +778,7 @@ impl ExtentService for ExtentNode {
                 code_des: format!("copied payload too short: {} < {}", payload.len(), want),
             }));
         }
-        let payload = payload[..want].to_vec();
+        let payload = Bytes::from(payload[..want].to_vec());
 
         let _g = extent.write_lock.lock().await;
         extent
@@ -782,9 +786,10 @@ impl ExtentService for ExtentNode {
             .truncate(0)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        let payload_len = payload.len() as u64;
         extent
             .file
-            .write_at(0, &payload)
+            .write_at(0, payload)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         extent
@@ -792,7 +797,7 @@ impl ExtentService for ExtentNode {
             .sync_all()
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        extent.len.store(payload.len() as u64, Ordering::SeqCst);
+        extent.len.store(payload_len, Ordering::SeqCst);
 
         let _ = self.save_meta(req.extent_id, &extent).await;
 
@@ -866,7 +871,9 @@ impl ExtentService for ExtentNode {
                         if tx
                             .send(Ok(CopyExtentResponse {
                                 data: Some(
-                                    autumn_proto::autumn::copy_extent_response::Data::Payload(buf),
+                                    autumn_proto::autumn::copy_extent_response::Data::Payload(
+                                        Bytes::from(buf),
+                                    ),
                                 ),
                             }))
                             .await
@@ -1038,7 +1045,7 @@ impl ExtentService for ExtentNode {
     ) -> Result<Response<Self::HeartbeatStream>, Status> {
         let _ = request.into_inner();
         let payload = Payload {
-            data: b"beat".to_vec(),
+            data: Bytes::from_static(b"beat"),
         };
         let (tx, rx) = mpsc::channel(4);
         tokio::spawn(async move {

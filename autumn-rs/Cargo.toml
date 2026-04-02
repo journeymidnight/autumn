@@ -16,6 +16,7 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 anyhow = "1"
+bytes = "1"
 async-trait = "0.1"
 crossbeam-skiplist = "0.1"
 dashmap = "6"

@@ -38,7 +38,7 @@ fn append_requests(
             })),
         },
         AppendRequest {
-            data: Some(append_request::Data::Payload(payload)),
+            data: Some(append_request::Data::Payload(payload.into())),
         },
     ]
 }

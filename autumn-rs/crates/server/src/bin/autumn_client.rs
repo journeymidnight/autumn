@@ -832,7 +832,7 @@ async fn main() -> Result<()> {
             for chunk in file_bytes.chunks(CHUNK_SIZE) {
                 messages.push(StreamPutRequest {
                     data: Some(autumn_proto::autumn::stream_put_request::Data::Payload(
-                        chunk.to_vec(),
+                        bytes::Bytes::copy_from_slice(chunk),
                     )),
                 });
             }

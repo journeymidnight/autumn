@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+pub use bytes::Bytes;
 
 mod blocking_io;
 mod std_io;
@@ -19,7 +20,7 @@ pub enum IoMode {
 #[async_trait]
 pub trait IoFile: Send + Sync {
     async fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>>;
-    async fn write_at(&self, offset: u64, data: &[u8]) -> Result<()>;
+    async fn write_at(&self, offset: u64, data: Bytes) -> Result<()>;
     async fn truncate(&self, len: u64) -> Result<()>;
     async fn sync_all(&self) -> Result<()>;
     async fn len(&self) -> Result<u64>;

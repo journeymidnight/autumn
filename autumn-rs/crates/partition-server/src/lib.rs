@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use bytes::{Bytes, BytesMut, BufMut};
 use crossbeam_skiplist::SkipMap;
 use autumn_proto::autumn::partition_kv_server::{PartitionKv, PartitionKvServer};
 use autumn_proto::autumn::partition_manager_service_client::PartitionManagerServiceClient;
@@ -1430,7 +1431,7 @@ impl PartitionServer {
             resp_tx: oneshot::Sender<Result<Vec<u8>, Status>>,
         }
 
-        let (valid, blocks, batch_must_sync, log_stream_id, part_sc) = {
+        let (valid, record_sizes, payload, batch_must_sync, log_stream_id, part_sc) = {
             let mut part = part_arc.write().await;
 
             let mut valid: Vec<ValidatedEntry> = Vec::with_capacity(batch.len());
@@ -1461,28 +1462,41 @@ impl PartitionServer {
                 return Ok(());
             }
 
-            // Build blocks for log_stream batch append.
+            // Build a single payload buffer for log_stream batch append.
             // ALL entries (small and large) go to logStream — matches Go design.
-            let blocks: Vec<Vec<u8>> = valid.iter()
-                .map(|e| Self::encode_record(e.op, &e.internal_key, &e.value, e.expires_at))
-                .collect();
+            // Encode directly into one BytesMut instead of N individual Vecs + concat.
+            let total_size: usize = valid.iter()
+                .map(|e| 17 + e.internal_key.len() + e.value.len())
+                .sum();
+            let mut payload_buf = BytesMut::with_capacity(total_size);
+            let mut record_sizes: Vec<u32> = Vec::with_capacity(valid.len());
+            for e in &valid {
+                let before = payload_buf.len();
+                payload_buf.put_u8(e.op);
+                payload_buf.put_u32_le(e.internal_key.len() as u32);
+                payload_buf.put_u32_le(e.value.len() as u32);
+                payload_buf.put_u64_le(e.expires_at);
+                payload_buf.extend_from_slice(&e.internal_key);
+                payload_buf.extend_from_slice(&e.value);
+                record_sizes.push((payload_buf.len() - before) as u32);
+            }
+            let payload = payload_buf.freeze();
 
             // If ANY request in the batch requires sync, the whole batch syncs.
             let batch_must_sync = valid.iter().any(|e| e.must_sync);
             let log_stream_id = part.log_stream_id;
             let part_sc = part.stream_client.clone();
 
-            (valid, blocks, batch_must_sync, log_stream_id, part_sc)
+            (valid, record_sizes, payload, batch_must_sync, log_stream_id, part_sc)
             // write lock released here
         };
 
         // Phase 2: Append to logStream without holding the partition write lock.
         // Reads, flushes, and compaction can proceed concurrently.
-        let block_refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
         let result = {
             let mut sc = part_sc.lock().await;
-            sc.append_batch(log_stream_id, &block_refs, batch_must_sync).await
-                .map_err(|e| anyhow!("log_stream append_batch: {e}"))?
+            sc.append_bytes(log_stream_id, payload, batch_must_sync).await
+                .map_err(|e| anyhow!("log_stream append_bytes: {e}"))?
         };
 
         // Phase 3: Re-acquire write lock to insert into memtable and update VP head.
@@ -1493,7 +1507,7 @@ impl PartitionServer {
             let mut cumulative: u32 = 0;
             for (i, entry) in valid.into_iter().enumerate() {
                 let record_offset = result.offset + cumulative;
-                cumulative += blocks[i].len() as u32;
+                cumulative += record_sizes[i];
 
                 let mem_entry = if entry.value.len() > VALUE_THROTTLE {
                     let vp = ValuePointer {

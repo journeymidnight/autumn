@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 
+use bytes::Bytes;
+
 use crate::{normalize_path, IoEngine, IoFile};
 
 pub struct StdIoEngine;
@@ -78,9 +80,8 @@ impl IoFile for StdIoFile {
         .context("read join")?
     }
 
-    async fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
+    async fn write_at(&self, offset: u64, data: Bytes) -> Result<()> {
         let inner = Arc::clone(&self.inner);
-        let data = data.to_vec();
         tokio::task::spawn_blocking(move || {
             let file = inner.lock().expect("file poisoned");
             #[cfg(unix)]
@@ -155,8 +156,8 @@ mod tests {
         let engine = StdIoEngine;
 
         let file = engine.create(&path).await.expect("create file");
-        file.write_at(0, b"hello").await.expect("write 1");
-        file.write_at(10, b"world").await.expect("write 2");
+        file.write_at(0, Bytes::from_static(b"hello")).await.expect("write 1");
+        file.write_at(10, Bytes::from_static(b"world")).await.expect("write 2");
         file.sync_all().await.expect("sync");
 
         let first = file.read_at(0, 5).await.expect("read first");

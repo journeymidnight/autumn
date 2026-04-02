@@ -9,6 +9,8 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 
+use bytes::Bytes;
+
 use crate::{normalize_path, IoEngine, IoFile};
 
 /// Number of worker threads for parallel file I/O.
@@ -44,7 +46,7 @@ enum Command {
     WriteAt {
         file_id: u64,
         offset: u64,
-        data: Vec<u8>,
+        data: Bytes,
         resp: oneshot::Sender<std::result::Result<(), String>>,
     },
     Truncate {
@@ -258,13 +260,13 @@ impl IoFile for BlockingIoFile {
         out.map_err(|e| anyhow!(e))
     }
 
-    async fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
+    async fn write_at(&self, offset: u64, data: Bytes) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(Command::WriteAt {
                 file_id: self.file_id,
                 offset,
-                data: data.to_vec(),
+                data,
                 resp: resp_tx,
             })
             .await
@@ -337,8 +339,8 @@ mod tests {
         let engine = BlockingIoEngine::new().expect("new blocking engine");
 
         let file = engine.create(&path).await.expect("create file");
-        file.write_at(0, b"hello").await.expect("write 1");
-        file.write_at(10, b"world").await.expect("write 2");
+        file.write_at(0, Bytes::from_static(b"hello")).await.expect("write 1");
+        file.write_at(10, Bytes::from_static(b"world")).await.expect("write 2");
         file.sync_all().await.expect("sync");
 
         let first = file.read_at(0, 5).await.expect("read first");
@@ -361,8 +363,8 @@ mod tests {
         let f1 = engine.create(&path1).await.expect("create f1");
         let f2 = engine.create(&path2).await.expect("create f2");
 
-        f1.write_at(0, b"aaaa").await.expect("write f1");
-        f2.write_at(0, b"bbbb").await.expect("write f2");
+        f1.write_at(0, Bytes::from_static(b"aaaa")).await.expect("write f1");
+        f2.write_at(0, Bytes::from_static(b"bbbb")).await.expect("write f2");
         f1.sync_all().await.expect("sync f1");
         f2.sync_all().await.expect("sync f2");
 
@@ -385,7 +387,7 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 let f = eng.create(&path).await.expect("create");
                 let data = vec![i as u8; 1024];
-                f.write_at(0, &data).await.expect("write");
+                f.write_at(0, Bytes::from(data.clone())).await.expect("write");
                 let read = f.read_at(0, 1024).await.expect("read");
                 assert_eq!(read, data);
             }));
