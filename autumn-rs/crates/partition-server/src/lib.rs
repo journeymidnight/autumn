@@ -258,10 +258,6 @@ struct WriteRequest {
     /// Channel to notify the caller when the write is durable.
     /// Sends back `Ok(user_key)` on success, `Err(Status)` on failure.
     resp_tx: oneshot::Sender<Result<Vec<u8>, Status>>,
-    admitted_at: Option<Instant>,
-    handler_started_at: Instant,
-    send_started_at: Instant,
-    enqueue_at: Instant,
 }
 
 impl WriteRequest {
@@ -279,17 +275,9 @@ impl WriteRequest {
 struct BatchStats {
     ops: u64,
     batch_size: u64,
-    admission_wait_ns: u64,
-    admission_samples: u64,
-    pre_send_ns: u64,
-    send_wait_ns: u64,
-    pre_enqueue_ns: u64,
-    queue_wait_ns: u64,
     phase1_ns: u64,
     phase2_ns: u64,
     phase3_ns: u64,
-    post_enqueue_ns: u64,
-    handler_total_ns: u64,
     end_to_end_ns: u64,
 }
 
@@ -298,17 +286,9 @@ struct WriteLoopMetrics {
     ops: u64,
     batches: u64,
     batch_size_total: u64,
-    admission_wait_ns: u64,
-    admission_samples: u64,
-    pre_send_ns: u64,
-    send_wait_ns: u64,
-    pre_enqueue_ns: u64,
-    queue_wait_ns: u64,
     phase1_ns: u64,
     phase2_ns: u64,
     phase3_ns: u64,
-    post_enqueue_ns: u64,
-    handler_total_ns: u64,
     end_to_end_ns: u64,
 }
 
@@ -319,17 +299,9 @@ impl WriteLoopMetrics {
             ops: 0,
             batches: 0,
             batch_size_total: 0,
-            admission_wait_ns: 0,
-            admission_samples: 0,
-            pre_send_ns: 0,
-            send_wait_ns: 0,
-            pre_enqueue_ns: 0,
-            queue_wait_ns: 0,
             phase1_ns: 0,
             phase2_ns: 0,
             phase3_ns: 0,
-            post_enqueue_ns: 0,
-            handler_total_ns: 0,
             end_to_end_ns: 0,
         }
     }
@@ -341,17 +313,9 @@ impl WriteLoopMetrics {
         self.ops += stats.ops;
         self.batches += 1;
         self.batch_size_total += stats.batch_size;
-        self.admission_wait_ns += stats.admission_wait_ns;
-        self.admission_samples += stats.admission_samples;
-        self.pre_send_ns += stats.pre_send_ns;
-        self.send_wait_ns += stats.send_wait_ns;
-        self.pre_enqueue_ns += stats.pre_enqueue_ns;
-        self.queue_wait_ns += stats.queue_wait_ns;
         self.phase1_ns += stats.phase1_ns;
         self.phase2_ns += stats.phase2_ns;
         self.phase3_ns += stats.phase3_ns;
-        self.post_enqueue_ns += stats.post_enqueue_ns;
-        self.handler_total_ns += stats.handler_total_ns;
         self.end_to_end_ns += stats.end_to_end_ns;
     }
 
@@ -369,7 +333,6 @@ impl WriteLoopMetrics {
 
     fn report(&mut self, part_id: u64) {
         let elapsed = self.started_at.elapsed();
-        let ops = self.ops.max(1);
         let batches = self.batches.max(1);
         tracing::info!(
             part_id,
@@ -378,21 +341,10 @@ impl WriteLoopMetrics {
             ops_per_sec = self.ops as f64 / elapsed.as_secs_f64().max(1e-9),
             avg_batch_size = self.batch_size_total as f64 / batches as f64,
             fill_ratio = self.batch_size_total as f64 / (batches * MAX_WRITE_BATCH as u64) as f64,
-            admission_samples = self.admission_samples,
-            avg_admission_wait_ms = ns_to_ms(self.admission_wait_ns, self.admission_samples.max(1)),
-            avg_pre_send_ms = ns_to_ms(self.pre_send_ns, ops),
-            avg_send_wait_ms = ns_to_ms(self.send_wait_ns, ops),
-            avg_pre_enqueue_ms = ns_to_ms(self.pre_enqueue_ns, ops),
-            avg_queue_wait_ms = ns_to_ms(self.queue_wait_ns, ops),
             avg_phase1_ms = ns_to_ms(self.phase1_ns, batches),
             avg_phase2_ms = ns_to_ms(self.phase2_ns, batches),
             avg_phase3_ms = ns_to_ms(self.phase3_ns, batches),
-            avg_phase1_share_ms = ns_to_ms(self.phase1_ns, ops),
-            avg_phase2_share_ms = ns_to_ms(self.phase2_ns, ops),
-            avg_phase3_share_ms = ns_to_ms(self.phase3_ns, ops),
-            avg_post_enqueue_ms = ns_to_ms(self.post_enqueue_ns, ops),
-            avg_handler_total_ms = ns_to_ms(self.handler_total_ns, ops),
-            avg_end_to_end_ms = ns_to_ms(self.end_to_end_ns, ops),
+            avg_end_to_end_ms = ns_to_ms(self.end_to_end_ns, batches),
             "partition write summary",
         );
         *self = Self::new();
@@ -433,9 +385,6 @@ fn record_write_batch_completion(
     }
     metrics.maybe_report(part_id);
 }
-
-#[derive(Clone, Copy, Debug)]
-struct AdmissionStamp(Instant);
 
 // ---------------------------------------------------------------------------
 // PartitionServer
@@ -1924,18 +1873,10 @@ impl PartitionServer {
             value: Bytes,
             expires_at: u64,
             must_sync: bool,
-            handler_started_at: Instant,
-            enqueue_at: Instant,
             resp_tx: oneshot::Sender<Result<Vec<u8>, Status>>,
         }
 
         let phase1_started_at = Instant::now();
-        let mut admission_wait_ns = 0u64;
-        let mut admission_samples = 0u64;
-        let mut pre_send_ns = 0u64;
-        let mut send_wait_ns = 0u64;
-        let mut pre_enqueue_ns = 0u64;
-        let mut queue_wait_ns = 0u64;
         let (valid, record_sizes, payload, batch_must_sync, log_stream_id, part_sc) = {
             let mut part = part_arc.write().await;
 
@@ -1957,25 +1898,6 @@ impl PartitionServer {
                         .send(Err(Status::invalid_argument("key is out of range")));
                     continue;
                 }
-                if let Some(admitted_at) = req.admitted_at {
-                    admission_wait_ns = admission_wait_ns.saturating_add(duration_to_ns(
-                        req.handler_started_at
-                            .saturating_duration_since(admitted_at),
-                    ));
-                    admission_samples += 1;
-                }
-                pre_send_ns = pre_send_ns.saturating_add(duration_to_ns(
-                    req.send_started_at
-                        .saturating_duration_since(req.handler_started_at),
-                ));
-                send_wait_ns = send_wait_ns.saturating_add(duration_to_ns(
-                    req.enqueue_at
-                        .saturating_duration_since(req.send_started_at),
-                ));
-                pre_enqueue_ns = pre_enqueue_ns.saturating_add(duration_to_ns(
-                    req.enqueue_at
-                        .saturating_duration_since(req.handler_started_at),
-                ));
                 part.seq_number += 1;
                 let seq = part.seq_number;
                 let internal_key = key_with_ts(&user_key, seq);
@@ -1986,13 +1908,8 @@ impl PartitionServer {
                     value,
                     expires_at,
                     must_sync: req.must_sync,
-                    handler_started_at: req.handler_started_at,
-                    enqueue_at: req.enqueue_at,
                     resp_tx: req.resp_tx,
                 });
-                queue_wait_ns = queue_wait_ns.saturating_add(duration_to_ns(
-                    picked_at.saturating_duration_since(req.enqueue_at),
-                ));
             }
 
             if valid.is_empty() {
@@ -2057,12 +1974,7 @@ impl PartitionServer {
 
         // Phase 3: Re-acquire write lock to insert into memtable and update VP head.
         let phase3_started_at = Instant::now();
-        let mut responses: Vec<(
-            Vec<u8>,
-            Instant,
-            Instant,
-            oneshot::Sender<Result<Vec<u8>, Status>>,
-        )> = Vec::new();
+        let mut responses: Vec<(Vec<u8>, oneshot::Sender<Result<Vec<u8>, Status>>)> = Vec::new();
         {
             let mut part = part_arc.write().await;
 
@@ -2093,12 +2005,7 @@ impl PartitionServer {
                 let write_size = (entry.user_key.len() + mem_entry.value.len() + 32) as u64;
                 part.active
                     .insert(entry.internal_key, mem_entry, write_size);
-                responses.push((
-                    entry.user_key.to_vec(),
-                    entry.handler_started_at,
-                    entry.enqueue_at,
-                    entry.resp_tx,
-                ));
+                responses.push((entry.user_key.to_vec(), entry.resp_tx));
             }
 
             // Update VP head to end of this batch.
@@ -2107,7 +2014,7 @@ impl PartitionServer {
 
             if let Err(e) = server.maybe_rotate_locked(&mut part).await {
                 let msg = format!("maybe_rotate: {e}");
-                for (_, _, _, tx) in responses {
+                for (_, tx) in responses {
                     let _ = tx.send(Err(Status::internal(msg.clone())));
                 }
                 return Err(anyhow!(msg));
@@ -2116,38 +2023,17 @@ impl PartitionServer {
         let phase3_elapsed = phase3_started_at.elapsed();
 
         // Notify all callers.
-        let acked_at = Instant::now();
-        let mut post_enqueue_ns = 0u64;
-        let mut handler_total_ns = 0u64;
-        let mut end_to_end_ns = 0u64;
-        for (key, handler_started_at, enqueue_at, tx) in responses {
-            post_enqueue_ns = post_enqueue_ns.saturating_add(duration_to_ns(
-                acked_at.saturating_duration_since(enqueue_at),
-            ));
-            handler_total_ns = handler_total_ns.saturating_add(duration_to_ns(
-                acked_at.saturating_duration_since(handler_started_at),
-            ));
-            end_to_end_ns = end_to_end_ns.saturating_add(duration_to_ns(
-                acked_at.saturating_duration_since(enqueue_at),
-            ));
+        for (key, tx) in responses {
             let _ = tx.send(Ok(key));
         }
 
         Ok(BatchStats {
             ops: record_sizes.len() as u64,
             batch_size: record_sizes.len() as u64,
-            admission_wait_ns,
-            admission_samples,
-            pre_send_ns,
-            send_wait_ns,
-            pre_enqueue_ns,
-            queue_wait_ns,
             phase1_ns: duration_to_ns(phase1_elapsed),
             phase2_ns: duration_to_ns(phase2_elapsed),
             phase3_ns: duration_to_ns(phase3_elapsed),
-            post_enqueue_ns,
-            handler_total_ns,
-            end_to_end_ns,
+            end_to_end_ns: duration_to_ns(picked_at.elapsed()),
         })
     }
 
@@ -2225,12 +2111,6 @@ impl PartitionServer {
             .initial_stream_window_size(Some(32 * 1024 * 1024u32))
             .http2_keepalive_interval(Some(std::time::Duration::from_secs(15)))
             .http2_keepalive_timeout(Some(std::time::Duration::from_secs(5)))
-            .layer(tonic::service::interceptor(|mut request: Request<()>| {
-                request
-                    .extensions_mut()
-                    .insert(AdmissionStamp(Instant::now()));
-                Ok(request)
-            }))
             .add_service(
                 PartitionKvServer::new(self)
                     .max_decoding_message_size(GRPC_MAX_MSG)
@@ -2374,12 +2254,6 @@ impl PartitionServer {
 #[tonic::async_trait]
 impl PartitionKv for PartitionServer {
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
-        let handler_started_at = Instant::now();
-        let admitted_at = request
-            .extensions()
-            .get::<AdmissionStamp>()
-            .copied()
-            .map(|stamp| stamp.0);
         let req = request.into_inner();
         let p = self
             .get_partition_or_sync(req.part_id)
@@ -2391,7 +2265,6 @@ impl PartitionKv for PartitionServer {
             let part = p.read().await;
             part.write_tx.clone()
         };
-        let send_started_at = Instant::now();
         let permit = write_tx
             .reserve()
             .await
@@ -2404,10 +2277,6 @@ impl PartitionKv for PartitionServer {
             },
             must_sync: req.must_sync,
             resp_tx,
-            admitted_at,
-            handler_started_at,
-            send_started_at,
-            enqueue_at: Instant::now(),
         });
 
         let key = resp_rx
@@ -2472,12 +2341,6 @@ impl PartitionKv for PartitionServer {
         &self,
         request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
-        let handler_started_at = Instant::now();
-        let admitted_at = request
-            .extensions()
-            .get::<AdmissionStamp>()
-            .copied()
-            .map(|stamp| stamp.0);
         let req = request.into_inner();
         let p = self
             .get_partition_or_sync(req.part_id)
@@ -2489,7 +2352,6 @@ impl PartitionKv for PartitionServer {
             let part = p.read().await;
             part.write_tx.clone()
         };
-        let send_started_at = Instant::now();
         let permit = write_tx
             .reserve()
             .await
@@ -2500,10 +2362,6 @@ impl PartitionKv for PartitionServer {
             },
             must_sync: req.must_sync,
             resp_tx,
-            admitted_at,
-            handler_started_at,
-            send_started_at,
-            enqueue_at: Instant::now(),
         });
 
         let key = resp_rx

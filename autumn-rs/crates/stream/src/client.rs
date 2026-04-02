@@ -543,12 +543,23 @@ impl StreamClient {
                 });
             }
 
+            let total_elapsed = append_started_at.elapsed();
+            tracing::debug!(
+                stream_id,
+                payload_len = payload.len(),
+                lock_wait_ms = lock_wait.as_secs_f64() * 1000.0,
+                extent_lookup_ms = extent_lookup_elapsed.as_secs_f64() * 1000.0,
+                fanout_ms = fanout_elapsed.as_secs_f64() * 1000.0,
+                total_ms = total_elapsed.as_secs_f64() * 1000.0,
+                retry,
+                "append_payload"
+            );
             self.append_metrics.record(
                 &self.owner_key,
                 lock_wait,
                 extent_lookup_elapsed,
                 fanout_elapsed,
-                append_started_at.elapsed(),
+                total_elapsed,
                 retry as u64,
             );
             return Ok(AppendResult {
