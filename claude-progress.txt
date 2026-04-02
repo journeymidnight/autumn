@@ -1,53 +1,36 @@
-Date: 2026-04-01
+Date: 2026-04-02
 TaskStatus: completed
-Task scope: Performance optimization — eliminate redundant network RPCs
+Task scope: Bug fix — gRPC message size limits causing all puts to fail
 
 Current summary:
-  Implemented 4 performance optimizations targeting unnecessary network round trips.
-  All focused on caching: zero new RPCs on steady-state operations.
+  Fixed two related bugs that caused all put operations to fail:
 
-  1. Cache current_commit in StreamClient (crates/stream/src/client.rs):
-     - Added commit_cache: HashMap<u64, u32> field (keyed by extent_id)
-     - append_payload uses cached value instead of calling current_commit() RPC
-     - First append to any extent still calls current_commit() (crash recovery safety)
-     - Cache updated after every successful append with appended.end
-     - Cache evicted on error, retry, saw_not_found, or extent rollover
-     - Eliminates 1 commit_length RPC per append in steady state
+  1. ExtentNode read_bytes/copy_extent sent entire extent payloads as single gRPC messages.
+     SSTs > 4MB (tonic default) triggered OutOfRange errors during partition recovery.
+     Fix: chunk streaming responses into 1MB pieces.
+     Files: crates/stream/src/extent_node.rs
+     Commit: 071b5364
 
-  2. ClusterClient routing cache (crates/server/src/bin/autumn_client.rs):
-     - Added regions: Vec<(u64, RegionInfo)> and ps_details: HashMap<u64, PsDetail>
-     - connect() calls refresh_regions() once to populate cache at startup
-     - resolve_key(): local lookup_key() with linear scan, refresh+retry on miss
-     - resolve_part_id(): same pattern — local lookup, refresh on miss
-     - all_partitions(): uses cache, no GetRegions RPC
-     - refresh_regions() available for manual invalidation
-     - Eliminates GetRegions() RPC on every put/get/del/head/ls/bench operation
+  2. tonic defaults to 4MB max message size; Go uses 64MB (8MB for manager).
+     PutRequest with large values and AppendRequest payloads both exceeded the limit.
+     Fix: set max_decoding_message_size / max_encoding_message_size = 64MB on all
+     ExtentNode and PartitionServer gRPC endpoints (8MB for manager), matching Go.
+     Files: crates/partition-server/src/lib.rs, crates/stream/src/extent_node.rs,
+            crates/stream/src/client.rs, crates/server/src/bin/autumn_client.rs,
+            crates/manager/src/lib.rs
+     Commit: 303b84fe
 
-  3. Cache extent_info in StreamClient (crates/stream/src/client.rs):
-     - Added extent_info_cache: HashMap<u64, ExtentInfo> field
-     - Added fetch_extent_info() helper: cache-first, populate on miss
-     - read_bytes_from_extent() uses fetch_extent_info() instead of direct manager RPC
-     - get_extent_info() delegates to fetch_extent_info()
-     - On read error: invalidates cache entry for that extent_id
-     - Eliminates extent_info manager RPC on every VP (large value) read
+  Also improved error reporting in part_lookup_to_status (format!("{:#}", err) for
+  full anyhow chain) and added SST parse diagnostics (read_len + preview bytes).
 
-  4. Remove manager RPC from ExtentNode read_bytes (crates/stream/src/extent_node.rs):
-     - Removed extent_info_from_manager() call from read_bytes handler
-     - Uses local ExtentEntry state (eversion atomic) for eversion checks
-     - Seal state is maintained by append path and re_avali RPC — no polling needed
-     - Aligns with Go's extent node which never calls the manager on reads
-     - Eliminates 1 manager RPC per VP read on the server side
+  Root cause of "stale process" cluster issue: cluster.sh stop loses PID files when
+  processes were started in a previous session. Must kill by port or use restart.
 
-  Files changed:
-    crates/stream/src/client.rs
-    crates/stream/src/extent_node.rs
-    crates/server/src/bin/autumn_client.rs
-
-  Tests: cargo test -p autumn-stream -p autumn-partition-server → all pass
+  Tests: cargo test --workspace → all pass
   Build: cargo build --workspace → clean
-
-  Also added F039 to feature_list.md: etcd-watch-based partition routing
-  (the full Go-equivalent solution for automatic routing table updates).
+  Manual: echo hello | $AC put testkey /dev/stdin → ok
+          dd 7MB | $AC put bigkey /tmp/test-7mb.bin → ok
+          $AC get bigkey | wc -c → 7340032 ✓
 
 Main gaps:
   - F039 — Full etcd-watch routing (currently simple one-shot cache)
@@ -57,5 +40,4 @@ Main gaps:
   - Phase 3 perf: binary search in lookup_in_sst (3a)
 
 Next steps:
-  Run wbench --no-sync and rbench to verify improvement.
-  Expected: write p50 ~50ms (was 104ms), read p50 ~5ms (was 48ms).
+  Run wbench and rbench end-to-end benchmarks with the now-working cluster.
