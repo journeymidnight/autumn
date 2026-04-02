@@ -1055,8 +1055,36 @@ async fn main() -> Result<()> {
             if partitions.is_empty() {
                 bail!("no partitions found, run bootstrap first");
             }
-            let partitions = Arc::new(partitions);
-            let manager_addr = Arc::new(args.manager.clone());
+
+            // Pre-connect to each unique PS address once.
+            // PartitionKvClient<Channel> wraps an HTTP/2 Channel which is Clone
+            // and multiplexes all threads over the same TCP connection — no
+            // per-thread connection exhaustion.
+            let mut ps_clients: HashMap<String, PartitionKvClient<Channel>> = HashMap::new();
+            for (_, ps_addr) in &partitions {
+                if !ps_clients.contains_key(ps_addr) {
+                    let endpoint = normalize(ps_addr);
+                    let channel = Endpoint::from_shared(endpoint.clone())?
+                        .connect()
+                        .await
+                        .with_context(|| format!("connect PS {endpoint}"))?;
+                    const GRPC_MAX_MSG: usize = 64 * 1024 * 1024;
+                    ps_clients.insert(
+                        ps_addr.clone(),
+                        PartitionKvClient::new(channel)
+                            .max_decoding_message_size(GRPC_MAX_MSG)
+                            .max_encoding_message_size(GRPC_MAX_MSG),
+                    );
+                }
+            }
+
+            // Build per-thread (part_id, ps_client) pairs by cloning the shared channel.
+            let thread_targets: Vec<(u64, PartitionKvClient<Channel>)> = (0..threads)
+                .map(|tid| {
+                    let (part_id, ps_addr) = &partitions[tid % partitions.len()];
+                    (*part_id, ps_clients[ps_addr].clone())
+                })
+                .collect();
 
             let deadline = Arc::new(std::time::SystemTime::now()
                 + Duration::from_secs(duration_secs));
@@ -1064,51 +1092,33 @@ async fn main() -> Result<()> {
             let total_errors = Arc::new(AtomicU64::new(0));
             let bench_start = Instant::now();
 
-            // Shared result buffer per thread (collect samples)
-            let results: Arc<tokio::sync::Mutex<Vec<BenchResult>>> =
-                Arc::new(tokio::sync::Mutex::new(Vec::new()));
-            let latencies: Arc<tokio::sync::Mutex<Vec<f64>>> =
-                Arc::new(tokio::sync::Mutex::new(Vec::new()));
-
             let mut handles = Vec::new();
-            for tid in 0..threads {
-                let partitions = Arc::clone(&partitions);
-                let manager_addr = Arc::clone(&manager_addr);
+            for (tid, (part_id, mut ps)) in thread_targets.into_iter().enumerate() {
                 let deadline = Arc::clone(&deadline);
                 let total_ops = Arc::clone(&total_ops);
                 let total_errors = Arc::clone(&total_errors);
-                let results = Arc::clone(&results);
-                let latencies = Arc::clone(&latencies);
                 let value_bytes: Vec<u8> = (0..value_size).map(|i| (i % 256) as u8).collect();
 
                 let handle = tokio::spawn(async move {
-                    let mut cc = match ClusterClient::connect(&manager_addr).await {
-                        Ok(c) => c,
-                        Err(e) => { eprintln!("thread {tid} connect error: {e}"); return; }
-                    };
                     let mut seq: u64 = 0;
-                    // Cycle through partitions
-                    let num_parts = partitions.len();
+                    // Per-thread local buffers — merged into global vecs after the run.
+                    let mut local_latencies: Vec<f64> = Vec::new();
+                    let mut local_results: Vec<BenchResult> = Vec::new();
+
                     loop {
                         if std::time::SystemTime::now() >= *deadline {
                             break;
                         }
-                        let (part_id, ps_addr) = &partitions[tid % num_parts];
                         let key = format!("bench_{}_{}", tid, seq);
                         seq += 1;
 
-                        let ps = match cc.get_ps_client(ps_addr).await {
-                            Ok(ps) => ps,
-                            Err(_) => { total_errors.fetch_add(1, Ordering::Relaxed); continue; }
-                        };
                         let t0 = Instant::now();
-                        let op_start =
-                            bench_start.elapsed().as_secs_f64();
+                        let op_start = bench_start.elapsed().as_secs_f64();
                         let res = ps.put(Request::new(PutRequest {
                             key: key.as_bytes().to_vec(),
                             value: value_bytes.clone(),
                             expires_at: 0,
-                            part_id: *part_id,
+                            part_id,
                             must_sync: !nosync,
                         })).await;
                         let elapsed = t0.elapsed();
@@ -1116,17 +1126,24 @@ async fn main() -> Result<()> {
                         match res {
                             Ok(_) => {
                                 total_ops.fetch_add(1, Ordering::Relaxed);
-                                let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
-                                latencies.lock().await.push(elapsed_ms);
-                                results.lock().await.push(BenchResult {
-                                    key: key.clone(),
+                                local_latencies.push(elapsed.as_secs_f64() * 1000.0);
+                                local_results.push(BenchResult {
+                                    key,
                                     start_time: op_start,
                                     elapsed: elapsed.as_secs_f64(),
                                 });
                             }
-                            Err(_) => { total_errors.fetch_add(1, Ordering::Relaxed); }
+                            Err(e) => {
+                                total_errors.fetch_add(1, Ordering::Relaxed);
+                                // Log only the first error per thread to avoid spam.
+                                if seq == 1 {
+                                    eprintln!("thread {tid} put error: {e}");
+                                }
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                            }
                         }
                     }
+                    (local_latencies, local_results)
                 });
                 handles.push(handle);
             }
@@ -1143,7 +1160,14 @@ async fn main() -> Result<()> {
                 }
             });
 
-            for h in handles { h.await.ok(); }
+            let mut all_latencies: Vec<f64> = Vec::new();
+            let mut all_results: Vec<BenchResult> = Vec::new();
+            for h in handles {
+                if let Ok((lats, res)) = h.await {
+                    all_latencies.extend(lats);
+                    all_results.extend(res);
+                }
+            }
             progress.abort();
             eprintln!();
 
@@ -1152,13 +1176,11 @@ async fn main() -> Result<()> {
             let errs = total_errors.load(Ordering::Relaxed);
             if errs > 0 { eprintln!("errors: {errs}"); }
 
-            let mut lat_guard = latencies.lock().await;
             let mut hist = LatencyHist::new();
-            hist.samples_ms = lat_guard.drain(..).collect();
+            hist.samples_ms = all_latencies;
             print_bench_summary("Write", threads, value_size, elapsed, ops, &mut hist);
 
-            let results_guard = results.lock().await;
-            let json = serde_json::to_string_pretty(&*results_guard)?;
+            let json = serde_json::to_string_pretty(&all_results)?;
             tokio::fs::write("write_result.json", json).await?;
             println!("results written to write_result.json");
         }
