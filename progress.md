@@ -1,57 +1,54 @@
 Date: 2026-04-02
 TaskStatus: completed
-Task scope: F020 diagnostic subtask (server-side unary Put timing segmentation)
+Task scope: F020 diagnostic subtask (tonic admission timing in release)
 
 Current summary:
-- Extended `partition write summary` with handler-side timing fields:
-  `avg_pre_send_ms`, `avg_send_wait_ms`, `avg_pre_enqueue_ms`,
-  `avg_post_enqueue_ms`, `avg_handler_total_ms`, plus amortized per-op phase
-  fields `avg_phase1_share_ms`, `avg_phase2_share_ms`, `avg_phase3_share_ms`.
-- Rebuilt `autumn-ps`, brought up a fresh isolated debug cluster with
-  manager=`127.0.0.1:19001`, extent=`127.0.0.1:19101`, ps=`127.0.0.1:19201`,
-  bootstrapped one partition (`part_id=1775122487378`), and reran single-partition
-  `wbench --threads 256 --duration 10 --size 8192 --nosync`.
-- Steady-state baseline (`--channels-per-ps 1`) averaged:
-  `ops/sec ~= 4778.50`, `client p50 ~= 52.22ms`,
-  `avg_pre_enqueue_ms ~= 0.012`,
-  `avg_queue_wait_ms ~= 2.594`,
-  `avg_phase2_share_ms ~= 0.049`,
-  `avg_post_enqueue_ms ~= 4.099`,
-  `avg_handler_total_ms ~= 4.112`,
-  `avg_stream_append_total_ms ~= 1.014`.
-- Spot check with `--channels-per-ps 16` stayed the same shape:
-  `ops/sec ~= 4819.44`, `client p50 ~= 51.25ms`,
-  `avg_pre_enqueue_ms ~= 0.018`,
-  `avg_queue_wait_ms ~= 2.762`,
-  `avg_phase2_share_ms ~= 0.052`,
-  `avg_post_enqueue_ms ~= 4.195`,
-  `avg_handler_total_ms ~= 4.213`,
-  `avg_stream_append_total_ms ~= 0.918`.
-- Conclusion: the application handler itself only costs about `4.1ms` after it
-  starts executing, while client `p50` stays around `51-52ms`. Roughly
-  `47-48ms` is therefore outside the handler timing window, pointing the next
-  investigation at tonic/h2 receive, request dispatch, or runtime scheduling
-  before `PartitionKv::put()` is entered.
+- Added a tonic server interceptor in `autumn-partition-server` that stamps each
+  inbound request at service admission and threads that timestamp into the
+  existing `partition write summary` as `admission_samples` and
+  `avg_admission_wait_ms`.
+- Updated the write-path profiling section in `autumn-rs/README.md` so manual
+  verification now explicitly calls out `avg_admission_wait_ms` as the gap from
+  tonic admission to `PartitionKv::put()` entry.
+- Rebuilt release binaries, then brought up a fresh isolated release cluster
+  with manager=`127.0.0.1:29001`, extent=`127.0.0.1:29101`, ps=`127.0.0.1:29201`,
+  bootstrapped one partition (`part_id=1775123809739`), and reran single-partition
+  `wbench --threads 256 --duration 5 --size 8192 --nosync --part-id 1775123809739`.
+- Release benchmark summary:
+  `ops/sec ~= 22363.34`, `client p50 ~= 11.43ms`, `p95 ~= 13.61ms`,
+  `p99 ~= 19.39ms`.
+- Server-side release summaries during that run showed
+  `admission_samples == ops`,
+  `avg_admission_wait_ms ~= 0.056-0.208`,
+  `avg_queue_wait_ms ~= 0.50-0.76`,
+  `avg_post_enqueue_ms ~= 0.82-1.20`,
+  `avg_handler_total_ms ~= 0.86-1.20`.
+- Conclusion: the new admission probe is working, and in release the
+  interceptor-to-handler gap is sub-millisecond. The large `~50ms` behavior
+  previously observed in debug is not reproduced in release, so handler entry
+  delay is not the dominant remaining source of latency under the optimized
+  build.
 
 Verification:
-- `cargo build -p autumn-server --bin autumn-ps`
-- `cargo test -p autumn-server --bin autumn-client`
-- `cargo test -p autumn-partition-server --lib`
-- Manual benchmark runs on 2026-04-02; outputs stored under
-  `/tmp/autumn-wbench-20260402-channels`,
-  `/tmp/autumn-wbench-20260402-handler`,
-  `/tmp/autumn-wbench-20260402-handler2`
+- `cargo build --release -p autumn-server --bin autumn-ps --bin autumn-client --bin autumn-manager-server --bin autumn-extent-node`
+- `cargo build --release -p autumn-server --bin autumn-stream-cli`
+- `cargo test --release -p autumn-server --bin autumn-client`
+- `cargo test --release -p autumn-partition-server --lib`
+- Manual release cluster + benchmark on 2026-04-02 using
+  `target/release/{autumn-manager-server,autumn-extent-node,autumn-ps,autumn-stream-cli,autumn-client}`
 
 Main gaps:
 - F020 is still not implemented: there is no production connection pool with
   keep-alive heartbeat or shared reuse in the stream client path.
-- The dominant missing segment is no longer inside the application handler; it
-  is earlier in the RPC stack before `PartitionKv::put()` begins running.
+- In release, the dominant missing segment is no longer explained by
+  tonic-admission-to-handler delay; the remaining client/server gap is now
+  outside the instrumented admission + handler window.
 
 Next steps:
-1) Add timing as close as possible to tonic request admission so the gap between
-   socket/h2 delivery and `PartitionKv::put()` entry becomes visible.
-2) Inspect tonic/h2 configuration and runtime behavior under 256 concurrent
-   unary requests before changing storage internals again.
-3) Keep F020 scoped as a production client/runtime improvement, not as the
-   immediate explanation for the current single-partition throughput ceiling.
+1) Compare release `wbench` with `--channels-per-ps > 1` and, if needed,
+   explicit HTTP/2 window tuning to see whether the remaining `~10ms` gap
+   moves with connection-level settings.
+2) Add client-side or transport-edge timing if we need to separate client send,
+   server admission, and response receive more cleanly.
+3) Keep F020 scoped as a production client/runtime improvement, not as a proxy
+   for single-partition debug-build latency.

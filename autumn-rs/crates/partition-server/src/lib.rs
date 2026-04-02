@@ -256,6 +256,7 @@ struct WriteRequest {
     /// Channel to notify the caller when the write is durable.
     /// Sends back `Ok(user_key)` on success, `Err(Status)` on failure.
     resp_tx: oneshot::Sender<Result<Vec<u8>, Status>>,
+    admitted_at: Option<Instant>,
     handler_started_at: Instant,
     send_started_at: Instant,
     enqueue_at: Instant,
@@ -265,6 +266,8 @@ struct WriteRequest {
 struct BatchStats {
     ops: u64,
     batch_size: u64,
+    admission_wait_ns: u64,
+    admission_samples: u64,
     pre_send_ns: u64,
     send_wait_ns: u64,
     pre_enqueue_ns: u64,
@@ -282,6 +285,8 @@ struct WriteLoopMetrics {
     ops: u64,
     batches: u64,
     batch_size_total: u64,
+    admission_wait_ns: u64,
+    admission_samples: u64,
     pre_send_ns: u64,
     send_wait_ns: u64,
     pre_enqueue_ns: u64,
@@ -301,6 +306,8 @@ impl WriteLoopMetrics {
             ops: 0,
             batches: 0,
             batch_size_total: 0,
+            admission_wait_ns: 0,
+            admission_samples: 0,
             pre_send_ns: 0,
             send_wait_ns: 0,
             pre_enqueue_ns: 0,
@@ -321,6 +328,8 @@ impl WriteLoopMetrics {
         self.ops += stats.ops;
         self.batches += 1;
         self.batch_size_total += stats.batch_size;
+        self.admission_wait_ns += stats.admission_wait_ns;
+        self.admission_samples += stats.admission_samples;
         self.pre_send_ns += stats.pre_send_ns;
         self.send_wait_ns += stats.send_wait_ns;
         self.pre_enqueue_ns += stats.pre_enqueue_ns;
@@ -356,6 +365,8 @@ impl WriteLoopMetrics {
             ops_per_sec = self.ops as f64 / elapsed.as_secs_f64().max(1e-9),
             avg_batch_size = self.batch_size_total as f64 / batches as f64,
             fill_ratio = self.batch_size_total as f64 / (batches * MAX_WRITE_BATCH as u64) as f64,
+            admission_samples = self.admission_samples,
+            avg_admission_wait_ms = ns_to_ms(self.admission_wait_ns, self.admission_samples.max(1)),
             avg_pre_send_ms = ns_to_ms(self.pre_send_ns, ops),
             avg_send_wait_ms = ns_to_ms(self.send_wait_ns, ops),
             avg_pre_enqueue_ms = ns_to_ms(self.pre_enqueue_ns, ops),
@@ -385,6 +396,9 @@ fn ns_to_ms(total_ns: u64, denom: u64) -> f64 {
     }
     total_ns as f64 / denom as f64 / 1_000_000.0
 }
+
+#[derive(Clone, Copy, Debug)]
+struct AdmissionStamp(Instant);
 
 // ---------------------------------------------------------------------------
 // PartitionServer
@@ -1830,6 +1844,8 @@ impl PartitionServer {
         }
 
         let phase1_started_at = Instant::now();
+        let mut admission_wait_ns = 0u64;
+        let mut admission_samples = 0u64;
         let mut pre_send_ns = 0u64;
         let mut send_wait_ns = 0u64;
         let mut pre_enqueue_ns = 0u64;
@@ -1854,6 +1870,13 @@ impl PartitionServer {
                         .resp_tx
                         .send(Err(Status::invalid_argument("key is out of range")));
                     continue;
+                }
+                if let Some(admitted_at) = req.admitted_at {
+                    admission_wait_ns = admission_wait_ns.saturating_add(duration_to_ns(
+                        req.handler_started_at
+                            .saturating_duration_since(admitted_at),
+                    ));
+                    admission_samples += 1;
                 }
                 pre_send_ns = pre_send_ns.saturating_add(duration_to_ns(
                     req.send_started_at
@@ -2027,6 +2050,8 @@ impl PartitionServer {
         Ok(BatchStats {
             ops: record_sizes.len() as u64,
             batch_size: record_sizes.len() as u64,
+            admission_wait_ns,
+            admission_samples,
             pre_send_ns,
             send_wait_ns,
             pre_enqueue_ns,
@@ -2108,6 +2133,12 @@ impl PartitionServer {
     pub async fn serve(self, addr: SocketAddr) -> Result<()> {
         const GRPC_MAX_MSG: usize = 64 * 1024 * 1024;
         Server::builder()
+            .layer(tonic::service::interceptor(|mut request: Request<()>| {
+                request
+                    .extensions_mut()
+                    .insert(AdmissionStamp(Instant::now()));
+                Ok(request)
+            }))
             .add_service(
                 PartitionKvServer::new(self)
                     .max_decoding_message_size(GRPC_MAX_MSG)
@@ -2252,6 +2283,11 @@ impl PartitionServer {
 impl PartitionKv for PartitionServer {
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
         let handler_started_at = Instant::now();
+        let admitted_at = request
+            .extensions()
+            .get::<AdmissionStamp>()
+            .copied()
+            .map(|stamp| stamp.0);
         let req = request.into_inner();
         let p = self
             .get_partition_or_sync(req.part_id)
@@ -2276,6 +2312,7 @@ impl PartitionKv for PartitionServer {
             },
             must_sync: req.must_sync,
             resp_tx,
+            admitted_at,
             handler_started_at,
             send_started_at,
             enqueue_at: Instant::now(),
@@ -2344,6 +2381,11 @@ impl PartitionKv for PartitionServer {
         request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
         let handler_started_at = Instant::now();
+        let admitted_at = request
+            .extensions()
+            .get::<AdmissionStamp>()
+            .copied()
+            .map(|stamp| stamp.0);
         let req = request.into_inner();
         let p = self
             .get_partition_or_sync(req.part_id)
@@ -2366,6 +2408,7 @@ impl PartitionKv for PartitionServer {
             },
             must_sync: req.must_sync,
             resp_tx,
+            admitted_at,
             handler_started_at,
             send_started_at,
             enqueue_at: Instant::now(),
