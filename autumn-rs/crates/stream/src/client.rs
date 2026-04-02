@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use futures::future::join_all;
 use autumn_proto::autumn::extent_service_client::ExtentServiceClient;
 use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
 use autumn_proto::autumn::{
@@ -277,29 +279,58 @@ impl StreamClient {
                 self.current_commit(&tail).await?
             };
 
-            let reqs = vec![
-                AppendRequest {
-                    data: Some(append_request::Data::Header(AppendRequestHeader {
-                        extent_id: tail.extent.extent_id,
-                        eversion: tail.extent.eversion,
-                        commit,
-                        revision,
-                        must_sync,
-                    })),
-                },
-                AppendRequest {
-                    data: Some(append_request::Data::Payload(payload.clone())),
-                },
-            ];
+            let header = AppendRequestHeader {
+                extent_id: tail.extent.extent_id,
+                eversion: tail.extent.eversion,
+                commit,
+                revision,
+                must_sync,
+            };
+            // Share payload across replica tasks without copying.
+            let payload_arc: Arc<Vec<u8>> = Arc::new(payload.clone());
+
+            // Pre-resolve all extent clients (requires &mut self, so must be sequential).
+            let mut clients: Vec<(String, ExtentServiceClient<Channel>)> =
+                Vec::with_capacity(tail.replica_addrs.len());
+            for addr in &tail.replica_addrs {
+                let client = self.extent_client(addr).await?;
+                clients.push((addr.clone(), client.clone()));
+            }
+
+            // Fan out to all replicas in parallel.
+            let extent_id = tail.extent.extent_id;
+            let handles: Vec<_> = clients
+                .into_iter()
+                .map(|(addr, mut client)| {
+                    let hdr = header.clone();
+                    let p = payload_arc.clone();
+                    tokio::spawn(async move {
+                        let reqs = vec![
+                            AppendRequest {
+                                data: Some(append_request::Data::Header(hdr)),
+                            },
+                            AppendRequest {
+                                data: Some(append_request::Data::Payload((*p).clone())),
+                            },
+                        ];
+                        let resp = client.append(Request::new(iter(reqs))).await;
+                        (addr, resp)
+                    })
+                })
+                .collect();
+            let results = join_all(handles).await;
 
             let mut first_resp: Option<autumn_proto::autumn::AppendResponse> = None;
             let mut saw_not_found = false;
             let mut append_error = None;
 
-            for addr in &tail.replica_addrs {
-                let resp = {
-                    let ex_client = self.extent_client(addr).await?;
-                    ex_client.append(Request::new(iter(reqs.clone()))).await
+            for join_result in results {
+                let (addr, resp) = match join_result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        append_error = Some(anyhow!("replica task panicked: {e}"));
+                        break;
+                    }
                 };
                 let inner = match resp {
                     Ok(v) => v.into_inner(),
@@ -320,8 +351,7 @@ impl StreamClient {
                 if let Some(first) = &first_resp {
                     if inner.offset != first.offset || inner.end != first.end {
                         append_error = Some(anyhow!(
-                            "replica append offset mismatch on extent {}",
-                            tail.extent.extent_id
+                            "replica append offset mismatch on extent {extent_id}"
                         ));
                         break;
                     }

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 
 use anyhow::{anyhow, Context, Result};
@@ -9,9 +11,15 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{normalize_path, IoEngine, IoFile};
 
+/// Number of worker threads for parallel file I/O.
+/// Each file is pinned to one worker (file_id % num_workers), preserving
+/// per-file ordering while allowing different files to make progress in parallel.
+const NUM_IO_WORKERS: usize = 4;
+
 #[derive(Clone)]
 pub struct BlockingIoEngine {
-    tx: mpsc::Sender<Command>,
+    senders: Vec<mpsc::Sender<Command>>,
+    next_file_id: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -24,7 +32,8 @@ enum Command {
     Open {
         path: PathBuf,
         create: bool,
-        resp: oneshot::Sender<std::result::Result<u64, String>>,
+        file_id: u64,
+        resp: oneshot::Sender<std::result::Result<(), String>>,
     },
     ReadAt {
         file_id: u64,
@@ -58,51 +67,57 @@ enum Command {
 
 impl BlockingIoEngine {
     pub fn new() -> Result<Self> {
-        let (tx, mut rx) = mpsc::channel::<Command>(8192);
-
-        thread::Builder::new()
-            .name("autumn-blocking-io-worker".to_string())
-            .spawn(move || {
-                let mut files: HashMap<u64, std::fs::File> = HashMap::new();
-                let mut next_file_id: u64 = 1;
-
-                while let Some(cmd) = rx.blocking_recv() {
-                    handle_command(cmd, &mut files, &mut next_file_id);
-                }
-            })
-            .context("spawn blocking io worker")?;
-
-        Ok(Self { tx })
+        let mut senders = Vec::with_capacity(NUM_IO_WORKERS);
+        for i in 0..NUM_IO_WORKERS {
+            let (tx, mut rx) = mpsc::channel::<Command>(8192 / NUM_IO_WORKERS + 1);
+            thread::Builder::new()
+                .name(format!("autumn-io-worker-{i}"))
+                .spawn(move || {
+                    let mut files: HashMap<u64, std::fs::File> = HashMap::new();
+                    while let Some(cmd) = rx.blocking_recv() {
+                        handle_command(cmd, &mut files);
+                    }
+                })
+                .context("spawn blocking io worker")?;
+            senders.push(tx);
+        }
+        Ok(Self {
+            senders,
+            next_file_id: Arc::new(AtomicU64::new(1)),
+        })
     }
 
     async fn open_impl(&self, path: &Path, create: bool) -> Result<std::sync::Arc<dyn IoFile>> {
         let path = normalize_path(path);
+        let file_id = self.next_file_id.fetch_add(1, Ordering::Relaxed);
+        let worker_idx = (file_id as usize) % self.senders.len();
+        let tx = &self.senders[worker_idx];
+
         let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(Command::Open {
+            path,
+            create,
+            file_id,
+            resp: resp_tx,
+        })
+        .await
+        .context("send open request")?;
 
-        self.tx
-            .send(Command::Open {
-                path,
-                create,
-                resp: resp_tx,
-            })
-            .await
-            .context("send open request")?;
-
-        let file_id = resp_rx
+        resp_rx
             .await
             .context("open worker dropped")?
             .map_err(|e| anyhow!(e))?;
 
         Ok(std::sync::Arc::new(BlockingIoFile {
             file_id,
-            tx: self.tx.clone(),
+            tx: tx.clone(),
         }))
     }
 }
 
-fn handle_command(cmd: Command, files: &mut HashMap<u64, std::fs::File>, next_file_id: &mut u64) {
+fn handle_command(cmd: Command, files: &mut HashMap<u64, std::fs::File>) {
     match cmd {
-        Command::Open { path, create, resp } => {
+        Command::Open { path, create, file_id, resp } => {
             let mut opts = OpenOptions::new();
             opts.read(true).write(true);
             if create {
@@ -112,10 +127,7 @@ fn handle_command(cmd: Command, files: &mut HashMap<u64, std::fs::File>, next_fi
                 .open(&path)
                 .map_err(|e| format!("open file {}: {e}", path.display()))
                 .map(|f| {
-                    let id = *next_file_id;
-                    *next_file_id += 1;
-                    files.insert(id, f);
-                    id
+                    files.insert(file_id, f);
                 });
             let _ = resp.send(result);
         }
@@ -340,7 +352,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_worker_supports_multi_files() {
+    async fn multi_worker_supports_multi_files() {
         let dir = tempfile::tempdir().expect("tmp dir");
         let path1 = dir.path().join("f1.data");
         let path2 = dir.path().join("f2.data");
@@ -358,5 +370,28 @@ mod tests {
         let v2 = f2.read_at(0, 4).await.expect("read f2");
         assert_eq!(v1, b"aaaa");
         assert_eq!(v2, b"bbbb");
+    }
+
+    #[tokio::test]
+    async fn parallel_writes_to_different_files() {
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let engine = std::sync::Arc::new(BlockingIoEngine::new().expect("new blocking engine"));
+        let n = 8usize;
+        let mut handles = Vec::new();
+
+        for i in 0..n {
+            let eng = engine.clone();
+            let path = dir.path().join(format!("pf{i}.data"));
+            handles.push(tokio::spawn(async move {
+                let f = eng.create(&path).await.expect("create");
+                let data = vec![i as u8; 1024];
+                f.write_at(0, &data).await.expect("write");
+                let read = f.read_at(0, 1024).await.expect("read");
+                assert_eq!(read, data);
+            }));
+        }
+        for h in handles {
+            h.await.expect("task");
+        }
     }
 }

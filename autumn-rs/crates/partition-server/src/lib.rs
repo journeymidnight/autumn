@@ -1352,11 +1352,18 @@ impl PartitionServer {
         part_weak: std::sync::Weak<RwLock<PartitionData>>,
         mut write_rx: mpsc::Receiver<WriteRequest>,
     ) {
+        // 1-deep pipeline: while batch N is doing network I/O (Phase 2 of
+        // process_write_batch), the loop is already collecting batch N+1 from
+        // the channel.  We wait for the previous handle before spawning the
+        // next, which preserves Phase-1 / Phase-3 ordering (seq assignment and
+        // memtable inserts run under the write lock, which is held per-batch).
+        let mut in_flight: Option<tokio::task::JoinHandle<()>> = None;
+
         loop {
             // Block until at least one request arrives.
             let first = match write_rx.recv().await {
                 Some(r) => r,
-                None => return, // channel closed — partition dropped
+                None => break, // channel closed — partition dropped
             };
 
             // Drain additional requests non-blocking to form a batch.
@@ -1365,6 +1372,14 @@ impl PartitionServer {
                 match write_rx.try_recv() {
                     Ok(r) => batch.push(r),
                     Err(_) => break,
+                }
+            }
+
+            // Wait for the previous batch to finish before starting this one.
+            // This ensures seq numbers and memtable inserts remain ordered.
+            if let Some(handle) = in_flight.take() {
+                if let Err(e) = handle.await {
+                    tracing::error!("write batch task panicked: {e}");
                 }
             }
 
@@ -1380,8 +1395,18 @@ impl PartitionServer {
                 }
             };
 
-            if let Err(e) = Self::process_write_batch(&server, &part_arc, batch).await {
-                tracing::error!("write batch error: {e}");
+            let server_clone = server.clone();
+            in_flight = Some(tokio::spawn(async move {
+                if let Err(e) = Self::process_write_batch(&server_clone, &part_arc, batch).await {
+                    tracing::error!("write batch error: {e}");
+                }
+            }));
+        }
+
+        // Drain the last in-flight batch.
+        if let Some(handle) = in_flight {
+            if let Err(e) = handle.await {
+                tracing::error!("write batch task panicked: {e}");
             }
         }
     }
