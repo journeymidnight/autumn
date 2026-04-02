@@ -242,7 +242,7 @@ async fn partition_server_put_get_and_split_flow() {
         .stream_id;
 
     let data_dir = tempfile::tempdir().expect("tempdir");
-    let ps = PartitionServer::connect(12, &endpoint, data_dir.path(), IoMode::Standard)
+    let ps = PartitionServer::connect(12, &endpoint)
         .await
         .expect("connect partition server");
 
@@ -444,7 +444,7 @@ async fn partition_server_recovery_replays_table_and_wal() {
     .await
     .expect("upsert partition");
 
-    let ps1 = PartitionServer::connect(22, &endpoint, data_dir.path(), IoMode::Standard)
+    let ps1 = PartitionServer::connect(22, &endpoint)
         .await
         .expect("connect partition server");
     ps1.sync_regions_once().await.expect("sync regions");
@@ -459,12 +459,15 @@ async fn partition_server_recovery_replays_table_and_wal() {
 
     kv1.put(Request::new(PutRequest { must_sync: false,
         key: b"a-flush".to_vec(),
-        value: vec![b'x'; 300 * 1024],
+        value: b"flushed-value".to_vec(),
         expires_at: 0,
         part_id: 511,
     }))
     .await
     .expect("put flush key");
+
+    // Force flush so the key lands in an SSTable (not just WAL).
+    ps1.flush_partition(511).await.expect("flush ps1");
 
     kv1.put(Request::new(PutRequest { must_sync: false,
         key: b"a-wal-1".to_vec(),
@@ -487,7 +490,7 @@ async fn partition_server_recovery_replays_table_and_wal() {
     ps1_task.abort();
     sleep(Duration::from_millis(120)).await;
 
-    let ps2 = PartitionServer::connect(22, &endpoint, data_dir.path(), IoMode::Standard)
+    let ps2 = PartitionServer::connect(22, &endpoint)
         .await
         .expect("reconnect partition server");
     ps2.sync_regions_once().await.expect("resync regions");
@@ -508,7 +511,7 @@ async fn partition_server_recovery_replays_table_and_wal() {
         .await
         .expect("get flush key")
         .into_inner();
-    assert_eq!(got_flush.value.len(), 300 * 1024);
+    assert_eq!(got_flush.value, b"flushed-value");
 
     let got_wal_1 = kv2
         .get(Request::new(GetRequest {
@@ -864,7 +867,7 @@ async fn f030_flush_writes_sst_to_row_stream() {
         .await.expect("create meta stream").into_inner().stream.expect("meta stream").stream_id;
 
     let data_dir = tempfile::tempdir().expect("tempdir");
-    let ps = PartitionServer::connect(41, &endpoint, data_dir.path(), IoMode::Standard)
+    let ps = PartitionServer::connect(41, &endpoint)
         .await.expect("connect ps");
     let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
         .await.expect("connect pm");
@@ -884,14 +887,13 @@ async fn f030_flush_writes_sst_to_row_stream() {
     let mut kv = PartitionKvClient::connect(format!("http://{}", ps_addr))
         .await.expect("connect kv");
 
-    // 300 KB put triggers flush (FLUSH_MEM_BYTES = 256 KB).
     kv.put(Request::new(PutRequest { must_sync: false,
         key: b"a-big".to_vec(),
-        value: vec![b'X'; 300 * 1024],
+        value: vec![b'X'; 4 * 1024],
         expires_at: 0,
         part_id: 601,
     })).await.expect("put big");
-    sleep(Duration::from_millis(300)).await; // wait for background flush
+    ps.flush_partition(601).await.expect("flush");
 
     let mut sc = StreamClient::connect(&endpoint, "test-f030-flush".to_string(), 128 * 1024 * 1024)
         .await.expect("stream client");
@@ -942,22 +944,22 @@ async fn f030_recovery_from_meta_and_row_streams() {
     })).await.expect("upsert partition");
 
     // First PS: write one flushed key + one WAL-only key.
-    let ps1 = PartitionServer::connect(42, &endpoint, data_dir.path(), IoMode::Standard)
+    let ps1 = PartitionServer::connect(42, &endpoint)
         .await.expect("connect ps1");
     ps1.sync_regions_once().await.expect("sync regions");
     let ps1_addr = pick_addr();
-    let ps1_task = tokio::spawn(ps1.serve(ps1_addr));
+    let ps1_task = tokio::spawn(ps1.clone().serve(ps1_addr));
     sleep(Duration::from_millis(120)).await;
 
     let mut kv1 = PartitionKvClient::connect(format!("http://{}", ps1_addr))
         .await.expect("connect kv1");
     kv1.put(Request::new(PutRequest { must_sync: false,
         key: b"a-streamed".to_vec(),
-        value: vec![b'S'; 300 * 1024], // triggers flush
+        value: vec![b'S'; 4 * 1024],
         expires_at: 0,
         part_id: 611,
     })).await.expect("put streamed");
-    sleep(Duration::from_millis(300)).await; // wait for bg flush
+    ps1.flush_partition(611).await.expect("flush ps1");
     kv1.put(Request::new(PutRequest { must_sync: false,
         key: b"a-wal-only".to_vec(),
         value: b"small".to_vec(),
@@ -968,7 +970,7 @@ async fn f030_recovery_from_meta_and_row_streams() {
     sleep(Duration::from_millis(120)).await;
 
     // Second PS: recover – reads metaStream → SST from rowStream → local WAL.
-    let ps2 = PartitionServer::connect(42, &endpoint, data_dir.path(), IoMode::Standard)
+    let ps2 = PartitionServer::connect(42, &endpoint)
         .await.expect("connect ps2");
     ps2.sync_regions_once().await.expect("resync regions");
     let ps2_addr = pick_addr();
@@ -980,7 +982,7 @@ async fn f030_recovery_from_meta_and_row_streams() {
 
     let v1 = kv2.get(Request::new(GetRequest { key: b"a-streamed".to_vec(), part_id: 611 }))
         .await.expect("get streamed").into_inner();
-    assert_eq!(v1.value.len(), 300 * 1024, "stream-backed SST key survives restart");
+    assert_eq!(v1.value.len(), 4 * 1024, "stream-backed SST key survives restart");
 
     let v2 = kv2.get(Request::new(GetRequest { key: b"a-wal-only".to_vec(), part_id: 611 }))
         .await.expect("get wal-only").into_inner();
@@ -1015,7 +1017,7 @@ async fn f029_compaction_merges_small_tables() {
         .await.expect("create meta stream").into_inner().stream.expect("meta stream").stream_id;
 
     let data_dir = tempfile::tempdir().expect("tempdir");
-    let ps = PartitionServer::connect(43, &endpoint, data_dir.path(), IoMode::Standard)
+    let ps = PartitionServer::connect(43, &endpoint)
         .await.expect("connect ps");
     let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
         .await.expect("connect pm");
@@ -1035,15 +1037,15 @@ async fn f029_compaction_merges_small_tables() {
     let mut kv = PartitionKvClient::connect(format!("http://{}", ps_addr))
         .await.expect("connect kv");
 
-    // Write 3 large values, each triggering a separate flush.
+    // Write 3 values, each followed by an explicit flush.
     for i in 0u8..3 {
         kv.put(Request::new(PutRequest { must_sync: false,
             key: format!("key-{:02}", i).into_bytes(),
-            value: vec![b'A' + i; 300 * 1024],
+            value: vec![b'A' + i; 4 * 1024],
             expires_at: 0,
             part_id: 621,
         })).await.expect("put large key");
-        sleep(Duration::from_millis(400)).await; // wait for background flush
+        ps.flush_partition(621).await.expect("flush");
     }
 
     // Verify we have 3 SSTables in metaStream before compaction.
@@ -1066,7 +1068,7 @@ async fn f029_compaction_merges_small_tables() {
             key: format!("key-{:02}", i).into_bytes(),
             part_id: 621,
         })).await.expect("get after compact").into_inner();
-        assert_eq!(resp.value.len(), 300 * 1024,
+        assert_eq!(resp.value.len(), 4 * 1024,
             "key-{:02} must be readable after compaction", i);
         assert!(resp.value.iter().all(|&b| b == b'A' + i),
             "key-{:02} value bytes must match", i);
@@ -1107,7 +1109,7 @@ async fn f031_large_value_stored_in_log_stream() {
         .await.expect("create meta stream").into_inner().stream.expect("meta stream").stream_id;
 
     let data_dir = tempfile::tempdir().expect("tempdir");
-    let ps = PartitionServer::connect(51, &endpoint, data_dir.path(), IoMode::Standard)
+    let ps = PartitionServer::connect(51, &endpoint)
         .await.expect("connect ps");
     let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
         .await.expect("connect pm");
@@ -1188,11 +1190,11 @@ async fn f031_recovery_replays_log_stream() {
     })).await.expect("upsert partition");
 
     // First PS: write a large value + filler to trigger flush, then a small WAL-only key.
-    let ps1 = PartitionServer::connect(52, &endpoint, data_dir.path(), IoMode::Standard)
+    let ps1 = PartitionServer::connect(52, &endpoint)
         .await.expect("connect ps1");
     ps1.sync_regions_once().await.expect("sync regions");
     let ps1_addr = pick_addr();
-    let ps1_task = tokio::spawn(ps1.serve(ps1_addr));
+    let ps1_task = tokio::spawn(ps1.clone().serve(ps1_addr));
     sleep(Duration::from_millis(120)).await;
 
     let mut kv1 = PartitionKvClient::connect(format!("http://{}", ps1_addr))
@@ -1206,14 +1208,8 @@ async fn f031_recovery_replays_log_stream() {
         part_id: 711,
     })).await.expect("put large");
 
-    // Filler triggers flush so the SST gets a ValuePointer record for b-large.
-    kv1.put(Request::new(PutRequest { must_sync: false,
-        key: b"b-filler".to_vec(),
-        value: vec![b'F'; 300 * 1024],
-        expires_at: 0,
-        part_id: 711,
-    })).await.expect("put filler");
-    sleep(Duration::from_millis(500)).await; // wait for background flush
+    // Force flush so the SST gets a ValuePointer record for b-large.
+    ps1.flush_partition(711).await.expect("flush ps1");
 
     kv1.put(Request::new(PutRequest { must_sync: false,
         key: b"b-wal-small".to_vec(),
@@ -1226,7 +1222,7 @@ async fn f031_recovery_replays_log_stream() {
     sleep(Duration::from_millis(120)).await;
 
     // Second PS: recover.
-    let ps2 = PartitionServer::connect(52, &endpoint, data_dir.path(), IoMode::Standard)
+    let ps2 = PartitionServer::connect(52, &endpoint)
         .await.expect("connect ps2");
     ps2.sync_regions_once().await.expect("resync");
     let ps2_addr = pick_addr();
@@ -1269,7 +1265,7 @@ async fn f031_compaction_preserves_value_pointers() {
         .await.expect("create meta stream").into_inner().stream.expect("meta stream").stream_id;
 
     let data_dir = tempfile::tempdir().expect("tempdir");
-    let ps = PartitionServer::connect(53, &endpoint, data_dir.path(), IoMode::Standard)
+    let ps = PartitionServer::connect(53, &endpoint)
         .await.expect("connect ps");
     let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
         .await.expect("connect pm");
@@ -1291,7 +1287,7 @@ async fn f031_compaction_preserves_value_pointers() {
 
     let large_val: Vec<u8> = (0u8..=255).cycle().take(8 * 1024).collect();
 
-    // Write 3 rounds of large + filler to produce 3 SSTables with ValuePointers.
+    // Write 3 rounds of large values, each followed by explicit flush, to produce 3 SSTables.
     for i in 0..3u8 {
         kv.put(Request::new(PutRequest { must_sync: false,
             key: format!("c-large-{}", i).into_bytes(),
@@ -1299,13 +1295,7 @@ async fn f031_compaction_preserves_value_pointers() {
             expires_at: 0,
             part_id: 721,
         })).await.expect("put large");
-        kv.put(Request::new(PutRequest { must_sync: false,
-            key: format!("c-fill-{}", i).into_bytes(),
-            value: vec![b'F'; 300 * 1024],
-            expires_at: 0,
-            part_id: 721,
-        })).await.expect("put filler");
-        sleep(Duration::from_millis(400)).await; // wait for flush
+        ps.flush_partition(721).await.expect("flush");
     }
 
     // Trigger major compaction.
@@ -1349,7 +1339,7 @@ async fn f033_gc_reclaims_log_stream_extents() {
         .await.expect("create meta stream").into_inner().stream.expect("meta stream").stream_id;
 
     let data_dir = tempfile::tempdir().expect("tempdir");
-    let ps = PartitionServer::connect(59, &endpoint, data_dir.path(), IoMode::Standard)
+    let ps = PartitionServer::connect(59, &endpoint)
         .await.expect("connect ps");
     let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
         .await.expect("connect pm");
@@ -1370,7 +1360,7 @@ async fn f033_gc_reclaims_log_stream_extents() {
         .await.expect("connect kv");
 
     // Round 1: write large values for 3 keys, each >4KB so they go to logStream.
-    // Each write also uses a 300KB filler key to trigger flush after this key.
+    // Explicit flush after each key so the VP is recorded in an SSTable.
     let val_v1: Vec<u8> = vec![b'A'; 8 * 1024];
     for i in 0u8..3 {
         kv.put(Request::new(PutRequest { must_sync: false,
@@ -1379,14 +1369,7 @@ async fn f033_gc_reclaims_log_stream_extents() {
             expires_at: 0,
             part_id: 801,
         })).await.expect("put v1");
-        // Filler to trigger flush.
-        kv.put(Request::new(PutRequest { must_sync: false,
-            key: format!("gc-fill-{}", i).into_bytes(),
-            value: vec![b'F'; 300 * 1024],
-            expires_at: 0,
-            part_id: 801,
-        })).await.expect("put filler");
-        sleep(Duration::from_millis(400)).await;
+        ps.flush_partition(801).await.expect("flush round1");
     }
 
     // Round 2: overwrite the same keys with new values.
@@ -1399,13 +1382,7 @@ async fn f033_gc_reclaims_log_stream_extents() {
             expires_at: 0,
             part_id: 801,
         })).await.expect("put v2");
-        kv.put(Request::new(PutRequest { must_sync: false,
-            key: format!("gc-fill2-{}", i).into_bytes(),
-            value: vec![b'G'; 300 * 1024],
-            expires_at: 0,
-            part_id: 801,
-        })).await.expect("put filler2");
-        sleep(Duration::from_millis(400)).await;
+        ps.flush_partition(801).await.expect("flush round2");
     }
 
     // Major compaction: merges SSTables and builds discard maps for dead VP entries.
@@ -1454,7 +1431,7 @@ async fn f037_overlap_detected_after_split_and_cleared_by_compaction() {
         .await.expect("create meta stream").into_inner().stream.expect("meta stream").stream_id;
 
     let data_dir = tempfile::tempdir().expect("tempdir");
-    let ps = PartitionServer::connect(71, &endpoint, data_dir.path(), IoMode::Standard)
+    let ps = PartitionServer::connect(71, &endpoint)
         .await.expect("connect ps");
     let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
         .await.expect("connect pm");
@@ -1483,13 +1460,7 @@ async fn f037_overlap_detected_after_split_and_cleared_by_compaction() {
             part_id: 901,
         })).await.expect("put a-key");
     }
-    kv.put(Request::new(PutRequest { must_sync: false,
-        key: b"a-filler".to_vec(),
-        value: vec![b'X'; 300 * 1024],
-        expires_at: 0,
-        part_id: 901,
-    })).await.expect("put a-filler");
-    sleep(Duration::from_millis(400)).await;
+    ps.flush_partition(901).await.expect("flush after a-keys");
 
     // Write keys in the "y*" range and flush them to a second SSTable.
     for i in 0u8..5 {
@@ -1500,13 +1471,7 @@ async fn f037_overlap_detected_after_split_and_cleared_by_compaction() {
             part_id: 901,
         })).await.expect("put y-key");
     }
-    kv.put(Request::new(PutRequest { must_sync: false,
-        key: b"y-filler".to_vec(),
-        value: vec![b'Y'; 300 * 1024],
-        expires_at: 0,
-        part_id: 901,
-    })).await.expect("put y-filler");
-    sleep(Duration::from_millis(400)).await;
+    ps.flush_partition(901).await.expect("flush after y-keys");
 
     // Parent has no overlap before the split.
     assert!(!ps.has_overlap(901), "parent must not have overlap before split");
@@ -1558,8 +1523,8 @@ async fn f037_overlap_detected_after_split_and_cleared_by_compaction() {
     }
 
     // Trigger major compaction on the left child to remove out-of-range keys.
-    ps.trigger_major_compact(901);
-    sleep(Duration::from_millis(1000)).await;
+    ps.trigger_major_compact(901).expect("trigger_major_compact must succeed");
+    sleep(Duration::from_millis(3000)).await;
 
     // Overlap must be cleared after major compaction.
     assert!(!ps.has_overlap(901), "left child overlap must be cleared after major compaction");

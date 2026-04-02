@@ -248,9 +248,9 @@ Operates on **user keys only** (8-byte MVCC suffix stripped before hashing). 1% 
 | Constant | Value | Meaning |
 |----------|-------|---------|
 | `VALUE_THROTTLE` | 4 KB | Large value threshold (store as VP) |
-| `FLUSH_MEM_BYTES` | 256 KB | Memtable size trigger for rotation |
-| `FLUSH_MEM_OPS` | 512 | Memtable op count trigger |
+| `FLUSH_MEM_BYTES` | 64 MB | Memtable size trigger for rotation |
 | `MAX_SKIP_LIST` | 64 MB | Maximum skip list size |
+| `MAX_WRITE_BATCH` | 256 | Max requests per group-commit batch |
 | `BLOCK_SIZE_TARGET` | 64 KB | Target SSTable block size |
 | `GC_DISCARD_RATIO` | 0.4 (40%) | Min discard ratio to trigger GC |
 | `OP_VALUE_POINTER` | 0x80 | Op flag bit for ValuePointer entries |
@@ -267,9 +267,9 @@ Operates on **user keys only** (8-byte MVCC suffix stripped before hashing). 1% 
 
 5. **No local WAL file** — logStream is the sole WAL. All writes (small and large) go to logStream via `append_batch`. Recovery reads logStream from the VP head checkpoint in metaStream. If no checkpoint exists (tables is empty AND vp_eid == 0), recovery replays logStream from the very first extent, offset 0 — this covers partitions that accepted writes but were killed before their first flush. Unflushed imm tables that are in memory are also covered: logStream contains all records newer than the last SSTable flush.
 
-6. **Group commit batching** — the background_write_loop drains up to MAX_WRITE_BATCH (128) requests per RPC cycle. If ANY request in a batch has `must_sync=true`, the entire batch is synced. This allows `--nosync` clients to piggyback on sync requests from other clients without extra overhead.
+6. **Group commit batching** — the background_write_loop drains up to MAX_WRITE_BATCH (256) requests per RPC cycle. If ANY request in a batch has `must_sync=true`, the entire batch is synced. This allows `--nosync` clients to piggyback on sync requests from other clients without extra overhead.
 
-7. **Per-partition StreamClient** — each `PartitionData` holds its own `stream_client: Arc<Mutex<StreamClient>>` created via `StreamClient::new_with_revision`. This eliminates cross-partition serialization: different partitions can append to logStream concurrently. The server-level `PartitionServer.stream_client` is used only in `split_part` for coordination RPCs.
+7. **Per-partition StreamClient** — each `PartitionData` holds its own `stream_client: Arc<StreamClient>` (no Mutex) created via `StreamClient::new_with_revision`. StreamClient is internally concurrent via per-stream locking (`DashMap<stream_id, Arc<Mutex<StreamAppendState>>>`). Different streams (log/row/meta) are fully concurrent; the same stream is serialized. The server-level `PartitionServer.stream_client` is used only in `split_part` for coordination RPCs.
 
 8. **`process_write_batch` lock scope** — the write lock is held only for seq number assignment and block encoding (Phase 1), then released before the `append_batch` network RPC (Phase 2), then re-acquired for memtable insert and VP head update (Phase 3). This prevents the partition write lock from blocking reads/flushes/compaction during network I/O.
 

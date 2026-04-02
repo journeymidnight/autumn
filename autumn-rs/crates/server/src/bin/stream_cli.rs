@@ -230,7 +230,7 @@ async fn cmd_stream_info(manager: &str, stream_id: u64) -> Result<()> {
 }
 
 async fn cmd_append(manager: &str, stream_id: u64, data: String, owner_key: String) -> Result<()> {
-    let mut client = StreamClient::connect(manager, owner_key, 256 * 1024 * 1024).await?;
+    let client = StreamClient::connect(manager, owner_key, 256 * 1024 * 1024).await?;
     let result = client.append(stream_id, data.as_bytes(), true).await?;
     println!("extent_id : {}", result.extent_id);
     println!("offset    : {}", result.offset);

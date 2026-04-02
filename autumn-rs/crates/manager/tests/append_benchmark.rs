@@ -45,7 +45,7 @@ fn batch_count(iter: usize, total_blocks: usize, batch_size: usize, num_reqs: us
 }
 
 async fn bench_worker(
-    mut client: StreamClient,
+    client: Arc<StreamClient>,
     stream_id: u64,
     payload: Arc<Vec<u8>>,
     must_sync: bool,
@@ -137,9 +137,11 @@ async fn benchmark_append_stream_throughput() {
     let max_extent_size = 512 * 1024 * 1024;
     let payload = Arc::new(vec![b'x'; payload_size]);
     const BATCH_SIZE: usize = 16;
-    let mut client = StreamClient::connect(&endpoint, "owner/bench/0".to_string(), max_extent_size)
-        .await
-        .expect("stream client");
+    let client = Arc::new(
+        StreamClient::connect(&endpoint, "owner/bench/0".to_string(), max_extent_size)
+            .await
+            .expect("stream client"),
+    );
 
     let warmup_reqs = warmup_ops.div_ceil(BATCH_SIZE);
     for i in 0..warmup_reqs {
@@ -154,7 +156,7 @@ async fn benchmark_append_stream_throughput() {
     let mut req_txs = Vec::with_capacity(depth);
     let mut workers = Vec::with_capacity(depth);
     for _ in 0..depth {
-        let worker_client = client.clone();
+        let worker_client = Arc::clone(&client);
         let (req_tx, req_rx) = mpsc::channel::<usize>(depth * 2);
         req_txs.push(req_tx);
         workers.push(tokio::spawn(bench_worker(

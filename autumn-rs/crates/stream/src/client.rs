@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use bytes::{Bytes, BytesMut};
+use dashmap::DashMap;
 use futures::future::join_all;
 use autumn_proto::autumn::extent_service_client::ExtentServiceClient;
 use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
@@ -12,6 +13,7 @@ use autumn_proto::autumn::{
     NodesInfoResponse, PunchHolesRequest, ReadBytesRequest, ReadBytesResponseHeader,
     StreamAllocExtentRequest, StreamInfo, StreamInfoRequest, TruncateRequest,
 };
+use tokio::sync::Mutex;
 use tokio_stream::iter;
 use tonic::transport::Channel;
 use tonic::Request;
@@ -23,28 +25,35 @@ pub struct AppendResult {
     pub end: u32,
 }
 
+#[derive(Debug, Clone)]
+struct StreamTail {
+    extent: ExtentInfo,
+    replica_addrs: Vec<String>,
+}
 
-#[derive(Clone)]
+/// Per-stream append state: tail info and commit cache.
+/// Protected by a Mutex so appends to the same stream are serialized,
+/// while appends to different streams are fully concurrent.
+struct StreamAppendState {
+    tail: Option<StreamTail>,
+    commit: Option<u32>,
+}
+
+/// A lock-free StreamClient where operations on different stream_ids
+/// never block each other.  No external Mutex is required.
 pub struct StreamClient {
     manager: StreamManagerServiceClient<Channel>,
     owner_key: String,
     revision: i64,
     max_extent_size: u32,
-    extent_clients: HashMap<String, ExtentServiceClient<Channel>>,
-    stream_tails: HashMap<u64, StreamTail>,
-    nodes_cache: HashMap<u64, String>,
-    /// Cached commit position per extent_id. Updated after every successful append,
-    /// eliminating the commit_length RPC on steady-state writes.
-    commit_cache: HashMap<u64, u32>,
-    /// Cached ExtentInfo per extent_id for read path, eliminating the extent_info
-    /// manager RPC on every ValuePointer read.
-    extent_info_cache: HashMap<u64, ExtentInfo>,
-}
-
-#[derive(Debug, Clone)]
-struct StreamTail {
-    extent: ExtentInfo,
-    replica_addrs: Vec<String>,
+    /// gRPC connections to extent nodes, keyed by address.
+    extent_clients: DashMap<String, ExtentServiceClient<Channel>>,
+    /// Node-id → address map (refreshed on miss).
+    nodes_cache: DashMap<u64, String>,
+    /// Cached ExtentInfo for read path.
+    extent_info_cache: DashMap<u64, ExtentInfo>,
+    /// Per-stream tail + commit state, each individually locked.
+    stream_states: DashMap<u64, Arc<Mutex<StreamAppendState>>>,
 }
 
 impl StreamClient {
@@ -70,17 +79,15 @@ impl StreamClient {
             owner_key,
             revision: lock.revision,
             max_extent_size,
-            extent_clients: HashMap::new(),
-            stream_tails: HashMap::new(),
-            nodes_cache: HashMap::new(),
-            commit_cache: HashMap::new(),
-            extent_info_cache: HashMap::new(),
+            extent_clients: DashMap::new(),
+            nodes_cache: DashMap::new(),
+            extent_info_cache: DashMap::new(),
+            stream_states: DashMap::new(),
         })
     }
 
     /// Create a StreamClient that reuses an existing owner-lock revision without
-    /// calling `acquire_owner_lock` again.  Used to create per-partition clients
-    /// that share the same fencing identity as the server-level client.
+    /// calling `acquire_owner_lock` again.
     pub async fn new_with_revision(
         manager_endpoint: &str,
         owner_key: String,
@@ -94,54 +101,60 @@ impl StreamClient {
             owner_key,
             revision,
             max_extent_size,
-            extent_clients: HashMap::new(),
-            stream_tails: HashMap::new(),
-            nodes_cache: HashMap::new(),
-            commit_cache: HashMap::new(),
-            extent_info_cache: HashMap::new(),
+            extent_clients: DashMap::new(),
+            nodes_cache: DashMap::new(),
+            extent_info_cache: DashMap::new(),
+            stream_states: DashMap::new(),
         })
     }
 
     pub fn revision(&self) -> i64 { self.revision }
     pub fn owner_key(&self) -> &str { &self.owner_key }
 
-    async fn extent_client(&mut self, addr: &str) -> Result<&mut ExtentServiceClient<Channel>> {
-        if !self.extent_clients.contains_key(addr) {
-            let endpoint = normalize_endpoint(addr);
-            let channel = tonic::transport::Endpoint::from_shared(endpoint)?
-                .connect().await?;
-            const GRPC_MAX_MSG: usize = 64 * 1024 * 1024;
-            let client = ExtentServiceClient::new(channel)
-                .max_decoding_message_size(GRPC_MAX_MSG)
-                .max_encoding_message_size(GRPC_MAX_MSG);
-            self.extent_clients.insert(addr.to_string(), client);
+    // ── internal helpers ─────────────────────────────────────────────────────
+
+    /// Return a cloned gRPC client for the given node address,
+    /// creating and caching the connection on first use.
+    async fn extent_client(&self, addr: &str) -> Result<ExtentServiceClient<Channel>> {
+        if let Some(client) = self.extent_clients.get(addr) {
+            return Ok(client.clone());
         }
-        self.extent_clients
-            .get_mut(addr)
-            .ok_or_else(|| anyhow!("missing extent client for {}", addr))
+        let endpoint = normalize_endpoint(addr);
+        let channel = tonic::transport::Endpoint::from_shared(endpoint)?
+            .connect()
+            .await?;
+        const GRPC_MAX_MSG: usize = 64 * 1024 * 1024;
+        let client = ExtentServiceClient::new(channel)
+            .max_decoding_message_size(GRPC_MAX_MSG)
+            .max_encoding_message_size(GRPC_MAX_MSG);
+        // Benign race: two tasks may create connections concurrently; the second
+        // insert simply overwrites the first — both connections are valid.
+        self.extent_clients.insert(addr.to_string(), client.clone());
+        Ok(client)
     }
 
-    async fn refresh_nodes_map(&mut self) -> Result<()> {
+    async fn refresh_nodes_map(&self) -> Result<()> {
         let resp: NodesInfoResponse = self
             .manager
+            .clone()
             .nodes_info(Request::new(autumn_proto::autumn::Empty {}))
             .await?
             .into_inner();
         if resp.code != Code::Ok as i32 {
             return Err(anyhow!("nodes_info failed: {}", resp.code_des));
         }
-        self.nodes_cache = resp
-            .nodes
-            .into_iter()
-            .map(|(id, node)| (id, node.address))
-            .collect();
+        self.nodes_cache.clear();
+        for (id, node) in resp.nodes {
+            self.nodes_cache.insert(id, node.address);
+        }
         Ok(())
     }
 
-    fn replica_addrs(ex: &ExtentInfo, nodes: &HashMap<u64, String>) -> Result<Vec<String>> {
+    fn replica_addrs_from_cache(&self, ex: &ExtentInfo) -> Result<Vec<String>> {
         let mut addrs = Vec::with_capacity(ex.replicates.len() + ex.parity.len());
         for node_id in ex.replicates.iter().chain(ex.parity.iter()) {
-            let addr = nodes
+            let addr = self
+                .nodes_cache
                 .get(node_id)
                 .ok_or_else(|| anyhow!("node {} missing", node_id))?;
             addrs.push(addr.clone());
@@ -152,35 +165,35 @@ impl StreamClient {
         Ok(addrs)
     }
 
-    async fn replica_addrs_for_extent(&mut self, ex: &ExtentInfo) -> Result<Vec<String>> {
+    async fn replica_addrs_for_extent(&self, ex: &ExtentInfo) -> Result<Vec<String>> {
         if self.nodes_cache.is_empty() {
             self.refresh_nodes_map().await?;
         }
-        if let Ok(addrs) = Self::replica_addrs(ex, &self.nodes_cache) {
+        if let Ok(addrs) = self.replica_addrs_from_cache(ex) {
             return Ok(addrs);
         }
-
         self.refresh_nodes_map().await?;
-        Self::replica_addrs(ex, &self.nodes_cache)
+        self.replica_addrs_from_cache(ex)
     }
 
-    async fn cache_stream_tail(
-        &mut self,
-        stream_id: u64,
-        extent: ExtentInfo,
-    ) -> Result<StreamTail> {
-        let replica_addrs = self.replica_addrs_for_extent(&extent).await?;
-        let tail = StreamTail {
-            extent,
-            replica_addrs,
-        };
-        self.stream_tails.insert(stream_id, tail.clone());
-        Ok(tail)
+    /// Get or create the per-stream append state (returned as Arc so the caller
+    /// can lock it after releasing the DashMap shard lock).
+    fn stream_state(&self, stream_id: u64) -> Arc<Mutex<StreamAppendState>> {
+        if let Some(s) = self.stream_states.get(&stream_id) {
+            return s.clone();
+        }
+        let state = Arc::new(Mutex::new(StreamAppendState {
+            tail: None,
+            commit: None,
+        }));
+        self.stream_states.insert(stream_id, state.clone());
+        state
     }
 
-    async fn load_stream_tail(&mut self, stream_id: u64) -> Result<StreamTail> {
+    async fn load_stream_tail(&self, stream_id: u64) -> Result<StreamTail> {
         let resp = self
             .manager
+            .clone()
             .stream_info(Request::new(StreamInfoRequest {
                 stream_ids: vec![stream_id],
             }))
@@ -206,19 +219,15 @@ impl StreamClient {
             .get(&tail_id)
             .cloned()
             .ok_or_else(|| anyhow!("tail extent {} not found", tail_id))?;
-        self.cache_stream_tail(stream_id, tail_extent).await
+
+        let replica_addrs = self.replica_addrs_for_extent(&tail_extent).await?;
+        Ok(StreamTail { extent: tail_extent, replica_addrs })
     }
 
-    async fn stream_tail(&mut self, stream_id: u64) -> Result<StreamTail> {
-        if let Some(tail) = self.stream_tails.get(&stream_id) {
-            return Ok(tail.clone());
-        }
-        self.load_stream_tail(stream_id).await
-    }
-
-    async fn check_commit(&mut self, stream_id: u64) -> Result<(StreamInfo, ExtentInfo, u32)> {
+    async fn check_commit(&self, stream_id: u64) -> Result<(StreamInfo, ExtentInfo, u32)> {
         let resp = self
             .manager
+            .clone()
             .check_commit_length(Request::new(CheckCommitLengthRequest {
                 stream_id,
                 owner_key: self.owner_key.clone(),
@@ -238,12 +247,13 @@ impl StreamClient {
     }
 
     async fn alloc_new_extent(
-        &mut self,
+        &self,
         stream_id: u64,
         end: u32,
     ) -> Result<(StreamInfo, ExtentInfo)> {
         let resp = self
             .manager
+            .clone()
             .stream_alloc_extent(Request::new(StreamAllocExtentRequest {
                 stream_id,
                 owner_key: self.owner_key.clone(),
@@ -261,22 +271,35 @@ impl StreamClient {
         ))
     }
 
+    /// Core append implementation.  Acquires the per-stream state lock so that
+    /// appends to the same stream are serialized while different streams are
+    /// fully concurrent.
     async fn append_payload(
-        &mut self,
+        &self,
         stream_id: u64,
         payload: Bytes,
         must_sync: bool,
     ) -> Result<AppendResult> {
+        let state_arc = self.stream_state(stream_id);
+        let mut state = state_arc.lock().await;
+
         let mut retry = 0usize;
         loop {
-            let tail = self.stream_tail(stream_id).await?;
+            // Resolve stream tail (cached).
+            let tail = match &state.tail {
+                Some(t) => t.clone(),
+                None => {
+                    let t = self.load_stream_tail(stream_id).await?;
+                    state.tail = Some(t.clone());
+                    t
+                }
+            };
+
             let revision = self.revision;
-            // Use cached commit if available (avoids a commit_length RPC per append).
-            // First append to any extent always fetches from replicas (crash recovery).
-            let commit = if let Some(&cached) = self.commit_cache.get(&tail.extent.extent_id) {
-                cached
-            } else {
-                self.current_commit(&tail).await?
+            // Use cached commit if available.
+            let commit = match state.commit {
+                Some(c) => c,
+                None => self.current_commit(&tail).await?,
             };
 
             let header = AppendRequestHeader {
@@ -287,16 +310,15 @@ impl StreamClient {
                 must_sync,
             };
 
-            // Pre-resolve all extent clients (requires &mut self, so must be sequential).
+            // Pre-resolve extent clients.
             let mut clients: Vec<(String, ExtentServiceClient<Channel>)> =
                 Vec::with_capacity(tail.replica_addrs.len());
             for addr in &tail.replica_addrs {
                 let client = self.extent_client(addr).await?;
-                clients.push((addr.clone(), client.clone()));
+                clients.push((addr.clone(), client));
             }
 
             // Fan out to all replicas in parallel.
-            // Bytes::clone() is O(1) ref-count bump — no data copy.
             let extent_id = tail.extent.extent_id;
             let handles: Vec<_> = clients
                 .into_iter()
@@ -360,16 +382,27 @@ impl StreamClient {
             }
 
             if saw_not_found {
-                self.commit_cache.remove(&tail.extent.extent_id);
-                let (_, new_tail) = self.alloc_new_extent(stream_id, 0).await?;
-                let _ = self.cache_stream_tail(stream_id, new_tail).await?;
+                state.commit = None;
+                state.tail = None;
+                let (_, new_tail_ext) = self.alloc_new_extent(stream_id, 0).await?;
+                let replica_addrs = self.replica_addrs_for_extent(&new_tail_ext).await?;
+                state.tail = Some(StreamTail { extent: new_tail_ext, replica_addrs });
                 continue;
             }
             if let Some(err) = append_error {
-                self.commit_cache.remove(&tail.extent.extent_id);
-                self.stream_tails.remove(&stream_id);
+                state.commit = None;
+                state.tail = None;
                 retry += 1;
                 if retry <= 3 {
+                    // Reload tail; if it's sealed (e.g., after a stream split), allocate a new extent.
+                    let fresh = self.load_stream_tail(stream_id).await?;
+                    if fresh.extent.sealed_length > 0 {
+                        let (_, new_tail_ext) = self.alloc_new_extent(stream_id, 0).await?;
+                        let replica_addrs = self.replica_addrs_for_extent(&new_tail_ext).await?;
+                        state.tail = Some(StreamTail { extent: new_tail_ext, replica_addrs });
+                    } else {
+                        state.tail = Some(fresh);
+                    }
                     continue;
                 }
                 return Err(err);
@@ -377,13 +410,15 @@ impl StreamClient {
             let appended =
                 first_resp.ok_or_else(|| anyhow!("append failed: no replica response"))?;
 
-            // Cache the commit position for the next append.
-            self.commit_cache.insert(tail.extent.extent_id, appended.end);
+            // Update cached commit for next append.
+            state.commit = Some(appended.end);
 
             if appended.end >= self.max_extent_size {
-                self.commit_cache.remove(&tail.extent.extent_id);
-                let (_, new_tail) = self.alloc_new_extent(stream_id, appended.end).await?;
-                let _ = self.cache_stream_tail(stream_id, new_tail).await?;
+                state.commit = None;
+                state.tail = None;
+                let (_, new_tail_ext) = self.alloc_new_extent(stream_id, appended.end).await?;
+                let replica_addrs = self.replica_addrs_for_extent(&new_tail_ext).await?;
+                state.tail = Some(StreamTail { extent: new_tail_ext, replica_addrs });
             }
 
             return Ok(AppendResult {
@@ -394,13 +429,13 @@ impl StreamClient {
         }
     }
 
-    async fn current_commit(&mut self, tail: &StreamTail) -> Result<u32> {
+    async fn current_commit(&self, tail: &StreamTail) -> Result<u32> {
         let mut min_len: Option<u32> = None;
         let revision = self.revision;
         for addr in &tail.replica_addrs {
             let resp = {
-                let ex_client = self.extent_client(addr).await?;
-                ex_client
+                let mut client = self.extent_client(addr).await?;
+                client
                     .commit_length(Request::new(CommitLengthRequest {
                         extent_id: tail.extent.extent_id,
                         revision,
@@ -419,8 +454,10 @@ impl StreamClient {
         min_len.ok_or_else(|| anyhow!("no available replica for commit_length"))
     }
 
+    // ── public append API ────────────────────────────────────────────────────
+
     pub async fn append_batch_repeated(
-        &mut self,
+        &self,
         stream_id: u64,
         block: &[u8],
         count: usize,
@@ -429,22 +466,19 @@ impl StreamClient {
         if count == 0 {
             return Err(anyhow!("append_batch_repeated requires count > 0"));
         }
-
         let total = block
             .len()
             .checked_mul(count)
             .ok_or_else(|| anyhow!("append payload too large"))?;
-
         let mut payload = BytesMut::with_capacity(total);
         for _ in 0..count {
             payload.extend_from_slice(block);
         }
-
         self.append_payload(stream_id, payload.freeze(), must_sync).await
     }
 
     pub async fn append_batch(
-        &mut self,
+        &self,
         stream_id: u64,
         blocks: &[&[u8]],
         must_sync: bool,
@@ -452,22 +486,19 @@ impl StreamClient {
         if blocks.is_empty() {
             return Err(anyhow!("append_batch requires at least one block"));
         }
-
         let total = blocks.iter().try_fold(0usize, |acc, b| {
             acc.checked_add(b.len()).ok_or_else(|| anyhow!("append payload too large"))
         })?;
-
         let mut payload = BytesMut::with_capacity(total);
         for b in blocks {
             payload.extend_from_slice(b);
         }
-
         self.append_payload(stream_id, payload.freeze(), must_sync).await
     }
 
     /// Append a pre-built Bytes payload directly (avoids an extra copy).
     pub async fn append_bytes(
-        &mut self,
+        &self,
         stream_id: u64,
         payload: Bytes,
         must_sync: bool,
@@ -476,7 +507,7 @@ impl StreamClient {
     }
 
     pub async fn append(
-        &mut self,
+        &self,
         stream_id: u64,
         payload: &[u8],
         must_sync: bool,
@@ -484,18 +515,19 @@ impl StreamClient {
         self.append_payload(stream_id, Bytes::copy_from_slice(payload), must_sync).await
     }
 
-    pub async fn commit_length(&mut self, stream_id: u64) -> Result<u32> {
+    pub async fn commit_length(&self, stream_id: u64) -> Result<u32> {
         let (_, _, end) = self.check_commit(stream_id).await?;
         Ok(end)
     }
 
     pub async fn punch_holes(
-        &mut self,
+        &self,
         stream_id: u64,
         extent_ids: Vec<u64>,
     ) -> Result<StreamInfo> {
         let resp = self
             .manager
+            .clone()
             .stream_punch_holes(Request::new(PunchHolesRequest {
                 stream_id,
                 extent_ids,
@@ -510,9 +542,10 @@ impl StreamClient {
         resp.stream.context("stream missing")
     }
 
-    pub async fn truncate(&mut self, stream_id: u64, extent_id: u64) -> Result<StreamInfo> {
+    pub async fn truncate(&self, stream_id: u64, extent_id: u64) -> Result<StreamInfo> {
         let resp = self
             .manager
+            .clone()
             .truncate(Request::new(TruncateRequest {
                 stream_id,
                 extent_id,
@@ -529,9 +562,10 @@ impl StreamClient {
     }
 
     /// Return the StreamInfo for the given stream (extent ID list, etc.).
-    pub async fn get_stream_info(&mut self, stream_id: u64) -> Result<StreamInfo> {
+    pub async fn get_stream_info(&self, stream_id: u64) -> Result<StreamInfo> {
         let resp = self
             .manager
+            .clone()
             .stream_info(Request::new(StreamInfoRequest {
                 stream_ids: vec![stream_id],
             }))
@@ -547,17 +581,17 @@ impl StreamClient {
     }
 
     /// Return the ExtentInfo for a given extent (includes sealed_length). Cached.
-    pub async fn get_extent_info(&mut self, extent_id: u64) -> Result<ExtentInfo> {
+    pub async fn get_extent_info(&self, extent_id: u64) -> Result<ExtentInfo> {
         self.fetch_extent_info(extent_id).await
     }
 
-    /// Fetch ExtentInfo from manager and cache it. Invalidates and re-fetches on error.
-    async fn fetch_extent_info(&mut self, extent_id: u64) -> Result<ExtentInfo> {
+    async fn fetch_extent_info(&self, extent_id: u64) -> Result<ExtentInfo> {
         if let Some(ex) = self.extent_info_cache.get(&extent_id) {
             return Ok(ex.clone());
         }
         let resp = self
             .manager
+            .clone()
             .extent_info(Request::new(ExtentInfoRequest { extent_id }))
             .await?
             .into_inner();
@@ -570,10 +604,9 @@ impl StreamClient {
     }
 
     /// Read bytes from a specific extent.
-    /// Returns (payload_bytes, end) where end is the total extent length.
     /// Pass `length=0` to read from offset to the end of the extent.
     pub async fn read_bytes_from_extent(
-        &mut self,
+        &self,
         extent_id: u64,
         offset: u32,
         length: u32,
@@ -584,7 +617,7 @@ impl StreamClient {
         let mut last_err = anyhow!("no replicas for extent {}", extent_id);
         for addr in &addrs {
             let mut stream = {
-                let client = self.extent_client(addr).await?;
+                let mut client = self.extent_client(addr).await?;
                 match client
                     .read_bytes(Request::new(ReadBytesRequest {
                         extent_id,
@@ -630,7 +663,6 @@ impl StreamClient {
                 }
             }
             if !read_ok {
-                // Stale cached info may have caused the failure — invalidate and try next replica.
                 self.extent_info_cache.remove(&extent_id);
                 continue;
             }
@@ -648,7 +680,7 @@ impl StreamClient {
 
     /// Read all bytes from the last non-empty extent of the given stream.
     /// Returns None if the stream has no data.
-    pub async fn read_last_extent_data(&mut self, stream_id: u64) -> Result<Option<Vec<u8>>> {
+    pub async fn read_last_extent_data(&self, stream_id: u64) -> Result<Option<Vec<u8>>> {
         let info = self.get_stream_info(stream_id).await?;
         for &eid in info.extent_ids.iter().rev() {
             let (payload, _end) = self.read_bytes_from_extent(eid, 0, 0).await?;
@@ -661,11 +693,12 @@ impl StreamClient {
 
     /// Acquire an owner lock with the given key; returns the response (code + revision).
     pub async fn acquire_owner_lock(
-        &mut self,
+        &self,
         owner_key: String,
     ) -> Result<AcquireOwnerLockResponse> {
         Ok(self
             .manager
+            .clone()
             .acquire_owner_lock(Request::new(AcquireOwnerLockRequest { owner_key }))
             .await?
             .into_inner())
@@ -673,11 +706,12 @@ impl StreamClient {
 
     /// Call MultiModifySplit on the stream manager.
     pub async fn multi_modify_split(
-        &mut self,
+        &self,
         req: MultiModifySplitRequest,
     ) -> Result<MultiModifySplitResponse> {
         Ok(self
             .manager
+            .clone()
             .multi_modify_split(Request::new(req))
             .await?
             .into_inner())

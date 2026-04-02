@@ -1,43 +1,27 @@
 Date: 2026-04-02
 TaskStatus: completed
-Task scope: Bug fix — gRPC message size limits causing all puts to fail
+Task scope: Performance optimization — remove StreamClient Mutex, increase flush threshold, increase batch size
 
 Current summary:
-  Fixed two related bugs that caused all put operations to fail:
+  All three performance changes implemented and tested:
+  1. StreamClient lock-free (no external Mutex):
+     - Replaced Arc<Mutex<StreamClient>> → Arc<StreamClient> everywhere
+     - Per-stream locking inside StreamClient via DashMap<stream_id, Arc<Mutex<StreamAppendState>>>
+     - All StreamClient methods take &self (no &mut self)
+     - Parallel fan-out to replicas (tokio::spawn per replica)
+  2. FLUSH_MEM_BYTES: 256KB → 64MB (matches Go MaxSkipList)
+     - Removed FLUSH_MEM_OPS = 512 condition from maybe_rotate_locked
+  3. MAX_WRITE_BATCH: 128 → 256
 
-  1. ExtentNode read_bytes/copy_extent sent entire extent payloads as single gRPC messages.
-     SSTs > 4MB (tonic default) triggered OutOfRange errors during partition recovery.
-     Fix: chunk streaming responses into 1MB pieces.
-     Files: crates/stream/src/extent_node.rs
-     Commit: 071b5364
+Additional fixes:
+  - Fixed sealed-extent bug in StreamClient: after split, tail extent is sealed.
+    Compact's row_stream append now detects sealed tail and allocates new extent.
+  - Integration tests updated: replaced 300KB-filler flush trigger with explicit
+    flush_partition() method; added flush_partition() public API to PartitionServer.
+  - Pre-existing PartitionServer::connect signature mismatch in integration.rs fixed.
 
-  2. tonic defaults to 4MB max message size; Go uses 64MB (8MB for manager).
-     PutRequest with large values and AppendRequest payloads both exceeded the limit.
-     Fix: set max_decoding_message_size / max_encoding_message_size = 64MB on all
-     ExtentNode and PartitionServer gRPC endpoints (8MB for manager), matching Go.
-     Files: crates/partition-server/src/lib.rs, crates/stream/src/extent_node.rs,
-            crates/stream/src/client.rs, crates/server/src/bin/autumn_client.rs,
-            crates/manager/src/lib.rs
-     Commit: 303b84fe
-
-  Also improved error reporting in part_lookup_to_status (format!("{:#}", err) for
-  full anyhow chain) and added SST parse diagnostics (read_len + preview bytes).
-
-  Root cause of "stale process" cluster issue: cluster.sh stop loses PID files when
-  processes were started in a previous session. Must kill by port or use restart.
-
-  Tests: cargo test --workspace → all pass
-  Build: cargo build --workspace → clean
-  Manual: echo hello | $AC put testkey /dev/stdin → ok
-          dd 7MB | $AC put bigkey /tmp/test-7mb.bin → ok
-          $AC get bigkey | wc -c → 7340032 ✓
-
-Main gaps:
-  - F039 — Full etcd-watch routing (currently simple one-shot cache)
-  - F035 — Extent node WAL for small-write durability
-  - F020 — gRPC connection pool with health check
-  - Phase 2 perf: parallel replica fan-out (2a), StreamClient mutex split (2b)
-  - Phase 3 perf: binary search in lookup_in_sst (3a)
+All tests pass:
+  cargo test --workspace → all 38+ tests pass
 
 Next steps:
-  Run wbench and rbench end-to-end benchmarks with the now-working cluster.
+  Deploy and benchmark wbench to verify performance improvement vs Go.

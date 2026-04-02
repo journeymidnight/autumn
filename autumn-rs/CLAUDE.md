@@ -63,7 +63,7 @@ Put(key, value, must_sync)
   └─ Send WriteRequest{must_sync} to per-partition write_tx channel
        │
        └─ background_write_loop (group commit):
-            ├─ Drain up to 128 requests per batch
+            ├─ Drain up to 256 requests per batch
             ├─ Assign seq numbers, build WAL records
             │    [op:1][key_len:4][val_len:4][expires_at:8][key][value]
             ├─ stream_client.append_batch(log_stream_id, &blocks, batch_must_sync)
@@ -82,11 +82,11 @@ background_flush_loop (when signaled):
 
 No local WAL file. logStream is the sole WAL.
 
-Each partition uses its **own `StreamClient`** (`PartitionData.stream_client`), created via
+Each partition uses its **own `Arc<StreamClient>`** (`PartitionData.stream_client`), created via
 `StreamClient::new_with_revision` which reuses the server-level owner-lock revision without
-calling `acquire_owner_lock` again. The server-level `PartitionServer.stream_client` is
-reserved for split coordination RPCs only (`commit_length`, `acquire_owner_lock`,
-`multi_modify_split`).
+calling `acquire_owner_lock` again. `StreamClient` is internally concurrent via per-stream
+locking (`DashMap<stream_id, Arc<Mutex<StreamAppendState>>>`), so no external Mutex is needed.
+The server-level `PartitionServer.stream_client` is reserved for split coordination RPCs only.
 
 ## Core Read Data Flow
 
