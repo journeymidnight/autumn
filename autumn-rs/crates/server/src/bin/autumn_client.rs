@@ -31,6 +31,18 @@ fn normalize(addr: &str) -> String {
     }
 }
 
+async fn connect_ps_client(ps_addr: &str) -> Result<PartitionKvClient<Channel>> {
+    let endpoint = normalize(ps_addr);
+    let channel = Endpoint::from_shared(endpoint.clone())?
+        .connect()
+        .await
+        .with_context(|| format!("connect PS {endpoint}"))?;
+    const GRPC_MAX_MSG: usize = 64 * 1024 * 1024;
+    Ok(PartitionKvClient::new(channel)
+        .max_decoding_message_size(GRPC_MAX_MSG)
+        .max_encoding_message_size(GRPC_MAX_MSG))
+}
+
 struct ClusterClient {
     #[allow(dead_code)]
     manager: String,
@@ -92,18 +104,8 @@ impl ClusterClient {
     async fn get_ps_client(&mut self, ps_addr: &str) -> Result<&mut PartitionKvClient<Channel>> {
         let addr = ps_addr.to_string();
         if !self.ps_conns.contains_key(&addr) {
-            let endpoint = normalize(&addr);
-            let channel = Endpoint::from_shared(endpoint.clone())?
-                .connect()
-                .await
-                .with_context(|| format!("connect PS {endpoint}"))?;
-            const GRPC_MAX_MSG: usize = 64 * 1024 * 1024;
-            self.ps_conns.insert(
-                addr.clone(),
-                PartitionKvClient::new(channel)
-                    .max_decoding_message_size(GRPC_MAX_MSG)
-                    .max_encoding_message_size(GRPC_MAX_MSG),
-            );
+            self.ps_conns
+                .insert(addr.clone(), connect_ps_client(&addr).await?);
         }
         Ok(self.ps_conns.get_mut(&addr).unwrap())
     }
@@ -267,6 +269,7 @@ enum Command {
         report_interval_secs: u64,
         part_id: Option<u64>,
         reuse_value: bool,
+        channels_per_ps: usize,
     },
     RBench {
         threads: usize,
@@ -299,7 +302,7 @@ fn usage() -> ! {
     eprintln!("  forcegc <PARTID> <EXTID>...       Force GC specific extents");
     eprintln!("  format --listen <ADDR> --advertise <ADDR> <DIR>...");
     eprintln!("                                    Format disks and register node");
-    eprintln!("  wbench [--threads 4] [--duration 10] [--size 8192] [--nosync] [--report-interval 1] [--part-id ID] [--reuse-value true|false]");
+    eprintln!("  wbench [--threads 4] [--duration 10] [--size 8192] [--nosync] [--report-interval 1] [--part-id ID] [--reuse-value true|false] [--channels-per-ps 1]");
     eprintln!("                                    Write benchmark (--nosync skips fsync)");
     eprintln!("  rbench [--threads 40] [--duration 10] <RESULT_FILE>");
     eprintln!("                                    Read benchmark");
@@ -538,6 +541,7 @@ fn parse_args() -> Args {
             let mut report_interval_secs: u64 = 1;
             let mut part_id: Option<u64> = None;
             let mut reuse_value = true;
+            let mut channels_per_ps: usize = 1;
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--threads" | "-t" => {
@@ -568,6 +572,11 @@ fn parse_args() -> Args {
                         reuse_value = parse_bool_flag(&raw[i], "--reuse-value")
                             .expect("--reuse-value must be true or false");
                     }
+                    "--channels-per-ps" => {
+                        i += 1;
+                        channels_per_ps = parse_positive_usize_flag(&raw[i], "--channels-per-ps")
+                            .expect("--channels-per-ps must be a positive number");
+                    }
                     "--nosync" => {
                         nosync = true;
                     }
@@ -583,6 +592,7 @@ fn parse_args() -> Args {
                 report_interval_secs,
                 part_id,
                 reuse_value,
+                channels_per_ps,
             }
         }
         "rbench" => {
@@ -641,6 +651,16 @@ fn parse_bool_flag(value: &str, flag: &str) -> Result<bool> {
     }
 }
 
+fn parse_positive_usize_flag(value: &str, flag: &str) -> Result<usize> {
+    let parsed = value
+        .parse::<usize>()
+        .with_context(|| format!("{flag} must be a positive number"))?;
+    if parsed == 0 {
+        bail!("{flag} must be a positive number");
+    }
+    Ok(parsed)
+}
+
 // ---------------------------------------------------------------------------
 // Benchmark helpers
 // ---------------------------------------------------------------------------
@@ -661,6 +681,12 @@ struct BenchConfig {
     report_interval_secs: u64,
     part_id: Option<u64>,
     reuse_value: bool,
+    #[serde(default = "default_channels_per_ps")]
+    channels_per_ps: usize,
+}
+
+fn default_channels_per_ps() -> usize {
+    1
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -798,6 +824,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_positive_usize_flag_rejects_zero() {
+        assert_eq!(
+            parse_positive_usize_flag("8", "--channels-per-ps").unwrap(),
+            8
+        );
+        assert!(parse_positive_usize_flag("0", "--channels-per-ps").is_err());
+        assert!(parse_positive_usize_flag("abc", "--channels-per-ps").is_err());
+    }
+
+    #[test]
     fn parse_write_results_supports_legacy_format() {
         let json = serde_json::to_string(&vec![BenchResult {
             key: "k1".to_string(),
@@ -822,6 +858,7 @@ mod tests {
                 report_interval_secs: 1,
                 part_id: Some(7),
                 reuse_value: true,
+                channels_per_ps: 4,
             },
             summary: BenchSummaryRecord {
                 total_ops: 1,
@@ -847,6 +884,40 @@ mod tests {
         let parsed = parse_write_results(&json).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].key, "k2");
+    }
+
+    #[test]
+    fn parse_write_results_supports_report_wrapper_without_channels_per_ps() {
+        let json = r#"{
+            "version": 1,
+            "config": {
+                "threads": 4,
+                "duration_secs": 10,
+                "value_size": 8192,
+                "nosync": true,
+                "report_interval_secs": 1,
+                "part_id": 7,
+                "reuse_value": true
+            },
+            "summary": {
+                "total_ops": 1,
+                "total_bytes": 8192,
+                "ops_per_sec": 1.0,
+                "throughput_mb_per_sec": 1.0,
+                "p50_ms": 1.0,
+                "p95_ms": 1.0,
+                "p99_ms": 1.0
+            },
+            "ops_samples": [
+                { "second": 1, "ops": 1, "cumulative_ops": 1 }
+            ],
+            "results": [
+                { "key": "k3", "start_time": 0.1, "elapsed": 0.2 }
+            ]
+        }"#;
+        let parsed = parse_write_results(json).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].key, "k3");
     }
 }
 
@@ -1232,6 +1303,7 @@ async fn main() -> Result<()> {
             report_interval_secs,
             part_id,
             reuse_value,
+            channels_per_ps,
         } => {
             // Gather partition list for routing.
             let partitions = if let Some(part_id) = part_id {
@@ -1243,35 +1315,31 @@ async fn main() -> Result<()> {
                 bail!("no partitions found, run bootstrap first");
             }
 
-            // Pre-connect to each unique PS address once.
-            // PartitionKvClient<Channel> wraps an HTTP/2 Channel which is Clone
-            // and multiplexes all threads over the same TCP connection — no
-            // per-thread connection exhaustion.
-            let mut ps_clients: HashMap<String, PartitionKvClient<Channel>> = HashMap::new();
+            // Pre-connect independent channels per PS so the benchmark can
+            // distinguish single-connection gRPC/H2 limits from deeper
+            // server-side bottlenecks.
+            let mut ps_clients: HashMap<String, Vec<PartitionKvClient<Channel>>> = HashMap::new();
             for (_, ps_addr) in &partitions {
                 if !ps_clients.contains_key(ps_addr) {
-                    let endpoint = normalize(ps_addr);
-                    let channel = Endpoint::from_shared(endpoint.clone())?
-                        .connect()
-                        .await
-                        .with_context(|| format!("connect PS {endpoint}"))?;
-                    const GRPC_MAX_MSG: usize = 64 * 1024 * 1024;
-                    ps_clients.insert(
-                        ps_addr.clone(),
-                        PartitionKvClient::new(channel)
-                            .max_decoding_message_size(GRPC_MAX_MSG)
-                            .max_encoding_message_size(GRPC_MAX_MSG),
-                    );
+                    let mut clients = Vec::with_capacity(channels_per_ps);
+                    for _ in 0..channels_per_ps {
+                        clients.push(connect_ps_client(ps_addr).await?);
+                    }
+                    ps_clients.insert(ps_addr.clone(), clients);
                 }
             }
 
-            // Build per-thread (part_id, ps_client) pairs by cloning the shared channel.
-            let thread_targets: Vec<(u64, PartitionKvClient<Channel>)> = (0..threads)
-                .map(|tid| {
-                    let (part_id, ps_addr) = &partitions[tid % partitions.len()];
-                    (*part_id, ps_clients[ps_addr].clone())
-                })
-                .collect();
+            // Spread threads across each PS's channel set in round-robin order.
+            let mut ps_thread_counts: HashMap<String, usize> = HashMap::new();
+            let mut thread_targets: Vec<(u64, PartitionKvClient<Channel>)> =
+                Vec::with_capacity(threads);
+            for tid in 0..threads {
+                let (part_id, ps_addr) = &partitions[tid % partitions.len()];
+                let thread_count = ps_thread_counts.entry(ps_addr.clone()).or_insert(0);
+                let channel_idx = *thread_count % channels_per_ps;
+                *thread_count += 1;
+                thread_targets.push((*part_id, ps_clients[ps_addr][channel_idx].clone()));
+            }
 
             let deadline =
                 Arc::new(std::time::SystemTime::now() + Duration::from_secs(duration_secs));
@@ -1400,6 +1468,7 @@ async fn main() -> Result<()> {
                     report_interval_secs,
                     part_id,
                     reuse_value,
+                    channels_per_ps,
                 },
                 summary,
                 ops_samples: ops_samples.lock().await.drain(..).collect(),

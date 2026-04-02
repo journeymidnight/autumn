@@ -222,7 +222,7 @@ Default manager address: `127.0.0.1:9001`
 | `gc <PARTID>` | Trigger auto GC on a partition |
 | `forcegc <PARTID> <EXTID>...` | Force GC of specific extent IDs |
 | `format --listen <ADDR> --advertise <ADDR> <DIR>...` | Format disk dirs and register a new extent node |
-| `wbench [--threads 4] [--duration 10] [--size 8192] [--nosync] [--report-interval 1] [--part-id ID] [--reuse-value true|false]` | Write benchmark; `--nosync` skips fsync; outputs `write_result.json` with config/summary/ops samples/results |
+| `wbench [--threads 4] [--duration 10] [--size 8192] [--nosync] [--report-interval 1] [--part-id ID] [--reuse-value true|false] [--channels-per-ps 1]` | Write benchmark; `--nosync` skips fsync; `--channels-per-ps` opens multiple independent gRPC channels to the same PS; outputs `write_result.json` with config/summary/ops samples/results |
 | `rbench [--threads 40] [--duration 10] <RESULT_FILE>` | Read benchmark using keys from `write_result.json` |
 | `info` | Show cluster state (nodes / streams / partitions) |
 
@@ -323,6 +323,9 @@ $AC wbench --threads 16 --duration 10 --size 8192 --nosync
 # Pin the run to one partition and print one sample every 2 seconds
 $AC wbench --threads 256 --duration 10 --size 8192 --nosync --part-id <PARTID> --report-interval 2
 
+# Keep the same partition pinned, but fan threads out across 8 independent gRPC channels
+$AC wbench --threads 256 --duration 10 --size 8192 --nosync --part-id <PARTID> --channels-per-ps 8
+
 # Disable payload reuse to measure client-side allocation overhead explicitly
 $AC wbench --threads 64 --duration 10 --size 8192 --reuse-value false
 
@@ -331,6 +334,8 @@ $AC rbench --threads 40 --duration 10 write_result.json
 ```
 
 `--nosync` disables `must_sync` on the write request. The partition server will skip the fsync on `log_stream` appends for those writes (unless another write in the same batch requires sync).
+
+`--channels-per-ps` keeps the benchmark semantics unchanged, but pre-creates that many independent `PartitionKvClient<Channel>` connections per partition server and round-robins writer threads across them. This lets you test whether a single unary gRPC/HTTP2 connection is the batching bottleneck.
 
 `write_result.json` now stores benchmark metadata in addition to per-op results:
 
