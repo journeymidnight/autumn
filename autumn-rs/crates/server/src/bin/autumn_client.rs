@@ -207,16 +207,19 @@ enum Command {
     Put {
         key: String,
         file: String,
+        nosync: bool,
     },
     StreamPut {
         key: String,
         file: String,
+        nosync: bool,
     },
     Get {
         key: String,
     },
     Del {
         key: String,
+        nosync: bool,
     },
     Head {
         key: String,
@@ -248,6 +251,7 @@ enum Command {
         threads: usize,
         duration_secs: u64,
         value_size: usize,
+        nosync: bool,
     },
     RBench {
         threads: usize,
@@ -280,8 +284,8 @@ fn usage() -> ! {
     eprintln!("  forcegc <PARTID> <EXTID>...       Force GC specific extents");
     eprintln!("  format --listen <ADDR> --advertise <ADDR> <DIR>...");
     eprintln!("                                    Format disks and register node");
-    eprintln!("  wbench [--threads 4] [--duration 10] [--size 8192]");
-    eprintln!("                                    Write benchmark");
+    eprintln!("  wbench [--threads 4] [--duration 10] [--size 8192] [--nosync]");
+    eprintln!("                                    Write benchmark (--nosync skips fsync)");
     eprintln!("  rbench [--threads 40] [--duration 10] <RESULT_FILE>");
     eprintln!("                                    Read benchmark");
     eprintln!("  info                              Show cluster info");
@@ -337,22 +341,30 @@ fn parse_args() -> Args {
             }
         }
         "put" => {
+            let mut nosync = false;
+            while i < raw.len() && raw[i].starts_with('-') {
+                if raw[i] == "--nosync" { nosync = true; } i += 1;
+            }
             if i + 1 >= raw.len() {
                 eprintln!("put requires <KEY> <FILE>");
                 std::process::exit(1);
             }
             let key = raw[i].clone();
             let file = raw[i + 1].clone();
-            Command::Put { key, file }
+            Command::Put { key, file, nosync }
         }
         "streamput" => {
+            let mut nosync = false;
+            while i < raw.len() && raw[i].starts_with('-') {
+                if raw[i] == "--nosync" { nosync = true; } i += 1;
+            }
             if i + 1 >= raw.len() {
                 eprintln!("streamput requires <KEY> <FILE>");
                 std::process::exit(1);
             }
             let key = raw[i].clone();
             let file = raw[i + 1].clone();
-            Command::StreamPut { key, file }
+            Command::StreamPut { key, file, nosync }
         }
         "get" => {
             if i >= raw.len() {
@@ -364,12 +376,17 @@ fn parse_args() -> Args {
             }
         }
         "del" => {
+            let mut nosync = false;
+            while i < raw.len() && raw[i].starts_with('-') {
+                if raw[i] == "--nosync" { nosync = true; } i += 1;
+            }
             if i >= raw.len() {
                 eprintln!("del requires <KEY>");
                 std::process::exit(1);
             }
             Command::Del {
                 key: raw[i].clone(),
+                nosync,
             }
         }
         "head" => {
@@ -493,6 +510,7 @@ fn parse_args() -> Args {
             let mut threads: usize = 4;
             let mut duration_secs: u64 = 10;
             let mut value_size: usize = 8192;
+            let mut nosync = false;
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--threads" | "-t" => {
@@ -507,6 +525,7 @@ fn parse_args() -> Args {
                         i += 1;
                         value_size = raw[i].parse().expect("--size must be a number");
                     }
+                    "--nosync" => { nosync = true; }
                     _ => {}
                 }
                 i += 1;
@@ -515,6 +534,7 @@ fn parse_args() -> Args {
                 threads,
                 duration_secs,
                 value_size,
+                nosync,
             }
         }
         "rbench" => {
@@ -771,7 +791,7 @@ async fn main() -> Result<()> {
             println!("bootstrap succeeded: {} partition(s)", ranges.len());
         }
 
-        Command::Put { key, file } => {
+        Command::Put { key, file, nosync } => {
             let value = tokio::fs::read(&file)
                 .await
                 .with_context(|| format!("read file {file}"))?;
@@ -782,13 +802,14 @@ async fn main() -> Result<()> {
                 value,
                 expires_at: 0,
                 part_id,
+                must_sync: !nosync,
             }))
             .await
             .context("put")?;
             println!("ok");
         }
 
-        Command::StreamPut { key, file } => {
+        Command::StreamPut { key, file, nosync } => {
             let metadata = tokio::fs::metadata(&file)
                 .await
                 .with_context(|| format!("stat file {file}"))?;
@@ -809,6 +830,7 @@ async fn main() -> Result<()> {
                         len_of_value: file_size,
                         expires_at: 0,
                         part_id,
+                        must_sync: !nosync,
                     },
                 )),
             };
@@ -856,13 +878,14 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Del { key } => {
+        Command::Del { key, nosync } => {
             let (part_id, ps_addr) = client.resolve_key(key.as_bytes()).await?;
             let ps = client.get_ps_client(&ps_addr).await?;
             match ps
                 .delete(Request::new(DeleteRequest {
                     key: key.into_bytes(),
                     part_id,
+                    must_sync: !nosync,
                 }))
                 .await
             {
@@ -1032,6 +1055,7 @@ async fn main() -> Result<()> {
             threads,
             duration_secs,
             value_size,
+            nosync,
         } => {
             // Gather partition list for routing
             let partitions = client.all_partitions().await?;
@@ -1092,6 +1116,7 @@ async fn main() -> Result<()> {
                             value: value_bytes.clone(),
                             expires_at: 0,
                             part_id: *part_id,
+                            must_sync: !nosync,
                         })).await;
                         let elapsed = t0.elapsed();
 

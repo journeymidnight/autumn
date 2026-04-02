@@ -20,7 +20,7 @@ An LSM-tree based KV store built on top of the stream layer. Each `PartitionServ
 │  │  row_stream_id   ← SSTables                       │    │
 │  │  meta_stream_id  ← TableLocations checkpoint      │    │
 │  │                                                   │    │
-│  │  log_file: local WAL file (part-{id}.wal)         │    │
+│  │  write_tx: mpsc::Sender<WriteRequest>              │    │
 │  │  seq_number: monotonic MVCC counter               │    │
 │  │  has_overlap: AtomicU32                           │    │
 │  └───────────────────────────────────────────────────┘   │
@@ -32,30 +32,41 @@ An LSM-tree based KV store built on top of the stream layer. Each `PartitionServ
 
 ## MVCC Key Encoding
 
-Internal (storage) key = `user_key ++ BigEndian(u64::MAX - seq_number)`
+Internal (storage) key = `user_key ++ 0x00 ++ BigEndian(u64::MAX - seq_number)`
 
-The **inverted** sequence ensures that for the same user key, newer writes (higher seq) sort **before** older writes in byte order. Lookup uses `seek_user_key` which seeks to `user_key ++ BE(u64::MAX)` — the smallest possible internal key for this user key — then returns the first (newest) entry found.
+The null byte (`0x00`) is a **separator** between the user key and the inverted sequence number. This is critical: without the separator, a user key that is a prefix of another (e.g. `"mykey"` and `"mykey1"`) would sort incorrectly in internal-key space. With the separator, `"mykey\x00..."` sorts before `"mykey1\x00..."` because `0x00 < '1'`.
 
-## Write Path: Put / Delete
+The **inverted** sequence ensures that for the same user key, newer writes (higher seq) sort **before** older writes in byte order. Lookup uses `seek_user_key` which seeks to `user_key ++ 0x00 ++ BE(0)` — the smallest possible internal key for this user key — then returns the first (newest) entry found.
+
+## Write Path: Put / Delete (Group Commit)
 
 ```
-Put(key, value, part_id):
-  1. Check key is in_range(part.rg, key)
-  2. Increment seq_number
-  3. Encode internal_key = key_with_ts(key, seq)
-  4. Write WAL record to local log_file (write_at + sync_all)
-  5. If value.len() > VALUE_THROTTLE (4KB):
-       a. Append WAL record to log_stream via stream_client
-       b. Store ValuePointer{extent_id, offset, len} in memtable (op = 1 | OP_VALUE_POINTER)
-     Else:
-       c. Store value directly in memtable (op = 1)
-  6. active.insert(internal_key, MemEntry, write_size)
-  7. maybe_rotate_locked() → if thresholds exceeded, freeze active and signal flush_tx
+Put(key, value, part_id, must_sync):
+  1. Thin RPC handler: send WriteRequest{Put{key, value}, must_sync} to write_tx channel
+  2. Await response on oneshot channel
+
+background_write_loop (per partition):
+  1. Recv first WriteRequest (blocking)
+  2. Drain up to MAX_WRITE_BATCH (128) more non-blocking
+  3. Acquire partition write lock
+  4. Validate each key is in_range; error invalid ones
+  5. Assign seq_numbers, compute internal_keys
+  6. Encode all entries as WAL records: [op:1][key_len:4 LE][val_len:4 LE][expires_at:8 LE][key][value]
+  7. batch_must_sync = any(req.must_sync) — if ANY request needs fsync, whole batch syncs
+  8. stream_client.append_batch(log_stream_id, &blocks, batch_must_sync) — 1 RPC for entire batch
+     ALL entries (small and large) go to log_stream (no separate local WAL file)
+  9. Compute VP for large values (>4KB): VP points to record in logStream
+  10. Insert all into active Memtable
+  11. Update vp_extent_id / vp_offset to end of batch
+  12. maybe_rotate_locked() → flush if thresholds exceeded
+  13. Drop lock, reply Ok(key) to all requestors
 ```
 
-`Delete` writes `op = 2` (tombstone) with an empty value.
+`Delete` sends `WriteOp::Delete{user_key}`, writes `op = 2` (tombstone).
 
-**WAL format**: `[op:1][key_len:4 LE][val_len:4 LE][expires_at:8 LE][key][value]` (17-byte header)
+**Record format**: `[op:1][key_len:4 LE][val_len:4 LE][expires_at:8 LE][key][value]` (17-byte header)
+
+**No local WAL file**: logStream is the sole write-ahead log. Recovery replays logStream from the VP head recorded in the last metaStream checkpoint.
 
 ## Read Path: Get
 
@@ -145,7 +156,6 @@ Auto-selects sealed extents with discard ratio > 40% (`GC_DISCARD_RATIO`), up to
        - If live version has a VP pointing to THIS extent at THIS offset:
            → re-write value to new log_stream append (new extent_id, offset)
            → insert new memtable entry with updated VP
-           → append to local WAL
   4. punch_holes([old_extent_id]) on log_stream
 ```
 
@@ -177,10 +187,9 @@ After split, both child partitions will detect `has_overlap = true` on next open
   4. Replay logStream from VP head forward:
        - Read extent data from vp_extent_id onward
        - Decode WAL records, re-insert into memtable (active)
-  5. Replay local WAL file (part-{id}.wal) into active memtable:
-       - Large values in WAL are re-appended to log_stream (the old logStream
-         position may have been truncated/punched; WAL has the canonical bytes)
-  6. Spawn background loops: flush_loop, compact_loop, gc_loop
+       - Large values (>4KB): VP points to record in logStream
+       - Records with ts ≤ max_seq (already in SSTables) are skipped
+  5. Spawn background loops: flush_loop, compact_loop, gc_loop, write_loop
 ```
 
 ## SSTable Format
@@ -256,8 +265,8 @@ Operates on **user keys only** (8-byte MVCC suffix stripped before hashing). 1% 
 
 4. **`has_overlap` blocks split but not reads** — reads with `has_overlap` set do range-filter in `range()`. `get()` does NOT filter (point lookups are exact). Only `range()` scans need filtering.
 
-5. **WAL covers only active memtable** — once a memtable is frozen (moved to imm), it's in memory. If the process crashes with imm tables pending flush, they're lost. Recovery relies on the local WAL replaying them.
+5. **No local WAL file** — logStream is the sole WAL. All writes (small and large) go to logStream via `append_batch`. Recovery reads logStream from the VP head checkpoint in metaStream. Unflushed imm tables that are in memory are also covered: logStream contains all records newer than the last SSTable flush.
 
-6. **Large value WAL double-write** — on `Put` for values > 4KB, the value is written BOTH to the local WAL AND to the log_stream. During crash recovery, if the log_stream position was punched/truncated, the local WAL still has the bytes to re-append. This is intentional redundancy.
+6. **Group commit batching** — the background_write_loop drains up to MAX_WRITE_BATCH (128) requests per RPC cycle. If ANY request in a batch has `must_sync=true`, the entire batch is synced. This allows `--nosync` clients to piggyback on sync requests from other clients without extra overhead.
 
 7. **`sst_readers` and `tables` are always aligned by index** — `tables[i]` and `sst_readers[i]` refer to the same SSTable. Operations on these must maintain alignment. Compaction's atomic swap replaces slices, not individual elements.

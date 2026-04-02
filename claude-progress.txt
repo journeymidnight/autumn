@@ -1,45 +1,48 @@
 Date: 2026-04-01
 TaskStatus: completed
-Task scope: F010 – Partition API parity with Go legacy endpoints
+Task scope: Group commit + remove local WAL + client-controlled must_sync (plan: curried-dazzling-canyon.md)
 
 Current summary:
-  Implemented F010: Maintenance RPC + CLI parity with Go autumn-client.
+  Implemented all steps from the plan:
 
-  Changes in autumn-rs/crates/proto/proto/autumn.proto:
-  - Added CompactOp, AutoGcOp, ForceGcOp, MaintenanceRequest, MaintenanceResponse messages.
-  - Added Maintenance RPC to PartitionKv service.
+  1. Proto (already done in prior session):
+     - PutRequest.must_sync, DeleteRequest.must_sync, StreamPutRequestHeader.must_sync
 
-  Changes in autumn-rs/crates/partition-server/src/lib.rs:
-  - trigger_major_compact(part_id) -> Result<(), &'static str>  (was void)
-  - trigger_gc(part_id) -> Result<(), &'static str>             (was void)
-  - trigger_force_gc(part_id, extent_ids) -> Result<(), &'static str>  (new)
-  - maintenance() gRPC handler: dispatches oneof op to trigger_* methods.
+  2. Server — group-commit write loop + remove local WAL (already done in prior session):
+     - WriteOp / WriteRequest types added to lib.rs
+     - write_tx: mpsc::Sender<WriteRequest> in PartitionData (log_file/log_len removed)
+     - background_write_loop: batches up to 128 requests, 1 append_batch RPC for entire batch
+     - ALL entries (small + large) go to log_stream — no local WAL file
+     - batch_must_sync = any(req.must_sync): if any request needs sync, whole batch syncs
+     - put() / delete() handlers: thin — send to write_tx, await oneshot response
+     - stream_put() passes header.must_sync through to put()
+     - open_partition recovery: replays logStream from VP head; no local WAL step
 
-  Changes in autumn-rs/crates/server/src/bin/autumn_client.rs:
-  - compact <PARTID>: trigger major compaction via Maintenance RPC
-  - gc <PARTID>: trigger auto GC via Maintenance RPC
-  - forcegc <PARTID> <EXTID>...: force GC specific extents
-  - format --listen --advertise <DIR>...: format disk dirs, RegisterNode, write node_id/disk_id
-  - wbench [--threads] [--duration] [--size]: concurrent write benchmark + write_result.json
-  - rbench [--threads] [--duration] <RESULT_FILE>: concurrent read benchmark
-  - bootstrap: add --presplit N:hexstring to create N pre-split partitions (hex_split_ranges)
+  3. Client — --nosync flag (done this session):
+     - WBench, Put, Del, StreamPut Command variants: added nosync: bool field
+     - wbench parser: added --nosync flag
+     - put/del parsers: added --nosync flag (flag-first, before positional args)
+     - streamput parser: added --nosync flag
+     - PutRequest/DeleteRequest/StreamPutRequestHeader: must_sync = !nosync
+     - Usage string updated to show --nosync for wbench
 
-  Dependencies added to autumn-rs/crates/server/Cargo.toml:
-  - serde, serde_json (bench JSON output)
-  - rand (not actually used yet; reserved for future random key gen)
-  - uuid (format disk UUID marker)
+  4. Docs updated:
+     - crates/partition-server/CLAUDE.md: new write path, no local WAL, group commit
+     - autumn-rs/CLAUDE.md: updated Core Write Data Flow diagram
+     - autumn-rs/README.md: wbench --nosync example + description
 
-  Documentation updated:
-  - autumn-rs/crates/proto/CLAUDE.md: Maintenance RPC entry in PartitionKv table
-  - autumn-rs/crates/partition-server/CLAUDE.md: trigger_force_gc, trigger_major_compact notes
-  - autumn-rs/crates/server/CLAUDE.md: full command table updated
-  - autumn-rs/README.md: F010/F018 test sections with new CLI examples
+  Files changed:
+    crates/server/src/bin/autumn_client.rs
+    crates/partition-server/CLAUDE.md
+    autumn-rs/CLAUDE.md
+    autumn-rs/README.md
 
-  Tests: cargo test --workspace passes (12 unit + 13 integration).
+  Tests: cargo test -p autumn-partition-server → 12/12 pass.
+  Build: cargo build --workspace → clean.
 
-Main gaps:
-  Batch API intentionally skipped (was never implemented in Go either - stub only).
+Main gaps: none for this plan.
 
 Next steps:
-  F035 – Extent node WAL for small-write durability
-  F020 – gRPC connection pool with health check
+  F011 — mark umbrella as complete (all sub-features done)
+  F035 — Extent node WAL for small-write durability
+  F020 — gRPC connection pool with health check

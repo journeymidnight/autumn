@@ -1,383 +1,373 @@
 # autumn-rs
 
-Rust rewrite of `autumn` (stream layer + partition layer).
+Rust rewrite of `autumn`: a distributed KV storage engine with a stream layer and a partition layer.
+
+## Architecture
+
+```
+  Clients (autumn-client CLI / your application)
+       │  Put / Get / Delete / Range  (gRPC PartitionKv)
+       ▼
+  autumn-ps  (Partition Server — one or more)
+  ┌─────────────────────────────────────────────┐
+  │  LSM-tree per partition                      │
+  │  Each partition owns 3 streams:              │
+  │    log_stream  — WAL + large values (>4KB)   │
+  │    row_stream  — flushed SSTables            │
+  │    meta_stream — TableLocations checkpoint   │
+  └──────────┬──────────────────────────────────┘
+             │ append / read  (gRPC ExtentService)
+             ▼
+  autumn-extent-node  (one or more, holds raw extent files)
+
+  autumn-manager-server  (control plane, backed by etcd)
+  ├── allocates streams and extents
+  ├── routes partition → PS assignments
+  └── drives extent recovery
+```
+
+**Key concept — 3 streams per partition:** The 3 streams are created by `autumn-client bootstrap`,
+not by the partition server. The PS receives the stream IDs from the manager on startup and uses
+them to store its data.
 
 ## Prerequisites
 
-- Rust toolchain (`cargo`, edition 2021 compatible)
+- Rust toolchain (`cargo`, edition 2021)
 - `protoc` — `brew install protobuf`
-- `etcd` — `brew install etcd` (required for persistent mode)
+- `etcd` — `brew install etcd`
 
 ## Build
 
 ```bash
-cd /Users/zhangdongmao/upstream/autumn/autumn-rs
+cd autumn-rs
 cargo build --workspace
 ```
 
-## Manual test with process-level binaries (recommended)
+---
 
-Three binaries are provided for process-level manual testing without `cargo test`.
+## Dev Cluster Script (`cluster.sh`)
 
-### Step 1: start etcd
+`cluster.sh` manages the full cluster lifecycle — no extra tools required.
 
 ```bash
-etcd --data-dir /tmp/autumn-etcd \
-     --listen-client-urls http://127.0.0.1:2379 \
-     --advertise-client-urls http://127.0.0.1:2379 &
+cd autumn-rs
+cargo build --workspace          # build binaries first
+
+./cluster.sh start               # 1-replica cluster (default)
+./cluster.sh start 3             # 3-replica cluster
+
+./cluster.sh stop                # kill all processes
+./cluster.sh clean               # stop + wipe /tmp/autumn-rs data dirs
+./cluster.sh restart             # clean + start (fresh cluster)
+./cluster.sh restart 3           # fresh 3-replica cluster
+
+./cluster.sh status              # show which processes are running
+./cluster.sh logs                # tail all log files (Ctrl-C to exit)
 ```
 
-### Step 2: start manager
+After `start`, the script prints ready-to-use CLI examples:
 
-```bash
-# with etcd (metadata persists across restarts)
-./target/debug/autumn-manager-server --port 9001 --etcd 127.0.0.1:2379
-
-# without etcd (in-memory only, for quick dev testing)
-./target/debug/autumn-manager-server --port 9001
 ```
-
-### Step 3: start extent nodes
-
-```bash
-# single node
-./target/debug/autumn-extent-node \
-  --port 9101 --disk-id 1 --data /tmp/autumn-data-1
-
-# three nodes for replication testing
-./target/debug/autumn-extent-node --port 9101 --disk-id 1 --data /tmp/autumn-data-1 &
-./target/debug/autumn-extent-node --port 9102 --disk-id 2 --data /tmp/autumn-data-2 &
-./target/debug/autumn-extent-node --port 9103 --disk-id 3 --data /tmp/autumn-data-3 &
-```
-
-### Step 4: use autumn-stream-cli
-
-```bash
-CLI=./target/debug/autumn-stream-cli  # default manager: 127.0.0.1:9001
-
-# register extent nodes
-$CLI register-node --addr 127.0.0.1:9101 --disk disk-1
-$CLI register-node --addr 127.0.0.1:9102 --disk disk-2
-$CLI register-node --addr 127.0.0.1:9103 --disk disk-3
-
-# create a 3-replica stream
-$CLI create-stream --data-shard 3 --parity-shard 0
-# → prints stream_id (e.g. 1)
-
-# inspect stream layout
-$CLI stream-info --stream-id 1
-
-# append data
-$CLI append --stream-id 1 --data "hello autumn"
-$CLI append --stream-id 1 --data "second block"
-
-# read all blocks back
-$CLI read --stream-id 1
-```
-
-autumn-stream-cli flags:
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--manager` | `127.0.0.1:9001` | manager address |
-| `--owner-key` | `cli-owner` | owner lock key for append/read |
-
-### Etcd persistence test (crash recovery)
-
-```bash
-$CLI append --stream-id 1 --data "before crash"
-
-# kill manager
-pkill -f autumn-manager-server
-sleep 0.5
-
-# restart with same etcd
-./target/debug/autumn-manager-server --port 9001 --etcd 127.0.0.1:2379 &
-sleep 1
-
-# metadata and data are still there
-$CLI stream-info --stream-id 1
-$CLI read --stream-id 1
-```
-
-### 3-replica one-liner smoke test
-
-```bash
-pkill -f autumn-manager-server; pkill -f autumn-extent-node
-./target/debug/autumn-manager-server --port 9001 --etcd 127.0.0.1:2379 &
-./target/debug/autumn-extent-node --port 9101 --disk-id 1 --data /tmp/d1 &
-./target/debug/autumn-extent-node --port 9102 --disk-id 2 --data /tmp/d2 &
-./target/debug/autumn-extent-node --port 9103 --disk-id 3 --data /tmp/d3 &
-sleep 1
-CLI=./target/debug/autumn-stream-cli
-$CLI register-node --addr 127.0.0.1:9101 --disk disk-1
-$CLI register-node --addr 127.0.0.1:9102 --disk disk-2
-$CLI register-node --addr 127.0.0.1:9103 --disk disk-3
-SID=$($CLI create-stream --data-shard 3 | grep stream_id | awk '{print $3}')
-$CLI append --stream-id $SID --data "hello"
-$CLI read   --stream-id $SID
-```
-
-## Stream layer management (autumn-stream-cli)
-
-Use `autumn-stream-cli` for low-level stream and extent node management.
-
-```bash
-CLI=./target/debug/autumn-stream-cli
-
-# Register an extent node with the stream manager
-$CLI register-node --addr 127.0.0.1:9101 --disk disk-1
-
-# Create a stream (3 data shards, 0 parity)
-$CLI create-stream --data-shard 3
-
-# Show info for all streams
-$CLI stream-info
-
-# Show info for specific streams
-$CLI stream-info --streams 1,2,3
-
-# Append data to a stream
-$CLI append --stream-id 1 --data "hello"
-
-# Read from a stream
-$CLI read --stream-id 1
-```
-
-## Cluster management (autumn-client)
-
-Use `autumn-client` for partition-layer and full cluster management.
-
-```bash
-AC=./target/debug/autumn-client
-
-# Show cluster state (nodes, streams, partitions)
+AC="./target/debug/autumn-client --manager 127.0.0.1:9001"
 $AC info
-
-# Format a disk and register an extent node
-$AC format --listen 127.0.0.1:9101 --advertise 127.0.0.1:9101 /tmp/d1
-
-# Bootstrap cluster with single partition
-$AC bootstrap --replication 3+0
-
-# Bootstrap with 4 pre-split partitions (hex key space)
-$AC bootstrap --replication 3+0 --presplit 4:hexstring
+echo hello | $AC put mykey /dev/stdin
+$AC get mykey
+$AC ls
 ```
 
-## cargo test (unit / integration)
+Logs go to `/tmp/autumn-rs-logs/{etcd,manager,node1,...,ps}.log`.
+
+---
+
+## Quick Start: 1-replica cluster
+
+A minimal cluster: 1 manager, 1 extent node, 1 partition server.
 
 ```bash
-cargo test -p autumn-stream --test extent_append_semantics -- --nocapture
-cargo test -p autumn-stream --test extent_restart_recovery -- --nocapture
-cargo test -p autumn-manager --test integration -- --nocapture
-cargo test -p autumn-partition-server -- --nocapture
-```
-
-Smoke test via script:
-
-```bash
-./scripts/manual_stream_test.sh smoke
-```
-
-## Manual test: F030 Three-stream model with metaStream persistence
-
-Verify that after a flush, the SSTable is stored in rowStream and metaStream holds a `TableLocations` checkpoint. On restart, the partition server recovers by reading metaStream → rowStream SSTs → local WAL.
-
-```bash
-# Automated integration tests (spin up real infra internally):
-cargo test -p autumn-manager --test integration f030 -- --nocapture
-# expects: f030_flush_writes_sst_to_row_stream and f030_recovery_from_meta_and_row_streams both pass
-```
-
-For full manual verification, start the stack with `autumn-client bootstrap` (creates log/row/meta streams automatically), put a 300KB+ value to trigger flush, then restart `autumn-ps` and verify the value is still readable.
-
-## Manual test: F034 extent node metadata persistence (restart recovery)
-
-Verify that extent metadata (`sealed_length`, `eversion`, `last_revision`) survives a node restart. Each extent writes a `extent-{id}.meta` sidecar file on alloc, seal, recovery, and revision change. The node scans data dir on startup to reload all extents.
-
-```bash
+# Convenience aliases
+MANAGER=./target/debug/autumn-manager-server
+NODE=./target/debug/autumn-extent-node
+PS=./target/debug/autumn-ps
 SC=./target/debug/autumn-stream-cli
+AC=./target/debug/autumn-client
 
-# Start extent node
-./target/debug/autumn-extent-node --port 9101 --disk-id 1 --data /tmp/d1 &
-sleep 0.5
-
-# Alloc extent 5001 on the extent node directly
-$SC alloc-extent --node 127.0.0.1:9101 --extent-id 5001
-# expects: disk_id: 1
-
-# Check meta sidecar file was created
-ls /tmp/d1/extent-5001.meta
-# expects: file exists (40 bytes)
-
-# Kill and restart
-pkill -f autumn-extent-node
-sleep 0.3
-./target/debug/autumn-extent-node --port 9101 --disk-id 1 --data /tmp/d1 &
-sleep 0.5
-
-# Commit length shows extent was reloaded after restart
-$SC commit-length --node 127.0.0.1:9101 --extent-id 5001 --revision 0
-# expects: length: 0 (or whatever was written)
-```
-
-Automated test:
-```bash
-cargo test -p autumn-stream --test extent_restart_recovery -- --nocapture
-# expects: 3 tests pass (commit_length, revision, writable-after-restart)
-```
-
-## Manual test: F017 autumn-ps (partition server binary)
-
-Start the full stack (manager + 3 extent nodes + partition server), then verify with `autumn-client`.
-
-```bash
-# Clean up previous runs
+# Clean up any previous run
 pkill -f autumn-manager-server; pkill -f autumn-extent-node; pkill -f autumn-ps
+rm -rf /tmp/autumn-etcd /tmp/d1 /tmp/autumn-ps
 
-# Start etcd
+# Step 1 — etcd: stores manager metadata across restarts
 etcd --data-dir /tmp/autumn-etcd \
      --listen-client-urls http://127.0.0.1:2379 \
      --advertise-client-urls http://127.0.0.1:2379 &
 sleep 0.5
 
-# Start manager
-./target/debug/autumn-manager-server --port 9001 --etcd 127.0.0.1:2379 &
+# Step 2 — manager: control plane (stream allocation, partition routing)
+$MANAGER --port 9001 --etcd 127.0.0.1:2379 &
 sleep 0.5
 
-# Start 3 extent nodes
-./target/debug/autumn-extent-node --port 9101 --disk-id 1 --data /tmp/d1 &
-./target/debug/autumn-extent-node --port 9102 --disk-id 2 --data /tmp/d2 &
-./target/debug/autumn-extent-node --port 9103 --disk-id 3 --data /tmp/d3 &
+# Step 3 — extent node: data plane (stores raw extent files on disk)
+$NODE --port 9101 --disk-id 1 --data /tmp/d1 --manager 127.0.0.1:9001 &
 sleep 0.5
 
-# Register extent nodes with stream manager
-CLI=./target/debug/autumn-stream-cli
-$CLI register-node --addr 127.0.0.1:9101 --disk disk-1
-$CLI register-node --addr 127.0.0.1:9102 --disk disk-2
-$CLI register-node --addr 127.0.0.1:9103 --disk disk-3
+# Step 4 — register the extent node with the manager
+#   Without this, the manager does not know the node exists and cannot
+#   assign extents to it.
+$SC register-node --addr 127.0.0.1:9101 --disk disk-1
 
-# Start partition server (psid must be non-zero)
-./target/debug/autumn-ps --psid 1 --port 9201 --manager 127.0.0.1:9001 \
-  --data /tmp/autumn-ps --advertise 127.0.0.1:9201 &
+# Step 5 — partition server: KV API layer
+#   Starts up, registers itself with the manager (RegisterPs),
+#   then asks "which partitions belong to me?" (GetRegions).
+#   Answer: none yet — bootstrap hasn't run.
+$PS --psid 1 --port 9201 --manager 127.0.0.1:9001 \
+    --data /tmp/autumn-ps --advertise 127.0.0.1:9201 &
 sleep 1
-```
 
-Expected: autumn-ps logs `autumn-ps ready, serving on 0.0.0.0:9201`.
-
-## Manual test: F018 autumn-client (admin CLI)
-
-Continue from the autumn-ps setup above:
-
-```bash
-AC=./target/debug/autumn-client
-
-# Bootstrap: create log/row/meta streams and initial partition
-$AC bootstrap --replication 3+0
+# Step 6 — bootstrap: create 3 streams (log/row/meta) + 1 partition
+#   This is where the 3 streams are created.
+#   After this, the PS polls GetRegions(), finds the new partition,
+#   and calls open_partition() to start serving it.
+$AC bootstrap --replication 1+0
 # Expected: "bootstrap succeeded: 1 partition(s)"
 
-# Bootstrap with pre-split into 4 partitions (hexstring key space)
-$AC bootstrap --replication 3+0 --presplit 4:hexstring
-# Expected: "bootstrap succeeded: 4 partition(s)"
+sleep 1   # wait for PS to pick up the new partition
 
-# Show cluster info
+# Step 7 — verify
 $AC info
-# Expected: shows Nodes, Streams, Partitions sections
+# Expected: 1 node, 3 streams, 1 partition
 
-# Put a value
-echo "hello autumn" > /tmp/test-val.txt
-$AC put mykey /tmp/test-val.txt
-# Expected: "ok"
-
-# Get the value back
+echo "hello autumn" | $AC put mykey /dev/stdin
 $AC get mykey
-# Expected: prints "hello autumn"
-
-# Head (metadata)
-$AC head mykey
-# Expected: "key: mykey, length: 13"
-
-# List keys
-$AC ls --prefix ""
-# Expected: "mykey" in output
-
-# Stream-put a large file (uses gRPC client-streaming)
-dd if=/dev/urandom of=/tmp/big-val.bin bs=1024 count=100 2>/dev/null
-$AC streamput bigkey /tmp/big-val.bin
-# Expected: "ok (102400 bytes)"
-
-# Verify stream-put via get
-$AC head bigkey
-# Expected: "key: bigkey, length: 102400"
-
-# Delete the key
-$AC del mykey
-# Expected: "ok"
-
-# Verify deletion
-$AC get mykey
-# Expected: "key not found" (exit code 2)
-
-# Maintenance: trigger major compaction on partition (get PARTID from 'info')
-PARTID=$($AC info | grep "part " | awk '{print $2}' | head -1 | tr -d ':')
-$AC compact $PARTID
-# Expected: "compact triggered for partition <PARTID>"
-
-# Maintenance: trigger auto GC on partition
-$AC gc $PARTID
-# Expected: "gc triggered for partition <PARTID>"
-
-# Maintenance: force GC of specific extents (get extent IDs from 'info')
-$AC forcegc $PARTID 1 2
-# Expected: "forcegc triggered for partition <PARTID>, extents=[1, 2]"
-
-# Write benchmark (4 threads, 10 seconds, 8KB values)
-$AC wbench --threads 4 --duration 10 --size 8192
-# Expected: summary with ops/sec, throughput, p50/p95/p99 latency
-# Writes write_result.json
-
-# Read benchmark using keys from write_result.json
-$AC rbench --threads 40 --duration 10 write_result.json
-# Expected: summary with read throughput stats
+# Expected: "hello autumn"
 ```
 
-## Manual test: F010 format disk
+### What happens in bootstrap
+
+`autumn-client bootstrap --replication 1+0` does:
+
+1. `CreateStream(data_shard=1, parity_shard=0)` → **log_stream** (id=1)
+2. `CreateStream(data_shard=1, parity_shard=0)` → **row_stream**  (id=2)
+3. `CreateStream(data_shard=1, parity_shard=0)` → **meta_stream** (id=3)
+4. `UpsertPartition({ log=1, row=2, meta=3, range=["", "") })` → partition registered in manager
+
+The PS then picks up the partition via its background `sync_regions` loop and opens it.
+
+---
+
+## Quick Start: 3-replica cluster
+
+Same as above, but with 3 extent nodes and `--replication 3+0`.
 
 ```bash
+MANAGER=./target/debug/autumn-manager-server
+NODE=./target/debug/autumn-extent-node
+PS=./target/debug/autumn-ps
+SC=./target/debug/autumn-stream-cli
 AC=./target/debug/autumn-client
 
-# Format a new disk directory and register with manager
-$AC --manager 127.0.0.1:9001 format \
-  --listen 127.0.0.1:9104 \
-  --advertise 127.0.0.1:9104 \
-  /tmp/new-disk
-# Expected: "formatted /tmp/new-disk: disk_uuid=<UUID>"
-# Expected: "node registered: node_id=<N>"
-# Expected: writes /tmp/new-disk/node_id and /tmp/new-disk/disk_id files
+pkill -f autumn-manager-server; pkill -f autumn-extent-node; pkill -f autumn-ps
+rm -rf /tmp/autumn-etcd /tmp/d1 /tmp/d2 /tmp/d3 /tmp/autumn-ps
 
-# Then start the extent node using the registered info
-./target/debug/autumn-extent-node --port 9104 \
-  --disk-id $(cat /tmp/new-disk/disk_id) \
-  --data /tmp/new-disk
+etcd --data-dir /tmp/autumn-etcd \
+     --listen-client-urls http://127.0.0.1:2379 \
+     --advertise-client-urls http://127.0.0.1:2379 &
+sleep 0.5
+
+$MANAGER --port 9001 --etcd 127.0.0.1:2379 &
+sleep 0.5
+
+$NODE --port 9101 --disk-id 1 --data /tmp/d1 --manager 127.0.0.1:9001 &
+$NODE --port 9102 --disk-id 2 --data /tmp/d2 --manager 127.0.0.1:9001 &
+$NODE --port 9103 --disk-id 3 --data /tmp/d3 --manager 127.0.0.1:9001 &
+sleep 0.5
+
+$SC register-node --addr 127.0.0.1:9101 --disk disk-1
+$SC register-node --addr 127.0.0.1:9102 --disk disk-2
+$SC register-node --addr 127.0.0.1:9103 --disk disk-3
+
+$PS --psid 1 --port 9201 --manager 127.0.0.1:9001 \
+    --data /tmp/autumn-ps --advertise 127.0.0.1:9201 &
+sleep 1
+
+$AC bootstrap --replication 3+0
+sleep 1
+
+$AC info
+echo "hello" | $AC put mykey /dev/stdin
+$AC get mykey
 ```
+
+---
+
+## CLI reference
+
+### autumn-client
+
+```
+autumn-client --manager <ADDR> <COMMAND>
+```
+
+Default manager address: `127.0.0.1:9001`
+
+| Command | Description |
+|---------|-------------|
+| `bootstrap [--replication 1+0] [--presplit 1:normal\|N:hexstring]` | Create streams and partition(s). `N:hexstring` splits the hex key space into N partitions. |
+| `put <KEY> <FILE>` | Write key with value from file |
+| `streamput <KEY> <FILE>` | Stream-put large file in 512KB chunks |
+| `get <KEY>` | Read value (writes raw bytes to stdout) |
+| `del <KEY>` | Delete key |
+| `head <KEY>` | Show key metadata (length only) |
+| `ls [--prefix P] [--start S] [--limit N]` | Scan keys |
+| `split <PARTID>` | Trigger partition split (server picks split point) |
+| `compact <PARTID>` | Trigger major compaction on a partition |
+| `gc <PARTID>` | Trigger auto GC on a partition |
+| `forcegc <PARTID> <EXTID>...` | Force GC of specific extent IDs |
+| `format --listen <ADDR> --advertise <ADDR> <DIR>...` | Format disk dirs and register a new extent node |
+| `wbench [--threads 4] [--duration 10] [--size 8192] [--nosync]` | Write benchmark; `--nosync` skips fsync; outputs `write_result.json` |
+| `rbench [--threads 40] [--duration 10] <RESULT_FILE>` | Read benchmark using keys from `write_result.json` |
+| `info` | Show cluster state (nodes / streams / partitions) |
+
+### autumn-stream-cli
+
+```
+autumn-stream-cli --manager <ADDR> <COMMAND>
+```
+
+Default manager address: `127.0.0.1:9001`
+
+| Command | Description |
+|---------|-------------|
+| `register-node --addr <ADDR> --disk <UUID>` | Register an extent node with the manager |
+| `create-stream [--data-shard N] [--parity-shard M]` | Create a new stream |
+| `stream-info [--stream-id N]` | Show stream and extent metadata (omit `--stream-id` for all streams) |
+| `append --stream-id N --data <STR>` | Append string data to a stream |
+| `read --stream-id N [--length N]` | Read from a stream |
+| `alloc-extent --node <ADDR> --extent-id N` | Pre-create an extent on an extent node |
+| `commit-length --node <ADDR> --extent-id N [--revision N]` | Query the current write position of an extent |
+
+---
 
 ## Binary reference
 
-| Binary | Default port | Key flags |
-|--------|-------------|-----------|
-| `autumn-manager-server` | 9001 | `--port`, `--etcd` |
-| `autumn-extent-node` | 9101 | `--port`, `--disk-id`, `--data`, `--manager` |
-| `autumn-stream-cli` | — | `--manager`, subcommands below |
-| `autumn-ps` | 9201 | `--psid` (required), `--port`, `--manager`, `--data`, `--advertise` |
-| `autumn-client` | — | `--manager`, subcommands below |
+| Binary | Default port | Required flags | Purpose |
+|--------|-------------|----------------|---------|
+| `autumn-manager-server` | 9001 | — | Control plane: stream allocation, partition routing |
+| `autumn-extent-node` | 9101 | `--data <DIR>` | Data plane: stores extent files on disk |
+| `autumn-ps` | 9201 | `--psid <N>` | KV API: LSM-tree over stream layer |
+| `autumn-client` | — | `--manager` | Admin CLI |
+| `autumn-stream-cli` | — | `--manager` | Low-level stream layer CLI |
 
-`autumn-stream-cli` subcommands: `register-node`, `create-stream`, `stream-info`, `append`, `read`, `alloc-extent`, `commit-length`
+Key flags:
 
-`autumn-client` subcommands: `bootstrap [--presplit N:hexstring]`, `put`, `streamput`, `get`, `del`, `head`, `ls`, `split`, `compact`, `gc`, `forcegc`, `format`, `wbench`, `rbench`, `info`
+```
+autumn-manager-server --port 9001 --etcd 127.0.0.1:2379
+
+autumn-extent-node --port 9101 --disk-id 1 --data /tmp/d1 --manager 127.0.0.1:9001
+
+autumn-ps --psid 1 --port 9201 --manager 127.0.0.1:9001 \
+          --data /tmp/ps-wal --advertise 127.0.0.1:9201
+```
+
+---
+
+## Operations
+
+### KV operations
+
+```bash
+AC=./target/debug/autumn-client
+
+echo "hello" > /tmp/v.txt
+$AC put mykey /tmp/v.txt
+$AC get mykey
+$AC head mykey          # prints length
+$AC ls --prefix my      # scan keys with prefix
+$AC del mykey
+```
+
+### Large value (>4KB uses StreamPut)
+
+```bash
+dd if=/dev/urandom of=/tmp/big.bin bs=1024 count=100
+$AC streamput bigkey /tmp/big.bin
+$AC head bigkey         # expects: length: 102400
+```
+
+### Partition operations
+
+```bash
+# Get partition IDs from info
+$AC info
+
+# Split a partition (server picks mid-key automatically)
+$AC split <PARTID>
+
+# Trigger major compaction (clears overlap after split, reclaims space)
+$AC compact <PARTID>
+
+# Trigger auto GC (reclaims logStream extents with >40% discard)
+$AC gc <PARTID>
+
+# Force GC on specific extents
+$AC forcegc <PARTID> <EXTID1> <EXTID2>
+```
+
+### Benchmarks
+
+```bash
+# Write benchmark: 4 threads, 10 seconds, 8KB values (with fsync)
+$AC wbench --threads 4 --duration 10 --size 8192
+
+# Write benchmark without fsync (higher throughput, tests group-commit batching)
+$AC wbench --threads 16 --duration 10 --size 8192 --nosync
+
+# Read benchmark: load keys from previous wbench
+$AC rbench --threads 40 --duration 10 write_result.json
+```
+
+`--nosync` disables `must_sync` on the write request. The partition server will skip the fsync on `log_stream` appends for those writes (unless another write in the same batch requires sync).
+
+### Add a new extent node to a running cluster
+
+```bash
+AC=./target/debug/autumn-client
+NODE=./target/debug/autumn-extent-node
+
+# Format the disk and register the node with the manager
+$AC format --listen 127.0.0.1:9104 --advertise 127.0.0.1:9104 /tmp/d4
+# Prints: node_id=N, disk_id=M, writes /tmp/d4/node_id and /tmp/d4/disk_id
+
+# Start the extent node
+$NODE --port 9104 \
+      --disk-id $(cat /tmp/d4/disk_id) \
+      --data /tmp/d4 \
+      --manager 127.0.0.1:9001
+```
+
+---
+
+## Tests
+
+```bash
+# Unit + fast integration tests
+cargo test -p autumn-partition-server -- --nocapture
+
+# Stream layer tests (start etcd first)
+cargo test -p autumn-stream --test extent_append_semantics -- --nocapture
+cargo test -p autumn-stream --test extent_restart_recovery -- --nocapture
+
+# Manager integration tests (start etcd first)
+cargo test -p autumn-manager --test integration -- --nocapture
+
+# All tests
+cargo test --workspace
+```
+
+---
 
 ## Notes
 
-- `IoMode::IoUring` is not implemented yet; extent nodes use `IoMode::Standard`.
-- Without `--etcd`, manager runs in-memory only and logs a WARN on startup.
-- Recovery loops (dispatch + collect) only activate when manager is started with `--etcd`.
-- gRPC reflection is enabled on the manager; extent nodes do not expose reflection.
+- `IoMode::IoUring` is not yet implemented; extent nodes use `IoMode::Standard`.
+- Without `--etcd`, manager runs in-memory only (metadata lost on restart).
+- Erasure coding (`parity_shard > 0`) is not yet implemented; use `parity_shard=0`.
+- There is currently no automatic partition server failover; if a PS crashes, restart it
+  with the same `--psid` and it will re-register and reload its partitions.
