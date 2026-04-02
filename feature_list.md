@@ -117,7 +117,7 @@
 ### F020 · gRPC connection pool with health check
 - **Target:** Per-address gRPC connection pool with keep-alive heartbeat and lazy creation. Equivalent to Go `conn/pool.go`.
 - **Evidence:** `conn/pool.go` · `autumn-rs/crates/stream/src/client.rs`
-- **Notes:** Rust stream-layer calls still create ad-hoc gRPC clients per call; the production pool/heartbeat path is not implemented yet. Diagnostic aid added: `autumn-client wbench` now supports `--channels-per-ps <N>` to open multiple independent `PartitionKvClient<Channel>` connections per PS and test whether single-connection unary `Put` pressure is the current single-partition bottleneck. Go has a shared pool with 2s heartbeat health checking.
+- **Notes:** Rust stream-layer calls still create ad-hoc gRPC clients per call; the production pool/heartbeat path is not implemented yet. Diagnostic aids added: `autumn-client wbench` supports `--channels-per-ps <N>` to open multiple independent `PartitionKvClient<Channel>` connections per PS, and `partition write summary` now reports handler-side pre-enqueue / post-enqueue / handler-total timings. Latest isolated single-partition measurements show multi-channel pressure stays flat and `avg_handler_total_ms` is only about `4.1ms` while client `p50` remains about `51-52ms`, which shifts the next investigation toward tonic/h2 request admission before `PartitionKv::put()` runs. Go has a shared pool with 2s heartbeat health checking.
 - **passes:** false
 
 ### F039 · Client-side partition routing via etcd watch

@@ -351,7 +351,7 @@ $AC rbench --threads 40 --duration 10 write_result.json
 
 `rbench` accepts both the new wrapper format and the legacy top-level result array.
 
-For write-path profiling, run the partition server and client with `RUST_LOG=info`. The partition server emits `partition write summary` once per second with queue wait, batch fill ratio, and phase 1/2/3 timings; the stream client emits `stream append summary` with mutex wait, extent lookup, fanout append, and retry counts.
+For write-path profiling, run the partition server and client with `RUST_LOG=info`. The partition server emits `partition write summary` once per second with batch fill ratio, handler-side pre-enqueue timing, queue wait, phase 1/2/3 timings (both per-batch and amortized per-op), and handler total time; the stream client emits `stream append summary` with mutex wait, extent lookup, fanout append, and retry counts.
 
 ### Add a new extent node to a running cluster
 
