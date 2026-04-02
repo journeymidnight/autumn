@@ -1,27 +1,42 @@
 Date: 2026-04-02
 TaskStatus: completed
-Task scope: Performance optimization — remove StreamClient Mutex, increase flush threshold, increase batch size
+Task scope: F020 — gRPC connection pool with health check
 
 Current summary:
-  All three performance changes implemented and tested:
-  1. StreamClient lock-free (no external Mutex):
-     - Replaced Arc<Mutex<StreamClient>> → Arc<StreamClient> everywhere
-     - Per-stream locking inside StreamClient via DashMap<stream_id, Arc<Mutex<StreamAppendState>>>
-     - All StreamClient methods take &self (no &mut self)
-     - Parallel fan-out to replicas (tokio::spawn per replica)
-  2. FLUSH_MEM_BYTES: 256KB → 64MB (matches Go MaxSkipList)
-     - Removed FLUSH_MEM_OPS = 512 condition from maybe_rotate_locked
-  3. MAX_WRITE_BATCH: 128 → 256
+  Implemented ConnPool in autumn-rs/crates/stream/src/conn_pool.rs:
+  - DashMap<String, Arc<PoolEntry>> — one Channel per unique remote address
+  - AtomicI64 last_echo (unix millis) updated by streaming heartbeat task
+  - connect(addr) — get-or-create, no heartbeat (for manager connections)
+  - connect_extent(addr) — get-or-create + start heartbeat monitor
+  - extent_client(addr) — convenience wrapper returning ExtentServiceClient
+  - is_healthy(addr) — true if last_echo within 8s (4 × 2s ECHO_DURATION)
+  - background monitor_health loop: reconnects on stream error, logs transitions
 
-Additional fixes:
-  - Fixed sealed-extent bug in StreamClient: after split, tail extent is sealed.
-    Compact's row_stream append now detects sealed tail and allocates new extent.
-  - Integration tests updated: replaced 300KB-filler flush trigger with explicit
-    flush_partition() method; added flush_partition() public API to PartitionServer.
-  - Pre-existing PartitionServer::connect signature mismatch in integration.rs fixed.
+  Wired into StreamClient (client.rs):
+  - Removed per-instance extent_clients DashMap field
+  - Added pool: Arc<ConnPool> field
+  - connect() and new_with_revision() both accept pool: Arc<ConnPool>
+  - extent_client() delegates to pool.extent_client()
+  - is_extent_healthy() public helper added
+
+  Wired into PartitionServer (partition-server/src/lib.rs):
+  - Added pool: Arc<ConnPool> field
+  - connect_with_advertise() creates ConnPool, uses it for PM channel and StreamClient
+  - open_partition() passes self.pool.clone() to new_with_revision()
+  - Connection reduction: (P+2 + P*E) → (1 + E) channels
+
+  Connection reduction: previously each of P partitions had its own manager channel
+  and its own extent-node channel map. Now all share one Channel per address.
+
+  Updated all call sites:
+  - stream_cli.rs
+  - manager/tests/integration.rs (4 sites)
+  - manager/tests/etcd_stream_integration.rs
+  - manager/tests/append_benchmark.rs
 
 All tests pass:
-  cargo test --workspace → all 38+ tests pass
+  cargo test --workspace → all 43+ tests pass (0 failures)
 
 Next steps:
-  Deploy and benchmark wbench to verify performance improvement vs Go.
+  Deploy to cluster and verify heartbeat health logs appear in production.
+  F039 (client-side partition routing via etcd watch) is the next logical P1 feature.

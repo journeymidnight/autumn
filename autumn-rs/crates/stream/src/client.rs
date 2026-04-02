@@ -5,6 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use autumn_proto::autumn::extent_service_client::ExtentServiceClient;
 use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
+use crate::ConnPool;
 use autumn_proto::autumn::{
     append_request, read_bytes_response, AcquireOwnerLockRequest, AcquireOwnerLockResponse,
     AppendRequest, AppendRequestHeader, CheckCommitLengthRequest, Code, CommitLengthRequest,
@@ -137,8 +138,9 @@ pub struct StreamClient {
     owner_key: String,
     revision: i64,
     max_extent_size: u32,
-    /// gRPC connections to extent nodes, keyed by address.
-    extent_clients: DashMap<String, ExtentServiceClient<Channel>>,
+    /// Shared connection pool — one Channel per remote address, with
+    /// streaming heartbeat health checks for extent nodes.
+    pool: Arc<ConnPool>,
     /// Node-id → address map (refreshed on miss).
     nodes_cache: DashMap<u64, String>,
     /// Cached ExtentInfo for read path.
@@ -153,9 +155,10 @@ impl StreamClient {
         manager_endpoint: &str,
         owner_key: String,
         max_extent_size: u32,
+        pool: Arc<ConnPool>,
     ) -> Result<Self> {
-        let endpoint = normalize_endpoint(manager_endpoint);
-        let mut manager = StreamManagerServiceClient::connect(endpoint).await?;
+        let channel = pool.connect(manager_endpoint).await?;
+        let mut manager = StreamManagerServiceClient::new(channel);
         let lock = manager
             .acquire_owner_lock(Request::new(AcquireOwnerLockRequest {
                 owner_key: owner_key.clone(),
@@ -171,7 +174,7 @@ impl StreamClient {
             owner_key,
             revision: lock.revision,
             max_extent_size,
-            extent_clients: DashMap::new(),
+            pool,
             nodes_cache: DashMap::new(),
             extent_info_cache: DashMap::new(),
             stream_states: DashMap::new(),
@@ -186,15 +189,16 @@ impl StreamClient {
         owner_key: String,
         revision: i64,
         max_extent_size: u32,
+        pool: Arc<ConnPool>,
     ) -> Result<Self> {
-        let endpoint = normalize_endpoint(manager_endpoint);
-        let manager = StreamManagerServiceClient::connect(endpoint).await?;
+        let channel = pool.connect(manager_endpoint).await?;
+        let manager = StreamManagerServiceClient::new(channel);
         Ok(Self {
             manager,
             owner_key,
             revision,
             max_extent_size,
-            extent_clients: DashMap::new(),
+            pool,
             nodes_cache: DashMap::new(),
             extent_info_cache: DashMap::new(),
             stream_states: DashMap::new(),
@@ -211,24 +215,18 @@ impl StreamClient {
 
     // ── internal helpers ─────────────────────────────────────────────────────
 
-    /// Return a cloned gRPC client for the given node address,
-    /// creating and caching the connection on first use.
+    /// Return a gRPC client for the given extent-node address.
+    /// The underlying `Channel` is shared via `ConnPool` — one connection per
+    /// address across all `StreamClient` instances.  A streaming heartbeat
+    /// monitor is started on first use.
     async fn extent_client(&self, addr: &str) -> Result<ExtentServiceClient<Channel>> {
-        if let Some(client) = self.extent_clients.get(addr) {
-            return Ok(client.clone());
-        }
-        let endpoint = normalize_endpoint(addr);
-        let channel = tonic::transport::Endpoint::from_shared(endpoint)?
-            .connect()
-            .await?;
-        const GRPC_MAX_MSG: usize = 64 * 1024 * 1024;
-        let client = ExtentServiceClient::new(channel)
-            .max_decoding_message_size(GRPC_MAX_MSG)
-            .max_encoding_message_size(GRPC_MAX_MSG);
-        // Benign race: two tasks may create connections concurrently; the second
-        // insert simply overwrites the first — both connections are valid.
-        self.extent_clients.insert(addr.to_string(), client.clone());
-        Ok(client)
+        self.pool.extent_client(addr).await
+    }
+
+    /// Returns `true` if the heartbeat monitor has seen a recent echo from the
+    /// extent node at `addr` (within the last 8 s).
+    pub fn is_extent_healthy(&self, addr: &str) -> bool {
+        self.pool.is_healthy(addr)
     }
 
     async fn refresh_nodes_map(&self) -> Result<()> {
@@ -847,10 +845,3 @@ impl StreamClient {
     }
 }
 
-fn normalize_endpoint(endpoint: &str) -> String {
-    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        endpoint.to_string()
-    } else {
-        format!("http://{endpoint}")
-    }
-}

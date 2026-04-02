@@ -13,7 +13,8 @@ use autumn_proto::autumn::{
     SplitPartRequest, StreamAllocExtentRequest, StreamInfoRequest, TableLocations, TruncateRequest,
     UpsertPartitionRequest,
 };
-use autumn_stream::{ExtentNode, ExtentNodeConfig, StreamClient};
+use autumn_stream::{ConnPool, ExtentNode, ExtentNodeConfig, StreamClient};
+use std::sync::Arc;
 use partition_server::PartitionServer;
 use prost::Message as _;
 use tokio::time::sleep;
@@ -599,7 +600,7 @@ async fn stream_append_commit_punchhole_truncate_flow() {
         .into_inner();
     let stream_id = created.stream.expect("stream").stream_id;
 
-    let mut client = StreamClient::connect(&endpoint, "owner/e2e/1".to_string(), 8)
+    let mut client = StreamClient::connect(&endpoint, "owner/e2e/1".to_string(), 8, Arc::new(ConnPool::new()))
         .await
         .expect("stream client");
 
@@ -705,7 +706,7 @@ async fn stream_append_and_read_blocks_flow() {
     let stream_id = created.stream.expect("stream").stream_id;
 
     let mut client =
-        StreamClient::connect(&endpoint, "owner/read/1".to_string(), 512 * 1024 * 1024)
+        StreamClient::connect(&endpoint, "owner/read/1".to_string(), 512 * 1024 * 1024, Arc::new(ConnPool::new()))
             .await
             .expect("stream client");
     let batch = [b"hello".as_slice(), b"world".as_slice()];
@@ -955,7 +956,7 @@ async fn f030_flush_writes_sst_to_row_stream() {
     .expect("put big");
     ps.flush_partition(601).await.expect("flush");
 
-    let mut sc = StreamClient::connect(&endpoint, "test-f030-flush".to_string(), 128 * 1024 * 1024)
+    let mut sc = StreamClient::connect(&endpoint, "test-f030-flush".to_string(), 128 * 1024 * 1024, Arc::new(ConnPool::new()))
         .await
         .expect("stream client");
 
@@ -1227,7 +1228,7 @@ async fn f029_compaction_merges_small_tables() {
     }
 
     // Verify we have 3 SSTables in metaStream before compaction.
-    let mut sc = StreamClient::connect(&endpoint, "test-f029".to_string(), 128 * 1024 * 1024)
+    let mut sc = StreamClient::connect(&endpoint, "test-f029".to_string(), 128 * 1024 * 1024, Arc::new(ConnPool::new()))
         .await
         .expect("stream client");
     let meta_bytes_before = sc

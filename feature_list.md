@@ -116,9 +116,9 @@
 
 ### F020 · gRPC connection pool with health check
 - **Target:** Per-address gRPC connection pool with keep-alive heartbeat and lazy creation. Equivalent to Go `conn/pool.go`.
-- **Evidence:** `conn/pool.go` · `autumn-rs/crates/stream/src/client.rs`
-- **Notes:** Rust stream-layer calls still create ad-hoc gRPC clients per call; the production pool/heartbeat path is not implemented yet. Diagnostic aids added: `autumn-client wbench` supports `--channels-per-ps <N>` to open multiple independent `PartitionKvClient<Channel>` connections per PS, and `partition write summary` now reports handler-side pre-enqueue / post-enqueue / handler-total timings plus `avg_admission_wait_ms` from tonic interceptor admission to `PartitionKv::put()` entry. Latest isolated single-partition measurements show multi-channel pressure stays flat in debug, while a release rerun (`256` threads, `8192` bytes, `--nosync`) reached `ops/sec ~= 22363.34`, `client p50 ~= 11.43ms`, and `avg_admission_wait_ms ~= 0.056-0.208ms`, which indicates tonic admission itself is not the dominant remaining gap under optimized builds. Go has a shared pool with 2s heartbeat health checking.
-- **passes:** false
+- **Evidence:** `conn/pool.go` · `autumn-rs/crates/stream/src/conn_pool.rs` · `autumn-rs/crates/stream/src/client.rs` · `autumn-rs/crates/partition-server/src/lib.rs`
+- **Notes:** Implemented. `ConnPool` in `crates/stream/src/conn_pool.rs`: `DashMap<String, Arc<PoolEntry>>`, one HTTP/2 `Channel` per address. Extent-node connections spawn a background streaming-heartbeat monitor (`ExtentService::heartbeat`), updating `AtomicI64 last_echo`; `is_healthy()` checks staleness < 8s (4×ECHO_DURATION=2s). Manager connections go through the pool but without heartbeat. `Arc<ConnPool>` threaded into all `StreamClient` instances via `connect()/new_with_revision()` constructors. `PartitionServer` creates the pool once in `connect_with_advertise`, passes it to all per-partition `StreamClient` instances. Connection count reduced from (P+2+P×E) to (1+E). All workspace tests pass.
+- **passes:** true
 
 ### F039 · Client-side partition routing via etcd watch
 - **Target:** Client library (AutumnLib equivalent) loads partition routing table from etcd at connect time, keeps it updated via etcd watch on `regions/config` and `PSSERVER/` prefix. Key lookups use local binary search with zero RPC. Split/migration propagates automatically. Equivalent to Go `autumn_clientv1/lib.go` (regions cache + etcd watch goroutines + saveRegion + sort.Search).

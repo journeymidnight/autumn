@@ -20,7 +20,8 @@ use autumn_proto::autumn::{
     AllocExtentRequest, Code, CommitLengthRequest, CreateStreamRequest, Empty, ReadBytesRequest,
     RegisterNodeRequest, StreamInfoRequest,
 };
-use autumn_stream::StreamClient;
+use autumn_stream::{ConnPool, StreamClient};
+use std::sync::Arc;
 use tonic::Request;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -294,7 +295,8 @@ async fn cmd_stream_info(manager: &str, stream_id: u64) -> Result<()> {
 }
 
 async fn cmd_append(manager: &str, stream_id: u64, data: String, owner_key: String) -> Result<()> {
-    let client = StreamClient::connect(manager, owner_key, 256 * 1024 * 1024).await?;
+    let pool = Arc::new(ConnPool::new());
+    let client = StreamClient::connect(manager, owner_key, 256 * 1024 * 1024, pool).await?;
     let result = client.append(stream_id, data.as_bytes(), true).await?;
     println!("extent_id : {}", result.extent_id);
     println!("offset    : {}", result.offset);

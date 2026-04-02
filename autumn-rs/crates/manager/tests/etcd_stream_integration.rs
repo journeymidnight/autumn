@@ -12,7 +12,8 @@ use autumn_proto::autumn::{
     CreateStreamRequest, ExtentInfoRequest, ReadBytesRequest, RegisterNodeRequest,
     StreamAllocExtentRequest, StreamInfo, StreamInfoRequest,
 };
-use autumn_stream::{ExtentNode, ExtentNodeConfig, StreamClient};
+use autumn_stream::{ConnPool, ExtentNode, ExtentNodeConfig, StreamClient};
+use std::sync::Arc;
 use etcd_client::{Client as EtcdClient, GetOptions};
 use prost::Message;
 use tokio::time::sleep;
@@ -428,7 +429,7 @@ async fn etcd_replicated_append_and_recovery_flow() {
     assert_eq!(created.code, Code::Ok as i32);
     let stream_id = created.stream.expect("stream").stream_id;
 
-    let mut client = StreamClient::connect(&mgr_endpoint, "owner/recovery/1".to_string(), 4)
+    let mut client = StreamClient::connect(&mgr_endpoint, "owner/recovery/1".to_string(), 4, Arc::new(ConnPool::new()))
         .await
         .expect("connect stream client");
     let appended = client

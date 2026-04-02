@@ -6,7 +6,7 @@ use autumn_io_engine::IoMode;
 use autumn_manager::AutumnManager;
 use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
 use autumn_proto::autumn::{CreateStreamRequest, RegisterNodeRequest};
-use autumn_stream::{ExtentNode, ExtentNodeConfig, StreamClient};
+use autumn_stream::{ConnPool, ExtentNode, ExtentNodeConfig, StreamClient};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tonic::Request;
@@ -138,7 +138,7 @@ async fn benchmark_append_stream_throughput() {
     let payload = Arc::new(vec![b'x'; payload_size]);
     const BATCH_SIZE: usize = 16;
     let client = Arc::new(
-        StreamClient::connect(&endpoint, "owner/bench/0".to_string(), max_extent_size)
+        StreamClient::connect(&endpoint, "owner/bench/0".to_string(), max_extent_size, Arc::new(ConnPool::new()))
             .await
             .expect("stream client"),
     );

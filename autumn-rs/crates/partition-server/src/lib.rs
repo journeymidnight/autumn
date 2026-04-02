@@ -15,12 +15,12 @@ use autumn_proto::autumn::{
     PutRequest, PutResponse, Range, RangeRequest, RangeResponse, RegisterPsRequest,
     SplitPartRequest, SplitPartResponse, StreamPutRequest, TableLocations,
 };
-use autumn_stream::StreamClient;
+use autumn_stream::{ConnPool, StreamClient};
 use bytes::{BufMut, Bytes, BytesMut};
 use crossbeam_skiplist::SkipMap;
 use dashmap::DashMap;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
-use tonic::transport::{Channel, Endpoint, Server};
+use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status};
 
 use sstable::{IterItem, MemtableIterator, MergeIterator, SstBuilder, SstReader, TableIterator};
@@ -451,6 +451,8 @@ pub struct PartitionServer {
     stream_client: Arc<StreamClient>,
     /// Manager endpoint string, reused to create per-partition StreamClients.
     manager_endpoint: String,
+    /// Shared gRPC connection pool — one Channel per remote address.
+    pool: Arc<ConnPool>,
 }
 
 impl PartitionServer {
@@ -463,16 +465,17 @@ impl PartitionServer {
         manager_endpoint: &str,
         advertise_addr: Option<String>,
     ) -> Result<Self> {
-        let endpoint = normalize_endpoint(manager_endpoint)?;
-        let channel = Endpoint::from_shared(endpoint.clone())
-            .context("build endpoint")?
-            .connect()
+        let pool = Arc::new(ConnPool::new());
+
+        // Reuse pool for the PM client channel — no heartbeat needed for manager.
+        let channel = pool
+            .connect(manager_endpoint)
             .await
-            .with_context(|| format!("connect manager endpoint {endpoint}"))?;
+            .with_context(|| format!("connect manager endpoint {manager_endpoint}"))?;
 
         let pm_client = PartitionManagerServiceClient::new(channel);
         let owner_key = format!("ps-{ps_id}");
-        let sc = StreamClient::connect(manager_endpoint, owner_key, 128 * 1024 * 1024).await?;
+        let sc = StreamClient::connect(manager_endpoint, owner_key, 128 * 1024 * 1024, pool.clone()).await?;
 
         let server = Self {
             ps_id,
@@ -481,6 +484,7 @@ impl PartitionServer {
             pm_client: Arc::new(Mutex::new(pm_client)),
             stream_client: Arc::new(sc),
             manager_endpoint: manager_endpoint.to_string(),
+            pool,
         };
 
         server.register_ps().await?;
@@ -658,12 +662,14 @@ impl PartitionServer {
         row_stream_id: u64,
         meta_stream_id: u64,
     ) -> Result<Arc<RwLock<PartitionData>>> {
-        // Create a per-partition StreamClient that shares the server's owner-lock revision.
+        // Create a per-partition StreamClient that shares the server's owner-lock revision
+        // and the server-level connection pool (so all partitions share one Channel per address).
         let part_sc = StreamClient::new_with_revision(
             &self.manager_endpoint,
             self.stream_client.owner_key().to_string(),
             self.stream_client.revision(),
             128 * 1024 * 1024,
+            self.pool.clone(),
         )
         .await
         .context("create per-partition StreamClient")?;
@@ -2904,17 +2910,6 @@ impl PartitionKv for PartitionServer {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn normalize_endpoint(endpoint: &str) -> Result<String> {
-    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        Ok(endpoint.to_string())
-    } else {
-        Ok(format!("http://{endpoint}"))
-    }
-}
 
 fn internal_to_status<E: std::fmt::Display>(err: E) -> Status {
     Status::internal(err.to_string())
@@ -2954,15 +2949,13 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use autumn_stream::normalize_endpoint;
 
     #[test]
     fn endpoint_normalization() {
+        assert_eq!(normalize_endpoint("127.0.0.1:9000"), "http://127.0.0.1:9000");
         assert_eq!(
-            normalize_endpoint("127.0.0.1:9000").unwrap(),
-            "http://127.0.0.1:9000"
-        );
-        assert_eq!(
-            normalize_endpoint("http://127.0.0.1:9000").unwrap(),
+            normalize_endpoint("http://127.0.0.1:9000"),
             "http://127.0.0.1:9000"
         );
     }
