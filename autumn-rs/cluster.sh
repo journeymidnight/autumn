@@ -59,6 +59,16 @@ kill_proc() {
         local pid; pid="$(cat "$pf")"
         if kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null || true
+            # Wait up to 5s for process to exit; SIGKILL if stuck
+            local i=0
+            while kill -0 "$pid" 2>/dev/null && (( i < 50 )); do
+                sleep 0.1
+                (( i++ ))
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -9 "$pid" 2>/dev/null || true
+                sleep 0.2
+            fi
             echo "[cluster] stopped $name (pid $pid)"
         fi
         rm -f "$pf"
@@ -70,7 +80,7 @@ wait_port() {
     echo -n "[cluster] waiting for $name on :$port ..."
     for _ in $(seq 1 $retries); do
         if nc -z 127.0.0.1 "$port" 2>/dev/null; then echo " ok"; return 0; fi
-        sleep 1
+        sleep 0.5
     done
     echo " TIMEOUT"
     die "$name did not start in time (port $port)"
@@ -83,6 +93,9 @@ wait_port() {
 do_start() {
     local replicas="${1:-1}"
     [[ "$replicas" == "1" || "$replicas" == "3" ]] || die "replicas must be 1 or 3"
+
+    # Stop any leftover processes from a previous run to avoid port conflicts
+    do_stop
 
     need_bin "$MANAGER"
     need_bin "$NODE"
