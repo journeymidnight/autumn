@@ -1502,8 +1502,6 @@ async fn main() -> Result<()> {
             let total_ops = Arc::new(AtomicU64::new(0));
             let total_errors = Arc::new(AtomicU64::new(0));
             let bench_start = Instant::now();
-            let latencies: Arc<tokio::sync::Mutex<Vec<f64>>> =
-                Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
             let mut handles = Vec::new();
             let keys_per_thread = (keys.len() + threads - 1) / threads;
@@ -1514,23 +1512,24 @@ async fn main() -> Result<()> {
                 let deadline = Arc::clone(&deadline);
                 let total_ops = Arc::clone(&total_ops);
                 let total_errors = Arc::clone(&total_errors);
-                let latencies = Arc::clone(&latencies);
 
                 let handle = tokio::spawn(async move {
                     let mut cc = match ClusterClient::connect(&manager_addr).await {
                         Ok(c) => c,
                         Err(e) => {
                             eprintln!("thread {tid} connect error: {e}");
-                            return;
+                            return Vec::new();
                         }
                     };
                     let start_idx = tid * keys_per_thread;
                     let end_idx = (start_idx + keys_per_thread).min(keys.len());
                     if start_idx >= end_idx {
-                        return;
+                        return Vec::new();
                     }
                     let my_keys = &keys[start_idx..end_idx];
                     let mut ki = 0usize;
+                    let mut local_latencies: Vec<f64> = Vec::new();
+                    let mut logged_errors = 0u32;
 
                     loop {
                         if std::time::SystemTime::now() >= *deadline {
@@ -1541,15 +1540,23 @@ async fn main() -> Result<()> {
 
                         let (part_id, ps_addr) = match cc.resolve_key(key.as_bytes()).await {
                             Ok(r) => r,
-                            Err(_) => {
+                            Err(e) => {
                                 total_errors.fetch_add(1, Ordering::Relaxed);
+                                if logged_errors < 3 {
+                                    eprintln!("thread {tid} resolve_key error: {e}");
+                                    logged_errors += 1;
+                                }
                                 continue;
                             }
                         };
                         let ps = match cc.get_ps_client(&ps_addr).await {
                             Ok(ps) => ps,
-                            Err(_) => {
+                            Err(e) => {
                                 total_errors.fetch_add(1, Ordering::Relaxed);
+                                if logged_errors < 3 {
+                                    eprintln!("thread {tid} get_ps_client error: {e}");
+                                    logged_errors += 1;
+                                }
                                 continue;
                             }
                         };
@@ -1565,13 +1572,18 @@ async fn main() -> Result<()> {
                         match res {
                             Ok(_) => {
                                 total_ops.fetch_add(1, Ordering::Relaxed);
-                                latencies.lock().await.push(elapsed.as_secs_f64() * 1000.0);
+                                local_latencies.push(elapsed.as_secs_f64() * 1000.0);
                             }
-                            Err(_) => {
+                            Err(e) => {
                                 total_errors.fetch_add(1, Ordering::Relaxed);
+                                if logged_errors < 3 {
+                                    eprintln!("thread {tid} get error: {e}");
+                                    logged_errors += 1;
+                                }
                             }
                         }
                     }
+                    local_latencies
                 });
                 handles.push(handle);
             }
@@ -1587,8 +1599,11 @@ async fn main() -> Result<()> {
                 }
             });
 
+            let mut all_latencies: Vec<f64> = Vec::new();
             for h in handles {
-                h.await.ok();
+                if let Ok(lats) = h.await {
+                    all_latencies.extend(lats);
+                }
             }
             progress.abort();
             eprintln!();
@@ -1600,9 +1615,8 @@ async fn main() -> Result<()> {
                 eprintln!("errors: {errs}");
             }
 
-            let mut lat_guard = latencies.lock().await;
             let mut hist = LatencyHist::new();
-            hist.samples_ms = lat_guard.drain(..).collect();
+            hist.samples_ms = all_latencies;
             let _ = print_bench_summary("Read", threads, 0, elapsed, ops, &mut hist);
         }
 
