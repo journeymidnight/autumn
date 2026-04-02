@@ -31,6 +31,12 @@ pub struct StreamClient {
     extent_clients: HashMap<String, ExtentServiceClient<Channel>>,
     stream_tails: HashMap<u64, StreamTail>,
     nodes_cache: HashMap<u64, String>,
+    /// Cached commit position per extent_id. Updated after every successful append,
+    /// eliminating the commit_length RPC on steady-state writes.
+    commit_cache: HashMap<u64, u32>,
+    /// Cached ExtentInfo per extent_id for read path, eliminating the extent_info
+    /// manager RPC on every ValuePointer read.
+    extent_info_cache: HashMap<u64, ExtentInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +71,8 @@ impl StreamClient {
             extent_clients: HashMap::new(),
             stream_tails: HashMap::new(),
             nodes_cache: HashMap::new(),
+            commit_cache: HashMap::new(),
+            extent_info_cache: HashMap::new(),
         })
     }
 
@@ -87,6 +95,8 @@ impl StreamClient {
             extent_clients: HashMap::new(),
             stream_tails: HashMap::new(),
             nodes_cache: HashMap::new(),
+            commit_cache: HashMap::new(),
+            extent_info_cache: HashMap::new(),
         })
     }
 
@@ -254,7 +264,13 @@ impl StreamClient {
         loop {
             let tail = self.stream_tail(stream_id).await?;
             let revision = self.revision;
-            let commit = self.current_commit(&tail).await?;
+            // Use cached commit if available (avoids a commit_length RPC per append).
+            // First append to any extent always fetches from replicas (crash recovery).
+            let commit = if let Some(&cached) = self.commit_cache.get(&tail.extent.extent_id) {
+                cached
+            } else {
+                self.current_commit(&tail).await?
+            };
 
             let reqs = vec![
                 AppendRequest {
@@ -310,11 +326,13 @@ impl StreamClient {
             }
 
             if saw_not_found {
+                self.commit_cache.remove(&tail.extent.extent_id);
                 let (_, new_tail) = self.alloc_new_extent(stream_id, 0).await?;
                 let _ = self.cache_stream_tail(stream_id, new_tail).await?;
                 continue;
             }
             if let Some(err) = append_error {
+                self.commit_cache.remove(&tail.extent.extent_id);
                 self.stream_tails.remove(&stream_id);
                 retry += 1;
                 if retry <= 3 {
@@ -325,7 +343,11 @@ impl StreamClient {
             let appended =
                 first_resp.ok_or_else(|| anyhow!("append failed: no replica response"))?;
 
+            // Cache the commit position for the next append.
+            self.commit_cache.insert(tail.extent.extent_id, appended.end);
+
             if appended.end >= self.max_extent_size {
+                self.commit_cache.remove(&tail.extent.extent_id);
                 let (_, new_tail) = self.alloc_new_extent(stream_id, appended.end).await?;
                 let _ = self.cache_stream_tail(stream_id, new_tail).await?;
             }
@@ -480,8 +502,16 @@ impl StreamClient {
             .ok_or_else(|| anyhow!("stream {} not in stream_info response", stream_id))
     }
 
-    /// Return the ExtentInfo for a given extent (includes sealed_length).
+    /// Return the ExtentInfo for a given extent (includes sealed_length). Cached.
     pub async fn get_extent_info(&mut self, extent_id: u64) -> Result<ExtentInfo> {
+        self.fetch_extent_info(extent_id).await
+    }
+
+    /// Fetch ExtentInfo from manager and cache it. Invalidates and re-fetches on error.
+    async fn fetch_extent_info(&mut self, extent_id: u64) -> Result<ExtentInfo> {
+        if let Some(ex) = self.extent_info_cache.get(&extent_id) {
+            return Ok(ex.clone());
+        }
         let resp = self
             .manager
             .extent_info(Request::new(ExtentInfoRequest { extent_id }))
@@ -490,7 +520,9 @@ impl StreamClient {
         if resp.code != Code::Ok as i32 {
             return Err(anyhow!("extent_info failed: {}", resp.code_des));
         }
-        resp.ex_info.context("extent_info missing ex_info")
+        let ex = resp.ex_info.context("extent_info missing ex_info")?;
+        self.extent_info_cache.insert(extent_id, ex.clone());
+        Ok(ex)
     }
 
     /// Read bytes from a specific extent.
@@ -502,15 +534,7 @@ impl StreamClient {
         offset: u32,
         length: u32,
     ) -> Result<(Vec<u8>, u32)> {
-        let resp = self
-            .manager
-            .extent_info(Request::new(ExtentInfoRequest { extent_id }))
-            .await?
-            .into_inner();
-        if resp.code != Code::Ok as i32 {
-            return Err(anyhow!("extent_info failed: {}", resp.code_des));
-        }
-        let ex = resp.ex_info.context("extent_info missing ex_info")?;
+        let ex = self.fetch_extent_info(extent_id).await?;
         let addrs = self.replica_addrs_for_extent(&ex).await?;
 
         let mut last_err = anyhow!("no replicas for extent {}", extent_id);
@@ -562,6 +586,8 @@ impl StreamClient {
                 }
             }
             if !read_ok {
+                // Stale cached info may have caused the failure — invalidate and try next replica.
+                self.extent_info_cache.remove(&extent_id);
                 continue;
             }
             let header = match header {

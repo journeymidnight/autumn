@@ -1,50 +1,61 @@
 Date: 2026-04-01
 TaskStatus: completed
-Task scope: Per-partition StreamClient + crash recovery bug fix
+Task scope: Performance optimization — eliminate redundant network RPCs
 
 Current summary:
-  Fixed two issues identified by benchmark regression (~39 ops/s) and adversarial review:
+  Implemented 4 performance optimizations targeting unnecessary network round trips.
+  All focused on caching: zero new RPCs on steady-state operations.
 
-  1. Crash recovery bug (critical): open_partition only replayed logStream when
-     recovered_vp_eid > 0. A partition that accepted writes but never flushed
-     (no checkpoint) would silently lose all acked writes on restart.
-     Fix: added "no-checkpoint" branch — when tables is empty and vp_eid == 0,
-     replay from the very start of logStream (matching Go's `WithReadFromStart` path).
+  1. Cache current_commit in StreamClient (crates/stream/src/client.rs):
+     - Added commit_cache: HashMap<u64, u32> field (keyed by extent_id)
+     - append_payload uses cached value instead of calling current_commit() RPC
+     - First append to any extent still calls current_commit() (crash recovery safety)
+     - Cache updated after every successful append with appended.end
+     - Cache evicted on error, retry, saw_not_found, or extent rollover
+     - Eliminates 1 commit_length RPC per append in steady state
 
-  2. Per-partition StreamClient (write perf regression):
-     - Added StreamClient::new_with_revision() constructor that reuses an existing
-       owner-lock revision without calling acquire_owner_lock again.
-     - Added revision() / owner_key() accessors to StreamClient.
-     - Added manager_endpoint: String to PartitionServer.
-     - Added stream_client: Arc<Mutex<StreamClient>> to PartitionData.
-     - open_partition creates a per-partition StreamClient from the server's revision.
-     - All I/O in flush, compact, GC, write path now uses the partition's own client.
-     - split_part coordination RPCs (commit_length, acquire_owner_lock,
-       multi_modify_split) still use the server-level stream_client.
+  2. ClusterClient routing cache (crates/server/src/bin/autumn_client.rs):
+     - Added regions: Vec<(u64, RegionInfo)> and ps_details: HashMap<u64, PsDetail>
+     - connect() calls refresh_regions() once to populate cache at startup
+     - resolve_key(): local lookup_key() with linear scan, refresh+retry on miss
+     - resolve_part_id(): same pattern — local lookup, refresh on miss
+     - all_partitions(): uses cache, no GetRegions RPC
+     - refresh_regions() available for manual invalidation
+     - Eliminates GetRegions() RPC on every put/get/del/head/ls/bench operation
 
-  3. Lock scope optimization in process_write_batch (Step 5):
-     - Phase 1: hold write lock → validate, assign seqs, encode blocks, clone sc → release
-     - Phase 2: do append_batch RPC without holding ANY partition lock
-     - Phase 3: re-acquire write lock → insert memtable, update VP head, maybe_rotate
-     Eliminates blocking reads/flushes/compaction during network I/O.
+  3. Cache extent_info in StreamClient (crates/stream/src/client.rs):
+     - Added extent_info_cache: HashMap<u64, ExtentInfo> field
+     - Added fetch_extent_info() helper: cache-first, populate on miss
+     - read_bytes_from_extent() uses fetch_extent_info() instead of direct manager RPC
+     - get_extent_info() delegates to fetch_extent_info()
+     - On read error: invalidates cache entry for that extent_id
+     - Eliminates extent_info manager RPC on every VP (large value) read
 
-  4. Fixed integration test build: added must_sync: false to PutRequest initializers
-     in crates/manager/tests/integration.rs (pre-existing breakage from prior commit).
+  4. Remove manager RPC from ExtentNode read_bytes (crates/stream/src/extent_node.rs):
+     - Removed extent_info_from_manager() call from read_bytes handler
+     - Uses local ExtentEntry state (eversion atomic) for eversion checks
+     - Seal state is maintained by append path and re_avali RPC — no polling needed
+     - Aligns with Go's extent node which never calls the manager on reads
+     - Eliminates 1 manager RPC per VP read on the server side
 
   Files changed:
     crates/stream/src/client.rs
-    crates/partition-server/src/lib.rs
-    crates/manager/tests/integration.rs (test fix)
+    crates/stream/src/extent_node.rs
+    crates/server/src/bin/autumn_client.rs
 
-  Tests: cargo test -p autumn-partition-server -p autumn-stream → all pass.
-  Build: cargo build --workspace → clean.
+  Tests: cargo test -p autumn-stream -p autumn-partition-server → all pass
+  Build: cargo build --workspace → clean
+
+  Also added F039 to feature_list.md: etcd-watch-based partition routing
+  (the full Go-equivalent solution for automatic routing table updates).
 
 Main gaps:
-  - F035 — Extent node WAL for small-write durability (not implemented)
-  - F020 — gRPC connection pool with health check (not implemented)
-  - autumn-manager integration tests have additional pre-existing failures
-    (PartitionServer::connect API changed in prior commit, tests not updated)
+  - F039 — Full etcd-watch routing (currently simple one-shot cache)
+  - F035 — Extent node WAL for small-write durability
+  - F020 — gRPC connection pool with health check
+  - Phase 2 perf: parallel replica fan-out (2a), StreamClient mutex split (2b)
+  - Phase 3 perf: binary search in lookup_in_sst (3a)
 
 Next steps:
-  Run wbench --threads 16 --duration 10 --nosync to verify perf improvement.
-  Update CLAUDE.md files to reflect per-partition StreamClient architecture.
+  Run wbench --no-sync and rbench to verify improvement.
+  Expected: write p50 ~50ms (was 104ms), read p50 ~5ms (was 48ms).

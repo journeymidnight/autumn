@@ -1,15 +1,12 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use autumn_io_engine::IoMode;
 use autumn_partition_server::PartitionServer;
 
 struct Args {
     port: u16,
     psid: u64,
     manager: String,
-    data: PathBuf,
     advertise: Option<String>,
 }
 
@@ -17,7 +14,6 @@ fn parse_args() -> Args {
     let mut port: u16 = 9201;
     let mut psid: u64 = 0;
     let mut manager = String::from("127.0.0.1:9001");
-    let mut data = PathBuf::from("/tmp/autumn-ps");
     let mut advertise: Option<String> = None;
 
     let args: Vec<String> = std::env::args().collect();
@@ -36,10 +32,6 @@ fn parse_args() -> Args {
                 i += 1;
                 manager = args[i].clone();
             }
-            "--data" => {
-                i += 1;
-                data = PathBuf::from(&args[i]);
-            }
             "--advertise" => {
                 i += 1;
                 advertise = Some(args[i].clone());
@@ -51,7 +43,6 @@ fn parse_args() -> Args {
                 eprintln!("  --psid <ID>          Partition server ID (required, non-zero)");
                 eprintln!("  --port <PORT>        gRPC listen port [default: 9201]");
                 eprintln!("  --manager <ADDR>     Manager endpoint [default: 127.0.0.1:9001]");
-                eprintln!("  --data <DIR>         Data directory [default: /tmp/autumn-ps]");
                 eprintln!("  --advertise <ADDR>   Advertise address for cluster discovery");
                 std::process::exit(0);
             }
@@ -65,13 +56,7 @@ fn parse_args() -> Args {
         std::process::exit(1);
     }
 
-    Args {
-        port,
-        psid,
-        manager,
-        data,
-        advertise,
-    }
+    Args { port, psid, manager, advertise }
 }
 
 #[tokio::main]
@@ -93,19 +78,16 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| format!("127.0.0.1:{}", args.port));
 
     tracing::info!(
-        "autumn-ps starting: psid={}, listen={}, manager={}, data={}, advertise={}",
+        "autumn-ps starting: psid={}, listen={}, manager={}, advertise={}",
         args.psid,
         addr,
         args.manager,
-        args.data.display(),
         advertise,
     );
 
     let ps = PartitionServer::connect_with_advertise(
         args.psid,
         &args.manager,
-        &args.data,
-        IoMode::Standard,
         Some(advertise),
     )
     .await

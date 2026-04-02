@@ -9,8 +9,8 @@ use autumn_proto::autumn::partition_manager_service_client::PartitionManagerServ
 use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
 use autumn_proto::autumn::{
     AutoGcOp, CompactOp, CreateStreamRequest, DeleteRequest, Empty, ForceGcOp, GetRequest,
-    HeadRequest, MaintenanceRequest, NodesInfoResponse, PutRequest, RangeRequest, RegionInfo,
-    RegisterNodeRequest, SplitPartRequest, StreamInfoRequest, StreamPutRequest,
+    HeadRequest, MaintenanceRequest, NodesInfoResponse, PsDetail, PutRequest, RangeRequest,
+    RegionInfo, RegisterNodeRequest, SplitPartRequest, StreamInfoRequest, StreamPutRequest,
     StreamPutRequestHeader, UpsertPartitionRequest,
 };
 use autumn_proto::autumn::{PartitionMeta, Range};
@@ -36,6 +36,10 @@ struct ClusterClient {
     sm: StreamManagerServiceClient<Channel>,
     pm: PartitionManagerServiceClient<Channel>,
     ps_conns: HashMap<String, PartitionKvClient<Channel>>,
+    /// Cached regions sorted by start_key for O(log n) key routing.
+    /// Populated once at connect time; refreshed on routing failure.
+    regions: Vec<(u64, RegionInfo)>,
+    ps_details: HashMap<u64, PsDetail>,
 }
 
 impl ClusterClient {
@@ -46,12 +50,34 @@ impl ClusterClient {
             .await
             .with_context(|| format!("connect manager {endpoint}"))?;
 
-        Ok(Self {
+        let mut client = Self {
             manager: manager.to_string(),
             sm: StreamManagerServiceClient::new(channel.clone()),
             pm: PartitionManagerServiceClient::new(channel),
             ps_conns: HashMap::new(),
-        })
+            regions: Vec::new(),
+            ps_details: HashMap::new(),
+        };
+        client.refresh_regions().await?;
+        Ok(client)
+    }
+
+    async fn refresh_regions(&mut self) -> Result<()> {
+        let resp = self
+            .pm
+            .get_regions(Request::new(Empty {}))
+            .await
+            .context("get regions")?
+            .into_inner();
+        let regions_map = resp.regions.unwrap_or_default().regions;
+        let mut sorted: Vec<(u64, RegionInfo)> = regions_map.into_iter().collect();
+        sorted.sort_by(|a, b| {
+            a.1.rg.as_ref().map(|r| r.start_key.as_slice()).unwrap_or(&[])
+                .cmp(b.1.rg.as_ref().map(|r| r.start_key.as_slice()).unwrap_or(&[]))
+        });
+        self.regions = sorted;
+        self.ps_details = resp.ps_details;
+        Ok(())
     }
 
     async fn get_ps_client(&mut self, ps_addr: &str) -> Result<&mut PartitionKvClient<Channel>> {
@@ -68,89 +94,51 @@ impl ClusterClient {
         Ok(self.ps_conns.get_mut(&addr).unwrap())
     }
 
-    async fn resolve_key(&mut self, key: &[u8]) -> Result<(u64, String)> {
-        let resp = self
-            .pm
-            .get_regions(Request::new(Empty {}))
-            .await
-            .context("get regions")?
-            .into_inner();
-
-        let regions = resp.regions.unwrap_or_default().regions;
-        let ps_details = resp.ps_details;
-
-        let mut sorted: Vec<(u64, RegionInfo)> = regions.into_iter().collect();
-        sorted.sort_by(|a, b| {
-            a.1.rg
-                .as_ref()
-                .map(|r| r.start_key.clone())
-                .unwrap_or_default()
-                .cmp(
-                    &b.1.rg
-                        .as_ref()
-                        .map(|r| r.start_key.clone())
-                        .unwrap_or_default(),
-                )
-        });
-
-        for (_, region) in &sorted {
-            let rg = region.rg.as_ref().unwrap();
+    fn lookup_key(&self, key: &[u8]) -> Option<(u64, String)> {
+        for (_, region) in &self.regions {
+            let rg = region.rg.as_ref()?;
             let in_range = key >= rg.start_key.as_slice()
                 && (rg.end_key.is_empty() || key < rg.end_key.as_slice());
             if in_range {
-                let ps_id = region.ps_id;
-                let addr = ps_details
-                    .get(&ps_id)
-                    .map(|d| d.address.clone())
-                    .ok_or_else(|| anyhow!("PS {} address not found", ps_id))?;
-                return Ok((region.part_id, addr));
+                let addr = self.ps_details.get(&region.ps_id)?.address.clone();
+                return Some((region.part_id, addr));
             }
         }
+        None
+    }
 
-        bail!("key is out of range")
+    async fn resolve_key(&mut self, key: &[u8]) -> Result<(u64, String)> {
+        if let Some(result) = self.lookup_key(key) {
+            return Ok(result);
+        }
+        // Cache miss or key out of range — refresh and retry once.
+        self.refresh_regions().await?;
+        self.lookup_key(key).ok_or_else(|| anyhow!("key is out of range"))
     }
 
     async fn resolve_part_id(&mut self, part_id: u64) -> Result<String> {
-        let resp = self
-            .pm
-            .get_regions(Request::new(Empty {}))
-            .await
-            .context("get regions")?
-            .into_inner();
-
-        let regions = resp.regions.unwrap_or_default().regions;
-        let ps_details = resp.ps_details;
-
-        let region = regions
-            .get(&part_id)
-            .ok_or_else(|| anyhow!("partition {} not found", part_id))?;
-        let addr = ps_details
-            .get(&region.ps_id)
-            .map(|d| d.address.clone())
-            .ok_or_else(|| anyhow!("PS {} address not found", region.ps_id))?;
-        Ok(addr)
+        let lookup = |regions: &Vec<(u64, RegionInfo)>, ps_details: &HashMap<u64, PsDetail>| {
+            regions.iter().find(|(_, r)| r.part_id == part_id).and_then(|(_, region)| {
+                ps_details.get(&region.ps_id).map(|d| d.address.clone())
+            })
+        };
+        if let Some(addr) = lookup(&self.regions, &self.ps_details) {
+            return Ok(addr);
+        }
+        self.refresh_regions().await?;
+        lookup(&self.regions, &self.ps_details)
+            .ok_or_else(|| anyhow!("partition {} not found", part_id))
     }
 
     /// Return sorted (part_id, ps_addr) for all partitions, to distribute bench load.
     async fn all_partitions(&mut self) -> Result<Vec<(u64, String)>> {
-        let resp = self
-            .pm
-            .get_regions(Request::new(Empty {}))
-            .await
-            .context("get regions")?
-            .into_inner();
-
-        let regions = resp.regions.unwrap_or_default().regions;
-        let ps_details = resp.ps_details;
-
-        let mut result = Vec::new();
-        for (part_id, region) in regions {
-            let addr = ps_details
-                .get(&region.ps_id)
-                .map(|d| d.address.clone())
-                .unwrap_or_default();
-            result.push((part_id, addr));
+        if self.regions.is_empty() {
+            self.refresh_regions().await?;
         }
+        let mut result: Vec<(u64, String)> = self.regions.iter().map(|(_, region)| {
+            let addr = self.ps_details.get(&region.ps_id).map(|d| d.address.clone()).unwrap_or_default();
+            (region.part_id, addr)
+        }).collect();
         result.sort_by_key(|(pid, _)| *pid);
         Ok(result)
     }

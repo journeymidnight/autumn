@@ -120,6 +120,12 @@
 - **Notes:** Rust creates ad-hoc gRPC clients per call. Go has a shared pool with 2s heartbeat health checking.
 - **passes:** false
 
+### F039 · Client-side partition routing via etcd watch
+- **Target:** Client library (AutumnLib equivalent) loads partition routing table from etcd at connect time, keeps it updated via etcd watch on `regions/config` and `PSSERVER/` prefix. Key lookups use local binary search with zero RPC. Split/migration propagates automatically. Equivalent to Go `autumn_clientv1/lib.go` (regions cache + etcd watch goroutines + saveRegion + sort.Search).
+- **Evidence:** `autumn_clientv1/lib.go` (lines 21-31: cached regions/psDetails, lines 48-69: saveRegion with sort+validate, lines 71-153: Connect with etcd watches, lines 107-147: watch goroutines) · `autumn-rs/crates/server/src/bin/autumn_client.rs` (ClusterClient.resolve_key calls GetRegions RPC on every operation)
+- **Notes:** Go implementation: (1) Connect() loads regions/config from etcd, sorts by StartKey, caches in lib.regions; (2) Two etcd watch goroutines push-update regions and PS addresses; (3) Get/Put do sort.Search on cached regions — zero RPC; (4) Split propagates: PS writes etcd → PartitionManager updates regions/config → etcd watch delivers to all clients. Interim solution: ClusterClient caches GetRegions() result at connect() time, refreshes on routing failure. Full etcd watch requires client-side etcd dependency.
+- **passes:** false
+
 ---
 
 ## P2 — Distributed Capabilities & Operations

@@ -637,25 +637,14 @@ impl ExtentService for ExtentNode {
     ) -> Result<Response<Self::ReadBytesStream>, Status> {
         let req = request.into_inner();
         let extent = self.get_extent(req.extent_id).await?;
-        if let Some(ex) = self.extent_info_from_manager(req.extent_id).await? {
-            let sealed_changed = Self::apply_extent_meta(&extent, &ex);
-            if sealed_changed {
-                let _ = self.save_meta(req.extent_id, &extent).await;
-            }
-            if req.eversion > 0 && req.eversion < ex.eversion {
-                return Err(Status::failed_precondition(format!(
-                    "extent {} eversion too low: got {}, expect >= {}",
-                    req.extent_id, req.eversion, ex.eversion
-                )));
-            }
-        } else {
-            let ev = extent.eversion.load(Ordering::SeqCst);
-            if req.eversion > 0 && req.eversion < ev {
-                return Err(Status::failed_precondition(format!(
-                    "extent {} eversion too low: got {}, expect >= {}",
-                    req.extent_id, req.eversion, ev
-                )));
-            }
+        // Use local extent state for eversion checks (no manager RPC needed on reads).
+        // Seal/eversion updates arrive through the append path and re_avali RPC.
+        let ev = extent.eversion.load(Ordering::SeqCst);
+        if req.eversion > 0 && req.eversion < ev {
+            return Err(Status::failed_precondition(format!(
+                "extent {} eversion too low: got {}, expect >= {}",
+                req.extent_id, req.eversion, ev
+            )));
         }
 
         let total_len = extent.len.load(Ordering::SeqCst);
@@ -673,6 +662,7 @@ impl ExtentService for ExtentNode {
             end,
         };
 
+        const CHUNK_SIZE: u64 = 1024 * 1024; // 1 MB per streaming message
         let (tx, rx) = mpsc::channel(16);
         let file = Arc::clone(&extent.file);
         tokio::spawn(async move {
@@ -683,19 +673,27 @@ impl ExtentService for ExtentNode {
                     )),
                 }))
                 .await;
-            if read_size > 0 {
-                match file.read_at(read_offset, read_size as usize).await {
+            let mut sent = 0u64;
+            while sent < read_size {
+                let chunk_len = ((read_size - sent) as usize).min(CHUNK_SIZE as usize);
+                match file.read_at(read_offset + sent, chunk_len).await {
                     Ok(buf) => {
-                        let _ = tx
+                        sent += buf.len() as u64;
+                        if tx
                             .send(Ok(ReadBytesResponse {
                                 data: Some(
                                     autumn_proto::autumn::read_bytes_response::Data::Payload(buf),
                                 ),
                             }))
-                            .await;
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                     Err(e) => {
                         let _ = tx.send(Err(Status::internal(e.to_string()))).await;
+                        break;
                     }
                 }
             }
@@ -837,18 +835,14 @@ impl ExtentService for ExtentNode {
             req.size.min(logical_len.saturating_sub(offset))
         };
 
-        let payload = extent
-            .file
-            .read_at(offset, size as usize)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
         let header = CopyResponseHeader {
             code: Code::Ok as i32,
             code_des: String::new(),
-            payload_len: payload.len() as u64,
+            payload_len: size,
         };
 
+        const COPY_CHUNK_SIZE: u64 = 1024 * 1024; // 1 MB per streaming message
+        let file = Arc::clone(&extent.file);
         let (tx, rx) = mpsc::channel(8);
         tokio::spawn(async move {
             let _ = tx
@@ -858,13 +852,30 @@ impl ExtentService for ExtentNode {
                     )),
                 }))
                 .await;
-            let _ = tx
-                .send(Ok(CopyExtentResponse {
-                    data: Some(autumn_proto::autumn::copy_extent_response::Data::Payload(
-                        payload,
-                    )),
-                }))
-                .await;
+            let mut sent = 0u64;
+            while sent < size {
+                let chunk_len = ((size - sent) as usize).min(COPY_CHUNK_SIZE as usize);
+                match file.read_at(offset + sent, chunk_len).await {
+                    Ok(buf) => {
+                        sent += buf.len() as u64;
+                        if tx
+                            .send(Ok(CopyExtentResponse {
+                                data: Some(
+                                    autumn_proto::autumn::copy_extent_response::Data::Payload(buf),
+                                ),
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(Status::internal(e.to_string()))).await;
+                        break;
+                    }
+                }
+            }
         });
 
         Ok(Response::new(

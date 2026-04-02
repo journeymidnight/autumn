@@ -6,13 +6,13 @@ use super::format::{
     MAX_ENTRIES_PER_BLOCK,
 };
 
-/// Strip the 8-byte MVCC timestamp suffix from an internal key to get the user key.
-/// Used for bloom filter hashing (matching Go's `ParseKey`).
+/// Strip the 9-byte MVCC suffix (1 null separator + 8-byte timestamp) from an internal key
+/// to get the user key. Used for bloom filter hashing.
 fn parse_user_key(internal_key: &[u8]) -> &[u8] {
-    if internal_key.len() <= 8 {
+    if internal_key.len() <= 9 {
         internal_key
     } else {
-        &internal_key[..internal_key.len() - 8]
+        &internal_key[..internal_key.len() - 9]
     }
 }
 
@@ -229,6 +229,7 @@ mod tests {
 
     fn ikey(user_key: &[u8], seq: u64) -> Vec<u8> {
         let mut k = user_key.to_vec();
+        k.push(0u8); // null separator
         k.extend_from_slice(&(u64::MAX - seq).to_be_bytes());
         k
     }

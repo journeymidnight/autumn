@@ -250,6 +250,7 @@ message PutRequest {
   bytes value = 2;
   uint64 expires_at = 3;
   uint64 part_id = 4;
+  bool must_sync = 5;
 }
 
 message PutResponse {
@@ -269,6 +270,7 @@ message GetResponse {
 message DeleteRequest {
   bytes key = 1;
   uint64 part_id = 2;
+  bool must_sync = 3;
 }
 
 message DeleteResponse {
@@ -312,6 +314,7 @@ message StreamPutRequestHeader {
   uint32 len_of_value = 2;
   uint64 expires_at = 3;
   uint64 part_id = 4;
+  bool must_sync = 5;
 }
 
 message StreamPutRequest {

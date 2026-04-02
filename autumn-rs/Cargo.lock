@@ -140,12 +140,16 @@ dependencies = [
  "autumn-partition-server",
  "autumn-proto",
  "autumn-stream",
+ "rand",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "tonic 0.11.0",
  "tonic-reflection",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

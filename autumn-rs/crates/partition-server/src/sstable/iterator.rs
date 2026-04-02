@@ -303,6 +303,7 @@ mod tests {
 
     fn ikey(user_key: &[u8], seq: u64) -> Vec<u8> {
         let mut k = user_key.to_vec();
+        k.push(0u8); // null separator
         k.extend_from_slice(&(u64::MAX - seq).to_be_bytes());
         k
     }
