@@ -82,6 +82,12 @@ background_flush_loop (when signaled):
 
 No local WAL file. logStream is the sole WAL.
 
+Each partition uses its **own `StreamClient`** (`PartitionData.stream_client`), created via
+`StreamClient::new_with_revision` which reuses the server-level owner-lock revision without
+calling `acquire_owner_lock` again. The server-level `PartitionServer.stream_client` is
+reserved for split coordination RPCs only (`commit_length`, `acquire_owner_lock`,
+`multi_modify_split`).
+
 ## Core Read Data Flow
 
 ```

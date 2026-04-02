@@ -1,48 +1,50 @@
 Date: 2026-04-01
 TaskStatus: completed
-Task scope: Group commit + remove local WAL + client-controlled must_sync (plan: curried-dazzling-canyon.md)
+Task scope: Per-partition StreamClient + crash recovery bug fix
 
 Current summary:
-  Implemented all steps from the plan:
+  Fixed two issues identified by benchmark regression (~39 ops/s) and adversarial review:
 
-  1. Proto (already done in prior session):
-     - PutRequest.must_sync, DeleteRequest.must_sync, StreamPutRequestHeader.must_sync
+  1. Crash recovery bug (critical): open_partition only replayed logStream when
+     recovered_vp_eid > 0. A partition that accepted writes but never flushed
+     (no checkpoint) would silently lose all acked writes on restart.
+     Fix: added "no-checkpoint" branch — when tables is empty and vp_eid == 0,
+     replay from the very start of logStream (matching Go's `WithReadFromStart` path).
 
-  2. Server — group-commit write loop + remove local WAL (already done in prior session):
-     - WriteOp / WriteRequest types added to lib.rs
-     - write_tx: mpsc::Sender<WriteRequest> in PartitionData (log_file/log_len removed)
-     - background_write_loop: batches up to 128 requests, 1 append_batch RPC for entire batch
-     - ALL entries (small + large) go to log_stream — no local WAL file
-     - batch_must_sync = any(req.must_sync): if any request needs sync, whole batch syncs
-     - put() / delete() handlers: thin — send to write_tx, await oneshot response
-     - stream_put() passes header.must_sync through to put()
-     - open_partition recovery: replays logStream from VP head; no local WAL step
+  2. Per-partition StreamClient (write perf regression):
+     - Added StreamClient::new_with_revision() constructor that reuses an existing
+       owner-lock revision without calling acquire_owner_lock again.
+     - Added revision() / owner_key() accessors to StreamClient.
+     - Added manager_endpoint: String to PartitionServer.
+     - Added stream_client: Arc<Mutex<StreamClient>> to PartitionData.
+     - open_partition creates a per-partition StreamClient from the server's revision.
+     - All I/O in flush, compact, GC, write path now uses the partition's own client.
+     - split_part coordination RPCs (commit_length, acquire_owner_lock,
+       multi_modify_split) still use the server-level stream_client.
 
-  3. Client — --nosync flag (done this session):
-     - WBench, Put, Del, StreamPut Command variants: added nosync: bool field
-     - wbench parser: added --nosync flag
-     - put/del parsers: added --nosync flag (flag-first, before positional args)
-     - streamput parser: added --nosync flag
-     - PutRequest/DeleteRequest/StreamPutRequestHeader: must_sync = !nosync
-     - Usage string updated to show --nosync for wbench
+  3. Lock scope optimization in process_write_batch (Step 5):
+     - Phase 1: hold write lock → validate, assign seqs, encode blocks, clone sc → release
+     - Phase 2: do append_batch RPC without holding ANY partition lock
+     - Phase 3: re-acquire write lock → insert memtable, update VP head, maybe_rotate
+     Eliminates blocking reads/flushes/compaction during network I/O.
 
-  4. Docs updated:
-     - crates/partition-server/CLAUDE.md: new write path, no local WAL, group commit
-     - autumn-rs/CLAUDE.md: updated Core Write Data Flow diagram
-     - autumn-rs/README.md: wbench --nosync example + description
+  4. Fixed integration test build: added must_sync: false to PutRequest initializers
+     in crates/manager/tests/integration.rs (pre-existing breakage from prior commit).
 
   Files changed:
-    crates/server/src/bin/autumn_client.rs
-    crates/partition-server/CLAUDE.md
-    autumn-rs/CLAUDE.md
-    autumn-rs/README.md
+    crates/stream/src/client.rs
+    crates/partition-server/src/lib.rs
+    crates/manager/tests/integration.rs (test fix)
 
-  Tests: cargo test -p autumn-partition-server → 12/12 pass.
+  Tests: cargo test -p autumn-partition-server -p autumn-stream → all pass.
   Build: cargo build --workspace → clean.
 
-Main gaps: none for this plan.
+Main gaps:
+  - F035 — Extent node WAL for small-write durability (not implemented)
+  - F020 — gRPC connection pool with health check (not implemented)
+  - autumn-manager integration tests have additional pre-existing failures
+    (PartitionServer::connect API changed in prior commit, tests not updated)
 
 Next steps:
-  F011 — mark umbrella as complete (all sub-features done)
-  F035 — Extent node WAL for small-write durability
-  F020 — gRPC connection pool with health check
+  Run wbench --threads 16 --duration 10 --nosync to verify perf improvement.
+  Update CLAUDE.md files to reflect per-partition StreamClient architecture.

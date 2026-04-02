@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use crossbeam_skiplist::SkipMap;
-use autumn_io_engine::{build_engine, IoEngine, IoFile, IoMode};
 use autumn_proto::autumn::partition_kv_server::{PartitionKv, PartitionKvServer};
 use autumn_proto::autumn::partition_manager_service_client::PartitionManagerServiceClient;
 use autumn_proto::autumn::{
@@ -20,7 +19,7 @@ use autumn_proto::autumn::{
 };
 use autumn_stream::StreamClient;
 use dashmap::DashMap;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tonic::transport::{Channel, Endpoint, Server};
 use tonic::{Request, Response, Status};
 
@@ -33,6 +32,10 @@ use sstable::{IterItem, MergeIterator, MemtableIterator, SstBuilder, SstReader, 
 const FLUSH_MEM_BYTES: u64 = 256 * 1024;
 const FLUSH_MEM_OPS: usize = 512;
 const MAX_SKIP_LIST: u64 = 64 * 1024 * 1024;
+/// Capacity of the per-partition write channel.
+const WRITE_CHANNEL_CAP: usize = 1024;
+/// Max writes batched in one group-commit cycle.
+const MAX_WRITE_BATCH: usize = 128;
 const COMPACT_RATIO: f64 = 0.5;
 const HEAD_RATIO: f64 = 0.3;
 const COMPACT_N: usize = 5;
@@ -41,11 +44,17 @@ const COMPACT_N: usize = 5;
 // MVCC internal-key helpers
 // ---------------------------------------------------------------------------
 
-const TS_SIZE: usize = 8;
+/// Bytes for the inverted sequence number.
+const TS_BYTES: usize = 8;
+/// Total suffix length: 1 null separator + 8-byte inverted seq.
+/// The null separator ensures that a user_key that is a prefix of another user_key
+/// still sorts before it in internal-key space (e.g. "mykey\x00..." < "mykey1\x00...").
+const TS_SIZE: usize = TS_BYTES + 1;
 
 fn key_with_ts(user_key: &[u8], ts: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(user_key.len() + TS_SIZE);
     out.extend_from_slice(user_key);
+    out.push(0u8); // null separator: preserves user-key lexicographic order
     out.extend_from_slice(&(u64::MAX - ts).to_be_bytes());
     out
 }
@@ -57,7 +66,8 @@ fn parse_key(internal_key: &[u8]) -> &[u8] {
 
 fn parse_ts(internal_key: &[u8]) -> u64 {
     if internal_key.len() <= TS_SIZE { return 0; }
-    let b: [u8; 8] = internal_key[internal_key.len() - TS_SIZE..].try_into().unwrap();
+    // Timestamp occupies the last TS_BYTES bytes (after the null separator).
+    let b: [u8; 8] = internal_key[internal_key.len() - TS_BYTES..].try_into().unwrap();
     u64::MAX - u64::from_be_bytes(b)
 }
 
@@ -188,10 +198,12 @@ struct PartitionData {
     /// SstReader aligned with `tables` (same index).
     sst_readers: Vec<Arc<SstReader>>,
     has_overlap: Arc<AtomicU32>,
-    log_file: Arc<dyn IoFile>,
-    log_len: u64,
+    /// Sender end of the group-commit write channel.
+    write_tx: mpsc::Sender<WriteRequest>,
     vp_extent_id: u64,
     vp_offset: u32,
+    /// Per-partition StreamClient — not shared with other partitions.
+    stream_client: Arc<Mutex<StreamClient>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +216,26 @@ enum GcTask {
 }
 
 // ---------------------------------------------------------------------------
+// Group-commit write channel types
+// ---------------------------------------------------------------------------
+
+/// An operation submitted to the per-partition write loop.
+enum WriteOp {
+    Put { user_key: Vec<u8>, value: Vec<u8>, expires_at: u64 },
+    Delete { user_key: Vec<u8> },
+}
+
+/// A write request sent through the per-partition write channel.
+struct WriteRequest {
+    op: WriteOp,
+    /// If true, the log_stream append must fsync before acking.
+    must_sync: bool,
+    /// Channel to notify the caller when the write is durable.
+    /// Sends back `Ok(user_key)` on success, `Err(Status)` on failure.
+    resp_tx: oneshot::Sender<Result<Vec<u8>, Status>>,
+}
+
+// ---------------------------------------------------------------------------
 // PartitionServer
 // ---------------------------------------------------------------------------
 
@@ -211,28 +243,25 @@ enum GcTask {
 pub struct PartitionServer {
     ps_id: u64,
     advertise_addr: Option<String>,
-    data_dir: Arc<PathBuf>,
-    io: Arc<dyn IoEngine>,
     partitions: Arc<DashMap<u64, Arc<RwLock<PartitionData>>>>,
     pm_client: Arc<Mutex<PartitionManagerServiceClient<Channel>>>,
+    /// Server-level StreamClient used only for split coordination RPCs.
     stream_client: Arc<Mutex<StreamClient>>,
+    /// Manager endpoint string, reused to create per-partition StreamClients.
+    manager_endpoint: String,
 }
 
 impl PartitionServer {
     pub async fn connect(
         ps_id: u64,
         manager_endpoint: &str,
-        data_dir: impl AsRef<Path>,
-        io_mode: IoMode,
     ) -> Result<Self> {
-        Self::connect_with_advertise(ps_id, manager_endpoint, data_dir, io_mode, None).await
+        Self::connect_with_advertise(ps_id, manager_endpoint, None).await
     }
 
     pub async fn connect_with_advertise(
         ps_id: u64,
         manager_endpoint: &str,
-        data_dir: impl AsRef<Path>,
-        io_mode: IoMode,
         advertise_addr: Option<String>,
     ) -> Result<Self> {
         let endpoint = normalize_endpoint(manager_endpoint)?;
@@ -246,18 +275,13 @@ impl PartitionServer {
         let owner_key = format!("ps-{ps_id}");
         let sc = StreamClient::connect(manager_endpoint, owner_key, 128 * 1024 * 1024).await?;
 
-        let io = build_engine(io_mode)?;
-        let data_dir = data_dir.as_ref().to_path_buf();
-        tokio::fs::create_dir_all(&data_dir).await?;
-
         let server = Self {
             ps_id,
             advertise_addr,
-            data_dir: Arc::new(data_dir),
-            io,
             partitions: Arc::new(DashMap::new()),
             pm_client: Arc::new(Mutex::new(pm_client)),
             stream_client: Arc::new(Mutex::new(sc)),
+            manager_endpoint: manager_endpoint.to_string(),
         };
 
         server.register_ps().await?;
@@ -280,9 +304,6 @@ impl PartitionServer {
         key < rg.end_key.as_slice()
     }
 
-    fn part_log_path(&self, part_id: u64) -> PathBuf {
-        self.data_dir.join(format!("part-{part_id}.wal"))
-    }
 
     // -----------------------------------------------------------------------
     // WAL record encode / decode (format unchanged for backward compat)
@@ -346,7 +367,7 @@ impl PartitionServer {
     }
 
     async fn save_table_locs_raw(
-        &self,
+        stream_client: &Arc<Mutex<StreamClient>>,
         meta_stream_id: u64,
         tables: &[TableMeta],
         vp_extent_id: u64,
@@ -361,7 +382,7 @@ impl PartitionServer {
             vp_offset,
         };
         let data = locs_proto.encode_length_delimited_to_vec();
-        let mut sc = self.stream_client.lock().await;
+        let mut sc = stream_client.lock().await;
         sc.append(meta_stream_id, &data, true).await?;
         let info = sc.get_stream_info(meta_stream_id).await?;
         if info.extent_ids.len() > 1 {
@@ -375,6 +396,25 @@ impl PartitionServer {
     // Open / recover a partition
     // -----------------------------------------------------------------------
 
+    /// Decode WAL records from `bytes`, returning `(byte_offset, op, key, value, expires_at)`.
+    /// `byte_offset` is the offset of each record within the buffer.
+    fn decode_records_with_offsets(bytes: &[u8]) -> Vec<(usize, u8, Vec<u8>, Vec<u8>, u64)> {
+        let mut out = Vec::new();
+        let mut cursor = 0usize;
+        while cursor + 17 <= bytes.len() {
+            let record_start = cursor;
+            let op = bytes[cursor]; cursor += 1;
+            let key_len = u32::from_le_bytes(bytes[cursor..cursor+4].try_into().unwrap()) as usize; cursor += 4;
+            let val_len = u32::from_le_bytes(bytes[cursor..cursor+4].try_into().unwrap()) as usize; cursor += 4;
+            let expires_at = u64::from_le_bytes(bytes[cursor..cursor+8].try_into().unwrap()); cursor += 8;
+            if cursor + key_len + val_len > bytes.len() { break; }
+            let key = bytes[cursor..cursor+key_len].to_vec(); cursor += key_len;
+            let value = bytes[cursor..cursor+val_len].to_vec(); cursor += val_len;
+            out.push((record_start, op, key, value, expires_at));
+        }
+        out
+    }
+
     async fn open_partition(
         &self,
         part_id: u64,
@@ -383,8 +423,15 @@ impl PartitionServer {
         row_stream_id: u64,
         meta_stream_id: u64,
     ) -> Result<Arc<RwLock<PartitionData>>> {
-        let log_file = self.io.create(&self.part_log_path(part_id)).await?;
-        let wal_len = log_file.len().await?;
+        // Create a per-partition StreamClient that shares the server's owner-lock revision.
+        let (owner_key, revision) = {
+            let sc = self.stream_client.lock().await;
+            (sc.owner_key().to_string(), sc.revision())
+        };
+        let part_sc = StreamClient::new_with_revision(
+            &self.manager_endpoint, owner_key, revision, 128 * 1024 * 1024,
+        ).await.context("create per-partition StreamClient")?;
+        let part_sc = Arc::new(Mutex::new(part_sc));
 
         let mut tables: Vec<TableMeta> = Vec::new();
         let mut sst_readers: Vec<Arc<SstReader>> = Vec::new();
@@ -395,7 +442,7 @@ impl PartitionServer {
 
         // Step 1: Read metaStream to get last checkpoint.
         let meta_bytes_opt = {
-            let mut sc = self.stream_client.lock().await;
+            let mut sc = part_sc.lock().await;
             sc.read_last_extent_data(meta_stream_id).await?
         };
 
@@ -409,7 +456,7 @@ impl PartitionServer {
             // Step 2: For each SSTable location, read bytes from rowStream.
             for loc in locations.locs {
                 let sst_bytes = {
-                    let mut sc = self.stream_client.lock().await;
+                    let mut sc = part_sc.lock().await;
                     let (data, _end) = sc
                         .read_bytes_from_extent(loc.extent_id, loc.offset, loc.len)
                         .await
@@ -453,68 +500,73 @@ impl PartitionServer {
                 });
                 sst_readers.push(Arc::new(reader));
             }
-
-            // Step 2b: Replay logStream from vhead to recover in-flight large values.
-            if recovered_vp_eid > 0 {
-                let stream_info = {
-                    let mut sc = self.stream_client.lock().await;
-                    sc.get_stream_info(log_stream_id).await?
-                };
-                for eid in stream_info.extent_ids {
-                    if eid < recovered_vp_eid { continue; }
-                    let start_off = if eid == recovered_vp_eid { recovered_vp_off } else { 0 };
-                    let data = {
-                        let mut sc = self.stream_client.lock().await;
-                        match sc.read_bytes_from_extent(eid, start_off, 0).await {
-                            Ok((d, _)) => d,
-                            Err(_) => continue,
-                        }
-                    };
-                    for (op, key, value, expires_at) in Self::decode_records_full(&data) {
-                        let ts = parse_ts(&key);
-                        if ts > max_seq { max_seq = ts; }
-                        // This will be overwritten by WAL replay below if WAL has newer versions.
-                        // The logStream replay only recovers data NOT in SSTables.
-                        // We use this to seed the sequence counter.
-                        let _ = (op, key, value, expires_at); // actual replay done in WAL step
-                    }
-                }
-            }
         }
 
-        // Step 3: Replay local WAL into active memtable.
+        // Step 2b: Replay logStream to recover unflushed writes.
+        // `max_seq` is the SSTable watermark — records with ts > max_seq are unflushed.
+        // Two cases (matching Go's recovery logic):
+        //   a) No checkpoint (recovered_vp_eid == 0 && tables empty): replay from the very
+        //      beginning of logStream.  Covers the case where writes were acked but the
+        //      partition was killed before its first flush.
+        //   b) Checkpoint exists (recovered_vp_eid > 0): replay from the VP head forward.
+        let sst_max_seq = max_seq;
         let active = Memtable::new();
-        if wal_len > 0 {
-            let wal_bytes = log_file.read_at(0, wal_len as usize).await?;
-            for (op, key, value, expires_at) in Self::decode_records_full(&wal_bytes) {
-                let ts = parse_ts(&key);
-                if ts > max_seq { max_seq = ts; }
 
-                let mem_entry = if op == 1 && value.len() > VALUE_THROTTLE {
-                    // Large value in WAL: re-append to logStream.
-                    let log_entry = Self::encode_record(1, &key, &value, expires_at);
-                    let result = {
-                        let mut sc = self.stream_client.lock().await;
-                        sc.append(log_stream_id, &log_entry, true).await?
-                    };
-                    let vp = ValuePointer {
-                        extent_id: result.extent_id,
-                        offset: result.offset,
-                        len: value.len() as u32,
-                    };
-                    if result.extent_id > recovered_vp_eid
-                        || (result.extent_id == recovered_vp_eid && result.end > recovered_vp_off)
-                    {
-                        recovered_vp_eid = result.extent_id;
-                        recovered_vp_off = result.end;
+        let replay_extents: Option<Vec<(u64, u32)>> = if recovered_vp_eid == 0 && tables.is_empty() {
+            // No checkpoint — replay from the start of the log stream.
+            let stream_info = {
+                let mut sc = part_sc.lock().await;
+                sc.get_stream_info(log_stream_id).await?
+            };
+            Some(stream_info.extent_ids.into_iter().map(|eid| (eid, 0u32)).collect())
+        } else if recovered_vp_eid > 0 {
+            // Checkpoint exists — replay from the VP head.
+            let stream_info = {
+                let mut sc = part_sc.lock().await;
+                sc.get_stream_info(log_stream_id).await?
+            };
+            Some(stream_info.extent_ids.into_iter().filter_map(|eid| {
+                if eid < recovered_vp_eid { None }
+                else {
+                    let off = if eid == recovered_vp_eid { recovered_vp_off } else { 0 };
+                    Some((eid, off))
+                }
+            }).collect())
+        } else {
+            None
+        };
+
+        if let Some(extents) = replay_extents {
+            for (eid, start_off) in extents {
+                let data = {
+                    let mut sc = part_sc.lock().await;
+                    match sc.read_bytes_from_extent(eid, start_off, 0).await {
+                        Ok((d, _)) => d,
+                        Err(_) => continue,
                     }
-                    MemEntry { op: 1 | OP_VALUE_POINTER, value: vp.encode().to_vec(), expires_at }
-                } else {
-                    MemEntry { op, value, expires_at }
                 };
+                for (buf_off, op, key, value, expires_at) in Self::decode_records_with_offsets(&data) {
+                    let ts = parse_ts(&key);
+                    if ts > max_seq { max_seq = ts; }
+                    // Only replay records newer than what is already in SSTables.
+                    if ts <= sst_max_seq { continue; }
 
-                let size = key.len() as u64 + mem_entry.value.len() as u64 + 32;
-                active.insert(key, mem_entry, size);
+                    let record_extent_off = start_off + buf_off as u32;
+                    let mem_entry = if value.len() > VALUE_THROTTLE {
+                        // Large value: VP points to the WAL record in logStream.
+                        let vp = ValuePointer {
+                            extent_id: eid,
+                            offset: record_extent_off,
+                            len: value.len() as u32,
+                        };
+                        MemEntry { op: (op & 0x7f) | OP_VALUE_POINTER, value: vp.encode().to_vec(), expires_at }
+                    } else {
+                        MemEntry { op, value, expires_at }
+                    };
+
+                    let size = key.len() as u64 + mem_entry.value.len() as u64 + 32;
+                    active.insert(key, mem_entry, size);
+                }
             }
         }
 
@@ -522,6 +574,7 @@ impl PartitionServer {
         let (flush_tx, flush_rx) = mpsc::unbounded_channel::<()>();
         let (compact_tx, compact_rx) = mpsc::channel::<bool>(1);
         let (gc_tx, gc_rx) = mpsc::channel::<GcTask>(1);
+        let (write_tx, write_rx) = mpsc::channel::<WriteRequest>(WRITE_CHANNEL_CAP);
         let has_overlap = Arc::new(AtomicU32::new(if detected_overlap { 1 } else { 0 }));
 
         let part = Arc::new(RwLock::new(PartitionData {
@@ -532,6 +585,7 @@ impl PartitionServer {
             flush_tx,
             compact_tx,
             gc_tx,
+            write_tx,
             seq_number,
             log_stream_id,
             row_stream_id,
@@ -539,10 +593,9 @@ impl PartitionServer {
             tables,
             sst_readers,
             has_overlap: has_overlap.clone(),
-            log_file,
-            log_len: wal_len,
             vp_extent_id: recovered_vp_eid,
             vp_offset: recovered_vp_off,
+            stream_client: part_sc,
         }));
 
         {
@@ -560,26 +613,13 @@ impl PartitionServer {
             let server_clone = self.clone();
             tokio::spawn(Self::background_gc_loop(server_clone, part_weak, gc_rx));
         }
+        {
+            let part_weak = Arc::downgrade(&part);
+            let server_clone = self.clone();
+            tokio::spawn(Self::background_write_loop(server_clone, part_weak, write_rx));
+        }
 
         Ok(part)
-    }
-
-    // -----------------------------------------------------------------------
-    // WAL append
-    // -----------------------------------------------------------------------
-
-    async fn append_log(
-        part: &mut PartitionData,
-        op: u8,
-        internal_key: &[u8],
-        value: &[u8],
-        expires_at: u64,
-    ) -> Result<()> {
-        let buf = Self::encode_record(op, internal_key, value, expires_at);
-        part.log_file.write_at(part.log_len, &buf).await?;
-        part.log_file.sync_all().await?;
-        part.log_len += buf.len() as u64;
-        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -598,11 +638,6 @@ impl PartitionServer {
 
         part.imm.push_back(Arc::new(frozen));
         part.active = Memtable::new();
-
-        // Truncate WAL (values are in SkipMap — same crash-safety trade-off as before).
-        part.log_file.truncate(0).await?;
-        part.log_file.sync_all().await?;
-        part.log_len = 0;
 
         let _ = part.flush_tx.send(());
         Ok(())
@@ -628,8 +663,9 @@ impl PartitionServer {
 
         let (sst_bytes, last_seq) = Self::build_sst_bytes(&imm_mem, part.vp_extent_id, part.vp_offset);
 
+        let part_sc = part.stream_client.clone();
         let result = {
-            let mut sc = self.stream_client.lock().await;
+            let mut sc = part_sc.lock().await;
             sc.append(part.row_stream_id, &sst_bytes, true).await?
         };
 
@@ -646,24 +682,24 @@ impl PartitionServer {
         });
         part.sst_readers.push(Arc::new(reader));
 
-        self.save_table_locs_raw(part.meta_stream_id, &part.tables, part.vp_extent_id, part.vp_offset).await?;
+        Self::save_table_locs_raw(&part_sc, part.meta_stream_id, &part.tables, part.vp_extent_id, part.vp_offset).await?;
         Ok(true)
     }
 
     /// Async flush: build SST outside the lock, briefly take write lock to update state.
     async fn flush_one_imm_async(&self, part: &Arc<RwLock<PartitionData>>) -> Result<bool> {
-        // Phase 1: peek imm + capture stream IDs.
-        let (imm_mem, row_stream_id, meta_stream_id, snap_vp_eid, snap_vp_off) = {
+        // Phase 1: peek imm + capture stream IDs and partition's stream client.
+        let (imm_mem, row_stream_id, meta_stream_id, snap_vp_eid, snap_vp_off, part_sc) = {
             let guard = part.read().await;
             let Some(imm_mem) = guard.imm.front().cloned() else { return Ok(false); };
-            (imm_mem, guard.row_stream_id, guard.meta_stream_id, guard.vp_extent_id, guard.vp_offset)
+            (imm_mem, guard.row_stream_id, guard.meta_stream_id, guard.vp_extent_id, guard.vp_offset, guard.stream_client.clone())
         };
 
         // Phase 2: build SST bytes (no lock).
         let (sst_bytes, last_seq) = Self::build_sst_bytes(&imm_mem, snap_vp_eid, snap_vp_off);
 
         let result = {
-            let mut sc = self.stream_client.lock().await;
+            let mut sc = part_sc.lock().await;
             sc.append(row_stream_id, &sst_bytes, true).await?
         };
 
@@ -689,7 +725,7 @@ impl PartitionServer {
             (guard.tables.clone(), veid, voff)
         };
 
-        self.save_table_locs_raw(meta_stream_id, &tables_snapshot, vp_eid, vp_off).await?;
+        Self::save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, vp_eid, vp_off).await?;
         Ok(true)
     }
 
@@ -813,7 +849,7 @@ impl PartitionServer {
         let compact_keys: std::collections::HashSet<(u64, u32)> = tbls.iter().map(|t| t.loc()).collect();
 
         // Grab SstReaders for selected tables and the partition range for overlap filtering.
-        let (readers, row_stream_id, meta_stream_id, compact_vp_eid, compact_vp_off, rg) = {
+        let (readers, row_stream_id, meta_stream_id, compact_vp_eid, compact_vp_off, rg, part_sc) = {
             let guard = part.read().await;
             let mut rds: Vec<Arc<SstReader>> = Vec::new();
             for t in &tbls {
@@ -821,7 +857,7 @@ impl PartitionServer {
                     rds.push(guard.sst_readers[idx].clone());
                 }
             }
-            (rds, guard.row_stream_id, guard.meta_stream_id, guard.vp_extent_id, guard.vp_offset, guard.rg.clone())
+            (rds, guard.row_stream_id, guard.meta_stream_id, guard.vp_extent_id, guard.vp_offset, guard.rg.clone(), guard.stream_client.clone())
         };
 
         if readers.is_empty() { return Ok(false); }
@@ -910,7 +946,7 @@ impl PartitionServer {
         // Validate discards: remove extents no longer in the logStream.
         let log_stream_id = { part.read().await.log_stream_id };
         let log_extent_ids = {
-            let mut sc = self.stream_client.lock().await;
+            let mut sc = part_sc.lock().await;
             sc.get_stream_info(log_stream_id).await.map(|s| s.extent_ids).unwrap_or_default()
         };
         Self::valid_discard(&mut discards, &log_extent_ids);
@@ -924,7 +960,7 @@ impl PartitionServer {
                 let voff = if veid == guard.vp_extent_id { guard.vp_offset } else { compact_vp_off };
                 (guard.tables.clone(), veid, voff)
             };
-            self.save_table_locs_raw(meta_stream_id, &tables_snapshot, vp_eid, vp_off).await?;
+            Self::save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, vp_eid, vp_off).await?;
             return Ok(true);
         }
 
@@ -942,7 +978,7 @@ impl PartitionServer {
             }
             let sst_bytes = b.finish();
             let result = {
-                let mut sc = self.stream_client.lock().await;
+                let mut sc = part_sc.lock().await;
                 sc.append(row_stream_id, &sst_bytes, true).await?
             };
             let estimated_size = sst_bytes.len() as u64;
@@ -972,7 +1008,7 @@ impl PartitionServer {
             (guard.tables.clone(), veid, voff)
         };
 
-        self.save_table_locs_raw(meta_stream_id, &tables_snapshot, final_vp_eid, final_vp_off).await?;
+        Self::save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, final_vp_eid, final_vp_off).await?;
         Ok(true)
     }
 
@@ -1017,8 +1053,11 @@ impl PartitionServer {
                         Ok(_) => {
                             has_overlap.store(0, Ordering::SeqCst);
                             if last_extent != 0 {
-                                let row_stream_id = part.read().await.row_stream_id;
-                                let mut sc = server.stream_client.lock().await;
+                                let (row_stream_id, part_sc) = {
+                                    let g = part.read().await;
+                                    (g.row_stream_id, g.stream_client.clone())
+                                };
+                                let mut sc = part_sc.lock().await;
                                 if let Err(e) = sc.truncate(row_stream_id, last_extent).await {
                                     tracing::warn!("major compaction truncate: {e}");
                                 }
@@ -1036,8 +1075,11 @@ impl PartitionServer {
                     match server.do_compact(&part, compact_tbls, false).await {
                         Ok(_) => {
                             if truncate_id != 0 {
-                                let row_stream_id = part.read().await.row_stream_id;
-                                let mut sc = server.stream_client.lock().await;
+                                let (row_stream_id, part_sc) = {
+                                    let g = part.read().await;
+                                    (g.row_stream_id, g.stream_client.clone())
+                                };
+                                let mut sc = part_sc.lock().await;
                                 if let Err(e) = sc.truncate(row_stream_id, truncate_id).await {
                                     tracing::warn!("minor compaction truncate: {e}");
                                 }
@@ -1074,22 +1116,23 @@ impl PartitionServer {
     /// GC a single logStream extent: replay its records, re-write live value-pointer
     /// entries, then punch the extent.
     async fn run_gc(
-        server: &PartitionServer,
+        _server: &PartitionServer,
         part: &Arc<RwLock<PartitionData>>,
         extent_id: u64,
         sealed_length: u32,
     ) -> Result<()> {
+        let (log_stream_id, rg, part_sc) = {
+            let g = part.read().await;
+            (g.log_stream_id, g.rg.clone(), g.stream_client.clone())
+        };
+
         // Read the whole extent.
         let (data, _end) = {
-            let mut sc = server.stream_client.lock().await;
+            let mut sc = part_sc.lock().await;
             sc.read_bytes_from_extent(extent_id, 0, sealed_length).await?
         };
 
         let records = Self::decode_records_full(&data);
-        let (log_stream_id, rg) = {
-            let g = part.read().await;
-            (g.log_stream_id, g.rg.clone())
-        };
 
         let mut moved = 0usize;
         for (op, key, value, expires_at) in records {
@@ -1136,7 +1179,7 @@ impl PartitionServer {
                         let internal_key = key_with_ts(&user_key, seq);
                         let log_entry = Self::encode_record(1, &internal_key, &value, expires_at);
                         let result = {
-                            let mut sc = server.stream_client.lock().await;
+                            let mut sc = part_sc.lock().await;
                             sc.append(log_stream_id, &log_entry, true).await?
                         };
                         let new_vp = ValuePointer { extent_id: result.extent_id, offset: result.offset, len: vp.len };
@@ -1144,7 +1187,6 @@ impl PartitionServer {
                         part_guard.vp_offset = result.end;
                         let mem_entry = MemEntry { op: 1 | OP_VALUE_POINTER, value: new_vp.encode().to_vec(), expires_at };
                         let write_size = (user_key.len() + value.len() + 32) as u64;
-                        Self::append_log(&mut part_guard, 1, &internal_key, &value, expires_at).await?;
                         part_guard.active.insert(internal_key, mem_entry, write_size);
                         moved += 1;
                     }
@@ -1154,7 +1196,7 @@ impl PartitionServer {
 
         // Punch this extent.
         {
-            let mut sc = server.stream_client.lock().await;
+            let mut sc = part_sc.lock().await;
             sc.punch_holes(log_stream_id, vec![extent_id]).await?;
         }
         tracing::info!("GC: punched extent {extent_id}, moved {moved} entries");
@@ -1187,14 +1229,14 @@ impl PartitionServer {
 
             let Some(part) = part_weak.upgrade() else { break; };
 
-            let (log_stream_id, readers_snapshot) = {
+            let (log_stream_id, readers_snapshot, part_sc) = {
                 let g = part.read().await;
-                (g.log_stream_id, g.sst_readers.clone())
+                (g.log_stream_id, g.sst_readers.clone(), g.stream_client.clone())
             };
 
             // Get logStream extent list.
             let stream_info = {
-                let mut sc = server.stream_client.lock().await;
+                let mut sc = part_sc.lock().await;
                 match sc.get_stream_info(log_stream_id).await {
                     Ok(s) => s,
                     Err(e) => { tracing::warn!("GC get_stream_info: {e}"); continue; }
@@ -1223,7 +1265,7 @@ impl PartitionServer {
                     let mut holes = Vec::new();
                     for eid in candidates.into_iter().take(MAX_GC_ONCE) {
                         let sealed_length = {
-                            let mut sc = server.stream_client.lock().await;
+                            let mut sc = part_sc.lock().await;
                             match sc.get_extent_info(eid).await {
                                 Ok(info) => info.sealed_length as u32,
                                 Err(e) => { tracing::warn!("GC extent_info {eid}: {e}"); continue; }
@@ -1243,7 +1285,7 @@ impl PartitionServer {
 
             for eid in holes {
                 let sealed_length = {
-                    let mut sc = server.stream_client.lock().await;
+                    let mut sc = part_sc.lock().await;
                     match sc.get_extent_info(eid).await {
                         Ok(info) => info.sealed_length as u32,
                         Err(e) => { tracing::warn!("GC extent_info {eid}: {e}"); continue; }
@@ -1293,6 +1335,167 @@ impl PartitionServer {
         } else {
             Err("no such partition")
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Group-commit write loop
+    // -----------------------------------------------------------------------
+
+    /// Background task: drains the write channel, batches entries, appends to
+    /// logStream in one RPC, inserts all into the memtable.
+    async fn background_write_loop(
+        server: PartitionServer,
+        part_weak: std::sync::Weak<RwLock<PartitionData>>,
+        mut write_rx: mpsc::Receiver<WriteRequest>,
+    ) {
+        loop {
+            // Block until at least one request arrives.
+            let first = match write_rx.recv().await {
+                Some(r) => r,
+                None => return, // channel closed — partition dropped
+            };
+
+            // Drain additional requests non-blocking to form a batch.
+            let mut batch: Vec<WriteRequest> = vec![first];
+            while batch.len() < MAX_WRITE_BATCH {
+                match write_rx.try_recv() {
+                    Ok(r) => batch.push(r),
+                    Err(_) => break,
+                }
+            }
+
+            // Upgrade weak ref; exit if partition was dropped.
+            let part_arc = match part_weak.upgrade() {
+                Some(a) => a,
+                None => {
+                    // Partition gone — error all pending requests.
+                    for req in batch {
+                        let _ = req.resp_tx.send(Err(Status::internal("partition dropped")));
+                    }
+                    return;
+                }
+            };
+
+            if let Err(e) = Self::process_write_batch(&server, &part_arc, batch).await {
+                tracing::error!("write batch error: {e}");
+            }
+        }
+    }
+
+    /// Process one batch of write requests under the partition write lock.
+    async fn process_write_batch(
+        server: &PartitionServer,
+        part_arc: &Arc<RwLock<PartitionData>>,
+        batch: Vec<WriteRequest>,
+    ) -> Result<()> {
+        // Phase 1: Hold write lock only to validate keys, assign seq numbers, encode
+        // blocks, and grab the partition's stream client.  Release before network I/O
+        // so reads, flush, and compaction are not blocked during the append RPC.
+        struct ValidatedEntry {
+            internal_key: Vec<u8>,
+            user_key: Vec<u8>,
+            op: u8,
+            value: Vec<u8>,
+            expires_at: u64,
+            must_sync: bool,
+            resp_tx: oneshot::Sender<Result<Vec<u8>, Status>>,
+        }
+
+        let (valid, blocks, batch_must_sync, log_stream_id, part_sc) = {
+            let mut part = part_arc.write().await;
+
+            let mut valid: Vec<ValidatedEntry> = Vec::with_capacity(batch.len());
+            for req in batch {
+                let (user_key, op, value, expires_at) = match req.op {
+                    WriteOp::Put { user_key, value, expires_at } => (user_key, 1u8, value, expires_at),
+                    WriteOp::Delete { user_key } => (user_key, 2u8, vec![], 0u64),
+                };
+                if !Self::in_range(&part.rg, &user_key) {
+                    let _ = req.resp_tx.send(Err(Status::invalid_argument("key is out of range")));
+                    continue;
+                }
+                part.seq_number += 1;
+                let seq = part.seq_number;
+                let internal_key = key_with_ts(&user_key, seq);
+                valid.push(ValidatedEntry {
+                    internal_key,
+                    user_key,
+                    op,
+                    value,
+                    expires_at,
+                    must_sync: req.must_sync,
+                    resp_tx: req.resp_tx,
+                });
+            }
+
+            if valid.is_empty() {
+                return Ok(());
+            }
+
+            // Build blocks for log_stream batch append.
+            // ALL entries (small and large) go to logStream — matches Go design.
+            let blocks: Vec<Vec<u8>> = valid.iter()
+                .map(|e| Self::encode_record(e.op, &e.internal_key, &e.value, e.expires_at))
+                .collect();
+
+            // If ANY request in the batch requires sync, the whole batch syncs.
+            let batch_must_sync = valid.iter().any(|e| e.must_sync);
+            let log_stream_id = part.log_stream_id;
+            let part_sc = part.stream_client.clone();
+
+            (valid, blocks, batch_must_sync, log_stream_id, part_sc)
+            // write lock released here
+        };
+
+        // Phase 2: Append to logStream without holding the partition write lock.
+        // Reads, flushes, and compaction can proceed concurrently.
+        let block_refs: Vec<&[u8]> = blocks.iter().map(|b| b.as_slice()).collect();
+        let result = {
+            let mut sc = part_sc.lock().await;
+            sc.append_batch(log_stream_id, &block_refs, batch_must_sync).await
+                .map_err(|e| anyhow!("log_stream append_batch: {e}"))?
+        };
+
+        // Phase 3: Re-acquire write lock to insert into memtable and update VP head.
+        let mut responses: Vec<(Vec<u8>, oneshot::Sender<Result<Vec<u8>, Status>>)> = Vec::new();
+        {
+            let mut part = part_arc.write().await;
+
+            let mut cumulative: u32 = 0;
+            for (i, entry) in valid.into_iter().enumerate() {
+                let record_offset = result.offset + cumulative;
+                cumulative += blocks[i].len() as u32;
+
+                let mem_entry = if entry.value.len() > VALUE_THROTTLE {
+                    let vp = ValuePointer {
+                        extent_id: result.extent_id,
+                        offset: record_offset,
+                        len: entry.value.len() as u32,
+                    };
+                    MemEntry { op: entry.op | OP_VALUE_POINTER, value: vp.encode().to_vec(), expires_at: entry.expires_at }
+                } else {
+                    MemEntry { op: entry.op, value: entry.value, expires_at: entry.expires_at }
+                };
+
+                let write_size = (entry.user_key.len() + mem_entry.value.len() + 32) as u64;
+                part.active.insert(entry.internal_key, mem_entry, write_size);
+                responses.push((entry.user_key, entry.resp_tx));
+            }
+
+            // Update VP head to end of this batch.
+            part.vp_extent_id = result.extent_id;
+            part.vp_offset = result.end;
+
+            server.maybe_rotate_locked(&mut part).await
+                .map_err(|e| anyhow!("maybe_rotate: {e}"))?;
+        } // write lock released here
+
+        // Notify all callers.
+        for (key, tx) in responses {
+            let _ = tx.send(Ok(key));
+        }
+
+        Ok(())
     }
 
     pub fn trigger_gc(&self, part_id: u64) -> Result<(), &'static str> {
@@ -1473,39 +1676,20 @@ impl PartitionKv for PartitionServer {
         let req = request.into_inner();
         let p = self.get_partition_or_sync(req.part_id).await
             .map_err(|e| part_lookup_to_status(req.part_id, e))?;
-        let mut part = p.write().await;
-        if !Self::in_range(&part.rg, &req.key) {
-            return Err(Status::invalid_argument("key is out of range"));
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        {
+            let part = p.read().await;
+            part.write_tx.send(WriteRequest {
+                op: WriteOp::Put { user_key: req.key.clone(), value: req.value, expires_at: req.expires_at },
+                must_sync: req.must_sync,
+                resp_tx,
+            }).await.map_err(|_| Status::internal("write channel closed"))?;
         }
 
-        part.seq_number += 1;
-        let seq = part.seq_number;
-        let internal_key = key_with_ts(&req.key, seq);
-
-        // Write to WAL for durability.
-        Self::append_log(&mut part, 1, &internal_key, &req.value, req.expires_at)
-            .await.map_err(internal_to_status)?;
-
-        // For large values: also append to logStream.
-        let mem_entry = if req.value.len() > VALUE_THROTTLE {
-            let log_entry = Self::encode_record(1, &internal_key, &req.value, req.expires_at);
-            let result = {
-                let mut sc = self.stream_client.lock().await;
-                sc.append(part.log_stream_id, &log_entry, true).await.map_err(internal_to_status)?
-            };
-            let vp = ValuePointer { extent_id: result.extent_id, offset: result.offset, len: req.value.len() as u32 };
-            part.vp_extent_id = result.extent_id;
-            part.vp_offset = result.end;
-            MemEntry { op: 1 | OP_VALUE_POINTER, value: vp.encode().to_vec(), expires_at: req.expires_at }
-        } else {
-            MemEntry { op: 1, value: req.value.clone(), expires_at: req.expires_at }
-        };
-
-        // Use original value length for flush accounting (large values stored as VP, but count their true size).
-        let write_size = (req.key.len() + req.value.len() + 32) as u64;
-        part.active.insert(internal_key, mem_entry, write_size);
-        self.maybe_rotate_locked(&mut part).await.map_err(internal_to_status)?;
-        Ok(Response::new(PutResponse { key: req.key }))
+        let key = resp_rx.await
+            .map_err(|_| Status::internal("write response dropped"))??;
+        Ok(Response::new(PutResponse { key }))
     }
 
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
@@ -1537,7 +1721,7 @@ impl PartitionKv for PartitionServer {
         if op == 2 { return Err(Status::not_found("key not found")); }
         if expires_at > 0 && expires_at <= now_secs() { return Err(Status::not_found("key not found")); }
 
-        let stream_client = self.stream_client.clone();
+        let stream_client = part.stream_client.clone();
         drop(part);
 
         let value = Self::resolve_value(op, raw_value, &stream_client)
@@ -1550,22 +1734,20 @@ impl PartitionKv for PartitionServer {
         let req = request.into_inner();
         let p = self.get_partition_or_sync(req.part_id).await
             .map_err(|e| part_lookup_to_status(req.part_id, e))?;
-        let mut part = p.write().await;
-        if !Self::in_range(&part.rg, &req.key) {
-            return Err(Status::invalid_argument("key is out of range"));
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        {
+            let part = p.read().await;
+            part.write_tx.send(WriteRequest {
+                op: WriteOp::Delete { user_key: req.key.clone() },
+                must_sync: req.must_sync,
+                resp_tx,
+            }).await.map_err(|_| Status::internal("write channel closed"))?;
         }
 
-        part.seq_number += 1;
-        let seq = part.seq_number;
-        let internal_key = key_with_ts(&req.key, seq);
-
-        Self::append_log(&mut part, 2, &internal_key, &[], 0)
-            .await.map_err(internal_to_status)?;
-
-        let write_size = (req.key.len() + 32) as u64;
-        part.active.insert(internal_key, MemEntry { op: 2, value: vec![], expires_at: 0 }, write_size);
-        self.maybe_rotate_locked(&mut part).await.map_err(internal_to_status)?;
-        Ok(Response::new(DeleteResponse { key: req.key }))
+        let key = resp_rx.await
+            .map_err(|_| Status::internal("write response dropped"))??;
+        Ok(Response::new(DeleteResponse { key }))
     }
 
     async fn head(&self, request: Request<HeadRequest>) -> Result<Response<HeadResponse>, Status> {
@@ -1725,7 +1907,7 @@ impl PartitionKv for PartitionServer {
         }
 
         // Collect unique live user keys.
-        let user_keys = Self::unique_user_keys_async(&part, &self.stream_client).await;
+        let user_keys = Self::unique_user_keys_async(&part, &part.stream_client.clone()).await;
         if user_keys.len() < 2 {
             drop(part);
             self.partitions.insert(req.part_id, p.clone());
@@ -1821,7 +2003,7 @@ impl PartitionKv for PartitionServer {
         if value.len() != expected_len {
             return Err(Status::invalid_argument(format!("payload {} bytes, header declared {}", value.len(), expected_len)));
         }
-        self.put(Request::new(PutRequest { key: header.key.clone(), value, expires_at: header.expires_at, part_id: header.part_id })).await
+        self.put(Request::new(PutRequest { key: header.key.clone(), value, expires_at: header.expires_at, part_id: header.part_id, must_sync: header.must_sync })).await
     }
 
     async fn maintenance(
@@ -1911,6 +2093,16 @@ mod tests {
         assert_eq!(parse_key(&k1), uk.as_slice());
         assert_eq!(parse_ts(&k1), 1);
         assert_eq!(parse_ts(&k3), 100);
+
+        // Critical: keys where one is a prefix of another must maintain
+        // user-key lexicographic order in internal-key space.
+        // Bug: without the null separator, "mykey\xff..." > "mykey1\xff..."
+        // which causes get("mykey") to return not-found after put("mykey") + put("mykey1").
+        let ka = key_with_ts(b"mykey", 1);
+        let kb = key_with_ts(b"mykey1", 2);
+        assert!(ka < kb, "\"mykey\" internal key must sort before \"mykey1\" internal key");
+        assert_eq!(parse_key(&ka), b"mykey");
+        assert_eq!(parse_key(&kb), b"mykey1");
     }
 
     #[test]

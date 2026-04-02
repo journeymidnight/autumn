@@ -276,7 +276,7 @@ async fn partition_server_put_get_and_split_flow() {
         .expect("connect kv");
 
     for k in ["a1", "a2", "a3", "a4"] {
-        kv.put(Request::new(PutRequest {
+        kv.put(Request::new(PutRequest { must_sync: false,
             key: k.as_bytes().to_vec(),
             value: format!("val-{k}").into_bytes(),
             expires_at: 0,
@@ -457,7 +457,7 @@ async fn partition_server_recovery_replays_table_and_wal() {
         .await
         .expect("connect kv1");
 
-    kv1.put(Request::new(PutRequest {
+    kv1.put(Request::new(PutRequest { must_sync: false,
         key: b"a-flush".to_vec(),
         value: vec![b'x'; 300 * 1024],
         expires_at: 0,
@@ -466,7 +466,7 @@ async fn partition_server_recovery_replays_table_and_wal() {
     .await
     .expect("put flush key");
 
-    kv1.put(Request::new(PutRequest {
+    kv1.put(Request::new(PutRequest { must_sync: false,
         key: b"a-wal-1".to_vec(),
         value: b"v1".to_vec(),
         expires_at: 0,
@@ -475,7 +475,7 @@ async fn partition_server_recovery_replays_table_and_wal() {
     .await
     .expect("put wal key 1");
 
-    kv1.put(Request::new(PutRequest {
+    kv1.put(Request::new(PutRequest { must_sync: false,
         key: b"a-wal-2".to_vec(),
         value: b"v2".to_vec(),
         expires_at: 0,
@@ -885,7 +885,7 @@ async fn f030_flush_writes_sst_to_row_stream() {
         .await.expect("connect kv");
 
     // 300 KB put triggers flush (FLUSH_MEM_BYTES = 256 KB).
-    kv.put(Request::new(PutRequest {
+    kv.put(Request::new(PutRequest { must_sync: false,
         key: b"a-big".to_vec(),
         value: vec![b'X'; 300 * 1024],
         expires_at: 0,
@@ -951,14 +951,14 @@ async fn f030_recovery_from_meta_and_row_streams() {
 
     let mut kv1 = PartitionKvClient::connect(format!("http://{}", ps1_addr))
         .await.expect("connect kv1");
-    kv1.put(Request::new(PutRequest {
+    kv1.put(Request::new(PutRequest { must_sync: false,
         key: b"a-streamed".to_vec(),
         value: vec![b'S'; 300 * 1024], // triggers flush
         expires_at: 0,
         part_id: 611,
     })).await.expect("put streamed");
     sleep(Duration::from_millis(300)).await; // wait for bg flush
-    kv1.put(Request::new(PutRequest {
+    kv1.put(Request::new(PutRequest { must_sync: false,
         key: b"a-wal-only".to_vec(),
         value: b"small".to_vec(),
         expires_at: 0,
@@ -1037,7 +1037,7 @@ async fn f029_compaction_merges_small_tables() {
 
     // Write 3 large values, each triggering a separate flush.
     for i in 0u8..3 {
-        kv.put(Request::new(PutRequest {
+        kv.put(Request::new(PutRequest { must_sync: false,
             key: format!("key-{:02}", i).into_bytes(),
             value: vec![b'A' + i; 300 * 1024],
             expires_at: 0,
@@ -1129,7 +1129,7 @@ async fn f031_large_value_stored_in_log_stream() {
 
     // Large value: 8 KB > VALUE_THROTTLE (4 KB) — stored in logStream.
     let large_val: Vec<u8> = (0u8..=255).cycle().take(8 * 1024).collect();
-    kv.put(Request::new(PutRequest {
+    kv.put(Request::new(PutRequest { must_sync: false,
         key: b"large-key".to_vec(),
         value: large_val.clone(),
         expires_at: 0,
@@ -1138,7 +1138,7 @@ async fn f031_large_value_stored_in_log_stream() {
 
     // Small value: 2 KB <= VALUE_THROTTLE — stays inline.
     let small_val = vec![b'S'; 2 * 1024];
-    kv.put(Request::new(PutRequest {
+    kv.put(Request::new(PutRequest { must_sync: false,
         key: b"small-key".to_vec(),
         value: small_val.clone(),
         expires_at: 0,
@@ -1199,7 +1199,7 @@ async fn f031_recovery_replays_log_stream() {
         .await.expect("connect kv1");
 
     let large_val: Vec<u8> = (0u8..=255).cycle().take(8 * 1024).collect();
-    kv1.put(Request::new(PutRequest {
+    kv1.put(Request::new(PutRequest { must_sync: false,
         key: b"b-large".to_vec(),
         value: large_val.clone(),
         expires_at: 0,
@@ -1207,7 +1207,7 @@ async fn f031_recovery_replays_log_stream() {
     })).await.expect("put large");
 
     // Filler triggers flush so the SST gets a ValuePointer record for b-large.
-    kv1.put(Request::new(PutRequest {
+    kv1.put(Request::new(PutRequest { must_sync: false,
         key: b"b-filler".to_vec(),
         value: vec![b'F'; 300 * 1024],
         expires_at: 0,
@@ -1215,7 +1215,7 @@ async fn f031_recovery_replays_log_stream() {
     })).await.expect("put filler");
     sleep(Duration::from_millis(500)).await; // wait for background flush
 
-    kv1.put(Request::new(PutRequest {
+    kv1.put(Request::new(PutRequest { must_sync: false,
         key: b"b-wal-small".to_vec(),
         value: b"small-wal".to_vec(),
         expires_at: 0,
@@ -1293,13 +1293,13 @@ async fn f031_compaction_preserves_value_pointers() {
 
     // Write 3 rounds of large + filler to produce 3 SSTables with ValuePointers.
     for i in 0..3u8 {
-        kv.put(Request::new(PutRequest {
+        kv.put(Request::new(PutRequest { must_sync: false,
             key: format!("c-large-{}", i).into_bytes(),
             value: large_val.clone(),
             expires_at: 0,
             part_id: 721,
         })).await.expect("put large");
-        kv.put(Request::new(PutRequest {
+        kv.put(Request::new(PutRequest { must_sync: false,
             key: format!("c-fill-{}", i).into_bytes(),
             value: vec![b'F'; 300 * 1024],
             expires_at: 0,
@@ -1373,14 +1373,14 @@ async fn f033_gc_reclaims_log_stream_extents() {
     // Each write also uses a 300KB filler key to trigger flush after this key.
     let val_v1: Vec<u8> = vec![b'A'; 8 * 1024];
     for i in 0u8..3 {
-        kv.put(Request::new(PutRequest {
+        kv.put(Request::new(PutRequest { must_sync: false,
             key: format!("gc-key-{}", i).into_bytes(),
             value: val_v1.clone(),
             expires_at: 0,
             part_id: 801,
         })).await.expect("put v1");
         // Filler to trigger flush.
-        kv.put(Request::new(PutRequest {
+        kv.put(Request::new(PutRequest { must_sync: false,
             key: format!("gc-fill-{}", i).into_bytes(),
             value: vec![b'F'; 300 * 1024],
             expires_at: 0,
@@ -1393,13 +1393,13 @@ async fn f033_gc_reclaims_log_stream_extents() {
     // This makes the Round 1 logStream records dead (VP entries now point nowhere current).
     let val_v2: Vec<u8> = vec![b'B'; 8 * 1024];
     for i in 0u8..3 {
-        kv.put(Request::new(PutRequest {
+        kv.put(Request::new(PutRequest { must_sync: false,
             key: format!("gc-key-{}", i).into_bytes(),
             value: val_v2.clone(),
             expires_at: 0,
             part_id: 801,
         })).await.expect("put v2");
-        kv.put(Request::new(PutRequest {
+        kv.put(Request::new(PutRequest { must_sync: false,
             key: format!("gc-fill2-{}", i).into_bytes(),
             value: vec![b'G'; 300 * 1024],
             expires_at: 0,
@@ -1476,14 +1476,14 @@ async fn f037_overlap_detected_after_split_and_cleared_by_compaction() {
 
     // Write keys in the "a*" range and flush them to an SSTable.
     for i in 0u8..5 {
-        kv.put(Request::new(PutRequest {
+        kv.put(Request::new(PutRequest { must_sync: false,
             key: format!("a-key-{:02}", i).into_bytes(),
             value: format!("val-a-{}", i).into_bytes(),
             expires_at: 0,
             part_id: 901,
         })).await.expect("put a-key");
     }
-    kv.put(Request::new(PutRequest {
+    kv.put(Request::new(PutRequest { must_sync: false,
         key: b"a-filler".to_vec(),
         value: vec![b'X'; 300 * 1024],
         expires_at: 0,
@@ -1493,14 +1493,14 @@ async fn f037_overlap_detected_after_split_and_cleared_by_compaction() {
 
     // Write keys in the "y*" range and flush them to a second SSTable.
     for i in 0u8..5 {
-        kv.put(Request::new(PutRequest {
+        kv.put(Request::new(PutRequest { must_sync: false,
             key: format!("y-key-{:02}", i).into_bytes(),
             value: format!("val-y-{}", i).into_bytes(),
             expires_at: 0,
             part_id: 901,
         })).await.expect("put y-key");
     }
-    kv.put(Request::new(PutRequest {
+    kv.put(Request::new(PutRequest { must_sync: false,
         key: b"y-filler".to_vec(),
         value: vec![b'Y'; 300 * 1024],
         expires_at: 0,

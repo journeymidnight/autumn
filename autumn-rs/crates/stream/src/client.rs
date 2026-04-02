@@ -68,6 +68,31 @@ impl StreamClient {
         })
     }
 
+    /// Create a StreamClient that reuses an existing owner-lock revision without
+    /// calling `acquire_owner_lock` again.  Used to create per-partition clients
+    /// that share the same fencing identity as the server-level client.
+    pub async fn new_with_revision(
+        manager_endpoint: &str,
+        owner_key: String,
+        revision: i64,
+        max_extent_size: u32,
+    ) -> Result<Self> {
+        let endpoint = normalize_endpoint(manager_endpoint);
+        let manager = StreamManagerServiceClient::connect(endpoint).await?;
+        Ok(Self {
+            manager,
+            owner_key,
+            revision,
+            max_extent_size,
+            extent_clients: HashMap::new(),
+            stream_tails: HashMap::new(),
+            nodes_cache: HashMap::new(),
+        })
+    }
+
+    pub fn revision(&self) -> i64 { self.revision }
+    pub fn owner_key(&self) -> &str { &self.owner_key }
+
     async fn extent_client(&mut self, addr: &str) -> Result<&mut ExtentServiceClient<Channel>> {
         if !self.extent_clients.contains_key(addr) {
             let endpoint = normalize_endpoint(addr);
