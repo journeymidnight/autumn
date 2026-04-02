@@ -33,8 +33,10 @@ const FLUSH_MEM_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SKIP_LIST: u64 = 64 * 1024 * 1024;
 /// Capacity of the per-partition write channel.
 const WRITE_CHANNEL_CAP: usize = 1024;
-/// Max writes batched in one group-commit cycle.
-const MAX_WRITE_BATCH: usize = 256;
+/// Soft op cap for one group-commit batch, matching Go's 3 * write channel size.
+const MAX_WRITE_BATCH: usize = WRITE_CHANNEL_CAP * 3;
+/// Go's doWrites also flushes a batch once its encoded gRPC payload gets large.
+const MAX_WRITE_BATCH_BYTES: usize = 30 * 1024 * 1024;
 const COMPACT_RATIO: f64 = 0.5;
 const HEAD_RATIO: f64 = 0.3;
 const COMPACT_N: usize = 5;
@@ -262,6 +264,17 @@ struct WriteRequest {
     enqueue_at: Instant,
 }
 
+impl WriteRequest {
+    fn encoded_size(&self) -> usize {
+        match &self.op {
+            WriteOp::Put {
+                user_key, value, ..
+            } => 17 + user_key.len() + value.len(),
+            WriteOp::Delete { user_key } => 17 + user_key.len(),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct BatchStats {
     ops: u64,
@@ -395,6 +408,30 @@ fn ns_to_ms(total_ns: u64, denom: u64) -> f64 {
         return 0.0;
     }
     total_ns as f64 / denom as f64 / 1_000_000.0
+}
+
+fn write_batch_too_big(batch: &[WriteRequest]) -> bool {
+    let mut size = 0usize;
+    for req in batch {
+        size += req.encoded_size();
+        if size > MAX_WRITE_BATCH_BYTES {
+            return true;
+        }
+    }
+    batch.len() > MAX_WRITE_BATCH
+}
+
+fn record_write_batch_completion(
+    metrics: &mut WriteLoopMetrics,
+    part_id: u64,
+    join_result: Result<Result<BatchStats>, tokio::task::JoinError>,
+) {
+    match join_result {
+        Ok(Ok(stats)) => metrics.record(stats),
+        Ok(Err(e)) => tracing::error!("write batch error: {e}"),
+        Err(e) => tracing::error!("write batch task panicked: {e}"),
+    }
+    metrics.maybe_report(part_id);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1754,71 +1791,114 @@ impl PartitionServer {
         part_weak: std::sync::Weak<RwLock<PartitionData>>,
         mut write_rx: mpsc::Receiver<WriteRequest>,
     ) {
-        // 1-deep pipeline: while batch N is doing network I/O (Phase 2 of
-        // process_write_batch), the loop is already collecting batch N+1 from
-        // the channel.  We wait for the previous handle before spawning the
-        // next, which preserves Phase-1 / Phase-3 ordering (seq assignment and
-        // memtable inserts run under the write lock, which is held per-batch).
+        enum BatchAction {
+            Received(WriteRequest),
+            DispatchReady,
+            ChannelClosed,
+            Completed(Result<Result<BatchStats>, tokio::task::JoinError>),
+        }
+
         let mut in_flight: Option<tokio::task::JoinHandle<Result<BatchStats>>> = None;
         let mut metrics = WriteLoopMetrics::new();
+        let mut pending: Vec<WriteRequest> = Vec::new();
 
-        loop {
-            // Block until at least one request arrives.
-            let first = match write_rx.recv().await {
-                Some(r) => r,
-                None => break, // channel closed — partition dropped
-            };
-
-            // Drain additional requests non-blocking to form a batch.
-            let mut batch: Vec<WriteRequest> = vec![first];
-            while batch.len() < MAX_WRITE_BATCH {
-                match write_rx.try_recv() {
-                    Ok(r) => batch.push(r),
-                    Err(_) => break,
+        'main: loop {
+            if pending.is_empty() {
+                match write_rx.recv().await {
+                    Some(req) => pending.push(req),
+                    None => break,
                 }
             }
 
-            // Wait for the previous batch to finish before starting this one.
-            // This ensures seq numbers and memtable inserts remain ordered.
-            if let Some(handle) = in_flight.take() {
-                match handle.await {
-                    Ok(Ok(stats)) => {
-                        metrics.record(stats);
-                        metrics.maybe_report(part_id);
+            loop {
+                if write_batch_too_big(&pending) {
+                    if let Some(handle) = in_flight.take() {
+                        record_write_batch_completion(&mut metrics, part_id, handle.await);
                     }
-                    Ok(Err(e)) => tracing::error!("write batch error: {e}"),
-                    Err(e) => tracing::error!("write batch task panicked: {e}"),
+                    let batch = std::mem::take(&mut pending);
+                    let handle = match Self::spawn_write_batch_task(&server, &part_weak, batch) {
+                        Some(handle) => handle,
+                        None => return,
+                    };
+                    in_flight = Some(handle);
+                    break;
+                }
+
+                let action = if let Some(handle) = in_flight.as_mut() {
+                    tokio::select! {
+                        received = write_rx.recv() => match received {
+                            Some(req) => BatchAction::Received(req),
+                            None => BatchAction::ChannelClosed,
+                        },
+                        completed = handle => BatchAction::Completed(completed),
+                    }
+                } else {
+                    tokio::select! {
+                        received = write_rx.recv() => match received {
+                            Some(req) => BatchAction::Received(req),
+                            None => BatchAction::ChannelClosed,
+                        },
+                        _ = std::future::ready(()) => BatchAction::DispatchReady,
+                    }
+                };
+
+                match action {
+                    BatchAction::Received(req) => pending.push(req),
+                    BatchAction::DispatchReady => {
+                        let batch = std::mem::take(&mut pending);
+                        let handle = match Self::spawn_write_batch_task(&server, &part_weak, batch)
+                        {
+                            Some(handle) => handle,
+                            None => return,
+                        };
+                        in_flight = Some(handle);
+                        break;
+                    }
+                    BatchAction::ChannelClosed => break 'main,
+                    BatchAction::Completed(join_result) => {
+                        in_flight = None;
+                        record_write_batch_completion(&mut metrics, part_id, join_result);
+                    }
                 }
             }
-
-            // Upgrade weak ref; exit if partition was dropped.
-            let part_arc = match part_weak.upgrade() {
-                Some(a) => a,
-                None => {
-                    // Partition gone — error all pending requests.
-                    for req in batch {
-                        let _ = req.resp_tx.send(Err(Status::internal("partition dropped")));
-                    }
-                    return;
-                }
-            };
-
-            let server_clone = server.clone();
-            let picked_at = Instant::now();
-            in_flight = Some(tokio::spawn(async move {
-                Self::process_write_batch(&server_clone, &part_arc, batch, picked_at).await
-            }));
         }
 
-        // Drain the last in-flight batch.
-        if let Some(handle) = in_flight {
-            match handle.await {
-                Ok(Ok(stats)) => metrics.record(stats),
-                Ok(Err(e)) => tracing::error!("write batch error: {e}"),
-                Err(e) => tracing::error!("write batch task panicked: {e}"),
-            }
+        if let Some(handle) = in_flight.take() {
+            record_write_batch_completion(&mut metrics, part_id, handle.await);
+        }
+        if !pending.is_empty() {
+            let batch = std::mem::take(&mut pending);
+            let handle = match Self::spawn_write_batch_task(&server, &part_weak, batch) {
+                Some(handle) => handle,
+                None => return,
+            };
+            record_write_batch_completion(&mut metrics, part_id, handle.await);
         }
         metrics.flush(part_id);
+    }
+
+    fn spawn_write_batch_task(
+        server: &PartitionServer,
+        part_weak: &std::sync::Weak<RwLock<PartitionData>>,
+        batch: Vec<WriteRequest>,
+    ) -> Option<tokio::task::JoinHandle<Result<BatchStats>>> {
+        if batch.is_empty() {
+            return None;
+        }
+        let part_arc = match part_weak.upgrade() {
+            Some(a) => a,
+            None => {
+                for req in batch {
+                    let _ = req.resp_tx.send(Err(Status::internal("partition dropped")));
+                }
+                return None;
+            }
+        };
+        let server_clone = server.clone();
+        let picked_at = Instant::now();
+        Some(tokio::spawn(async move {
+            Self::process_write_batch(&server_clone, &part_arc, batch, picked_at).await
+        }))
     }
 
     /// Process one batch of write requests under the partition write lock.
