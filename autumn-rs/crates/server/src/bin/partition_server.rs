@@ -56,7 +56,12 @@ fn parse_args() -> Args {
         std::process::exit(1);
     }
 
-    Args { port, psid, manager, advertise }
+    Args {
+        port,
+        psid,
+        manager,
+        advertise,
+    }
 }
 
 #[tokio::main]
@@ -85,13 +90,9 @@ async fn main() -> Result<()> {
         advertise,
     );
 
-    let ps = PartitionServer::connect_with_advertise(
-        args.psid,
-        &args.manager,
-        Some(advertise),
-    )
-    .await
-    .context("connect partition server")?;
+    let ps = PartitionServer::connect_with_advertise(args.psid, &args.manager, Some(advertise))
+        .await
+        .context("connect partition server")?;
 
     tracing::info!("autumn-ps ready, serving on {addr}");
 

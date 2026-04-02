@@ -2,14 +2,11 @@ mod sstable;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use bytes::{Bytes, BytesMut, BufMut};
-use crossbeam_skiplist::SkipMap;
 use autumn_proto::autumn::partition_kv_server::{PartitionKv, PartitionKvServer};
 use autumn_proto::autumn::partition_manager_service_client::PartitionManagerServiceClient;
 use autumn_proto::autumn::{
@@ -19,12 +16,14 @@ use autumn_proto::autumn::{
     SplitPartRequest, SplitPartResponse, StreamPutRequest, TableLocations,
 };
 use autumn_stream::StreamClient;
+use bytes::{BufMut, Bytes, BytesMut};
+use crossbeam_skiplist::SkipMap;
 use dashmap::DashMap;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tonic::transport::{Channel, Endpoint, Server};
 use tonic::{Request, Response, Status};
 
-use sstable::{IterItem, MergeIterator, MemtableIterator, SstBuilder, SstReader, TableIterator};
+use sstable::{IterItem, MemtableIterator, MergeIterator, SstBuilder, SstReader, TableIterator};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -60,14 +59,20 @@ fn key_with_ts(user_key: &[u8], ts: u64) -> Vec<u8> {
 }
 
 fn parse_key(internal_key: &[u8]) -> &[u8] {
-    if internal_key.len() <= TS_SIZE { return internal_key; }
+    if internal_key.len() <= TS_SIZE {
+        return internal_key;
+    }
     &internal_key[..internal_key.len() - TS_SIZE]
 }
 
 fn parse_ts(internal_key: &[u8]) -> u64 {
-    if internal_key.len() <= TS_SIZE { return 0; }
+    if internal_key.len() <= TS_SIZE {
+        return 0;
+    }
     // Timestamp occupies the last TS_BYTES bytes (after the null separator).
-    let b: [u8; 8] = internal_key[internal_key.len() - TS_BYTES..].try_into().unwrap();
+    let b: [u8; 8] = internal_key[internal_key.len() - TS_BYTES..]
+        .try_into()
+        .unwrap();
     u64::MAX - u64::from_be_bytes(b)
 }
 
@@ -127,7 +132,10 @@ struct Memtable {
 
 impl Memtable {
     fn new() -> Self {
-        Self { data: SkipMap::new(), bytes: AtomicU64::new(0) }
+        Self {
+            data: SkipMap::new(),
+            bytes: AtomicU64::new(0),
+        }
     }
 
     fn insert(&self, key: Vec<u8>, entry: MemEntry, size: u64) {
@@ -135,15 +143,20 @@ impl Memtable {
         self.bytes.fetch_add(size, Ordering::Relaxed);
     }
 
-    fn is_empty(&self) -> bool { self.data.is_empty() }
-    fn len(&self) -> usize { self.data.len() }
-    fn mem_bytes(&self) -> u64 { self.bytes.load(Ordering::Relaxed) }
+    fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+    fn mem_bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
 
     /// Search for the newest version of `user_key`.
     fn seek_user_key(&self, user_key: &[u8]) -> Option<MemEntry> {
         let seek = key_with_ts(user_key, u64::MAX);
         for entry in self.data.range(seek..) {
-            if parse_key(entry.key()) != user_key { break; }
+            if parse_key(entry.key()) != user_key {
+                break;
+            }
             return Some(entry.value().clone());
         }
         None
@@ -151,12 +164,15 @@ impl Memtable {
 
     /// Collect all entries as a sorted Vec for merge iteration.
     fn snapshot_sorted(&self) -> Vec<IterItem> {
-        self.data.iter().map(|e| IterItem {
-            key: e.key().clone(),
-            op: e.value().op,
-            value: e.value().value.clone(),
-            expires_at: e.value().expires_at,
-        }).collect()
+        self.data
+            .iter()
+            .map(|e| IterItem {
+                key: e.key().clone(),
+                op: e.value().op,
+                value: e.value().value.clone(),
+                expires_at: e.value().expires_at,
+            })
+            .collect()
     }
 }
 
@@ -174,7 +190,9 @@ struct TableMeta {
 }
 
 impl TableMeta {
-    fn loc(&self) -> (u64, u32) { (self.extent_id, self.offset) }
+    fn loc(&self) -> (u64, u32) {
+        (self.extent_id, self.offset)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -182,7 +200,6 @@ impl TableMeta {
 // ---------------------------------------------------------------------------
 
 struct PartitionData {
-    part_id: u64,
     rg: Range,
     active: Memtable,
     imm: VecDeque<Arc<Memtable>>,
@@ -221,8 +238,14 @@ enum GcTask {
 
 /// An operation submitted to the per-partition write loop.
 enum WriteOp {
-    Put { user_key: Vec<u8>, value: Vec<u8>, expires_at: u64 },
-    Delete { user_key: Vec<u8> },
+    Put {
+        user_key: Bytes,
+        value: Bytes,
+        expires_at: u64,
+    },
+    Delete {
+        user_key: Vec<u8>,
+    },
 }
 
 /// A write request sent through the per-partition write channel.
@@ -233,6 +256,104 @@ struct WriteRequest {
     /// Channel to notify the caller when the write is durable.
     /// Sends back `Ok(user_key)` on success, `Err(Status)` on failure.
     resp_tx: oneshot::Sender<Result<Vec<u8>, Status>>,
+    enqueue_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct BatchStats {
+    ops: u64,
+    batch_size: u64,
+    queue_wait_ns: u64,
+    phase1_ns: u64,
+    phase2_ns: u64,
+    phase3_ns: u64,
+    end_to_end_ns: u64,
+}
+
+struct WriteLoopMetrics {
+    started_at: Instant,
+    ops: u64,
+    batches: u64,
+    batch_size_total: u64,
+    queue_wait_ns: u64,
+    phase1_ns: u64,
+    phase2_ns: u64,
+    phase3_ns: u64,
+    end_to_end_ns: u64,
+}
+
+impl WriteLoopMetrics {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            ops: 0,
+            batches: 0,
+            batch_size_total: 0,
+            queue_wait_ns: 0,
+            phase1_ns: 0,
+            phase2_ns: 0,
+            phase3_ns: 0,
+            end_to_end_ns: 0,
+        }
+    }
+
+    fn record(&mut self, stats: BatchStats) {
+        if stats.ops == 0 {
+            return;
+        }
+        self.ops += stats.ops;
+        self.batches += 1;
+        self.batch_size_total += stats.batch_size;
+        self.queue_wait_ns += stats.queue_wait_ns;
+        self.phase1_ns += stats.phase1_ns;
+        self.phase2_ns += stats.phase2_ns;
+        self.phase3_ns += stats.phase3_ns;
+        self.end_to_end_ns += stats.end_to_end_ns;
+    }
+
+    fn maybe_report(&mut self, part_id: u64) {
+        if self.started_at.elapsed() >= Duration::from_secs(1) {
+            self.report(part_id);
+        }
+    }
+
+    fn flush(&mut self, part_id: u64) {
+        if self.ops > 0 {
+            self.report(part_id);
+        }
+    }
+
+    fn report(&mut self, part_id: u64) {
+        let elapsed = self.started_at.elapsed();
+        let ops = self.ops.max(1);
+        let batches = self.batches.max(1);
+        tracing::info!(
+            part_id,
+            ops = self.ops,
+            batches = self.batches,
+            ops_per_sec = self.ops as f64 / elapsed.as_secs_f64().max(1e-9),
+            avg_batch_size = self.batch_size_total as f64 / batches as f64,
+            fill_ratio = self.batch_size_total as f64 / (batches * MAX_WRITE_BATCH as u64) as f64,
+            avg_queue_wait_ms = ns_to_ms(self.queue_wait_ns, ops),
+            avg_phase1_ms = ns_to_ms(self.phase1_ns, batches),
+            avg_phase2_ms = ns_to_ms(self.phase2_ns, batches),
+            avg_phase3_ms = ns_to_ms(self.phase3_ns, batches),
+            avg_end_to_end_ms = ns_to_ms(self.end_to_end_ns, ops),
+            "partition write summary",
+        );
+        *self = Self::new();
+    }
+}
+
+fn duration_to_ns(dur: Duration) -> u64 {
+    dur.as_nanos().min(u64::MAX as u128) as u64
+}
+
+fn ns_to_ms(total_ns: u64, denom: u64) -> f64 {
+    if denom == 0 {
+        return 0.0;
+    }
+    total_ns as f64 / denom as f64 / 1_000_000.0
 }
 
 // ---------------------------------------------------------------------------
@@ -252,10 +373,7 @@ pub struct PartitionServer {
 }
 
 impl PartitionServer {
-    pub async fn connect(
-        ps_id: u64,
-        manager_endpoint: &str,
-    ) -> Result<Self> {
+    pub async fn connect(ps_id: u64, manager_endpoint: &str) -> Result<Self> {
         Self::connect_with_advertise(ps_id, manager_endpoint, None).await
     }
 
@@ -290,20 +408,30 @@ impl PartitionServer {
     }
 
     async fn register_ps(&self) -> Result<()> {
-        let address = self.advertise_addr.clone()
+        let address = self
+            .advertise_addr
+            .clone()
             .unwrap_or_else(|| format!("ps-{}", self.ps_id));
         let mut client = self.pm_client.lock().await;
-        client.register_ps(Request::new(RegisterPsRequest { ps_id: self.ps_id, address }))
-            .await.context("register ps")?;
+        client
+            .register_ps(Request::new(RegisterPsRequest {
+                ps_id: self.ps_id,
+                address,
+            }))
+            .await
+            .context("register ps")?;
         Ok(())
     }
 
     fn in_range(rg: &Range, key: &[u8]) -> bool {
-        if key < rg.start_key.as_slice() { return false; }
-        if rg.end_key.is_empty() { return true; }
+        if key < rg.start_key.as_slice() {
+            return false;
+        }
+        if rg.end_key.is_empty() {
+            return true;
+        }
         key < rg.end_key.as_slice()
     }
-
 
     // -----------------------------------------------------------------------
     // WAL record encode / decode (format unchanged for backward compat)
@@ -325,13 +453,23 @@ impl PartitionServer {
         let mut out = Vec::new();
         let mut cursor = 0usize;
         while cursor + 17 <= bytes.len() {
-            let op = bytes[cursor]; cursor += 1;
-            let key_len = u32::from_le_bytes(bytes[cursor..cursor+4].try_into().unwrap()) as usize; cursor += 4;
-            let val_len = u32::from_le_bytes(bytes[cursor..cursor+4].try_into().unwrap()) as usize; cursor += 4;
-            let expires_at = u64::from_le_bytes(bytes[cursor..cursor+8].try_into().unwrap()); cursor += 8;
-            if cursor + key_len + val_len > bytes.len() { break; }
-            let key = bytes[cursor..cursor+key_len].to_vec(); cursor += key_len;
-            let value = bytes[cursor..cursor+val_len].to_vec(); cursor += val_len;
+            let op = bytes[cursor];
+            cursor += 1;
+            let key_len =
+                u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            let val_len =
+                u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            let expires_at = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+            cursor += 8;
+            if cursor + key_len + val_len > bytes.len() {
+                break;
+            }
+            let key = bytes[cursor..cursor + key_len].to_vec();
+            cursor += key_len;
+            let value = bytes[cursor..cursor + val_len].to_vec();
+            cursor += val_len;
             out.push((op, key, value, expires_at));
         }
         out
@@ -347,22 +485,24 @@ impl PartitionServer {
         let mut buf = data;
         while !buf.is_empty() {
             match TableLocations::decode_length_delimited(buf) {
-                Ok(locs) => {
-                    match prost::decode_length_delimiter(buf) {
-                        Ok(msg_len) => {
-                            let prefix_len = prost::length_delimiter_len(msg_len);
-                            let total = prefix_len + msg_len;
-                            if total > buf.len() { break; }
-                            buf = &buf[total..];
-                            last = Some(locs);
+                Ok(locs) => match prost::decode_length_delimiter(buf) {
+                    Ok(msg_len) => {
+                        let prefix_len = prost::length_delimiter_len(msg_len);
+                        let total = prefix_len + msg_len;
+                        if total > buf.len() {
+                            break;
                         }
-                        Err(_) => break,
+                        buf = &buf[total..];
+                        last = Some(locs);
                     }
-                }
+                    Err(_) => break,
+                },
                 Err(_) => break,
             }
         }
-        if let Some(locs) = last { return Ok(locs); }
+        if let Some(locs) = last {
+            return Ok(locs);
+        }
         TableLocations::decode(data).map_err(|e| anyhow!("decode TableLocations: {e}"))
     }
 
@@ -375,9 +515,14 @@ impl PartitionServer {
     ) -> Result<()> {
         use prost::Message as _;
         let locs_proto = TableLocations {
-            locs: tables.iter().map(|t| Location {
-                extent_id: t.extent_id, offset: t.offset, len: t.len,
-            }).collect(),
+            locs: tables
+                .iter()
+                .map(|t| Location {
+                    extent_id: t.extent_id,
+                    offset: t.offset,
+                    len: t.len,
+                })
+                .collect(),
             vp_extent_id,
             vp_offset,
         };
@@ -402,13 +547,23 @@ impl PartitionServer {
         let mut cursor = 0usize;
         while cursor + 17 <= bytes.len() {
             let record_start = cursor;
-            let op = bytes[cursor]; cursor += 1;
-            let key_len = u32::from_le_bytes(bytes[cursor..cursor+4].try_into().unwrap()) as usize; cursor += 4;
-            let val_len = u32::from_le_bytes(bytes[cursor..cursor+4].try_into().unwrap()) as usize; cursor += 4;
-            let expires_at = u64::from_le_bytes(bytes[cursor..cursor+8].try_into().unwrap()); cursor += 8;
-            if cursor + key_len + val_len > bytes.len() { break; }
-            let key = bytes[cursor..cursor+key_len].to_vec(); cursor += key_len;
-            let value = bytes[cursor..cursor+val_len].to_vec(); cursor += val_len;
+            let op = bytes[cursor];
+            cursor += 1;
+            let key_len =
+                u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            let val_len =
+                u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            let expires_at = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+            cursor += 8;
+            if cursor + key_len + val_len > bytes.len() {
+                break;
+            }
+            let key = bytes[cursor..cursor + key_len].to_vec();
+            cursor += key_len;
+            let value = bytes[cursor..cursor + val_len].to_vec();
+            cursor += val_len;
             out.push((record_start, op, key, value, expires_at));
         }
         out
@@ -428,7 +583,9 @@ impl PartitionServer {
             self.stream_client.owner_key().to_string(),
             self.stream_client.revision(),
             128 * 1024 * 1024,
-        ).await.context("create per-partition StreamClient")?;
+        )
+        .await
+        .context("create per-partition StreamClient")?;
         let part_sc = Arc::new(part_sc);
 
         let mut tables: Vec<TableMeta> = Vec::new();
@@ -453,20 +610,29 @@ impl PartitionServer {
                 let (sst_bytes, _end) = part_sc
                     .read_bytes_from_extent(loc.extent_id, loc.offset, loc.len)
                     .await
-                    .with_context(|| format!(
-                        "read SST from rowStream extent={} offset={}", loc.extent_id, loc.offset
-                    ))?;
-
-                let sst_arc = Arc::new(sst_bytes);
-                let reader = SstReader::from_bytes(sst_arc.clone())
                     .with_context(|| {
-                        let preview_len = sst_arc.len().min(32);
-                        format!("open SST extent={} offset={} read_len={} preview={:02x?}",
-                            loc.extent_id, loc.offset, sst_arc.len(), &sst_arc[..preview_len])
+                        format!(
+                            "read SST from rowStream extent={} offset={}",
+                            loc.extent_id, loc.offset
+                        )
                     })?;
 
+                let sst_arc = Arc::new(sst_bytes);
+                let reader = SstReader::from_bytes(sst_arc.clone()).with_context(|| {
+                    let preview_len = sst_arc.len().min(32);
+                    format!(
+                        "open SST extent={} offset={} read_len={} preview={:02x?}",
+                        loc.extent_id,
+                        loc.offset,
+                        sst_arc.len(),
+                        &sst_arc[..preview_len]
+                    )
+                })?;
+
                 let tbl_last_seq = reader.seq_num();
-                if tbl_last_seq > max_seq { max_seq = tbl_last_seq; }
+                if tbl_last_seq > max_seq {
+                    max_seq = tbl_last_seq;
+                }
 
                 // Detect overlap: check if SST contains keys outside partition range.
                 if !detected_overlap {
@@ -479,7 +645,8 @@ impl PartitionServer {
 
                 // Restore vp head from SST MetaBlock if newer than checkpoint
                 if reader.vp_extent_id > recovered_vp_eid
-                    || (reader.vp_extent_id == recovered_vp_eid && reader.vp_offset > recovered_vp_off)
+                    || (reader.vp_extent_id == recovered_vp_eid
+                        && reader.vp_offset > recovered_vp_off)
                 {
                     recovered_vp_eid = reader.vp_extent_id;
                     recovered_vp_off = reader.vp_offset;
@@ -507,20 +674,38 @@ impl PartitionServer {
         let sst_max_seq = max_seq;
         let active = Memtable::new();
 
-        let replay_extents: Option<Vec<(u64, u32)>> = if recovered_vp_eid == 0 && tables.is_empty() {
+        let replay_extents: Option<Vec<(u64, u32)>> = if recovered_vp_eid == 0 && tables.is_empty()
+        {
             // No checkpoint — replay from the start of the log stream.
             let stream_info = part_sc.get_stream_info(log_stream_id).await?;
-            Some(stream_info.extent_ids.into_iter().map(|eid| (eid, 0u32)).collect())
+            Some(
+                stream_info
+                    .extent_ids
+                    .into_iter()
+                    .map(|eid| (eid, 0u32))
+                    .collect(),
+            )
         } else if recovered_vp_eid > 0 {
             // Checkpoint exists — replay from the VP head.
             let stream_info = part_sc.get_stream_info(log_stream_id).await?;
-            Some(stream_info.extent_ids.into_iter().filter_map(|eid| {
-                if eid < recovered_vp_eid { None }
-                else {
-                    let off = if eid == recovered_vp_eid { recovered_vp_off } else { 0 };
-                    Some((eid, off))
-                }
-            }).collect())
+            Some(
+                stream_info
+                    .extent_ids
+                    .into_iter()
+                    .filter_map(|eid| {
+                        if eid < recovered_vp_eid {
+                            None
+                        } else {
+                            let off = if eid == recovered_vp_eid {
+                                recovered_vp_off
+                            } else {
+                                0
+                            };
+                            Some((eid, off))
+                        }
+                    })
+                    .collect(),
+            )
         } else {
             None
         };
@@ -531,11 +716,17 @@ impl PartitionServer {
                     Ok((d, _)) => d,
                     Err(_) => continue,
                 };
-                for (buf_off, op, key, value, expires_at) in Self::decode_records_with_offsets(&data) {
+                for (buf_off, op, key, value, expires_at) in
+                    Self::decode_records_with_offsets(&data)
+                {
                     let ts = parse_ts(&key);
-                    if ts > max_seq { max_seq = ts; }
+                    if ts > max_seq {
+                        max_seq = ts;
+                    }
                     // Only replay records newer than what is already in SSTables.
-                    if ts <= sst_max_seq { continue; }
+                    if ts <= sst_max_seq {
+                        continue;
+                    }
 
                     let record_extent_off = start_off + buf_off as u32;
                     let mem_entry = if value.len() > VALUE_THROTTLE {
@@ -545,9 +736,17 @@ impl PartitionServer {
                             offset: record_extent_off,
                             len: value.len() as u32,
                         };
-                        MemEntry { op: (op & 0x7f) | OP_VALUE_POINTER, value: vp.encode().to_vec(), expires_at }
+                        MemEntry {
+                            op: (op & 0x7f) | OP_VALUE_POINTER,
+                            value: vp.encode().to_vec(),
+                            expires_at,
+                        }
                     } else {
-                        MemEntry { op, value, expires_at }
+                        MemEntry {
+                            op,
+                            value,
+                            expires_at,
+                        }
                     };
 
                     let size = key.len() as u64 + mem_entry.value.len() as u64 + 32;
@@ -564,7 +763,6 @@ impl PartitionServer {
         let has_overlap = Arc::new(AtomicU32::new(if detected_overlap { 1 } else { 0 }));
 
         let part = Arc::new(RwLock::new(PartitionData {
-            part_id,
             rg,
             active,
             imm: VecDeque::new(),
@@ -587,12 +785,21 @@ impl PartitionServer {
         {
             let part_weak = Arc::downgrade(&part);
             let server_clone = self.clone();
-            tokio::spawn(Self::background_flush_loop(server_clone, part_weak, flush_rx));
+            tokio::spawn(Self::background_flush_loop(
+                server_clone,
+                part_weak,
+                flush_rx,
+            ));
         }
         {
             let part_weak = Arc::downgrade(&part);
             let server_clone = self.clone();
-            tokio::spawn(Self::background_compact_loop(server_clone, part_weak, compact_rx, has_overlap));
+            tokio::spawn(Self::background_compact_loop(
+                server_clone,
+                part_weak,
+                compact_rx,
+                has_overlap,
+            ));
         }
         {
             let part_weak = Arc::downgrade(&part);
@@ -602,7 +809,12 @@ impl PartitionServer {
         {
             let part_weak = Arc::downgrade(&part);
             let server_clone = self.clone();
-            tokio::spawn(Self::background_write_loop(server_clone, part_weak, write_rx));
+            tokio::spawn(Self::background_write_loop(
+                server_clone,
+                part_id,
+                part_weak,
+                write_rx,
+            ));
         }
 
         Ok(part)
@@ -613,7 +825,9 @@ impl PartitionServer {
     // -----------------------------------------------------------------------
 
     async fn rotate_active_locked(&self, part: &mut PartitionData) -> Result<()> {
-        if part.active.is_empty() { return Ok(()); }
+        if part.active.is_empty() {
+            return Ok(());
+        }
 
         // Snapshot active entries into a new frozen Memtable.
         let frozen = Memtable::new();
@@ -639,15 +853,20 @@ impl PartitionServer {
     async fn flush_memtable_locked(&self, part: &mut PartitionData) -> Result<bool> {
         self.rotate_active_locked(part).await?;
         let mut any = false;
-        while self.flush_one_imm_locked(part).await? { any = true; }
+        while self.flush_one_imm_locked(part).await? {
+            any = true;
+        }
         Ok(any)
     }
 
     /// Flush one imm while holding the write lock.
     async fn flush_one_imm_locked(&self, part: &mut PartitionData) -> Result<bool> {
-        let Some(imm_mem) = part.imm.pop_front() else { return Ok(false); };
+        let Some(imm_mem) = part.imm.pop_front() else {
+            return Ok(false);
+        };
 
-        let (sst_bytes, last_seq) = Self::build_sst_bytes(&imm_mem, part.vp_extent_id, part.vp_offset);
+        let (sst_bytes, last_seq) =
+            Self::build_sst_bytes(&imm_mem, part.vp_extent_id, part.vp_offset);
 
         let part_sc = part.stream_client.clone();
         let result = part_sc.append(part.row_stream_id, &sst_bytes, true).await?;
@@ -665,7 +884,14 @@ impl PartitionServer {
         });
         part.sst_readers.push(Arc::new(reader));
 
-        Self::save_table_locs_raw(&part_sc, part.meta_stream_id, &part.tables, part.vp_extent_id, part.vp_offset).await?;
+        Self::save_table_locs_raw(
+            &part_sc,
+            part.meta_stream_id,
+            &part.tables,
+            part.vp_extent_id,
+            part.vp_offset,
+        )
+        .await?;
         Ok(true)
     }
 
@@ -674,8 +900,17 @@ impl PartitionServer {
         // Phase 1: peek imm + capture stream IDs and partition's stream client.
         let (imm_mem, row_stream_id, meta_stream_id, snap_vp_eid, snap_vp_off, part_sc) = {
             let guard = part.read().await;
-            let Some(imm_mem) = guard.imm.front().cloned() else { return Ok(false); };
-            (imm_mem, guard.row_stream_id, guard.meta_stream_id, guard.vp_extent_id, guard.vp_offset, guard.stream_client.clone())
+            let Some(imm_mem) = guard.imm.front().cloned() else {
+                return Ok(false);
+            };
+            (
+                imm_mem,
+                guard.row_stream_id,
+                guard.meta_stream_id,
+                guard.vp_extent_id,
+                guard.vp_offset,
+                guard.stream_client.clone(),
+            )
         };
 
         // Phase 2: build SST bytes (no lock).
@@ -701,11 +936,16 @@ impl PartitionServer {
             guard.imm.pop_front();
 
             let veid = guard.vp_extent_id.max(snap_vp_eid);
-            let voff = if veid == guard.vp_extent_id { guard.vp_offset } else { snap_vp_off };
+            let voff = if veid == guard.vp_extent_id {
+                guard.vp_offset
+            } else {
+                snap_vp_off
+            };
             (guard.tables.clone(), veid, voff)
         };
 
-        Self::save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, vp_eid, vp_off).await?;
+        Self::save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, vp_eid, vp_off)
+            .await?;
         Ok(true)
     }
 
@@ -718,7 +958,9 @@ impl PartitionServer {
             let ikey = entry.key();
             let me = entry.value();
             let ts = parse_ts(ikey);
-            if ts > last_seq { last_seq = ts; }
+            if ts > last_seq {
+                last_seq = ts;
+            }
             builder.add(ikey, me.op, &me.value, me.expires_at);
         }
 
@@ -736,12 +978,17 @@ impl PartitionServer {
         mut flush_rx: mpsc::UnboundedReceiver<()>,
     ) {
         while flush_rx.recv().await.is_some() {
-            let Some(part) = part_weak.upgrade() else { break; };
+            let Some(part) = part_weak.upgrade() else {
+                break;
+            };
             loop {
                 match server.flush_one_imm_async(&part).await {
                     Ok(true) => continue,
                     Ok(false) => break,
-                    Err(e) => { tracing::error!("background flush error: {e}"); break; }
+                    Err(e) => {
+                        tracing::error!("background flush error: {e}");
+                        break;
+                    }
                 }
             }
         }
@@ -752,39 +999,65 @@ impl PartitionServer {
     // -----------------------------------------------------------------------
 
     fn pickup_tables(tables: &[TableMeta], max_capacity: u64) -> (Vec<TableMeta>, u64) {
-        if tables.len() < 2 { return (vec![], 0); }
+        if tables.len() < 2 {
+            return (vec![], 0);
+        }
 
         let total_size: u64 = tables.iter().map(|t| t.estimated_size).sum();
         let head_extent = tables[0].extent_id;
-        let head_size: u64 = tables.iter().filter(|t| t.extent_id == head_extent).map(|t| t.estimated_size).sum();
+        let head_size: u64 = tables
+            .iter()
+            .filter(|t| t.extent_id == head_extent)
+            .map(|t| t.estimated_size)
+            .sum();
         let head_threshold = (HEAD_RATIO * total_size as f64).round() as u64;
 
         if head_size < head_threshold {
-            let chosen: Vec<TableMeta> = tables.iter().filter(|t| t.extent_id == head_extent)
-                .take(COMPACT_N).cloned().collect();
-            let truncate_id = tables.iter().find(|t| t.extent_id != head_extent)
-                .map(|t| t.extent_id).unwrap_or(0);
+            let chosen: Vec<TableMeta> = tables
+                .iter()
+                .filter(|t| t.extent_id == head_extent)
+                .take(COMPACT_N)
+                .cloned()
+                .collect();
+            let truncate_id = tables
+                .iter()
+                .find(|t| t.extent_id != head_extent)
+                .map(|t| t.extent_id)
+                .unwrap_or(0);
 
             let mut tbls_sorted = tables.to_vec();
             tbls_sorted.sort_by_key(|t| t.last_seq);
             let mut chosen_sorted = chosen.clone();
             chosen_sorted.sort_by_key(|t| t.last_seq);
-            if chosen_sorted.is_empty() { return (vec![], 0); }
+            if chosen_sorted.is_empty() {
+                return (vec![], 0);
+            }
 
             let start_seq = chosen_sorted[0].last_seq;
             let start_idx = tbls_sorted.partition_point(|t| t.last_seq < start_seq);
             let mut compact_tbls: Vec<TableMeta> = Vec::new();
             let mut ci = 0usize;
             let mut ti = start_idx;
-            while ti < tbls_sorted.len() && ci < chosen_sorted.len() && compact_tbls.len() < COMPACT_N {
+            while ti < tbls_sorted.len()
+                && ci < chosen_sorted.len()
+                && compact_tbls.len() < COMPACT_N
+            {
                 if tbls_sorted[ti].last_seq <= chosen_sorted[ci].last_seq {
                     compact_tbls.push(tbls_sorted[ti].clone());
-                    if tbls_sorted[ti].last_seq == chosen_sorted[ci].last_seq { ci += 1; }
+                    if tbls_sorted[ti].last_seq == chosen_sorted[ci].last_seq {
+                        ci += 1;
+                    }
                     ti += 1;
-                } else { break; }
+                } else {
+                    break;
+                }
             }
-            if ci == chosen_sorted.len() && compact_tbls.len() >= 2 { return (compact_tbls, truncate_id); }
-            if compact_tbls.len() >= 2 { return (compact_tbls, 0); }
+            if ci == chosen_sorted.len() && compact_tbls.len() >= 2 {
+                return (compact_tbls, truncate_id);
+            }
+            if compact_tbls.len() >= 2 {
+                return (compact_tbls, 0);
+            }
             return (vec![], 0);
         }
 
@@ -795,26 +1068,40 @@ impl PartitionServer {
         let mut compact_tbls: Vec<TableMeta> = Vec::new();
         let mut i = 0usize;
         while i < tbls_sorted.len() {
-            while i < tbls_sorted.len() && tbls_sorted[i].estimated_size < throttle && compact_tbls.len() < COMPACT_N {
-                if i > 0 && compact_tbls.is_empty()
-                    && tbls_sorted[i].estimated_size + tbls_sorted[i-1].estimated_size < max_capacity
+            while i < tbls_sorted.len()
+                && tbls_sorted[i].estimated_size < throttle
+                && compact_tbls.len() < COMPACT_N
+            {
+                if i > 0
+                    && compact_tbls.is_empty()
+                    && tbls_sorted[i].estimated_size + tbls_sorted[i - 1].estimated_size
+                        < max_capacity
                 {
-                    compact_tbls.push(tbls_sorted[i-1].clone());
+                    compact_tbls.push(tbls_sorted[i - 1].clone());
                 }
                 compact_tbls.push(tbls_sorted[i].clone());
                 i += 1;
             }
             if !compact_tbls.is_empty() {
                 if compact_tbls.len() == 1 {
-                    if i < tbls_sorted.len() && compact_tbls[0].estimated_size + tbls_sorted[i].estimated_size < max_capacity {
+                    if i < tbls_sorted.len()
+                        && compact_tbls[0].estimated_size + tbls_sorted[i].estimated_size
+                            < max_capacity
+                    {
                         compact_tbls.push(tbls_sorted[i].clone());
-                    } else { compact_tbls.clear(); i += 1; continue; }
+                    } else {
+                        compact_tbls.clear();
+                        i += 1;
+                        continue;
+                    }
                 }
                 break;
             }
             i += 1;
         }
-        if compact_tbls.len() >= 2 { return (compact_tbls, 0); }
+        if compact_tbls.len() >= 2 {
+            return (compact_tbls, 0);
+        }
         (vec![], 0)
     }
 
@@ -824,9 +1111,12 @@ impl PartitionServer {
         tbls: Vec<TableMeta>,
         major: bool,
     ) -> Result<bool> {
-        if tbls.is_empty() { return Ok(false); }
+        if tbls.is_empty() {
+            return Ok(false);
+        }
 
-        let compact_keys: std::collections::HashSet<(u64, u32)> = tbls.iter().map(|t| t.loc()).collect();
+        let compact_keys: std::collections::HashSet<(u64, u32)> =
+            tbls.iter().map(|t| t.loc()).collect();
 
         // Grab SstReaders for selected tables and the partition range for overlap filtering.
         let (readers, row_stream_id, meta_stream_id, compact_vp_eid, compact_vp_off, rg, part_sc) = {
@@ -837,20 +1127,36 @@ impl PartitionServer {
                     rds.push(guard.sst_readers[idx].clone());
                 }
             }
-            (rds, guard.row_stream_id, guard.meta_stream_id, guard.vp_extent_id, guard.vp_offset, guard.rg.clone(), guard.stream_client.clone())
+            (
+                rds,
+                guard.row_stream_id,
+                guard.meta_stream_id,
+                guard.vp_extent_id,
+                guard.vp_offset,
+                guard.rg.clone(),
+                guard.stream_client.clone(),
+            )
         };
 
-        if readers.is_empty() { return Ok(false); }
+        if readers.is_empty() {
+            return Ok(false);
+        }
 
         // Build merge iterator over selected SSTables (newest-seq first).
-        let mut readers_with_meta: Vec<(Arc<SstReader>, u64)> = readers.iter()
+        let mut readers_with_meta: Vec<(Arc<SstReader>, u64)> = readers
+            .iter()
             .zip(tbls.iter())
             .map(|(r, t)| (r.clone(), t.last_seq))
             .collect();
         readers_with_meta.sort_by(|a, b| b.1.cmp(&a.1)); // newest first
 
-        let iters: Vec<TableIterator> = readers_with_meta.iter()
-            .map(|(r, _)| { let mut it = TableIterator::new(r.clone()); it.rewind(); it })
+        let iters: Vec<TableIterator> = readers_with_meta
+            .iter()
+            .map(|(r, _)| {
+                let mut it = TableIterator::new(r.clone());
+                it.rewind();
+                it
+            })
             .collect();
         let mut merge = MergeIterator::new(iters);
         merge.rewind();
@@ -902,12 +1208,22 @@ impl PartitionServer {
 
             // In major mode, drop tombstones and expired entries.
             if major {
-                if item.op == 2 { add_discard(&item); merge.next(); continue; } // tombstone
-                if item.expires_at > 0 && item.expires_at <= now { add_discard(&item); merge.next(); continue; }
+                if item.op == 2 {
+                    add_discard(&item);
+                    merge.next();
+                    continue;
+                } // tombstone
+                if item.expires_at > 0 && item.expires_at <= now {
+                    add_discard(&item);
+                    merge.next();
+                    continue;
+                }
             }
 
             let ts = parse_ts(&item.key);
-            if ts > chunk_last_seq { chunk_last_seq = ts; }
+            if ts > chunk_last_seq {
+                chunk_last_seq = ts;
+            }
 
             let entry_size = item.key.len() + item.value.len() + 20;
             if current_size + entry_size > max_chunk && !current_entries.is_empty() {
@@ -925,7 +1241,11 @@ impl PartitionServer {
 
         // Validate discards: remove extents no longer in the logStream.
         let log_stream_id = { part.read().await.log_stream_id };
-        let log_extent_ids = part_sc.get_stream_info(log_stream_id).await.map(|s| s.extent_ids).unwrap_or_default();
+        let log_extent_ids = part_sc
+            .get_stream_info(log_stream_id)
+            .await
+            .map(|s| s.extent_ids)
+            .unwrap_or_default();
         Self::valid_discard(&mut discards, &log_extent_ids);
 
         if chunks.is_empty() {
@@ -934,10 +1254,15 @@ impl PartitionServer {
                 let mut guard = part.write().await;
                 self.remove_compacted_tables(&mut guard, &compact_keys);
                 let veid = guard.vp_extent_id.max(compact_vp_eid);
-                let voff = if veid == guard.vp_extent_id { guard.vp_offset } else { compact_vp_off };
+                let voff = if veid == guard.vp_extent_id {
+                    guard.vp_offset
+                } else {
+                    compact_vp_off
+                };
                 (guard.tables.clone(), veid, voff)
             };
-            Self::save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, vp_eid, vp_off).await?;
+            Self::save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, vp_eid, vp_off)
+                .await?;
             return Ok(true);
         }
 
@@ -978,11 +1303,22 @@ impl PartitionServer {
                 guard.tables.push(tbl_meta);
             }
             let veid = guard.vp_extent_id.max(compact_vp_eid);
-            let voff = if veid == guard.vp_extent_id { guard.vp_offset } else { compact_vp_off };
+            let voff = if veid == guard.vp_extent_id {
+                guard.vp_offset
+            } else {
+                compact_vp_off
+            };
             (guard.tables.clone(), veid, voff)
         };
 
-        Self::save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, final_vp_eid, final_vp_off).await?;
+        Self::save_table_locs_raw(
+            &part_sc,
+            meta_stream_id,
+            &tables_snapshot,
+            final_vp_eid,
+            final_vp_off,
+        )
+        .await?;
         Ok(true)
     }
 
@@ -1099,16 +1435,22 @@ impl PartitionServer {
         };
 
         // Read the whole extent.
-        let (data, _end) = part_sc.read_bytes_from_extent(extent_id, 0, sealed_length).await?;
+        let (data, _end) = part_sc
+            .read_bytes_from_extent(extent_id, 0, sealed_length)
+            .await?;
 
         let records = Self::decode_records_full(&data);
 
         let mut moved = 0usize;
         for (op, key, value, expires_at) in records {
             // Only process value-pointer entries (large values).
-            if op & OP_VALUE_POINTER == 0 { continue; }
+            if op & OP_VALUE_POINTER == 0 {
+                continue;
+            }
             let user_key = parse_key(&key).to_vec();
-            if !Self::in_range(&rg, &user_key) { continue; }
+            if !Self::in_range(&rg, &user_key) {
+                continue;
+            }
 
             // Check if this entry's (extent_id, offset) matches the current live VP.
             // The ValuePointer we stored in the WAL is the full value; the VP in the
@@ -1118,7 +1460,9 @@ impl PartitionServer {
             // Look up the current version: (op, value, expires_at).
             let current: Option<(u8, Vec<u8>, u64)> = {
                 let g = part.read().await;
-                let mem = g.active.seek_user_key(&user_key)
+                let mem = g
+                    .active
+                    .seek_user_key(&user_key)
                     .or_else(|| g.imm.iter().rev().find_map(|m| m.seek_user_key(&user_key)))
                     .map(|e| (e.op, e.value, e.expires_at));
                 if mem.is_some() {
@@ -1148,12 +1492,22 @@ impl PartitionServer {
                         let internal_key = key_with_ts(&user_key, seq);
                         let log_entry = Self::encode_record(1, &internal_key, &value, expires_at);
                         let result = part_sc.append(log_stream_id, &log_entry, true).await?;
-                        let new_vp = ValuePointer { extent_id: result.extent_id, offset: result.offset, len: vp.len };
+                        let new_vp = ValuePointer {
+                            extent_id: result.extent_id,
+                            offset: result.offset,
+                            len: vp.len,
+                        };
                         part_guard.vp_extent_id = result.extent_id;
                         part_guard.vp_offset = result.end;
-                        let mem_entry = MemEntry { op: 1 | OP_VALUE_POINTER, value: new_vp.encode().to_vec(), expires_at };
+                        let mem_entry = MemEntry {
+                            op: 1 | OP_VALUE_POINTER,
+                            value: new_vp.encode().to_vec(),
+                            expires_at,
+                        };
                         let write_size = (user_key.len() + value.len() + 32) as u64;
-                        part_guard.active.insert(internal_key, mem_entry, write_size);
+                        part_guard
+                            .active
+                            .insert(internal_key, mem_entry, write_size);
                         moved += 1;
                     }
                 }
@@ -1190,29 +1544,48 @@ impl PartitionServer {
                 }
             };
 
-            let Some(part) = part_weak.upgrade() else { break; };
+            let Some(part) = part_weak.upgrade() else {
+                break;
+            };
 
             let (log_stream_id, readers_snapshot, part_sc) = {
                 let g = part.read().await;
-                (g.log_stream_id, g.sst_readers.clone(), g.stream_client.clone())
+                (
+                    g.log_stream_id,
+                    g.sst_readers.clone(),
+                    g.stream_client.clone(),
+                )
             };
 
             // Get logStream extent list.
             let stream_info = match part_sc.get_stream_info(log_stream_id).await {
                 Ok(s) => s,
-                Err(e) => { tracing::warn!("GC get_stream_info: {e}"); continue; }
+                Err(e) => {
+                    tracing::warn!("GC get_stream_info: {e}");
+                    continue;
+                }
             };
             let extent_ids = stream_info.extent_ids;
-            if extent_ids.len() < 2 { continue; } // need at least 2 extents (last is active)
+            if extent_ids.len() < 2 {
+                continue;
+            } // need at least 2 extents (last is active)
 
             // Sealed extents = all except the last.
             let sealed_extents = &extent_ids[..extent_ids.len() - 1];
 
             // Determine which extents to GC.
             let holes: Vec<u64> = match task {
-                GcTask::Force { extent_ids: ref forced_ids } => {
-                    let idx: std::collections::HashSet<u64> = sealed_extents.iter().copied().collect();
-                    forced_ids.iter().copied().filter(|e| idx.contains(e)).take(MAX_GC_ONCE).collect()
+                GcTask::Force {
+                    extent_ids: ref forced_ids,
+                } => {
+                    let idx: std::collections::HashSet<u64> =
+                        sealed_extents.iter().copied().collect();
+                    forced_ids
+                        .iter()
+                        .copied()
+                        .filter(|e| idx.contains(e))
+                        .take(MAX_GC_ONCE)
+                        .collect()
                 }
                 GcTask::Auto => {
                     let mut discards = Self::get_discards(&readers_snapshot);
@@ -1226,9 +1599,14 @@ impl PartitionServer {
                     for eid in candidates.into_iter().take(MAX_GC_ONCE) {
                         let sealed_length = match part_sc.get_extent_info(eid).await {
                             Ok(info) => info.sealed_length as u32,
-                            Err(e) => { tracing::warn!("GC extent_info {eid}: {e}"); continue; }
+                            Err(e) => {
+                                tracing::warn!("GC extent_info {eid}: {e}");
+                                continue;
+                            }
                         };
-                        if sealed_length == 0 { continue; }
+                        if sealed_length == 0 {
+                            continue;
+                        }
                         let ratio = discards[&eid] as f64 / sealed_length as f64;
                         if ratio > GC_DISCARD_RATIO {
                             holes.push(eid);
@@ -1238,12 +1616,17 @@ impl PartitionServer {
                 }
             };
 
-            if holes.is_empty() { continue; }
+            if holes.is_empty() {
+                continue;
+            }
 
             for eid in holes {
                 let sealed_length = match part_sc.get_extent_info(eid).await {
                     Ok(info) => info.sealed_length as u32,
-                    Err(e) => { tracing::warn!("GC extent_info {eid}: {e}"); continue; }
+                    Err(e) => {
+                        tracing::warn!("GC extent_info {eid}: {e}");
+                        continue;
+                    }
                 };
                 if let Err(e) = Self::run_gc(&server, &part, eid, sealed_length).await {
                     tracing::error!("GC run_gc extent {eid}: {e}");
@@ -1257,16 +1640,24 @@ impl PartitionServer {
     // -----------------------------------------------------------------------
 
     async fn get_partition_or_sync(&self, part_id: u64) -> Result<Arc<RwLock<PartitionData>>> {
-        if let Some(part) = self.partitions.get(&part_id) { return Ok(part.clone()); }
+        if let Some(part) = self.partitions.get(&part_id) {
+            return Ok(part.clone());
+        }
         self.sync_regions_once().await?;
-        self.partitions.get(&part_id).map(|p| p.clone())
+        self.partitions
+            .get(&part_id)
+            .map(|p| p.clone())
             .ok_or_else(|| anyhow!("part {part_id} not found"))
     }
 
     async fn remove_partition_or_sync(&self, part_id: u64) -> Result<Arc<RwLock<PartitionData>>> {
-        if let Some((_, part)) = self.partitions.remove(&part_id) { return Ok(part); }
+        if let Some((_, part)) = self.partitions.remove(&part_id) {
+            return Ok(part);
+        }
         self.sync_regions_once().await?;
-        self.partitions.remove(&part_id).map(|(_, p)| p)
+        self.partitions
+            .remove(&part_id)
+            .map(|(_, p)| p)
             .ok_or_else(|| anyhow!("part {part_id} not found"))
     }
 
@@ -1285,7 +1676,10 @@ impl PartitionServer {
             let guard = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(part.read())
             });
-            guard.compact_tx.try_send(true).map_err(|_| "major compaction busy")
+            guard
+                .compact_tx
+                .try_send(true)
+                .map_err(|_| "major compaction busy")
         } else {
             Err("no such partition")
         }
@@ -1294,7 +1688,9 @@ impl PartitionServer {
     /// Force-flush all memtable data for a partition to rowStream.
     /// Used by integration tests to trigger a flush without relying on the threshold.
     pub async fn flush_partition(&self, part_id: u64) -> Result<()> {
-        let p = self.partitions.get(&part_id)
+        let p = self
+            .partitions
+            .get(&part_id)
             .ok_or_else(|| anyhow!("no such partition: {}", part_id))?
             .clone();
         let mut part = p.write().await;
@@ -1310,6 +1706,7 @@ impl PartitionServer {
     /// logStream in one RPC, inserts all into the memtable.
     async fn background_write_loop(
         server: PartitionServer,
+        part_id: u64,
         part_weak: std::sync::Weak<RwLock<PartitionData>>,
         mut write_rx: mpsc::Receiver<WriteRequest>,
     ) {
@@ -1318,7 +1715,8 @@ impl PartitionServer {
         // the channel.  We wait for the previous handle before spawning the
         // next, which preserves Phase-1 / Phase-3 ordering (seq assignment and
         // memtable inserts run under the write lock, which is held per-batch).
-        let mut in_flight: Option<tokio::task::JoinHandle<()>> = None;
+        let mut in_flight: Option<tokio::task::JoinHandle<Result<BatchStats>>> = None;
+        let mut metrics = WriteLoopMetrics::new();
 
         loop {
             // Block until at least one request arrives.
@@ -1339,8 +1737,13 @@ impl PartitionServer {
             // Wait for the previous batch to finish before starting this one.
             // This ensures seq numbers and memtable inserts remain ordered.
             if let Some(handle) = in_flight.take() {
-                if let Err(e) = handle.await {
-                    tracing::error!("write batch task panicked: {e}");
+                match handle.await {
+                    Ok(Ok(stats)) => {
+                        metrics.record(stats);
+                        metrics.maybe_report(part_id);
+                    }
+                    Ok(Err(e)) => tracing::error!("write batch error: {e}"),
+                    Err(e) => tracing::error!("write batch task panicked: {e}"),
                 }
             }
 
@@ -1357,19 +1760,21 @@ impl PartitionServer {
             };
 
             let server_clone = server.clone();
+            let picked_at = Instant::now();
             in_flight = Some(tokio::spawn(async move {
-                if let Err(e) = Self::process_write_batch(&server_clone, &part_arc, batch).await {
-                    tracing::error!("write batch error: {e}");
-                }
+                Self::process_write_batch(&server_clone, &part_arc, batch, picked_at).await
             }));
         }
 
         // Drain the last in-flight batch.
         if let Some(handle) = in_flight {
-            if let Err(e) = handle.await {
-                tracing::error!("write batch task panicked: {e}");
+            match handle.await {
+                Ok(Ok(stats)) => metrics.record(stats),
+                Ok(Err(e)) => tracing::error!("write batch error: {e}"),
+                Err(e) => tracing::error!("write batch task panicked: {e}"),
             }
         }
+        metrics.flush(part_id);
     }
 
     /// Process one batch of write requests under the partition write lock.
@@ -1377,31 +1782,43 @@ impl PartitionServer {
         server: &PartitionServer,
         part_arc: &Arc<RwLock<PartitionData>>,
         batch: Vec<WriteRequest>,
-    ) -> Result<()> {
+        picked_at: Instant,
+    ) -> Result<BatchStats> {
         // Phase 1: Hold write lock only to validate keys, assign seq numbers, encode
         // blocks, and grab the partition's stream client.  Release before network I/O
         // so reads, flush, and compaction are not blocked during the append RPC.
         struct ValidatedEntry {
             internal_key: Vec<u8>,
-            user_key: Vec<u8>,
+            user_key: Bytes,
             op: u8,
-            value: Vec<u8>,
+            value: Bytes,
             expires_at: u64,
             must_sync: bool,
+            enqueue_at: Instant,
             resp_tx: oneshot::Sender<Result<Vec<u8>, Status>>,
         }
 
+        let phase1_started_at = Instant::now();
+        let mut queue_wait_ns = 0u64;
         let (valid, record_sizes, payload, batch_must_sync, log_stream_id, part_sc) = {
             let mut part = part_arc.write().await;
 
             let mut valid: Vec<ValidatedEntry> = Vec::with_capacity(batch.len());
             for req in batch {
                 let (user_key, op, value, expires_at) = match req.op {
-                    WriteOp::Put { user_key, value, expires_at } => (user_key, 1u8, value, expires_at),
-                    WriteOp::Delete { user_key } => (user_key, 2u8, vec![], 0u64),
+                    WriteOp::Put {
+                        user_key,
+                        value,
+                        expires_at,
+                    } => (user_key, 1u8, value, expires_at),
+                    WriteOp::Delete { user_key } => {
+                        (Bytes::from(user_key), 2u8, Bytes::new(), 0u64)
+                    }
                 };
                 if !Self::in_range(&part.rg, &user_key) {
-                    let _ = req.resp_tx.send(Err(Status::invalid_argument("key is out of range")));
+                    let _ = req
+                        .resp_tx
+                        .send(Err(Status::invalid_argument("key is out of range")));
                     continue;
                 }
                 part.seq_number += 1;
@@ -1414,18 +1831,23 @@ impl PartitionServer {
                     value,
                     expires_at,
                     must_sync: req.must_sync,
+                    enqueue_at: req.enqueue_at,
                     resp_tx: req.resp_tx,
                 });
+                queue_wait_ns = queue_wait_ns.saturating_add(duration_to_ns(
+                    picked_at.saturating_duration_since(req.enqueue_at),
+                ));
             }
 
             if valid.is_empty() {
-                return Ok(());
+                return Ok(BatchStats::default());
             }
 
             // Build a single payload buffer for log_stream batch append.
             // ALL entries (small and large) go to logStream — matches Go design.
             // Encode directly into one BytesMut instead of N individual Vecs + concat.
-            let total_size: usize = valid.iter()
+            let total_size: usize = valid
+                .iter()
                 .map(|e| 17 + e.internal_key.len() + e.value.len())
                 .sum();
             let mut payload_buf = BytesMut::with_capacity(total_size);
@@ -1447,18 +1869,40 @@ impl PartitionServer {
             let log_stream_id = part.log_stream_id;
             let part_sc = part.stream_client.clone();
 
-            (valid, record_sizes, payload, batch_must_sync, log_stream_id, part_sc)
+            (
+                valid,
+                record_sizes,
+                payload,
+                batch_must_sync,
+                log_stream_id,
+                part_sc,
+            )
             // write lock released here
         };
+        let phase1_elapsed = phase1_started_at.elapsed();
 
         // Phase 2: Append to logStream without holding the partition write lock.
         // Reads, flushes, and compaction can proceed concurrently.
-        let result = part_sc
-            .append_bytes(log_stream_id, payload, batch_must_sync).await
-            .map_err(|e| anyhow!("log_stream append_bytes: {e}"))?;
+        let phase2_started_at = Instant::now();
+        let result = match part_sc
+            .append_bytes(log_stream_id, payload, batch_must_sync)
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                let msg = format!("log_stream append_bytes: {e}");
+                for entry in valid {
+                    let _ = entry.resp_tx.send(Err(Status::internal(msg.clone())));
+                }
+                return Err(anyhow!(msg));
+            }
+        };
+        let phase2_elapsed = phase2_started_at.elapsed();
 
         // Phase 3: Re-acquire write lock to insert into memtable and update VP head.
-        let mut responses: Vec<(Vec<u8>, oneshot::Sender<Result<Vec<u8>, Status>>)> = Vec::new();
+        let phase3_started_at = Instant::now();
+        let mut responses: Vec<(Vec<u8>, Instant, oneshot::Sender<Result<Vec<u8>, Status>>)> =
+            Vec::new();
         {
             let mut part = part_arc.write().await;
 
@@ -1473,30 +1917,58 @@ impl PartitionServer {
                         offset: record_offset,
                         len: entry.value.len() as u32,
                     };
-                    MemEntry { op: entry.op | OP_VALUE_POINTER, value: vp.encode().to_vec(), expires_at: entry.expires_at }
+                    MemEntry {
+                        op: entry.op | OP_VALUE_POINTER,
+                        value: vp.encode().to_vec(),
+                        expires_at: entry.expires_at,
+                    }
                 } else {
-                    MemEntry { op: entry.op, value: entry.value, expires_at: entry.expires_at }
+                    MemEntry {
+                        op: entry.op,
+                        value: entry.value.to_vec(),
+                        expires_at: entry.expires_at,
+                    }
                 };
 
                 let write_size = (entry.user_key.len() + mem_entry.value.len() + 32) as u64;
-                part.active.insert(entry.internal_key, mem_entry, write_size);
-                responses.push((entry.user_key, entry.resp_tx));
+                part.active
+                    .insert(entry.internal_key, mem_entry, write_size);
+                responses.push((entry.user_key.to_vec(), entry.enqueue_at, entry.resp_tx));
             }
 
             // Update VP head to end of this batch.
             part.vp_extent_id = result.extent_id;
             part.vp_offset = result.end;
 
-            server.maybe_rotate_locked(&mut part).await
-                .map_err(|e| anyhow!("maybe_rotate: {e}"))?;
+            if let Err(e) = server.maybe_rotate_locked(&mut part).await {
+                let msg = format!("maybe_rotate: {e}");
+                for (_, _, tx) in responses {
+                    let _ = tx.send(Err(Status::internal(msg.clone())));
+                }
+                return Err(anyhow!(msg));
+            }
         } // write lock released here
+        let phase3_elapsed = phase3_started_at.elapsed();
 
         // Notify all callers.
-        for (key, tx) in responses {
+        let acked_at = Instant::now();
+        let mut end_to_end_ns = 0u64;
+        for (key, enqueue_at, tx) in responses {
+            end_to_end_ns = end_to_end_ns.saturating_add(duration_to_ns(
+                acked_at.saturating_duration_since(enqueue_at),
+            ));
             let _ = tx.send(Ok(key));
         }
 
-        Ok(())
+        Ok(BatchStats {
+            ops: record_sizes.len() as u64,
+            batch_size: record_sizes.len() as u64,
+            queue_wait_ns,
+            phase1_ns: duration_to_ns(phase1_elapsed),
+            phase2_ns: duration_to_ns(phase2_elapsed),
+            phase3_ns: duration_to_ns(phase3_elapsed),
+            end_to_end_ns,
+        })
     }
 
     pub fn trigger_gc(&self, part_id: u64) -> Result<(), &'static str> {
@@ -1515,7 +1987,10 @@ impl PartitionServer {
             let guard = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(part.read())
             });
-            guard.gc_tx.try_send(GcTask::Force { extent_ids }).map_err(|_| "gc busy")
+            guard
+                .gc_tx
+                .try_send(GcTask::Force { extent_ids })
+                .map_err(|_| "gc busy")
         } else {
             Err("no such partition")
         }
@@ -1523,8 +1998,11 @@ impl PartitionServer {
 
     pub async fn sync_regions_once(&self) -> Result<()> {
         let mut client = self.pm_client.lock().await;
-        let resp = client.get_regions(Request::new(Empty {}))
-            .await.context("get regions")?.into_inner();
+        let resp = client
+            .get_regions(Request::new(Empty {}))
+            .await
+            .context("get regions")?
+            .into_inner();
         if resp.code != Code::Ok as i32 {
             return Err(anyhow!("manager get_regions failed: {}", resp.code_des));
         }
@@ -1533,17 +2011,26 @@ impl PartitionServer {
         for (part_id, region) in regions {
             if region.ps_id == self.ps_id {
                 if let Some(rg) = region.rg {
-                    wanted.insert(part_id, (rg, region.log_stream, region.row_stream, region.meta_stream));
+                    wanted.insert(
+                        part_id,
+                        (rg, region.log_stream, region.row_stream, region.meta_stream),
+                    );
                 }
             }
         }
         let current: Vec<u64> = self.partitions.iter().map(|v| *v.key()).collect();
         for part_id in current {
-            if !wanted.contains_key(&part_id) { self.partitions.remove(&part_id); }
+            if !wanted.contains_key(&part_id) {
+                self.partitions.remove(&part_id);
+            }
         }
         for (part_id, (rg, log_stream_id, row_stream_id, meta_stream_id)) in wanted {
-            if self.partitions.contains_key(&part_id) { continue; }
-            let part = self.open_partition(part_id, rg, log_stream_id, row_stream_id, meta_stream_id).await?;
+            if self.partitions.contains_key(&part_id) {
+                continue;
+            }
+            let part = self
+                .open_partition(part_id, rg, log_stream_id, row_stream_id, meta_stream_id)
+                .await?;
             self.partitions.insert(part_id, part);
         }
         Ok(())
@@ -1557,7 +2044,8 @@ impl PartitionServer {
                     .max_decoding_message_size(GRPC_MAX_MSG)
                     .max_encoding_message_size(GRPC_MAX_MSG),
             )
-            .serve(addr).await?;
+            .serve(addr)
+            .await?;
         Ok(())
     }
 
@@ -1568,11 +2056,14 @@ impl PartitionServer {
     /// Look up a user key across all layers: active → imm → SSTables (newest first).
     /// Returns (op, value, expires_at) for the newest version, or None if not present.
     fn lookup_in_memtable(mem: &Memtable, user_key: &[u8]) -> Option<(u8, Vec<u8>, u64)> {
-        mem.seek_user_key(user_key).map(|e| (e.op, e.value, e.expires_at))
+        mem.seek_user_key(user_key)
+            .map(|e| (e.op, e.value, e.expires_at))
     }
 
     fn lookup_in_sst(reader: &SstReader, user_key: &[u8]) -> Option<(u8, Vec<u8>, u64)> {
-        if !reader.bloom_may_contain(user_key) { return None; }
+        if !reader.bloom_may_contain(user_key) {
+            return None;
+        }
         let target = key_with_ts(user_key, u64::MAX);
         let block_idx = reader.find_block_for_key(&target);
         let block = reader.read_block(block_idx).ok()?;
@@ -1584,7 +2075,9 @@ impl PartitionServer {
             if uk == user_key {
                 return Some((op, value.to_vec(), expires_at));
             }
-            if uk > user_key { break; }
+            if uk > user_key {
+                break;
+            }
         }
         None
     }
@@ -1625,11 +2118,17 @@ impl PartitionServer {
             }
         }
 
-        seen.into_iter().filter_map(|(uk, (op, expires_at))| {
-            if op == 2 { return None; } // tombstone
-            if expires_at > 0 && expires_at <= now { return None; } // expired
-            Some(uk)
-        }).collect()
+        seen.into_iter()
+            .filter_map(|(uk, (op, expires_at))| {
+                if op == 2 {
+                    return None;
+                } // tombstone
+                if expires_at > 0 && expires_at <= now {
+                    return None;
+                } // expired
+                Some(uk)
+            })
+            .collect()
     }
 
     /// Read actual value bytes for a resolved (op, raw_value, expires_at) triple.
@@ -1650,14 +2149,21 @@ impl PartitionServer {
         }
     }
 
-    async fn read_value_from_log(vp: &ValuePointer, stream_client: &Arc<StreamClient>) -> Result<Vec<u8>> {
+    async fn read_value_from_log(
+        vp: &ValuePointer,
+        stream_client: &Arc<StreamClient>,
+    ) -> Result<Vec<u8>> {
         let read_len = 17 + 0 + vp.len; // op(1)+key_len(4)+val_len(4)+expires_at(8) = 17 + key + value
-        // We don't know key_len exactly; read a generous amount and parse.
-        // Use a larger read to capture the full record.
+                                        // We don't know key_len exactly; read a generous amount and parse.
+                                        // Use a larger read to capture the full record.
         let read_bytes = (read_len + 512).max(1024);
-        let (data, _end) = stream_client.read_bytes_from_extent(vp.extent_id, vp.offset, read_bytes).await?;
+        let (data, _end) = stream_client
+            .read_bytes_from_extent(vp.extent_id, vp.offset, read_bytes)
+            .await?;
         // Parse: [op:1][key_len:4][val_len:4][expires_at:8][key][value]
-        if data.len() < 17 { return Err(anyhow!("logStream record too short")); }
+        if data.len() < 17 {
+            return Err(anyhow!("logStream record too short"));
+        }
         let key_len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
         let val_len = u32::from_le_bytes(data[5..9].try_into().unwrap()) as usize;
         let val_start = 17 + key_len;
@@ -1677,27 +2183,40 @@ impl PartitionServer {
 impl PartitionKv for PartitionServer {
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
         let req = request.into_inner();
-        let p = self.get_partition_or_sync(req.part_id).await
+        let p = self
+            .get_partition_or_sync(req.part_id)
+            .await
             .map_err(|e| part_lookup_to_status(req.part_id, e))?;
 
         let (resp_tx, resp_rx) = oneshot::channel();
         {
             let part = p.read().await;
-            part.write_tx.send(WriteRequest {
-                op: WriteOp::Put { user_key: req.key.clone(), value: req.value, expires_at: req.expires_at },
-                must_sync: req.must_sync,
-                resp_tx,
-            }).await.map_err(|_| Status::internal("write channel closed"))?;
+            part.write_tx
+                .send(WriteRequest {
+                    op: WriteOp::Put {
+                        user_key: req.key.clone(),
+                        value: req.value,
+                        expires_at: req.expires_at,
+                    },
+                    must_sync: req.must_sync,
+                    resp_tx,
+                    enqueue_at: Instant::now(),
+                })
+                .await
+                .map_err(|_| Status::internal("write channel closed"))?;
         }
 
-        let key = resp_rx.await
+        let key = resp_rx
+            .await
             .map_err(|_| Status::internal("write response dropped"))??;
-        Ok(Response::new(PutResponse { key }))
+        Ok(Response::new(PutResponse { key: key.into() }))
     }
 
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         let req = request.into_inner();
-        let p = self.get_partition_or_sync(req.part_id).await
+        let p = self
+            .get_partition_or_sync(req.part_id)
+            .await
             .map_err(|e| part_lookup_to_status(req.part_id, e))?;
         let part = p.read().await;
         if !Self::in_range(&part.rg, &req.key) {
@@ -1705,81 +2224,115 @@ impl PartitionKv for PartitionServer {
         }
 
         // Search: active → imm (newest first) → SSTables (newest first).
-        let found: Option<(u8, Vec<u8>, u64)> =
-            Self::lookup_in_memtable(&part.active, &req.key)
+        let found: Option<(u8, Vec<u8>, u64)> = Self::lookup_in_memtable(&part.active, &req.key)
             .or_else(|| {
                 for imm in part.imm.iter().rev() {
-                    if let Some(r) = Self::lookup_in_memtable(imm, &req.key) { return Some(r); }
+                    if let Some(r) = Self::lookup_in_memtable(imm, &req.key) {
+                        return Some(r);
+                    }
                 }
                 None
             })
             .or_else(|| {
                 for reader in part.sst_readers.iter().rev() {
-                    if let Some(r) = Self::lookup_in_sst(reader, &req.key) { return Some(r); }
+                    if let Some(r) = Self::lookup_in_sst(reader, &req.key) {
+                        return Some(r);
+                    }
                 }
                 None
             });
 
-        let (op, raw_value, expires_at) = found.ok_or_else(|| Status::not_found("key not found"))?;
-        if op == 2 { return Err(Status::not_found("key not found")); }
-        if expires_at > 0 && expires_at <= now_secs() { return Err(Status::not_found("key not found")); }
+        let (op, raw_value, expires_at) =
+            found.ok_or_else(|| Status::not_found("key not found"))?;
+        if op == 2 {
+            return Err(Status::not_found("key not found"));
+        }
+        if expires_at > 0 && expires_at <= now_secs() {
+            return Err(Status::not_found("key not found"));
+        }
 
         let stream_client = part.stream_client.clone();
         drop(part);
 
         let value = Self::resolve_value(op, raw_value, &stream_client)
-            .await.map_err(internal_to_status)?;
+            .await
+            .map_err(internal_to_status)?;
 
-        Ok(Response::new(GetResponse { key: req.key, value }))
+        Ok(Response::new(GetResponse {
+            key: req.key,
+            value,
+        }))
     }
 
-    async fn delete(&self, request: Request<DeleteRequest>) -> Result<Response<DeleteResponse>, Status> {
+    async fn delete(
+        &self,
+        request: Request<DeleteRequest>,
+    ) -> Result<Response<DeleteResponse>, Status> {
         let req = request.into_inner();
-        let p = self.get_partition_or_sync(req.part_id).await
+        let p = self
+            .get_partition_or_sync(req.part_id)
+            .await
             .map_err(|e| part_lookup_to_status(req.part_id, e))?;
 
         let (resp_tx, resp_rx) = oneshot::channel();
         {
             let part = p.read().await;
-            part.write_tx.send(WriteRequest {
-                op: WriteOp::Delete { user_key: req.key.clone() },
-                must_sync: req.must_sync,
-                resp_tx,
-            }).await.map_err(|_| Status::internal("write channel closed"))?;
+            part.write_tx
+                .send(WriteRequest {
+                    op: WriteOp::Delete {
+                        user_key: req.key.clone(),
+                    },
+                    must_sync: req.must_sync,
+                    resp_tx,
+                    enqueue_at: Instant::now(),
+                })
+                .await
+                .map_err(|_| Status::internal("write channel closed"))?;
         }
 
-        let key = resp_rx.await
+        let key = resp_rx
+            .await
             .map_err(|_| Status::internal("write response dropped"))??;
         Ok(Response::new(DeleteResponse { key }))
     }
 
     async fn head(&self, request: Request<HeadRequest>) -> Result<Response<HeadResponse>, Status> {
         let req = request.into_inner();
-        let p = self.get_partition_or_sync(req.part_id).await
+        let p = self
+            .get_partition_or_sync(req.part_id)
+            .await
             .map_err(|e| part_lookup_to_status(req.part_id, e))?;
         let part = p.read().await;
         if !Self::in_range(&part.rg, &req.key) {
             return Err(Status::invalid_argument("key is out of range"));
         }
 
-        let found =
-            Self::lookup_in_memtable(&part.active, &req.key)
+        let found = Self::lookup_in_memtable(&part.active, &req.key)
             .or_else(|| {
                 for imm in part.imm.iter().rev() {
-                    if let Some(r) = Self::lookup_in_memtable(imm, &req.key) { return Some(r); }
+                    if let Some(r) = Self::lookup_in_memtable(imm, &req.key) {
+                        return Some(r);
+                    }
                 }
                 None
             })
             .or_else(|| {
                 for reader in part.sst_readers.iter().rev() {
-                    if let Some(r) = Self::lookup_in_sst(reader, &req.key) { return Some(r); }
+                    if let Some(r) = Self::lookup_in_sst(reader, &req.key) {
+                        return Some(r);
+                    }
                 }
                 None
             });
 
-        let (op, raw_value, expires_at) = found.ok_or_else(|| Status::not_found("key not found"))?;
-        if op == 2 { return Err(Status::not_found("key not found")); }
-        if expires_at > 0 && expires_at <= now_secs() { return Err(Status::not_found("key not found")); }
+        let (op, raw_value, expires_at) =
+            found.ok_or_else(|| Status::not_found("key not found"))?;
+        if op == 2 {
+            return Err(Status::not_found("key not found"));
+        }
+        if expires_at > 0 && expires_at <= now_secs() {
+            return Err(Status::not_found("key not found"));
+        }
 
         // For value length: if it's a ValuePointer, use the stored length.
         let value_len = if op & OP_VALUE_POINTER != 0 {
@@ -1792,20 +2345,37 @@ impl PartitionKv for PartitionServer {
             raw_value.len() as u32
         };
 
-        Ok(Response::new(HeadResponse { info: Some(HeadInfo { key: req.key, len: value_len }) }))
+        Ok(Response::new(HeadResponse {
+            info: Some(HeadInfo {
+                key: req.key,
+                len: value_len,
+            }),
+        }))
     }
 
-    async fn range(&self, request: Request<RangeRequest>) -> Result<Response<RangeResponse>, Status> {
+    async fn range(
+        &self,
+        request: Request<RangeRequest>,
+    ) -> Result<Response<RangeResponse>, Status> {
         let req = request.into_inner();
-        let p = self.get_partition_or_sync(req.part_id).await
+        let p = self
+            .get_partition_or_sync(req.part_id)
+            .await
             .map_err(|e| part_lookup_to_status(req.part_id, e))?;
         let part = p.read().await;
 
         if req.limit == 0 {
-            return Ok(Response::new(RangeResponse { truncated: true, keys: vec![] }));
+            return Ok(Response::new(RangeResponse {
+                truncated: true,
+                keys: vec![],
+            }));
         }
 
-        let start_user_key = if req.start.is_empty() { req.prefix.clone() } else { req.start.clone() };
+        let start_user_key = if req.start.is_empty() {
+            req.prefix.clone()
+        } else {
+            req.start.clone()
+        };
         let seek_key = key_with_ts(&start_user_key, u64::MAX);
 
         // Build merge iterator: memtable items + SST iterators.
@@ -1814,11 +2384,16 @@ impl PartitionKv for PartitionServer {
         mem_it.seek(&seek_key);
 
         // SST iterators (newest first).
-        let sst_iters: Vec<TableIterator> = part.sst_readers.iter().rev().map(|r| {
-            let mut it = TableIterator::new(r.clone());
-            it.seek(&seek_key);
-            it
-        }).collect();
+        let sst_iters: Vec<TableIterator> = part
+            .sst_readers
+            .iter()
+            .rev()
+            .map(|r| {
+                let mut it = TableIterator::new(r.clone());
+                it.seek(&seek_key);
+                it
+            })
+            .collect();
         let mut merge = MergeIterator::new(sst_iters);
 
         let now = now_secs();
@@ -1829,8 +2404,16 @@ impl PartitionKv for PartitionServer {
 
         // Drain memtable and SST merge together by advancing whichever has the smaller key.
         loop {
-            let mem_key = if mem_it.valid() { mem_it.item().map(|i| i.key.as_slice()) } else { None };
-            let sst_key = if merge.valid() { merge.item().map(|i| i.key.as_slice()) } else { None };
+            let mem_key = if mem_it.valid() {
+                mem_it.item().map(|i| i.key.as_slice())
+            } else {
+                None
+            };
+            let sst_key = if merge.valid() {
+                merge.item().map(|i| i.key.as_slice())
+            } else {
+                None
+            };
 
             let item = match (mem_key, sst_key) {
                 (None, None) => break,
@@ -1853,8 +2436,14 @@ impl PartitionKv for PartitionServer {
                         // Skip SST entries with same user key.
                         while merge.valid() {
                             if let Some(si) = merge.item() {
-                                if parse_key(&si.key) == uk_owned.as_slice() { merge.next(); } else { break; }
-                            } else { break; }
+                                if parse_key(&si.key) == uk_owned.as_slice() {
+                                    merge.next();
+                                } else {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
                         }
                         item
                     } else {
@@ -1864,8 +2453,14 @@ impl PartitionKv for PartitionServer {
                         // Skip mem entries with same user key.
                         while mem_it.valid() {
                             if let Some(mi) = mem_it.item() {
-                                if parse_key(&mi.key) == uk_owned.as_slice() { mem_it.next(); } else { break; }
-                            } else { break; }
+                                if parse_key(&mi.key) == uk_owned.as_slice() {
+                                    mem_it.next();
+                                } else {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
                         }
                         item
                     }
@@ -1874,20 +2469,35 @@ impl PartitionKv for PartitionServer {
 
             let uk = parse_key(&item.key);
             // When partition has overlapping keys, skip keys outside the partition range.
-            if check_overlap && !Self::in_range(&part_rg, uk) { continue; }
-            if !req.prefix.is_empty() && !uk.starts_with(&req.prefix as &[u8]) { break; }
-            if last_user_key.as_deref() == Some(uk) { continue; }
+            if check_overlap && !Self::in_range(&part_rg, uk) {
+                continue;
+            }
+            if !req.prefix.is_empty() && !uk.starts_with(&req.prefix as &[u8]) {
+                break;
+            }
+            if last_user_key.as_deref() == Some(uk) {
+                continue;
+            }
             last_user_key = Some(uk.to_vec());
 
-            if item.op == 2 { continue; }
-            if item.expires_at > 0 && item.expires_at <= now { continue; }
+            if item.op == 2 {
+                continue;
+            }
+            if item.expires_at > 0 && item.expires_at <= now {
+                continue;
+            }
 
             out.push(uk.to_vec());
-            if out.len() >= req.limit as usize { break; }
+            if out.len() >= req.limit as usize {
+                break;
+            }
         }
 
         let truncated = out.len() == req.limit as usize;
-        Ok(Response::new(RangeResponse { truncated, keys: out }))
+        Ok(Response::new(RangeResponse {
+            truncated,
+            keys: out,
+        }))
     }
 
     async fn split_part(
@@ -1895,7 +2505,9 @@ impl PartitionKv for PartitionServer {
         request: Request<SplitPartRequest>,
     ) -> Result<Response<SplitPartResponse>, Status> {
         let req = request.into_inner();
-        let p = self.remove_partition_or_sync(req.part_id).await
+        let p = self
+            .remove_partition_or_sync(req.part_id)
+            .await
             .map_err(|e| part_lookup_to_status(req.part_id, e))?;
 
         let mut part = p.write().await;
@@ -1905,7 +2517,7 @@ impl PartitionKv for PartitionServer {
             drop(part);
             self.partitions.insert(req.part_id, p.clone());
             return Err(Status::failed_precondition(
-                "cannot split: partition has overlapping keys, run major compaction first"
+                "cannot split: partition has overlapping keys, run major compaction first",
             ));
         }
 
@@ -1914,7 +2526,9 @@ impl PartitionKv for PartitionServer {
         if user_keys.len() < 2 {
             drop(part);
             self.partitions.insert(req.part_id, p.clone());
-            return Err(Status::failed_precondition("part has less than 2 keys, cannot split"));
+            return Err(Status::failed_precondition(
+                "part has less than 2 keys, cannot split",
+            ));
         }
 
         if let Err(err) = self.flush_memtable_locked(&mut part).await {
@@ -1929,16 +2543,38 @@ impl PartitionKv for PartitionServer {
         drop(part);
 
         let (log_end, row_end, meta_end) = {
-            let l = self.stream_client.commit_length(log_stream_id).await.unwrap_or(0).max(1);
-            let r = self.stream_client.commit_length(row_stream_id).await.unwrap_or(0).max(1);
-            let m = self.stream_client.commit_length(meta_stream_id).await.unwrap_or(0).max(1);
+            let l = self
+                .stream_client
+                .commit_length(log_stream_id)
+                .await
+                .unwrap_or(0)
+                .max(1);
+            let r = self
+                .stream_client
+                .commit_length(row_stream_id)
+                .await
+                .unwrap_or(0)
+                .max(1);
+            let m = self
+                .stream_client
+                .commit_length(meta_stream_id)
+                .await
+                .unwrap_or(0)
+                .max(1);
             (l, r, m)
         };
 
         let owner_key = format!("split/{}", req.part_id);
-        let lock_res = match self.stream_client.acquire_owner_lock(owner_key.clone()).await {
+        let lock_res = match self
+            .stream_client
+            .acquire_owner_lock(owner_key.clone())
+            .await
+        {
             Ok(v) => v,
-            Err(err) => { self.partitions.insert(req.part_id, p.clone()); return Err(internal_to_status(err)); }
+            Err(err) => {
+                self.partitions.insert(req.part_id, p.clone());
+                return Err(internal_to_status(err));
+            }
         };
         if lock_res.code != Code::Ok as i32 {
             self.partitions.insert(req.part_id, p.clone());
@@ -1949,15 +2585,19 @@ impl PartitionKv for PartitionServer {
         let mut split_err = String::new();
         let mut backoff = Duration::from_millis(100);
         for _ in 0..8 {
-            let res = match self.stream_client.multi_modify_split(MultiModifySplitRequest {
-                part_id: req.part_id,
-                mid_key: mid.clone(),
-                owner_key: owner_key.clone(),
-                revision: lock_res.revision,
-                log_stream_sealed_length: log_end,
-                row_stream_sealed_length: row_end,
-                meta_stream_sealed_length: meta_end,
-            }).await {
+            let res = match self
+                .stream_client
+                .multi_modify_split(MultiModifySplitRequest {
+                    part_id: req.part_id,
+                    mid_key: mid.clone(),
+                    owner_key: owner_key.clone(),
+                    revision: lock_res.revision,
+                    log_stream_sealed_length: log_end,
+                    row_stream_sealed_length: row_end,
+                    meta_stream_sealed_length: meta_end,
+                })
+                .await
+            {
                 Ok(v) => v,
                 Err(err) => {
                     split_err = err.to_string();
@@ -1966,13 +2606,23 @@ impl PartitionKv for PartitionServer {
                     continue;
                 }
             };
-            if res.code == Code::Ok as i32 { split_ok = true; break; }
-            split_err = if res.code_des.is_empty() { format!("code {}", res.code) } else { res.code_des };
+            if res.code == Code::Ok as i32 {
+                split_ok = true;
+                break;
+            }
+            split_err = if res.code_des.is_empty() {
+                format!("code {}", res.code)
+            } else {
+                res.code_des
+            };
             tokio::time::sleep(backoff).await;
             backoff = backoff.saturating_mul(2).min(Duration::from_secs(2));
         }
 
-        if !split_ok { self.partitions.insert(req.part_id, p.clone()); return Err(Status::failed_precondition(split_err)); }
+        if !split_ok {
+            self.partitions.insert(req.part_id, p.clone());
+            return Err(Status::failed_precondition(split_err));
+        }
         self.sync_regions_once().await.map_err(internal_to_status)?;
         Ok(Response::new(SplitPartResponse {}))
     }
@@ -1983,7 +2633,10 @@ impl PartitionKv for PartitionServer {
     ) -> Result<Response<PutResponse>, Status> {
         use autumn_proto::autumn::stream_put_request::Data;
         let mut stream = request.into_inner();
-        let first = stream.message().await.map_err(internal_to_status)?
+        let first = stream
+            .message()
+            .await
+            .map_err(internal_to_status)?
             .ok_or_else(|| Status::invalid_argument("empty stream"))?;
         let header = match first.data {
             Some(Data::Header(h)) => h,
@@ -2003,9 +2656,20 @@ impl PartitionKv for PartitionServer {
             }
         }
         if value.len() != expected_len {
-            return Err(Status::invalid_argument(format!("payload {} bytes, header declared {}", value.len(), expected_len)));
+            return Err(Status::invalid_argument(format!(
+                "payload {} bytes, header declared {}",
+                value.len(),
+                expected_len
+            )));
         }
-        self.put(Request::new(PutRequest { key: header.key.clone(), value, expires_at: header.expires_at, part_id: header.part_id, must_sync: header.must_sync })).await
+        self.put(Request::new(PutRequest {
+            key: header.key.clone().into(),
+            value: value.into(),
+            expires_at: header.expires_at,
+            part_id: header.part_id,
+            must_sync: header.must_sync,
+        }))
+        .await
     }
 
     async fn maintenance(
@@ -2054,20 +2718,29 @@ fn internal_to_status<E: std::fmt::Display>(err: E) -> Status {
 
 fn part_lookup_to_status(part_id: u64, err: anyhow::Error) -> Status {
     let msg = format!("{:#}", err); // full error chain
-    if msg.contains("not found") { Status::not_found(format!("part {part_id} not found")) }
-    else { Status::internal(msg) }
+    if msg.contains("not found") {
+        Status::not_found(format!("part {part_id} not found"))
+    } else {
+        Status::internal(msg)
+    }
 }
 
 fn rand_u64() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default().subsec_nanos() as u64
-        ^ std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default().as_millis() as u64
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64
+        ^ std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
 }
 
 fn now_secs() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default().as_secs()
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 // ---------------------------------------------------------------------------
@@ -2080,8 +2753,14 @@ mod tests {
 
     #[test]
     fn endpoint_normalization() {
-        assert_eq!(normalize_endpoint("127.0.0.1:9000").unwrap(), "http://127.0.0.1:9000");
-        assert_eq!(normalize_endpoint("http://127.0.0.1:9000").unwrap(), "http://127.0.0.1:9000");
+        assert_eq!(
+            normalize_endpoint("127.0.0.1:9000").unwrap(),
+            "http://127.0.0.1:9000"
+        );
+        assert_eq!(
+            normalize_endpoint("http://127.0.0.1:9000").unwrap(),
+            "http://127.0.0.1:9000"
+        );
     }
 
     #[test]
@@ -2102,14 +2781,21 @@ mod tests {
         // which causes get("mykey") to return not-found after put("mykey") + put("mykey1").
         let ka = key_with_ts(b"mykey", 1);
         let kb = key_with_ts(b"mykey1", 2);
-        assert!(ka < kb, "\"mykey\" internal key must sort before \"mykey1\" internal key");
+        assert!(
+            ka < kb,
+            "\"mykey\" internal key must sort before \"mykey1\" internal key"
+        );
         assert_eq!(parse_key(&ka), b"mykey");
         assert_eq!(parse_key(&kb), b"mykey1");
     }
 
     #[test]
     fn value_pointer_encode_decode() {
-        let vp = ValuePointer { extent_id: 0xDEAD, offset: 0x1234, len: 0xABCD };
+        let vp = ValuePointer {
+            extent_id: 0xDEAD,
+            offset: 0x1234,
+            len: 0xABCD,
+        };
         let enc = vp.encode();
         let dec = ValuePointer::decode(&enc);
         assert_eq!(dec.extent_id, vp.extent_id);

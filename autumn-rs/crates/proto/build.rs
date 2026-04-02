@@ -13,6 +13,8 @@ fn main() {
             ".autumn.v1.AppendRequest",
             ".autumn.v1.ReadBytesResponse",
             ".autumn.v1.CopyExtentResponse",
+            ".autumn.v1.PutRequest",
+            ".autumn.v1.PutResponse",
             ".autumn.v1.StreamPutRequest",
             ".autumn.v1.Payload",
         ])

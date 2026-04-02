@@ -93,7 +93,9 @@ impl SstBuilder {
 
         // Track metadata
         let ts = parse_seq(internal_key);
-        if ts > self.seq_num { self.seq_num = ts; }
+        if ts > self.seq_num {
+            self.seq_num = ts;
+        }
 
         if self.smallest_key.is_empty() {
             self.smallest_key = internal_key.to_vec();
@@ -119,11 +121,15 @@ impl SstBuilder {
         self.entry_offsets.push(self.current.len() as u32);
 
         // Write entry: [header:4][diff_key][op:1][val_len:4][expires_at:8][value]
-        let hdr = EntryHeader { overlap: overlap as u16, diff_len: diff_key.len() as u16 };
+        let hdr = EntryHeader {
+            overlap: overlap as u16,
+            diff_len: diff_key.len() as u16,
+        };
         self.current.extend_from_slice(&hdr.encode());
         self.current.extend_from_slice(diff_key);
         self.current.push(op);
-        self.current.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        self.current
+            .extend_from_slice(&(value.len() as u32).to_le_bytes());
         self.current.extend_from_slice(&expires_at.to_le_bytes());
         self.current.extend_from_slice(value);
 
@@ -250,7 +256,11 @@ mod tests {
         assert!(!data.is_empty());
 
         let reader = SstReader::from_bytes(std::sync::Arc::new(data)).expect("reader");
-        assert_eq!(reader.block_count(), 1, "should be one block for 3 small entries");
+        assert_eq!(
+            reader.block_count(),
+            1,
+            "should be one block for 3 small entries"
+        );
         assert_eq!(reader.seq_num(), 20);
         assert!(!reader.smallest_key().is_empty());
     }
@@ -274,7 +284,9 @@ mod tests {
         b.add(&ikey(b"key", 1), 1, b"val", 0);
         let mut data = b.finish();
         // Corrupt a byte in the first block
-        if data.len() > 5 { data[5] ^= 0xFF; }
+        if data.len() > 5 {
+            data[5] ^= 0xFF;
+        }
         // Reading should fail with a CRC error
         let reader = SstReader::from_bytes(std::sync::Arc::new(data)).expect("reader opens");
         // Trying to read the first block should produce a CRC error

@@ -1,6 +1,6 @@
 # autumn go→rust feature list
 
-**Last updated:** 2026-03-28
+**Last updated:** 2026-04-02
 
 **Rules:** `passes` and `notes` are the only mutable fields after a feature is created.
 
@@ -125,6 +125,12 @@
 - **Evidence:** `autumn_clientv1/lib.go` (lines 21-31: cached regions/psDetails, lines 48-69: saveRegion with sort+validate, lines 71-153: Connect with etcd watches, lines 107-147: watch goroutines) · `autumn-rs/crates/server/src/bin/autumn_client.rs` (ClusterClient.resolve_key calls GetRegions RPC on every operation)
 - **Notes:** Go implementation: (1) Connect() loads regions/config from etcd, sorts by StartKey, caches in lib.regions; (2) Two etcd watch goroutines push-update regions and PS addresses; (3) Get/Put do sort.Search on cached regions — zero RPC; (4) Split propagates: PS writes etcd → PartitionManager updates regions/config → etcd watch delivers to all clients. Interim solution: ClusterClient caches GetRegions() result at connect() time, refreshes on routing failure. Full etcd watch requires client-side etcd dependency.
 - **passes:** false
+
+### F040 · Single-partition write benchmark observability and payload reuse
+- **Target:** Make Rust single-partition `wbench` diagnosable and cheaper on the hot path: add per-second write-path summaries for partition/stream append phases, richer benchmark metadata output, explicit single-partition targeting, and payload reuse so 8KB benchmark values are not rebuilt per op on the client side.
+- **Evidence:** `autumn-rs/crates/server/src/bin/autumn_client.rs` · `autumn-rs/crates/partition-server/src/lib.rs` · `autumn-rs/crates/stream/src/client.rs` · `autumn-rs/crates/proto/build.rs`
+- **Notes:** Implemented. `PutRequest`/`PutResponse` now use `bytes::Bytes`, allowing `wbench` to reuse payloads cheaply with `--reuse-value true|false` and optional `--part-id` / `--report-interval`. `write_result.json` now stores config/summary/ops_samples/results and `rbench` accepts both the new wrapper and legacy array format. Partition server logs `partition write summary` (queue wait, batch fill ratio, phase1/2/3, end-to-end), and stream client logs `stream append summary` (lock wait, extent lookup, fanout append, retries). `autumn-client` unit tests for bool parsing + result-file compatibility pass; compile path updated through manager integration tests.
+- **passes:** true
 
 ---
 

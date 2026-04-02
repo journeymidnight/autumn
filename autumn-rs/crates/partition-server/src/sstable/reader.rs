@@ -52,7 +52,10 @@ impl SstReader {
         let base = sst_base as usize;
         let end = base + sst_len as usize;
         if end > data.len() {
-            return Err(anyhow!("SSTable slice out of bounds base={sst_base} len={sst_len} data_len={}", data.len()));
+            return Err(anyhow!(
+                "SSTable slice out of bounds base={sst_base} len={sst_len} data_len={}",
+                data.len()
+            ));
         }
         Self::parse(data, base, end)
     }
@@ -62,7 +65,7 @@ impl SstReader {
             return Err(anyhow!("SSTable too short"));
         }
         // Last 4 bytes of the SSTable: meta_len
-        let meta_len = u32::from_le_bytes(data[sst_end-4..sst_end].try_into().unwrap()) as usize;
+        let meta_len = u32::from_le_bytes(data[sst_end - 4..sst_end].try_into().unwrap()) as usize;
         if meta_len == 0 || meta_len + 4 > sst_end - sst_base {
             return Err(anyhow!("invalid meta_len={meta_len}"));
         }
@@ -130,12 +133,19 @@ impl SstReader {
 
     /// Read and decode block at index `idx`.
     pub fn read_block(&self, idx: usize) -> Result<DecodedBlock> {
-        let bo = self.block_offsets.get(idx)
-            .ok_or_else(|| anyhow!("block index {idx} out of range (total={})", self.block_offsets.len()))?;
+        let bo = self.block_offsets.get(idx).ok_or_else(|| {
+            anyhow!(
+                "block index {idx} out of range (total={})",
+                self.block_offsets.len()
+            )
+        })?;
         let start = self.sst_base as usize + bo.relative_offset as usize;
         let end = start + bo.block_len as usize;
         if end > self.data.len() {
-            return Err(anyhow!("block {idx} out of bounds: start={start} end={end} data_len={}", self.data.len()));
+            return Err(anyhow!(
+                "block {idx} out of bounds: start={start} end={end} data_len={}",
+                self.data.len()
+            ));
         }
         DecodedBlock::decode(&self.data[start..end], &bo.key)
     }

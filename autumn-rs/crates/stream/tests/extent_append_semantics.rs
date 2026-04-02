@@ -153,8 +153,16 @@ async fn append_with_mid_byte_commit_truncates_and_succeeds() {
         .await
         .expect("append with mid-byte commit")
         .into_inner();
-    assert_eq!(partial.code, Code::Ok as i32, "mid-byte commit should succeed: {}", partial.code_des);
-    assert_eq!(partial.end, 7, "truncated to 6 then appended 1 byte → end=7");
+    assert_eq!(
+        partial.code,
+        Code::Ok as i32,
+        "mid-byte commit should succeed: {}",
+        partial.code_des
+    );
+    assert_eq!(
+        partial.end, 7,
+        "truncated to 6 then appended 1 byte → end=7"
+    );
 
     let commit = client
         .commit_length(Request::new(CommitLengthRequest {

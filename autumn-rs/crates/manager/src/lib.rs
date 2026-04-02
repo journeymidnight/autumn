@@ -21,12 +21,12 @@ use autumn_proto::autumn::{
     CheckCommitLengthRequest, CheckCommitLengthResponse, Code, CreateStreamRequest,
     CreateStreamResponse, DfRequest, Empty, ExtentInfo, ExtentInfoRequest, ExtentInfoResponse,
     GetRegionsResponse, MultiModifySplitRequest, MultiModifySplitResponse, NodeInfo,
-    NodesInfoResponse, PsDetail, PunchHolesRequest, PunchHolesResponse, ReAvaliRequest, RecoveryTask,
-    RecoveryTaskStatus, RegionInfo, Regions, RegisterNodeRequest, RegisterNodeResponse,
-    RegisterPsRequest, RegisterPsResponse, RequireRecoveryRequest, StatusResponse,
-    StreamAllocExtentRequest, StreamAllocExtentResponse, StreamInfo, StreamInfoRequest,
-    StreamInfoResponse, TruncateRequest, TruncateResponse, UpsertPartitionRequest,
-    UpsertPartitionResponse,
+    NodesInfoResponse, PsDetail, PunchHolesRequest, PunchHolesResponse, ReAvaliRequest,
+    RecoveryTask, RecoveryTaskStatus, RegionInfo, Regions, RegisterNodeRequest,
+    RegisterNodeResponse, RegisterPsRequest, RegisterPsResponse, RequireRecoveryRequest,
+    StatusResponse, StreamAllocExtentRequest, StreamAllocExtentResponse, StreamInfo,
+    StreamInfoRequest, StreamInfoResponse, TruncateRequest, TruncateResponse,
+    UpsertPartitionRequest, UpsertPartitionResponse,
 };
 use etcd_client::{Client as EtcdClient, Compare, CompareOp, GetOptions, PutOptions, Txn, TxnOp};
 use prost::Message;

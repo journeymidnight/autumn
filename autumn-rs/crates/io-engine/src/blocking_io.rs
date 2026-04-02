@@ -119,7 +119,12 @@ impl BlockingIoEngine {
 
 fn handle_command(cmd: Command, files: &mut HashMap<u64, std::fs::File>) {
     match cmd {
-        Command::Open { path, create, file_id, resp } => {
+        Command::Open {
+            path,
+            create,
+            file_id,
+            resp,
+        } => {
             let mut opts = OpenOptions::new();
             opts.read(true).write(true);
             if create {
@@ -339,8 +344,12 @@ mod tests {
         let engine = BlockingIoEngine::new().expect("new blocking engine");
 
         let file = engine.create(&path).await.expect("create file");
-        file.write_at(0, Bytes::from_static(b"hello")).await.expect("write 1");
-        file.write_at(10, Bytes::from_static(b"world")).await.expect("write 2");
+        file.write_at(0, Bytes::from_static(b"hello"))
+            .await
+            .expect("write 1");
+        file.write_at(10, Bytes::from_static(b"world"))
+            .await
+            .expect("write 2");
         file.sync_all().await.expect("sync");
 
         let first = file.read_at(0, 5).await.expect("read first");
@@ -363,8 +372,12 @@ mod tests {
         let f1 = engine.create(&path1).await.expect("create f1");
         let f2 = engine.create(&path2).await.expect("create f2");
 
-        f1.write_at(0, Bytes::from_static(b"aaaa")).await.expect("write f1");
-        f2.write_at(0, Bytes::from_static(b"bbbb")).await.expect("write f2");
+        f1.write_at(0, Bytes::from_static(b"aaaa"))
+            .await
+            .expect("write f1");
+        f2.write_at(0, Bytes::from_static(b"bbbb"))
+            .await
+            .expect("write f2");
         f1.sync_all().await.expect("sync f1");
         f2.sync_all().await.expect("sync f2");
 
@@ -387,7 +400,9 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 let f = eng.create(&path).await.expect("create");
                 let data = vec![i as u8; 1024];
-                f.write_at(0, Bytes::from(data.clone())).await.expect("write");
+                f.write_at(0, Bytes::from(data.clone()))
+                    .await
+                    .expect("write");
                 let read = f.read_at(0, 1024).await.expect("read");
                 assert_eq!(read, data);
             }));

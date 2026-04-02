@@ -26,12 +26,8 @@ fn make_rt() -> Runtime {
 fn bench_blocking_io_sequential(c: &mut Criterion) {
     let rt = make_rt();
     let tmp = TempDir::new().unwrap();
-    let engine = rt.block_on(async {
-        build_engine(IoMode::Standard).unwrap()
-    });
-    let file = rt.block_on(async {
-        engine.create(&tmp.path().join("bench.dat")).await.unwrap()
-    });
+    let engine = rt.block_on(async { build_engine(IoMode::Standard).unwrap() });
+    let file = rt.block_on(async { engine.create(&tmp.path().join("bench.dat")).await.unwrap() });
 
     let mut group = c.benchmark_group("blocking_io_sequential");
     for size in [8 * 1024usize, 64 * 1024, 256 * 1024, 1024 * 1024] {
@@ -153,7 +149,9 @@ fn bench_blocking_io_parallel(c: &mut Criterion) {
                         tokio::spawn(async move { f.write_at(off, Bytes::from(d)).await.unwrap() })
                     })
                     .collect();
-                for t in tasks { t.await.unwrap(); }
+                for t in tasks {
+                    t.await.unwrap();
+                }
             }
         });
     });

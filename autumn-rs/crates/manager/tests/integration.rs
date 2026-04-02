@@ -13,9 +13,9 @@ use autumn_proto::autumn::{
     SplitPartRequest, StreamAllocExtentRequest, StreamInfoRequest, TableLocations, TruncateRequest,
     UpsertPartitionRequest,
 };
-use prost::Message as _;
 use autumn_stream::{ExtentNode, ExtentNodeConfig, StreamClient};
 use partition_server::PartitionServer;
+use prost::Message as _;
 use tokio::time::sleep;
 use tonic::Request;
 
@@ -25,18 +25,18 @@ fn decode_last_table_locations(data: &[u8]) -> TableLocations {
     let mut buf = data;
     while !buf.is_empty() {
         match TableLocations::decode_length_delimited(buf) {
-            Ok(locs) => {
-                match prost::decode_length_delimiter(buf) {
-                    Ok(msg_len) => {
-                        let prefix = prost::length_delimiter_len(msg_len);
-                        let total = prefix + msg_len;
-                        if total > buf.len() { break; }
-                        buf = &buf[total..];
-                        last = Some(locs);
+            Ok(locs) => match prost::decode_length_delimiter(buf) {
+                Ok(msg_len) => {
+                    let prefix = prost::length_delimiter_len(msg_len);
+                    let total = prefix + msg_len;
+                    if total > buf.len() {
+                        break;
                     }
-                    Err(_) => break,
+                    buf = &buf[total..];
+                    last = Some(locs);
                 }
-            }
+                Err(_) => break,
+            },
             Err(_) => break,
         }
     }
@@ -276,9 +276,10 @@ async fn partition_server_put_get_and_split_flow() {
         .expect("connect kv");
 
     for k in ["a1", "a2", "a3", "a4"] {
-        kv.put(Request::new(PutRequest { must_sync: false,
-            key: k.as_bytes().to_vec(),
-            value: format!("val-{k}").into_bytes(),
+        kv.put(Request::new(PutRequest {
+            must_sync: false,
+            key: k.as_bytes().to_vec().into(),
+            value: format!("val-{k}").into_bytes().into(),
             expires_at: 0,
             part_id: 501,
         }))
@@ -457,9 +458,10 @@ async fn partition_server_recovery_replays_table_and_wal() {
         .await
         .expect("connect kv1");
 
-    kv1.put(Request::new(PutRequest { must_sync: false,
-        key: b"a-flush".to_vec(),
-        value: b"flushed-value".to_vec(),
+    kv1.put(Request::new(PutRequest {
+        must_sync: false,
+        key: b"a-flush".to_vec().into(),
+        value: b"flushed-value".to_vec().into(),
         expires_at: 0,
         part_id: 511,
     }))
@@ -469,18 +471,20 @@ async fn partition_server_recovery_replays_table_and_wal() {
     // Force flush so the key lands in an SSTable (not just WAL).
     ps1.flush_partition(511).await.expect("flush ps1");
 
-    kv1.put(Request::new(PutRequest { must_sync: false,
-        key: b"a-wal-1".to_vec(),
-        value: b"v1".to_vec(),
+    kv1.put(Request::new(PutRequest {
+        must_sync: false,
+        key: b"a-wal-1".to_vec().into(),
+        value: b"v1".to_vec().into(),
         expires_at: 0,
         part_id: 511,
     }))
     .await
     .expect("put wal key 1");
 
-    kv1.put(Request::new(PutRequest { must_sync: false,
-        key: b"a-wal-2".to_vec(),
-        value: b"v2".to_vec(),
+    kv1.put(Request::new(PutRequest {
+        must_sync: false,
+        key: b"a-wal-2".to_vec().into(),
+        value: b"v2".to_vec().into(),
         expires_at: 0,
         part_id: 511,
     }))
@@ -807,7 +811,9 @@ async fn stream_append_and_read_blocks_flow() {
 // ---------------------------------------------------------------------------
 
 /// Helper: spin up manager + 2 extent nodes using dynamic ports.
-async fn setup_infra_f030(node_id_base: u64) -> (
+async fn setup_infra_f030(
+    node_id_base: u64,
+) -> (
     String,
     tokio::task::JoinHandle<Result<(), anyhow::Error>>,
     tokio::task::JoinHandle<Result<(), anyhow::Error>>,
@@ -830,10 +836,20 @@ async fn setup_infra_f030(node_id_base: u64) -> (
     let n1_dir = tempfile::tempdir().expect("n1 tempdir");
     let n2_dir = tempfile::tempdir().expect("n2 tempdir");
 
-    let n1 = ExtentNode::new(ExtentNodeConfig::new(n1_dir.path().to_path_buf(), IoMode::Standard, node_id_base))
-        .await.expect("node1");
-    let n2 = ExtentNode::new(ExtentNodeConfig::new(n2_dir.path().to_path_buf(), IoMode::Standard, node_id_base + 1))
-        .await.expect("node2");
+    let n1 = ExtentNode::new(ExtentNodeConfig::new(
+        n1_dir.path().to_path_buf(),
+        IoMode::Standard,
+        node_id_base,
+    ))
+    .await
+    .expect("node1");
+    let n2 = ExtentNode::new(ExtentNodeConfig::new(
+        n2_dir.path().to_path_buf(),
+        IoMode::Standard,
+        node_id_base + 1,
+    ))
+    .await
+    .expect("node2");
     let n1_task = tokio::spawn(n1.serve(n1_sock));
     let n2_task = tokio::spawn(n2.serve(n2_sock));
     sleep(Duration::from_millis(120)).await;
@@ -841,11 +857,15 @@ async fn setup_infra_f030(node_id_base: u64) -> (
     sm.register_node(Request::new(RegisterNodeRequest {
         addr: n1_sock.to_string(),
         disk_uuids: vec![format!("disk-f030-{}", node_id_base)],
-    })).await.expect("register n1");
+    }))
+    .await
+    .expect("register n1");
     sm.register_node(Request::new(RegisterNodeRequest {
         addr: n2_sock.to_string(),
         disk_uuids: vec![format!("disk-f030-{}", node_id_base + 1)],
-    })).await.expect("register n2");
+    }))
+    .await
+    .expect("register n2");
 
     (endpoint, n1_task, n2_task, mgr_task, n1_dir, n2_dir)
 }
@@ -854,30 +874,66 @@ async fn setup_infra_f030(node_id_base: u64) -> (
 /// a valid TableLocations protobuf pointing to that SSTable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn f030_flush_writes_sst_to_row_stream() {
-    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) =
-        setup_infra_f030(101).await;
+    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) = setup_infra_f030(101).await;
 
     let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
-        .await.expect("connect sm");
-    let log_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
-        .await.expect("create log stream").into_inner().stream.expect("log stream").stream_id;
-    let row_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
-        .await.expect("create row stream").into_inner().stream.expect("row stream").stream_id;
-    let meta_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
-        .await.expect("create meta stream").into_inner().stream.expect("meta stream").stream_id;
+        .await
+        .expect("connect sm");
+    let log_stream = sm
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard: 1,
+            parity_shard: 0,
+        }))
+        .await
+        .expect("create log stream")
+        .into_inner()
+        .stream
+        .expect("log stream")
+        .stream_id;
+    let row_stream = sm
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard: 1,
+            parity_shard: 0,
+        }))
+        .await
+        .expect("create row stream")
+        .into_inner()
+        .stream
+        .expect("row stream")
+        .stream_id;
+    let meta_stream = sm
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard: 1,
+            parity_shard: 0,
+        }))
+        .await
+        .expect("create meta stream")
+        .into_inner()
+        .stream
+        .expect("meta stream")
+        .stream_id;
 
     let data_dir = tempfile::tempdir().expect("tempdir");
     let ps = PartitionServer::connect(41, &endpoint)
-        .await.expect("connect ps");
+        .await
+        .expect("connect ps");
     let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
-        .await.expect("connect pm");
+        .await
+        .expect("connect pm");
     pm.upsert_partition(Request::new(UpsertPartitionRequest {
         meta: Some(PartitionMeta {
-            log_stream, row_stream, meta_stream,
+            log_stream,
+            row_stream,
+            meta_stream,
             part_id: 601,
-            rg: Some(Range { start_key: b"a".to_vec(), end_key: b"z".to_vec() }),
+            rg: Some(Range {
+                start_key: b"a".to_vec(),
+                end_key: b"z".to_vec(),
+            }),
         }),
-    })).await.expect("upsert partition");
+    }))
+    .await
+    .expect("upsert partition");
     ps.sync_regions_once().await.expect("sync regions");
 
     let ps_addr = pick_addr();
@@ -885,30 +941,51 @@ async fn f030_flush_writes_sst_to_row_stream() {
     sleep(Duration::from_millis(120)).await;
 
     let mut kv = PartitionKvClient::connect(format!("http://{}", ps_addr))
-        .await.expect("connect kv");
+        .await
+        .expect("connect kv");
 
-    kv.put(Request::new(PutRequest { must_sync: false,
-        key: b"a-big".to_vec(),
-        value: vec![b'X'; 4 * 1024],
+    kv.put(Request::new(PutRequest {
+        must_sync: false,
+        key: b"a-big".to_vec().into(),
+        value: vec![b'X'; 4 * 1024].into(),
         expires_at: 0,
         part_id: 601,
-    })).await.expect("put big");
+    }))
+    .await
+    .expect("put big");
     ps.flush_partition(601).await.expect("flush");
 
     let mut sc = StreamClient::connect(&endpoint, "test-f030-flush".to_string(), 128 * 1024 * 1024)
-        .await.expect("stream client");
+        .await
+        .expect("stream client");
 
     // rowStream: last block is the SSTable.
-    let sst = sc.read_last_extent_data(row_stream).await.expect("read_last_extent_data rowStream");
-    assert!(sst.is_some(), "rowStream must have SSTable data after flush");
+    let sst = sc
+        .read_last_extent_data(row_stream)
+        .await
+        .expect("read_last_extent_data rowStream");
+    assert!(
+        sst.is_some(),
+        "rowStream must have SSTable data after flush"
+    );
     assert!(!sst.unwrap().is_empty(), "SSTable data must not be empty");
 
     // metaStream: last extent has a length-delimited TableLocations proto.
-    let meta_bytes = sc.read_last_extent_data(meta_stream).await.expect("read_last_extent_data metaStream");
-    assert!(meta_bytes.is_some(), "metaStream must have a TableLocations entry");
+    let meta_bytes = sc
+        .read_last_extent_data(meta_stream)
+        .await
+        .expect("read_last_extent_data metaStream");
+    assert!(
+        meta_bytes.is_some(),
+        "metaStream must have a TableLocations entry"
+    );
     let raw = meta_bytes.unwrap();
     let locs = decode_last_table_locations(raw.as_slice());
-    assert_eq!(locs.locs.len(), 1, "TableLocations must list exactly one SSTable");
+    assert_eq!(
+        locs.locs.len(),
+        1,
+        "TableLocations must list exactly one SSTable"
+    );
 
     n1_task.abort();
     n2_task.abort();
@@ -920,72 +997,133 @@ async fn f030_flush_writes_sst_to_row_stream() {
 /// then replays the local WAL on top.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn f030_recovery_from_meta_and_row_streams() {
-    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) =
-        setup_infra_f030(103).await;
+    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) = setup_infra_f030(103).await;
 
     let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
-        .await.expect("connect sm");
-    let log_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
-        .await.expect("create log stream").into_inner().stream.expect("log stream").stream_id;
-    let row_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
-        .await.expect("create row stream").into_inner().stream.expect("row stream").stream_id;
-    let meta_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
-        .await.expect("create meta stream").into_inner().stream.expect("meta stream").stream_id;
+        .await
+        .expect("connect sm");
+    let log_stream = sm
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard: 1,
+            parity_shard: 0,
+        }))
+        .await
+        .expect("create log stream")
+        .into_inner()
+        .stream
+        .expect("log stream")
+        .stream_id;
+    let row_stream = sm
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard: 1,
+            parity_shard: 0,
+        }))
+        .await
+        .expect("create row stream")
+        .into_inner()
+        .stream
+        .expect("row stream")
+        .stream_id;
+    let meta_stream = sm
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard: 1,
+            parity_shard: 0,
+        }))
+        .await
+        .expect("create meta stream")
+        .into_inner()
+        .stream
+        .expect("meta stream")
+        .stream_id;
 
     let data_dir = tempfile::tempdir().expect("tempdir");
     let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
-        .await.expect("connect pm");
+        .await
+        .expect("connect pm");
     pm.upsert_partition(Request::new(UpsertPartitionRequest {
         meta: Some(PartitionMeta {
-            log_stream, row_stream, meta_stream,
+            log_stream,
+            row_stream,
+            meta_stream,
             part_id: 611,
-            rg: Some(Range { start_key: b"a".to_vec(), end_key: b"z".to_vec() }),
+            rg: Some(Range {
+                start_key: b"a".to_vec(),
+                end_key: b"z".to_vec(),
+            }),
         }),
-    })).await.expect("upsert partition");
+    }))
+    .await
+    .expect("upsert partition");
 
     // First PS: write one flushed key + one WAL-only key.
     let ps1 = PartitionServer::connect(42, &endpoint)
-        .await.expect("connect ps1");
+        .await
+        .expect("connect ps1");
     ps1.sync_regions_once().await.expect("sync regions");
     let ps1_addr = pick_addr();
     let ps1_task = tokio::spawn(ps1.clone().serve(ps1_addr));
     sleep(Duration::from_millis(120)).await;
 
     let mut kv1 = PartitionKvClient::connect(format!("http://{}", ps1_addr))
-        .await.expect("connect kv1");
-    kv1.put(Request::new(PutRequest { must_sync: false,
-        key: b"a-streamed".to_vec(),
-        value: vec![b'S'; 4 * 1024],
+        .await
+        .expect("connect kv1");
+    kv1.put(Request::new(PutRequest {
+        must_sync: false,
+        key: b"a-streamed".to_vec().into(),
+        value: vec![b'S'; 4 * 1024].into(),
         expires_at: 0,
         part_id: 611,
-    })).await.expect("put streamed");
+    }))
+    .await
+    .expect("put streamed");
     ps1.flush_partition(611).await.expect("flush ps1");
-    kv1.put(Request::new(PutRequest { must_sync: false,
-        key: b"a-wal-only".to_vec(),
-        value: b"small".to_vec(),
+    kv1.put(Request::new(PutRequest {
+        must_sync: false,
+        key: b"a-wal-only".to_vec().into(),
+        value: b"small".to_vec().into(),
         expires_at: 0,
         part_id: 611,
-    })).await.expect("put wal-only");
+    }))
+    .await
+    .expect("put wal-only");
     ps1_task.abort();
     sleep(Duration::from_millis(120)).await;
 
     // Second PS: recover – reads metaStream → SST from rowStream → local WAL.
     let ps2 = PartitionServer::connect(42, &endpoint)
-        .await.expect("connect ps2");
+        .await
+        .expect("connect ps2");
     ps2.sync_regions_once().await.expect("resync regions");
     let ps2_addr = pick_addr();
     let ps2_task = tokio::spawn(ps2.serve(ps2_addr));
     sleep(Duration::from_millis(120)).await;
 
     let mut kv2 = PartitionKvClient::connect(format!("http://{}", ps2_addr))
-        .await.expect("connect kv2");
+        .await
+        .expect("connect kv2");
 
-    let v1 = kv2.get(Request::new(GetRequest { key: b"a-streamed".to_vec(), part_id: 611 }))
-        .await.expect("get streamed").into_inner();
-    assert_eq!(v1.value.len(), 4 * 1024, "stream-backed SST key survives restart");
+    let v1 = kv2
+        .get(Request::new(GetRequest {
+            key: b"a-streamed".to_vec(),
+            part_id: 611,
+        }))
+        .await
+        .expect("get streamed")
+        .into_inner();
+    assert_eq!(
+        v1.value.len(),
+        4 * 1024,
+        "stream-backed SST key survives restart"
+    );
 
-    let v2 = kv2.get(Request::new(GetRequest { key: b"a-wal-only".to_vec(), part_id: 611 }))
-        .await.expect("get wal-only").into_inner();
+    let v2 = kv2
+        .get(Request::new(GetRequest {
+            key: b"a-wal-only".to_vec(),
+            part_id: 611,
+        }))
+        .await
+        .expect("get wal-only")
+        .into_inner();
     assert_eq!(v2.value, b"small", "WAL-only key survives restart");
 
     n1_task.abort();
@@ -1004,30 +1142,66 @@ async fn f030_recovery_from_meta_and_row_streams() {
 /// 4. Verify the number of SSTables decreased (merged into fewer tables).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn f029_compaction_merges_small_tables() {
-    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) =
-        setup_infra_f030(105).await;
+    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) = setup_infra_f030(105).await;
 
     let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
-        .await.expect("connect sm");
-    let log_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
-        .await.expect("create log stream").into_inner().stream.expect("log stream").stream_id;
-    let row_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
-        .await.expect("create row stream").into_inner().stream.expect("row stream").stream_id;
-    let meta_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
-        .await.expect("create meta stream").into_inner().stream.expect("meta stream").stream_id;
+        .await
+        .expect("connect sm");
+    let log_stream = sm
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard: 1,
+            parity_shard: 0,
+        }))
+        .await
+        .expect("create log stream")
+        .into_inner()
+        .stream
+        .expect("log stream")
+        .stream_id;
+    let row_stream = sm
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard: 1,
+            parity_shard: 0,
+        }))
+        .await
+        .expect("create row stream")
+        .into_inner()
+        .stream
+        .expect("row stream")
+        .stream_id;
+    let meta_stream = sm
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard: 1,
+            parity_shard: 0,
+        }))
+        .await
+        .expect("create meta stream")
+        .into_inner()
+        .stream
+        .expect("meta stream")
+        .stream_id;
 
     let data_dir = tempfile::tempdir().expect("tempdir");
     let ps = PartitionServer::connect(43, &endpoint)
-        .await.expect("connect ps");
+        .await
+        .expect("connect ps");
     let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
-        .await.expect("connect pm");
+        .await
+        .expect("connect pm");
     pm.upsert_partition(Request::new(UpsertPartitionRequest {
         meta: Some(PartitionMeta {
-            log_stream, row_stream, meta_stream,
+            log_stream,
+            row_stream,
+            meta_stream,
             part_id: 621,
-            rg: Some(Range { start_key: b"a".to_vec(), end_key: b"z".to_vec() }),
+            rg: Some(Range {
+                start_key: b"a".to_vec(),
+                end_key: b"z".to_vec(),
+            }),
         }),
-    })).await.expect("upsert partition");
+    }))
+    .await
+    .expect("upsert partition");
     ps.sync_regions_once().await.expect("sync regions");
 
     let ps_addr = pick_addr();
@@ -1035,28 +1209,38 @@ async fn f029_compaction_merges_small_tables() {
     sleep(Duration::from_millis(120)).await;
 
     let mut kv = PartitionKvClient::connect(format!("http://{}", ps_addr))
-        .await.expect("connect kv");
+        .await
+        .expect("connect kv");
 
     // Write 3 values, each followed by an explicit flush.
     for i in 0u8..3 {
-        kv.put(Request::new(PutRequest { must_sync: false,
-            key: format!("key-{:02}", i).into_bytes(),
-            value: vec![b'A' + i; 4 * 1024],
+        kv.put(Request::new(PutRequest {
+            must_sync: false,
+            key: format!("key-{:02}", i).into_bytes().into(),
+            value: vec![b'A' + i; 4 * 1024].into(),
             expires_at: 0,
             part_id: 621,
-        })).await.expect("put large key");
+        }))
+        .await
+        .expect("put large key");
         ps.flush_partition(621).await.expect("flush");
     }
 
     // Verify we have 3 SSTables in metaStream before compaction.
     let mut sc = StreamClient::connect(&endpoint, "test-f029".to_string(), 128 * 1024 * 1024)
-        .await.expect("stream client");
-    let meta_bytes_before = sc.read_last_extent_data(meta_stream).await.expect("read meta")
+        .await
+        .expect("stream client");
+    let meta_bytes_before = sc
+        .read_last_extent_data(meta_stream)
+        .await
+        .expect("read meta")
         .expect("meta data must exist");
     let locs_before = decode_last_table_locations(&meta_bytes_before);
-    assert!(locs_before.locs.len() >= 2,
+    assert!(
+        locs_before.locs.len() >= 2,
         "expected at least 2 SSTables before compaction, got {}",
-        locs_before.locs.len());
+        locs_before.locs.len()
+    );
 
     // Trigger major compaction (non-blocking send to bounded channel).
     ps.trigger_major_compact(621);
@@ -1064,23 +1248,40 @@ async fn f029_compaction_merges_small_tables() {
 
     // All keys must still be readable after compaction.
     for i in 0u8..3 {
-        let resp = kv.get(Request::new(GetRequest {
-            key: format!("key-{:02}", i).into_bytes(),
-            part_id: 621,
-        })).await.expect("get after compact").into_inner();
-        assert_eq!(resp.value.len(), 4 * 1024,
-            "key-{:02} must be readable after compaction", i);
-        assert!(resp.value.iter().all(|&b| b == b'A' + i),
-            "key-{:02} value bytes must match", i);
+        let resp = kv
+            .get(Request::new(GetRequest {
+                key: format!("key-{:02}", i).into_bytes(),
+                part_id: 621,
+            }))
+            .await
+            .expect("get after compact")
+            .into_inner();
+        assert_eq!(
+            resp.value.len(),
+            4 * 1024,
+            "key-{:02} must be readable after compaction",
+            i
+        );
+        assert!(
+            resp.value.iter().all(|&b| b == b'A' + i),
+            "key-{:02} value bytes must match",
+            i
+        );
     }
 
     // After major compaction the number of SSTables should have decreased.
-    let meta_bytes_after = sc.read_last_extent_data(meta_stream).await.expect("read meta after compact")
+    let meta_bytes_after = sc
+        .read_last_extent_data(meta_stream)
+        .await
+        .expect("read meta after compact")
         .expect("meta data must exist after compact");
     let locs_after = decode_last_table_locations(&meta_bytes_after);
-    assert!(locs_after.locs.len() < locs_before.locs.len(),
+    assert!(
+        locs_after.locs.len() < locs_before.locs.len(),
         "compaction should reduce SSTable count: before={} after={}",
-        locs_before.locs.len(), locs_after.locs.len());
+        locs_before.locs.len(),
+        locs_after.locs.len()
+    );
 
     n1_task.abort();
     n2_task.abort();
@@ -1096,30 +1297,66 @@ async fn f029_compaction_merges_small_tables() {
 /// Small values (<= 4KB) stay inline. Both are readable without restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn f031_large_value_stored_in_log_stream() {
-    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) =
-        setup_infra_f030(107).await;
+    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) = setup_infra_f030(107).await;
 
     let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
-        .await.expect("connect sm");
-    let log_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
-        .await.expect("create log stream").into_inner().stream.expect("log stream").stream_id;
-    let row_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
-        .await.expect("create row stream").into_inner().stream.expect("row stream").stream_id;
-    let meta_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
-        .await.expect("create meta stream").into_inner().stream.expect("meta stream").stream_id;
+        .await
+        .expect("connect sm");
+    let log_stream = sm
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard: 1,
+            parity_shard: 0,
+        }))
+        .await
+        .expect("create log stream")
+        .into_inner()
+        .stream
+        .expect("log stream")
+        .stream_id;
+    let row_stream = sm
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard: 1,
+            parity_shard: 0,
+        }))
+        .await
+        .expect("create row stream")
+        .into_inner()
+        .stream
+        .expect("row stream")
+        .stream_id;
+    let meta_stream = sm
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard: 1,
+            parity_shard: 0,
+        }))
+        .await
+        .expect("create meta stream")
+        .into_inner()
+        .stream
+        .expect("meta stream")
+        .stream_id;
 
     let data_dir = tempfile::tempdir().expect("tempdir");
     let ps = PartitionServer::connect(51, &endpoint)
-        .await.expect("connect ps");
+        .await
+        .expect("connect ps");
     let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
-        .await.expect("connect pm");
+        .await
+        .expect("connect pm");
     pm.upsert_partition(Request::new(UpsertPartitionRequest {
         meta: Some(PartitionMeta {
-            log_stream, row_stream, meta_stream,
+            log_stream,
+            row_stream,
+            meta_stream,
             part_id: 701,
-            rg: Some(Range { start_key: b"a".to_vec(), end_key: b"z".to_vec() }),
+            rg: Some(Range {
+                start_key: b"a".to_vec(),
+                end_key: b"z".to_vec(),
+            }),
         }),
-    })).await.expect("upsert partition");
+    }))
+    .await
+    .expect("upsert partition");
     ps.sync_regions_once().await.expect("sync regions");
 
     let ps_addr = pick_addr();
@@ -1127,33 +1364,58 @@ async fn f031_large_value_stored_in_log_stream() {
     sleep(Duration::from_millis(120)).await;
 
     let mut kv = PartitionKvClient::connect(format!("http://{}", ps_addr))
-        .await.expect("connect kv");
+        .await
+        .expect("connect kv");
 
     // Large value: 8 KB > VALUE_THROTTLE (4 KB) — stored in logStream.
     let large_val: Vec<u8> = (0u8..=255).cycle().take(8 * 1024).collect();
-    kv.put(Request::new(PutRequest { must_sync: false,
-        key: b"large-key".to_vec(),
-        value: large_val.clone(),
+    kv.put(Request::new(PutRequest {
+        must_sync: false,
+        key: b"large-key".to_vec().into(),
+        value: large_val.clone().into(),
         expires_at: 0,
         part_id: 701,
-    })).await.expect("put large value");
+    }))
+    .await
+    .expect("put large value");
 
     // Small value: 2 KB <= VALUE_THROTTLE — stays inline.
     let small_val = vec![b'S'; 2 * 1024];
-    kv.put(Request::new(PutRequest { must_sync: false,
-        key: b"small-key".to_vec(),
-        value: small_val.clone(),
+    kv.put(Request::new(PutRequest {
+        must_sync: false,
+        key: b"small-key".to_vec().into(),
+        value: small_val.clone().into(),
         expires_at: 0,
         part_id: 701,
-    })).await.expect("put small value");
+    }))
+    .await
+    .expect("put small value");
 
-    let got_large = kv.get(Request::new(GetRequest { key: b"large-key".to_vec(), part_id: 701 }))
-        .await.expect("get large").into_inner();
-    assert_eq!(got_large.value, large_val, "large value must roundtrip via logStream");
+    let got_large = kv
+        .get(Request::new(GetRequest {
+            key: b"large-key".to_vec(),
+            part_id: 701,
+        }))
+        .await
+        .expect("get large")
+        .into_inner();
+    assert_eq!(
+        got_large.value, large_val,
+        "large value must roundtrip via logStream"
+    );
 
-    let got_small = kv.get(Request::new(GetRequest { key: b"small-key".to_vec(), part_id: 701 }))
-        .await.expect("get small").into_inner();
-    assert_eq!(got_small.value, small_val, "small value must roundtrip inline");
+    let got_small = kv
+        .get(Request::new(GetRequest {
+            key: b"small-key".to_vec(),
+            part_id: 701,
+        }))
+        .await
+        .expect("get small")
+        .into_inner();
+    assert_eq!(
+        got_small.value, small_val,
+        "small value must roundtrip inline"
+    );
 
     n1_task.abort();
     n2_task.abort();
@@ -1166,81 +1428,144 @@ async fn f031_large_value_stored_in_log_stream() {
 /// readable after restart by following the pointer to logStream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn f031_recovery_replays_log_stream() {
-    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) =
-        setup_infra_f030(109).await;
+    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) = setup_infra_f030(109).await;
 
     let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
-        .await.expect("connect sm");
-    let log_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
-        .await.expect("create log stream").into_inner().stream.expect("log stream").stream_id;
-    let row_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
-        .await.expect("create row stream").into_inner().stream.expect("row stream").stream_id;
-    let meta_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
-        .await.expect("create meta stream").into_inner().stream.expect("meta stream").stream_id;
+        .await
+        .expect("connect sm");
+    let log_stream = sm
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard: 1,
+            parity_shard: 0,
+        }))
+        .await
+        .expect("create log stream")
+        .into_inner()
+        .stream
+        .expect("log stream")
+        .stream_id;
+    let row_stream = sm
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard: 1,
+            parity_shard: 0,
+        }))
+        .await
+        .expect("create row stream")
+        .into_inner()
+        .stream
+        .expect("row stream")
+        .stream_id;
+    let meta_stream = sm
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard: 1,
+            parity_shard: 0,
+        }))
+        .await
+        .expect("create meta stream")
+        .into_inner()
+        .stream
+        .expect("meta stream")
+        .stream_id;
 
     let data_dir = tempfile::tempdir().expect("tempdir");
     let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
-        .await.expect("connect pm");
+        .await
+        .expect("connect pm");
     pm.upsert_partition(Request::new(UpsertPartitionRequest {
         meta: Some(PartitionMeta {
-            log_stream, row_stream, meta_stream,
+            log_stream,
+            row_stream,
+            meta_stream,
             part_id: 711,
-            rg: Some(Range { start_key: b"a".to_vec(), end_key: b"z".to_vec() }),
+            rg: Some(Range {
+                start_key: b"a".to_vec(),
+                end_key: b"z".to_vec(),
+            }),
         }),
-    })).await.expect("upsert partition");
+    }))
+    .await
+    .expect("upsert partition");
 
     // First PS: write a large value + filler to trigger flush, then a small WAL-only key.
     let ps1 = PartitionServer::connect(52, &endpoint)
-        .await.expect("connect ps1");
+        .await
+        .expect("connect ps1");
     ps1.sync_regions_once().await.expect("sync regions");
     let ps1_addr = pick_addr();
     let ps1_task = tokio::spawn(ps1.clone().serve(ps1_addr));
     sleep(Duration::from_millis(120)).await;
 
     let mut kv1 = PartitionKvClient::connect(format!("http://{}", ps1_addr))
-        .await.expect("connect kv1");
+        .await
+        .expect("connect kv1");
 
     let large_val: Vec<u8> = (0u8..=255).cycle().take(8 * 1024).collect();
-    kv1.put(Request::new(PutRequest { must_sync: false,
-        key: b"b-large".to_vec(),
-        value: large_val.clone(),
+    kv1.put(Request::new(PutRequest {
+        must_sync: false,
+        key: b"b-large".to_vec().into(),
+        value: large_val.clone().into(),
         expires_at: 0,
         part_id: 711,
-    })).await.expect("put large");
+    }))
+    .await
+    .expect("put large");
 
     // Force flush so the SST gets a ValuePointer record for b-large.
     ps1.flush_partition(711).await.expect("flush ps1");
 
-    kv1.put(Request::new(PutRequest { must_sync: false,
-        key: b"b-wal-small".to_vec(),
-        value: b"small-wal".to_vec(),
+    kv1.put(Request::new(PutRequest {
+        must_sync: false,
+        key: b"b-wal-small".to_vec().into(),
+        value: b"small-wal".to_vec().into(),
         expires_at: 0,
         part_id: 711,
-    })).await.expect("put small wal");
+    }))
+    .await
+    .expect("put small wal");
 
     ps1_task.abort();
     sleep(Duration::from_millis(120)).await;
 
     // Second PS: recover.
     let ps2 = PartitionServer::connect(52, &endpoint)
-        .await.expect("connect ps2");
+        .await
+        .expect("connect ps2");
     ps2.sync_regions_once().await.expect("resync");
     let ps2_addr = pick_addr();
     let ps2_task = tokio::spawn(ps2.serve(ps2_addr));
     sleep(Duration::from_millis(120)).await;
 
     let mut kv2 = PartitionKvClient::connect(format!("http://{}", ps2_addr))
-        .await.expect("connect kv2");
+        .await
+        .expect("connect kv2");
 
     // Large value recovered via SST ValuePointer → logStream read.
-    let got_large = kv2.get(Request::new(GetRequest { key: b"b-large".to_vec(), part_id: 711 }))
-        .await.expect("get large after restart").into_inner();
-    assert_eq!(got_large.value, large_val, "large value must survive restart via logStream");
+    let got_large = kv2
+        .get(Request::new(GetRequest {
+            key: b"b-large".to_vec(),
+            part_id: 711,
+        }))
+        .await
+        .expect("get large after restart")
+        .into_inner();
+    assert_eq!(
+        got_large.value, large_val,
+        "large value must survive restart via logStream"
+    );
 
     // Small WAL key recovered from local WAL.
-    let got_small = kv2.get(Request::new(GetRequest { key: b"b-wal-small".to_vec(), part_id: 711 }))
-        .await.expect("get small after restart").into_inner();
-    assert_eq!(got_small.value, b"small-wal", "small WAL key must survive restart");
+    let got_small = kv2
+        .get(Request::new(GetRequest {
+            key: b"b-wal-small".to_vec(),
+            part_id: 711,
+        }))
+        .await
+        .expect("get small after restart")
+        .into_inner();
+    assert_eq!(
+        got_small.value, b"small-wal",
+        "small WAL key must survive restart"
+    );
 
     n1_task.abort();
     n2_task.abort();
@@ -1252,30 +1577,66 @@ async fn f031_recovery_replays_log_stream() {
 /// readable after compaction merges the SSTable that contains the pointer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn f031_compaction_preserves_value_pointers() {
-    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) =
-        setup_infra_f030(111).await;
+    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) = setup_infra_f030(111).await;
 
     let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
-        .await.expect("connect sm");
-    let log_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
-        .await.expect("create log stream").into_inner().stream.expect("log stream").stream_id;
-    let row_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
-        .await.expect("create row stream").into_inner().stream.expect("row stream").stream_id;
-    let meta_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
-        .await.expect("create meta stream").into_inner().stream.expect("meta stream").stream_id;
+        .await
+        .expect("connect sm");
+    let log_stream = sm
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard: 1,
+            parity_shard: 0,
+        }))
+        .await
+        .expect("create log stream")
+        .into_inner()
+        .stream
+        .expect("log stream")
+        .stream_id;
+    let row_stream = sm
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard: 1,
+            parity_shard: 0,
+        }))
+        .await
+        .expect("create row stream")
+        .into_inner()
+        .stream
+        .expect("row stream")
+        .stream_id;
+    let meta_stream = sm
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard: 1,
+            parity_shard: 0,
+        }))
+        .await
+        .expect("create meta stream")
+        .into_inner()
+        .stream
+        .expect("meta stream")
+        .stream_id;
 
     let data_dir = tempfile::tempdir().expect("tempdir");
     let ps = PartitionServer::connect(53, &endpoint)
-        .await.expect("connect ps");
+        .await
+        .expect("connect ps");
     let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
-        .await.expect("connect pm");
+        .await
+        .expect("connect pm");
     pm.upsert_partition(Request::new(UpsertPartitionRequest {
         meta: Some(PartitionMeta {
-            log_stream, row_stream, meta_stream,
+            log_stream,
+            row_stream,
+            meta_stream,
             part_id: 721,
-            rg: Some(Range { start_key: b"a".to_vec(), end_key: b"z".to_vec() }),
+            rg: Some(Range {
+                start_key: b"a".to_vec(),
+                end_key: b"z".to_vec(),
+            }),
         }),
-    })).await.expect("upsert partition");
+    }))
+    .await
+    .expect("upsert partition");
     ps.sync_regions_once().await.expect("sync regions");
 
     let ps_addr = pick_addr();
@@ -1283,18 +1644,22 @@ async fn f031_compaction_preserves_value_pointers() {
     sleep(Duration::from_millis(120)).await;
 
     let mut kv = PartitionKvClient::connect(format!("http://{}", ps_addr))
-        .await.expect("connect kv");
+        .await
+        .expect("connect kv");
 
     let large_val: Vec<u8> = (0u8..=255).cycle().take(8 * 1024).collect();
 
     // Write 3 rounds of large values, each followed by explicit flush, to produce 3 SSTables.
     for i in 0..3u8 {
-        kv.put(Request::new(PutRequest { must_sync: false,
-            key: format!("c-large-{}", i).into_bytes(),
-            value: large_val.clone(),
+        kv.put(Request::new(PutRequest {
+            must_sync: false,
+            key: format!("c-large-{}", i).into_bytes().into(),
+            value: large_val.clone().into(),
             expires_at: 0,
             part_id: 721,
-        })).await.expect("put large");
+        }))
+        .await
+        .expect("put large");
         ps.flush_partition(721).await.expect("flush");
     }
 
@@ -1304,12 +1669,19 @@ async fn f031_compaction_preserves_value_pointers() {
 
     // All large values must still be readable after compaction.
     for i in 0..3u8 {
-        let got = kv.get(Request::new(GetRequest {
-            key: format!("c-large-{}", i).into_bytes(),
-            part_id: 721,
-        })).await.expect("get large after compact").into_inner();
-        assert_eq!(got.value, large_val,
-            "large value c-large-{} must survive compaction", i);
+        let got = kv
+            .get(Request::new(GetRequest {
+                key: format!("c-large-{}", i).into_bytes(),
+                part_id: 721,
+            }))
+            .await
+            .expect("get large after compact")
+            .into_inner();
+        assert_eq!(
+            got.value, large_val,
+            "large value c-large-{} must survive compaction",
+            i
+        );
     }
 
     n1_task.abort();
@@ -1326,30 +1698,66 @@ async fn f031_compaction_preserves_value_pointers() {
 /// 4. Verify all current keys are still readable with correct values.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn f033_gc_reclaims_log_stream_extents() {
-    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) =
-        setup_infra_f030(117).await;
+    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) = setup_infra_f030(117).await;
 
     let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
-        .await.expect("connect sm");
-    let log_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
-        .await.expect("create log stream").into_inner().stream.expect("log stream").stream_id;
-    let row_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
-        .await.expect("create row stream").into_inner().stream.expect("row stream").stream_id;
-    let meta_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
-        .await.expect("create meta stream").into_inner().stream.expect("meta stream").stream_id;
+        .await
+        .expect("connect sm");
+    let log_stream = sm
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard: 1,
+            parity_shard: 0,
+        }))
+        .await
+        .expect("create log stream")
+        .into_inner()
+        .stream
+        .expect("log stream")
+        .stream_id;
+    let row_stream = sm
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard: 1,
+            parity_shard: 0,
+        }))
+        .await
+        .expect("create row stream")
+        .into_inner()
+        .stream
+        .expect("row stream")
+        .stream_id;
+    let meta_stream = sm
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard: 1,
+            parity_shard: 0,
+        }))
+        .await
+        .expect("create meta stream")
+        .into_inner()
+        .stream
+        .expect("meta stream")
+        .stream_id;
 
     let data_dir = tempfile::tempdir().expect("tempdir");
     let ps = PartitionServer::connect(59, &endpoint)
-        .await.expect("connect ps");
+        .await
+        .expect("connect ps");
     let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
-        .await.expect("connect pm");
+        .await
+        .expect("connect pm");
     pm.upsert_partition(Request::new(UpsertPartitionRequest {
         meta: Some(PartitionMeta {
-            log_stream, row_stream, meta_stream,
+            log_stream,
+            row_stream,
+            meta_stream,
             part_id: 801,
-            rg: Some(Range { start_key: b"a".to_vec(), end_key: b"z".to_vec() }),
+            rg: Some(Range {
+                start_key: b"a".to_vec(),
+                end_key: b"z".to_vec(),
+            }),
         }),
-    })).await.expect("upsert partition");
+    }))
+    .await
+    .expect("upsert partition");
     ps.sync_regions_once().await.expect("sync regions");
 
     let ps_addr = pick_addr();
@@ -1357,18 +1765,22 @@ async fn f033_gc_reclaims_log_stream_extents() {
     sleep(Duration::from_millis(120)).await;
 
     let mut kv = PartitionKvClient::connect(format!("http://{}", ps_addr))
-        .await.expect("connect kv");
+        .await
+        .expect("connect kv");
 
     // Round 1: write large values for 3 keys, each >4KB so they go to logStream.
     // Explicit flush after each key so the VP is recorded in an SSTable.
     let val_v1: Vec<u8> = vec![b'A'; 8 * 1024];
     for i in 0u8..3 {
-        kv.put(Request::new(PutRequest { must_sync: false,
-            key: format!("gc-key-{}", i).into_bytes(),
-            value: val_v1.clone(),
+        kv.put(Request::new(PutRequest {
+            must_sync: false,
+            key: format!("gc-key-{}", i).into_bytes().into(),
+            value: val_v1.clone().into(),
             expires_at: 0,
             part_id: 801,
-        })).await.expect("put v1");
+        }))
+        .await
+        .expect("put v1");
         ps.flush_partition(801).await.expect("flush round1");
     }
 
@@ -1376,12 +1788,15 @@ async fn f033_gc_reclaims_log_stream_extents() {
     // This makes the Round 1 logStream records dead (VP entries now point nowhere current).
     let val_v2: Vec<u8> = vec![b'B'; 8 * 1024];
     for i in 0u8..3 {
-        kv.put(Request::new(PutRequest { must_sync: false,
-            key: format!("gc-key-{}", i).into_bytes(),
-            value: val_v2.clone(),
+        kv.put(Request::new(PutRequest {
+            must_sync: false,
+            key: format!("gc-key-{}", i).into_bytes().into(),
+            value: val_v2.clone().into(),
             expires_at: 0,
             part_id: 801,
-        })).await.expect("put v2");
+        }))
+        .await
+        .expect("put v2");
         ps.flush_partition(801).await.expect("flush round2");
     }
 
@@ -1395,12 +1810,19 @@ async fn f033_gc_reclaims_log_stream_extents() {
 
     // All keys must still return the v2 values after GC.
     for i in 0u8..3 {
-        let resp = kv.get(Request::new(GetRequest {
-            key: format!("gc-key-{}", i).into_bytes(),
-            part_id: 801,
-        })).await.expect("get after gc").into_inner();
-        assert_eq!(resp.value, val_v2,
-            "gc-key-{} must return v2 value after GC", i);
+        let resp = kv
+            .get(Request::new(GetRequest {
+                key: format!("gc-key-{}", i).into_bytes(),
+                part_id: 801,
+            }))
+            .await
+            .expect("get after gc")
+            .into_inner();
+        assert_eq!(
+            resp.value, val_v2,
+            "gc-key-{} must return v2 value after GC",
+            i
+        );
     }
 
     n1_task.abort();
@@ -1418,30 +1840,66 @@ async fn f033_gc_reclaims_log_stream_extents() {
 /// overlapping partition must be rejected. Major compaction clears overlap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn f037_overlap_detected_after_split_and_cleared_by_compaction() {
-    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) =
-        setup_infra_f030(119).await;
+    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) = setup_infra_f030(119).await;
 
     let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
-        .await.expect("connect sm");
-    let log_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
-        .await.expect("create log stream").into_inner().stream.expect("log stream").stream_id;
-    let row_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
-        .await.expect("create row stream").into_inner().stream.expect("row stream").stream_id;
-    let meta_stream = sm.create_stream(Request::new(CreateStreamRequest { data_shard: 1, parity_shard: 0 }))
-        .await.expect("create meta stream").into_inner().stream.expect("meta stream").stream_id;
+        .await
+        .expect("connect sm");
+    let log_stream = sm
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard: 1,
+            parity_shard: 0,
+        }))
+        .await
+        .expect("create log stream")
+        .into_inner()
+        .stream
+        .expect("log stream")
+        .stream_id;
+    let row_stream = sm
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard: 1,
+            parity_shard: 0,
+        }))
+        .await
+        .expect("create row stream")
+        .into_inner()
+        .stream
+        .expect("row stream")
+        .stream_id;
+    let meta_stream = sm
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard: 1,
+            parity_shard: 0,
+        }))
+        .await
+        .expect("create meta stream")
+        .into_inner()
+        .stream
+        .expect("meta stream")
+        .stream_id;
 
     let data_dir = tempfile::tempdir().expect("tempdir");
     let ps = PartitionServer::connect(71, &endpoint)
-        .await.expect("connect ps");
+        .await
+        .expect("connect ps");
     let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
-        .await.expect("connect pm");
+        .await
+        .expect("connect pm");
     pm.upsert_partition(Request::new(UpsertPartitionRequest {
         meta: Some(PartitionMeta {
-            log_stream, row_stream, meta_stream,
+            log_stream,
+            row_stream,
+            meta_stream,
             part_id: 901,
-            rg: Some(Range { start_key: b"a".to_vec(), end_key: b"z".to_vec() }),
+            rg: Some(Range {
+                start_key: b"a".to_vec(),
+                end_key: b"z".to_vec(),
+            }),
         }),
-    })).await.expect("upsert partition");
+    }))
+    .await
+    .expect("upsert partition");
     ps.sync_regions_once().await.expect("sync regions");
 
     let ps_addr = pick_addr();
@@ -1449,93 +1907,162 @@ async fn f037_overlap_detected_after_split_and_cleared_by_compaction() {
     sleep(Duration::from_millis(120)).await;
 
     let mut kv = PartitionKvClient::connect(format!("http://{}", ps_addr))
-        .await.expect("connect kv");
+        .await
+        .expect("connect kv");
 
     // Write keys in the "a*" range and flush them to an SSTable.
     for i in 0u8..5 {
-        kv.put(Request::new(PutRequest { must_sync: false,
-            key: format!("a-key-{:02}", i).into_bytes(),
-            value: format!("val-a-{}", i).into_bytes(),
+        kv.put(Request::new(PutRequest {
+            must_sync: false,
+            key: format!("a-key-{:02}", i).into_bytes().into(),
+            value: format!("val-a-{}", i).into_bytes().into(),
             expires_at: 0,
             part_id: 901,
-        })).await.expect("put a-key");
+        }))
+        .await
+        .expect("put a-key");
     }
     ps.flush_partition(901).await.expect("flush after a-keys");
 
     // Write keys in the "y*" range and flush them to a second SSTable.
     for i in 0u8..5 {
-        kv.put(Request::new(PutRequest { must_sync: false,
-            key: format!("y-key-{:02}", i).into_bytes(),
-            value: format!("val-y-{}", i).into_bytes(),
+        kv.put(Request::new(PutRequest {
+            must_sync: false,
+            key: format!("y-key-{:02}", i).into_bytes().into(),
+            value: format!("val-y-{}", i).into_bytes().into(),
             expires_at: 0,
             part_id: 901,
-        })).await.expect("put y-key");
+        }))
+        .await
+        .expect("put y-key");
     }
     ps.flush_partition(901).await.expect("flush after y-keys");
 
     // Parent has no overlap before the split.
-    assert!(!ps.has_overlap(901), "parent must not have overlap before split");
+    assert!(
+        !ps.has_overlap(901),
+        "parent must not have overlap before split"
+    );
 
     // Split: creates left=[a, mid) and right=[mid, z). Both children inherit the parent's
     // SSTables which cover the full [a, z) range — both will have overlap on open.
     kv.split_part(Request::new(SplitPartRequest { part_id: 901 }))
-        .await.expect("initial split must succeed on non-overlapping partition");
+        .await
+        .expect("initial split must succeed on non-overlapping partition");
 
     // Sync to open both child partitions on the PS.
     ps.sync_regions_once().await.expect("sync after split");
     sleep(Duration::from_millis(300)).await;
 
     // Find the right child's part_id.
-    let regions_resp = pm.get_regions(Request::new(Empty {}))
-        .await.expect("get_regions").into_inner();
+    let regions_resp = pm
+        .get_regions(Request::new(Empty {}))
+        .await
+        .expect("get_regions")
+        .into_inner();
     let all_part_ids: Vec<u64> = regions_resp
-        .regions.as_ref().expect("regions present").regions
-        .values().map(|r| r.part_id).collect();
-    assert_eq!(all_part_ids.len(), 2, "should have 2 partitions after split");
-    let right_id = *all_part_ids.iter().find(|&&id| id != 901).expect("right child exists");
+        .regions
+        .as_ref()
+        .expect("regions present")
+        .regions
+        .values()
+        .map(|r| r.part_id)
+        .collect();
+    assert_eq!(
+        all_part_ids.len(),
+        2,
+        "should have 2 partitions after split"
+    );
+    let right_id = *all_part_ids
+        .iter()
+        .find(|&&id| id != 901)
+        .expect("right child exists");
 
     // Both children must detect overlap.
-    assert!(ps.has_overlap(901), "left child must detect overlap after split");
-    assert!(ps.has_overlap(right_id), "right child must detect overlap after split");
+    assert!(
+        ps.has_overlap(901),
+        "left child must detect overlap after split"
+    );
+    assert!(
+        ps.has_overlap(right_id),
+        "right child must detect overlap after split"
+    );
 
     // Split on an overlapping partition must be rejected with FAILED_PRECONDITION.
-    let split_err = kv.split_part(Request::new(SplitPartRequest { part_id: 901 }))
-        .await.expect_err("split on overlapping partition must fail");
-    assert_eq!(split_err.code(), tonic::Code::FailedPrecondition,
-        "expected FailedPrecondition, got: {split_err}");
+    let split_err = kv
+        .split_part(Request::new(SplitPartRequest { part_id: 901 }))
+        .await
+        .expect_err("split on overlapping partition must fail");
+    assert_eq!(
+        split_err.code(),
+        tonic::Code::FailedPrecondition,
+        "expected FailedPrecondition, got: {split_err}"
+    );
 
     // Range scan on the left child must only return keys within its range.
-    let left_rg = regions_resp.regions.as_ref().unwrap().regions
-        .values().find(|ri| ri.part_id == 901).unwrap().rg.clone().unwrap();
-    let range_resp = kv.range(Request::new(RangeRequest {
-        part_id: 901,
-        start: b"a".to_vec(),
-        prefix: vec![],
-        limit: 100,
-    })).await.expect("range on left child").into_inner();
+    let left_rg = regions_resp
+        .regions
+        .as_ref()
+        .unwrap()
+        .regions
+        .values()
+        .find(|ri| ri.part_id == 901)
+        .unwrap()
+        .rg
+        .clone()
+        .unwrap();
+    let range_resp = kv
+        .range(Request::new(RangeRequest {
+            part_id: 901,
+            start: b"a".to_vec(),
+            prefix: vec![],
+            limit: 100,
+        }))
+        .await
+        .expect("range on left child")
+        .into_inner();
     for key in &range_resp.keys {
-        assert!(key.as_slice() >= left_rg.start_key.as_slice(),
-            "key {:?} must be >= start_key", key);
+        assert!(
+            key.as_slice() >= left_rg.start_key.as_slice(),
+            "key {:?} must be >= start_key",
+            key
+        );
         if !left_rg.end_key.is_empty() {
-            assert!(key.as_slice() < left_rg.end_key.as_slice(),
-                "key {:?} must be < end_key {:?}", key, left_rg.end_key);
+            assert!(
+                key.as_slice() < left_rg.end_key.as_slice(),
+                "key {:?} must be < end_key {:?}",
+                key,
+                left_rg.end_key
+            );
         }
     }
 
     // Trigger major compaction on the left child to remove out-of-range keys.
-    ps.trigger_major_compact(901).expect("trigger_major_compact must succeed");
+    ps.trigger_major_compact(901)
+        .expect("trigger_major_compact must succeed");
     sleep(Duration::from_millis(3000)).await;
 
     // Overlap must be cleared after major compaction.
-    assert!(!ps.has_overlap(901), "left child overlap must be cleared after major compaction");
+    assert!(
+        !ps.has_overlap(901),
+        "left child overlap must be cleared after major compaction"
+    );
 
     // All in-range keys must still be readable after compaction.
     for key in &range_resp.keys {
-        let resp = kv.get(Request::new(GetRequest {
-            key: key.clone(),
-            part_id: 901,
-        })).await.expect("get after compaction").into_inner();
-        assert!(!resp.value.is_empty(), "key {:?} must be readable after compaction", key);
+        let resp = kv
+            .get(Request::new(GetRequest {
+                key: key.clone(),
+                part_id: 901,
+            }))
+            .await
+            .expect("get after compaction")
+            .into_inner();
+        assert!(
+            !resp.value.is_empty(),
+            "key {:?} must be readable after compaction",
+            key
+        );
     }
 
     n1_task.abort();

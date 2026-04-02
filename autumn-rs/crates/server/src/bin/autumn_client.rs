@@ -14,6 +14,7 @@ use autumn_proto::autumn::{
     StreamPutRequestHeader, UpsertPartitionRequest,
 };
 use autumn_proto::autumn::{PartitionMeta, Range};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
@@ -72,8 +73,16 @@ impl ClusterClient {
         let regions_map = resp.regions.unwrap_or_default().regions;
         let mut sorted: Vec<(u64, RegionInfo)> = regions_map.into_iter().collect();
         sorted.sort_by(|a, b| {
-            a.1.rg.as_ref().map(|r| r.start_key.as_slice()).unwrap_or(&[])
-                .cmp(b.1.rg.as_ref().map(|r| r.start_key.as_slice()).unwrap_or(&[]))
+            a.1.rg
+                .as_ref()
+                .map(|r| r.start_key.as_slice())
+                .unwrap_or(&[])
+                .cmp(
+                    b.1.rg
+                        .as_ref()
+                        .map(|r| r.start_key.as_slice())
+                        .unwrap_or(&[]),
+                )
         });
         self.regions = sorted;
         self.ps_details = resp.ps_details;
@@ -118,14 +127,16 @@ impl ClusterClient {
         }
         // Cache miss or key out of range — refresh and retry once.
         self.refresh_regions().await?;
-        self.lookup_key(key).ok_or_else(|| anyhow!("key is out of range"))
+        self.lookup_key(key)
+            .ok_or_else(|| anyhow!("key is out of range"))
     }
 
     async fn resolve_part_id(&mut self, part_id: u64) -> Result<String> {
         let lookup = |regions: &Vec<(u64, RegionInfo)>, ps_details: &HashMap<u64, PsDetail>| {
-            regions.iter().find(|(_, r)| r.part_id == part_id).and_then(|(_, region)| {
-                ps_details.get(&region.ps_id).map(|d| d.address.clone())
-            })
+            regions
+                .iter()
+                .find(|(_, r)| r.part_id == part_id)
+                .and_then(|(_, region)| ps_details.get(&region.ps_id).map(|d| d.address.clone()))
         };
         if let Some(addr) = lookup(&self.regions, &self.ps_details) {
             return Ok(addr);
@@ -140,10 +151,18 @@ impl ClusterClient {
         if self.regions.is_empty() {
             self.refresh_regions().await?;
         }
-        let mut result: Vec<(u64, String)> = self.regions.iter().map(|(_, region)| {
-            let addr = self.ps_details.get(&region.ps_id).map(|d| d.address.clone()).unwrap_or_default();
-            (region.part_id, addr)
-        }).collect();
+        let mut result: Vec<(u64, String)> = self
+            .regions
+            .iter()
+            .map(|(_, region)| {
+                let addr = self
+                    .ps_details
+                    .get(&region.ps_id)
+                    .map(|d| d.address.clone())
+                    .unwrap_or_default();
+                (region.part_id, addr)
+            })
+            .collect();
         result.sort_by_key(|(pid, _)| *pid);
         Ok(result)
     }
@@ -245,6 +264,9 @@ enum Command {
         duration_secs: u64,
         value_size: usize,
         nosync: bool,
+        report_interval_secs: u64,
+        part_id: Option<u64>,
+        reuse_value: bool,
     },
     RBench {
         threads: usize,
@@ -277,7 +299,7 @@ fn usage() -> ! {
     eprintln!("  forcegc <PARTID> <EXTID>...       Force GC specific extents");
     eprintln!("  format --listen <ADDR> --advertise <ADDR> <DIR>...");
     eprintln!("                                    Format disks and register node");
-    eprintln!("  wbench [--threads 4] [--duration 10] [--size 8192] [--nosync]");
+    eprintln!("  wbench [--threads 4] [--duration 10] [--size 8192] [--nosync] [--report-interval 1] [--part-id ID] [--reuse-value true|false]");
     eprintln!("                                    Write benchmark (--nosync skips fsync)");
     eprintln!("  rbench [--threads 40] [--duration 10] <RESULT_FILE>");
     eprintln!("                                    Read benchmark");
@@ -336,7 +358,10 @@ fn parse_args() -> Args {
         "put" => {
             let mut nosync = false;
             while i < raw.len() && raw[i].starts_with('-') {
-                if raw[i] == "--nosync" { nosync = true; } i += 1;
+                if raw[i] == "--nosync" {
+                    nosync = true;
+                }
+                i += 1;
             }
             if i + 1 >= raw.len() {
                 eprintln!("put requires <KEY> <FILE>");
@@ -349,7 +374,10 @@ fn parse_args() -> Args {
         "streamput" => {
             let mut nosync = false;
             while i < raw.len() && raw[i].starts_with('-') {
-                if raw[i] == "--nosync" { nosync = true; } i += 1;
+                if raw[i] == "--nosync" {
+                    nosync = true;
+                }
+                i += 1;
             }
             if i + 1 >= raw.len() {
                 eprintln!("streamput requires <KEY> <FILE>");
@@ -371,7 +399,10 @@ fn parse_args() -> Args {
         "del" => {
             let mut nosync = false;
             while i < raw.len() && raw[i].starts_with('-') {
-                if raw[i] == "--nosync" { nosync = true; } i += 1;
+                if raw[i] == "--nosync" {
+                    nosync = true;
+                }
+                i += 1;
             }
             if i >= raw.len() {
                 eprintln!("del requires <KEY>");
@@ -504,6 +535,9 @@ fn parse_args() -> Args {
             let mut duration_secs: u64 = 10;
             let mut value_size: usize = 8192;
             let mut nosync = false;
+            let mut report_interval_secs: u64 = 1;
+            let mut part_id: Option<u64> = None;
+            let mut reuse_value = true;
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--threads" | "-t" => {
@@ -518,7 +552,25 @@ fn parse_args() -> Args {
                         i += 1;
                         value_size = raw[i].parse().expect("--size must be a number");
                     }
-                    "--nosync" => { nosync = true; }
+                    "--report-interval" => {
+                        i += 1;
+                        report_interval_secs = raw[i]
+                            .parse::<u64>()
+                            .expect("--report-interval must be a number")
+                            .max(1);
+                    }
+                    "--part-id" => {
+                        i += 1;
+                        part_id = Some(raw[i].parse().expect("--part-id must be a number"));
+                    }
+                    "--reuse-value" => {
+                        i += 1;
+                        reuse_value = parse_bool_flag(&raw[i], "--reuse-value")
+                            .expect("--reuse-value must be true or false");
+                    }
+                    "--nosync" => {
+                        nosync = true;
+                    }
                     _ => {}
                 }
                 i += 1;
@@ -528,6 +580,9 @@ fn parse_args() -> Args {
                 duration_secs,
                 value_size,
                 nosync,
+                report_interval_secs,
+                part_id,
+                reuse_value,
             }
         }
         "rbench" => {
@@ -578,6 +633,14 @@ fn parse_replication(s: &str) -> Result<(u32, u32)> {
     Ok((data, parity))
 }
 
+fn parse_bool_flag(value: &str, flag: &str) -> Result<bool> {
+    match value {
+        "true" | "1" | "yes" => Ok(true),
+        "false" | "0" | "no" => Ok(false),
+        _ => bail!("{flag} must be true or false"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Benchmark helpers
 // ---------------------------------------------------------------------------
@@ -589,17 +652,53 @@ struct BenchResult {
     elapsed: f64,
 }
 
+#[derive(Serialize, Deserialize)]
+struct BenchConfig {
+    threads: usize,
+    duration_secs: u64,
+    value_size: usize,
+    nosync: bool,
+    report_interval_secs: u64,
+    part_id: Option<u64>,
+    reuse_value: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct BenchSummaryRecord {
+    total_ops: u64,
+    total_bytes: u64,
+    ops_per_sec: f64,
+    throughput_mb_per_sec: f64,
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct BenchSample {
+    second: u64,
+    ops: u64,
+    cumulative_ops: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WriteBenchReport {
+    version: u32,
+    config: BenchConfig,
+    summary: BenchSummaryRecord,
+    ops_samples: Vec<BenchSample>,
+    results: Vec<BenchResult>,
+}
+
 struct LatencyHist {
     samples_ms: Vec<f64>,
 }
 
 impl LatencyHist {
     fn new() -> Self {
-        Self { samples_ms: Vec::new() }
-    }
-
-    fn record(&mut self, elapsed: Duration) {
-        self.samples_ms.push(elapsed.as_secs_f64() * 1000.0);
+        Self {
+            samples_ms: Vec::new(),
+        }
     }
 
     fn percentile(&mut self, p: f64) -> f64 {
@@ -619,9 +718,15 @@ fn print_bench_summary(
     elapsed: Duration,
     total_ops: u64,
     latencies: &mut LatencyHist,
-) {
+) -> BenchSummaryRecord {
     let secs = elapsed.as_secs_f64();
-    let total_bytes = total_ops as f64 * value_size as f64;
+    let total_bytes = total_ops * value_size as u64;
+    let total_bytes_f64 = total_bytes as f64;
+    let p50_ms = latencies.percentile(50.0);
+    let p95_ms = latencies.percentile(95.0);
+    let p99_ms = latencies.percentile(99.0);
+    let ops_per_sec = total_ops as f64 / secs.max(1e-9);
+    let throughput_mb_per_sec = total_bytes_f64 / 1024.0 / 1024.0 / secs.max(1e-9);
     println!("\nSummary");
     println!("Threads         : {threads}");
     if value_size > 0 {
@@ -631,20 +736,35 @@ fn print_bench_summary(
     println!("Complete ops    : {total_ops}");
     println!(
         "Total data      : {:.2} MB",
-        total_bytes / 1024.0 / 1024.0
+        total_bytes_f64 / 1024.0 / 1024.0
     );
-    println!("Ops/sec         : {:.2}", total_ops as f64 / secs);
-    println!(
-        "Throughput/sec  : {:.2} MB/s",
-        total_bytes / 1024.0 / 1024.0 / secs
-    );
+    println!("Ops/sec         : {:.2}", ops_per_sec);
+    println!("Throughput/sec  : {:.2} MB/s", throughput_mb_per_sec);
     println!(
         "{} latency p50={:.2}ms p95={:.2}ms p99={:.2}ms",
-        label,
-        latencies.percentile(50.0),
-        latencies.percentile(95.0),
-        latencies.percentile(99.0),
+        label, p50_ms, p95_ms, p99_ms,
     );
+    BenchSummaryRecord {
+        total_ops,
+        total_bytes,
+        ops_per_sec,
+        throughput_mb_per_sec,
+        p50_ms,
+        p95_ms,
+        p99_ms,
+    }
+}
+
+fn parse_write_results(json: &str) -> Result<Vec<BenchResult>> {
+    let trimmed = json.trim_start();
+    if trimmed.starts_with('[') {
+        return serde_json::from_str(trimmed).context("parse legacy result file");
+    }
+    let report: WriteBenchReport = serde_json::from_str(trimmed).context("parse result report")?;
+    if report.results.is_empty() {
+        bail!("no keys in result file");
+    }
+    Ok(report.results)
 }
 
 // ---------------------------------------------------------------------------
@@ -655,8 +775,7 @@ fn format_disk(dir: &str) -> Result<String> {
     // Create 256 hash subdirectories 00..ff
     for byte in 0u8..=255 {
         let subdir = format!("{}/{:02x}", dir, byte);
-        std::fs::create_dir_all(&subdir)
-            .with_context(|| format!("create hash subdir {subdir}"))?;
+        std::fs::create_dir_all(&subdir).with_context(|| format!("create hash subdir {subdir}"))?;
     }
     // Generate UUID marker file
     let disk_uuid = uuid::Uuid::new_v4().to_string();
@@ -664,6 +783,71 @@ fn format_disk(dir: &str) -> Result<String> {
     std::fs::File::create(&marker_path)
         .with_context(|| format!("create UUID marker {marker_path}"))?;
     Ok(disk_uuid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_bool_flag_accepts_expected_values() {
+        assert!(parse_bool_flag("true", "--reuse-value").unwrap());
+        assert!(!parse_bool_flag("false", "--reuse-value").unwrap());
+        assert!(parse_bool_flag("1", "--reuse-value").unwrap());
+        assert!(parse_bool_flag("maybe", "--reuse-value").is_err());
+    }
+
+    #[test]
+    fn parse_write_results_supports_legacy_format() {
+        let json = serde_json::to_string(&vec![BenchResult {
+            key: "k1".to_string(),
+            start_time: 0.0,
+            elapsed: 1.0,
+        }])
+        .unwrap();
+        let parsed = parse_write_results(&json).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].key, "k1");
+    }
+
+    #[test]
+    fn parse_write_results_supports_report_wrapper() {
+        let json = serde_json::to_string(&WriteBenchReport {
+            version: 1,
+            config: BenchConfig {
+                threads: 4,
+                duration_secs: 10,
+                value_size: 8192,
+                nosync: true,
+                report_interval_secs: 1,
+                part_id: Some(7),
+                reuse_value: true,
+            },
+            summary: BenchSummaryRecord {
+                total_ops: 1,
+                total_bytes: 8192,
+                ops_per_sec: 1.0,
+                throughput_mb_per_sec: 1.0,
+                p50_ms: 1.0,
+                p95_ms: 1.0,
+                p99_ms: 1.0,
+            },
+            ops_samples: vec![BenchSample {
+                second: 1,
+                ops: 1,
+                cumulative_ops: 1,
+            }],
+            results: vec![BenchResult {
+                key: "k2".to_string(),
+                start_time: 0.1,
+                elapsed: 0.2,
+            }],
+        })
+        .unwrap();
+        let parsed = parse_write_results(&json).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].key, "k2");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -733,8 +917,7 @@ async fn main() -> Result<()> {
                     .await
                     .context("create meta stream")?
                     .into_inner();
-                let meta_stream_id =
-                    meta_resp.stream.as_ref().map(|s| s.stream_id).unwrap_or(0);
+                let meta_stream_id = meta_resp.stream.as_ref().map(|s| s.stream_id).unwrap_or(0);
 
                 let part_id = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -755,9 +938,7 @@ async fn main() -> Result<()> {
 
                 let resp = client
                     .pm
-                    .upsert_partition(Request::new(UpsertPartitionRequest {
-                        meta: Some(meta),
-                    }))
+                    .upsert_partition(Request::new(UpsertPartitionRequest { meta: Some(meta) }))
                     .await
                     .context("upsert partition")?
                     .into_inner();
@@ -791,8 +972,8 @@ async fn main() -> Result<()> {
             let (part_id, ps_addr) = client.resolve_key(key.as_bytes()).await?;
             let ps = client.get_ps_client(&ps_addr).await?;
             ps.put(Request::new(PutRequest {
-                key: key.into_bytes(),
-                value,
+                key: Bytes::from(key.into_bytes()),
+                value: Bytes::from(value),
                 expires_at: 0,
                 part_id,
                 must_sync: !nosync,
@@ -1003,8 +1184,7 @@ async fn main() -> Result<()> {
             // Format each disk directory
             let mut disk_uuids = Vec::new();
             for dir in &dirs {
-                std::fs::create_dir_all(dir)
-                    .with_context(|| format!("create dir {dir}"))?;
+                std::fs::create_dir_all(dir).with_context(|| format!("create dir {dir}"))?;
                 let uuid = format_disk(dir)?;
                 println!("formatted {dir}: disk_uuid={uuid}");
                 disk_uuids.push(uuid);
@@ -1049,9 +1229,16 @@ async fn main() -> Result<()> {
             duration_secs,
             value_size,
             nosync,
+            report_interval_secs,
+            part_id,
+            reuse_value,
         } => {
-            // Gather partition list for routing
-            let partitions = client.all_partitions().await?;
+            // Gather partition list for routing.
+            let partitions = if let Some(part_id) = part_id {
+                vec![(part_id, client.resolve_part_id(part_id).await?)]
+            } else {
+                client.all_partitions().await?
+            };
             if partitions.is_empty() {
                 bail!("no partitions found, run bootstrap first");
             }
@@ -1086,18 +1273,22 @@ async fn main() -> Result<()> {
                 })
                 .collect();
 
-            let deadline = Arc::new(std::time::SystemTime::now()
-                + Duration::from_secs(duration_secs));
+            let deadline =
+                Arc::new(std::time::SystemTime::now() + Duration::from_secs(duration_secs));
             let total_ops = Arc::new(AtomicU64::new(0));
             let total_errors = Arc::new(AtomicU64::new(0));
             let bench_start = Instant::now();
+            let ops_samples = Arc::new(tokio::sync::Mutex::new(Vec::<BenchSample>::new()));
 
             let mut handles = Vec::new();
             for (tid, (part_id, mut ps)) in thread_targets.into_iter().enumerate() {
                 let deadline = Arc::clone(&deadline);
                 let total_ops = Arc::clone(&total_ops);
                 let total_errors = Arc::clone(&total_errors);
-                let value_bytes: Vec<u8> = (0..value_size).map(|i| (i % 256) as u8).collect();
+                let value_template = (0..value_size)
+                    .map(|i| (i % 256) as u8)
+                    .collect::<Vec<u8>>();
+                let value_bytes = Bytes::from(value_template);
 
                 let handle = tokio::spawn(async move {
                     let mut seq: u64 = 0;
@@ -1114,13 +1305,20 @@ async fn main() -> Result<()> {
 
                         let t0 = Instant::now();
                         let op_start = bench_start.elapsed().as_secs_f64();
-                        let res = ps.put(Request::new(PutRequest {
-                            key: key.as_bytes().to_vec(),
-                            value: value_bytes.clone(),
-                            expires_at: 0,
-                            part_id,
-                            must_sync: !nosync,
-                        })).await;
+                        let value = if reuse_value {
+                            value_bytes.clone()
+                        } else {
+                            Bytes::copy_from_slice(value_bytes.as_ref())
+                        };
+                        let res = ps
+                            .put(Request::new(PutRequest {
+                                key: Bytes::copy_from_slice(key.as_bytes()),
+                                value,
+                                expires_at: 0,
+                                part_id,
+                                must_sync: !nosync,
+                            }))
+                            .await;
                         let elapsed = t0.elapsed();
 
                         match res {
@@ -1150,12 +1348,21 @@ async fn main() -> Result<()> {
 
             // Print live progress
             let total_ops_clone = Arc::clone(&total_ops);
+            let ops_samples_clone = Arc::clone(&ops_samples);
             let progress = tokio::spawn(async move {
                 let mut last = 0u64;
+                let mut second = 0u64;
                 loop {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    tokio::time::sleep(Duration::from_secs(report_interval_secs)).await;
                     let cur = total_ops_clone.load(Ordering::Relaxed);
-                    eprint!("\rops/s={}", cur - last);
+                    second += report_interval_secs;
+                    let delta = cur - last;
+                    eprint!("\rops/s={delta}");
+                    ops_samples_clone.lock().await.push(BenchSample {
+                        second,
+                        ops: delta,
+                        cumulative_ops: cur,
+                    });
                     last = cur;
                 }
             });
@@ -1174,13 +1381,32 @@ async fn main() -> Result<()> {
             let elapsed = bench_start.elapsed();
             let ops = total_ops.load(Ordering::Relaxed);
             let errs = total_errors.load(Ordering::Relaxed);
-            if errs > 0 { eprintln!("errors: {errs}"); }
+            if errs > 0 {
+                eprintln!("errors: {errs}");
+            }
 
             let mut hist = LatencyHist::new();
             hist.samples_ms = all_latencies;
-            print_bench_summary("Write", threads, value_size, elapsed, ops, &mut hist);
+            let summary =
+                print_bench_summary("Write", threads, value_size, elapsed, ops, &mut hist);
 
-            let json = serde_json::to_string_pretty(&all_results)?;
+            let report = WriteBenchReport {
+                version: 1,
+                config: BenchConfig {
+                    threads,
+                    duration_secs,
+                    value_size,
+                    nosync,
+                    report_interval_secs,
+                    part_id,
+                    reuse_value,
+                },
+                summary,
+                ops_samples: ops_samples.lock().await.drain(..).collect(),
+                results: all_results,
+            };
+
+            let json = serde_json::to_string_pretty(&report)?;
             tokio::fs::write("write_result.json", json).await?;
             println!("results written to write_result.json");
         }
@@ -1194,8 +1420,7 @@ async fn main() -> Result<()> {
             let json = tokio::fs::read_to_string(&result_file)
                 .await
                 .with_context(|| format!("read {result_file}"))?;
-            let write_results: Vec<BenchResult> = serde_json::from_str(&json)
-                .context("parse result file")?;
+            let write_results = parse_write_results(&json)?;
             let keys: Vec<String> = write_results.into_iter().map(|r| r.key).collect();
             if keys.is_empty() {
                 bail!("no keys in result file");
@@ -1203,8 +1428,8 @@ async fn main() -> Result<()> {
 
             let keys = Arc::new(keys);
             let manager_addr = Arc::new(args.manager.clone());
-            let deadline = Arc::new(std::time::SystemTime::now()
-                + Duration::from_secs(duration_secs));
+            let deadline =
+                Arc::new(std::time::SystemTime::now() + Duration::from_secs(duration_secs));
             let total_ops = Arc::new(AtomicU64::new(0));
             let total_errors = Arc::new(AtomicU64::new(0));
             let bench_start = Instant::now();
@@ -1225,11 +1450,16 @@ async fn main() -> Result<()> {
                 let handle = tokio::spawn(async move {
                     let mut cc = match ClusterClient::connect(&manager_addr).await {
                         Ok(c) => c,
-                        Err(e) => { eprintln!("thread {tid} connect error: {e}"); return; }
+                        Err(e) => {
+                            eprintln!("thread {tid} connect error: {e}");
+                            return;
+                        }
                     };
                     let start_idx = tid * keys_per_thread;
                     let end_idx = (start_idx + keys_per_thread).min(keys.len());
-                    if start_idx >= end_idx { return; }
+                    if start_idx >= end_idx {
+                        return;
+                    }
                     let my_keys = &keys[start_idx..end_idx];
                     let mut ki = 0usize;
 
@@ -1242,17 +1472,25 @@ async fn main() -> Result<()> {
 
                         let (part_id, ps_addr) = match cc.resolve_key(key.as_bytes()).await {
                             Ok(r) => r,
-                            Err(_) => { total_errors.fetch_add(1, Ordering::Relaxed); continue; }
+                            Err(_) => {
+                                total_errors.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
                         };
                         let ps = match cc.get_ps_client(&ps_addr).await {
                             Ok(ps) => ps,
-                            Err(_) => { total_errors.fetch_add(1, Ordering::Relaxed); continue; }
+                            Err(_) => {
+                                total_errors.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
                         };
                         let t0 = Instant::now();
-                        let res = ps.get(Request::new(GetRequest {
-                            key: key.as_bytes().to_vec(),
-                            part_id,
-                        })).await;
+                        let res = ps
+                            .get(Request::new(GetRequest {
+                                key: key.as_bytes().to_vec(),
+                                part_id,
+                            }))
+                            .await;
                         let elapsed = t0.elapsed();
 
                         match res {
@@ -1260,7 +1498,9 @@ async fn main() -> Result<()> {
                                 total_ops.fetch_add(1, Ordering::Relaxed);
                                 latencies.lock().await.push(elapsed.as_secs_f64() * 1000.0);
                             }
-                            Err(_) => { total_errors.fetch_add(1, Ordering::Relaxed); }
+                            Err(_) => {
+                                total_errors.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                 });
@@ -1278,19 +1518,23 @@ async fn main() -> Result<()> {
                 }
             });
 
-            for h in handles { h.await.ok(); }
+            for h in handles {
+                h.await.ok();
+            }
             progress.abort();
             eprintln!();
 
             let elapsed = bench_start.elapsed();
             let ops = total_ops.load(Ordering::Relaxed);
             let errs = total_errors.load(Ordering::Relaxed);
-            if errs > 0 { eprintln!("errors: {errs}"); }
+            if errs > 0 {
+                eprintln!("errors: {errs}");
+            }
 
             let mut lat_guard = latencies.lock().await;
             let mut hist = LatencyHist::new();
             hist.samples_ms = lat_guard.drain(..).collect();
-            print_bench_summary("Read", threads, 0, elapsed, ops, &mut hist);
+            let _ = print_bench_summary("Read", threads, 0, elapsed, ops, &mut hist);
         }
 
         Command::Info => {

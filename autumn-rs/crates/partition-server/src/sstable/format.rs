@@ -99,7 +99,7 @@ impl MetaBlock {
         buf.extend_from_slice(&self.vp_extent_id.to_le_bytes());
         buf.extend_from_slice(&self.vp_offset.to_le_bytes());
         buf.push(0u8); // compression_type = None
-        // Discard map: [count: u32 LE][extent_id: u64 LE][size: i64 LE] * count
+                       // Discard map: [count: u32 LE][extent_id: u64 LE][size: i64 LE] * count
         buf.extend_from_slice(&(self.discards.len() as u32).to_le_bytes());
         for (&eid, &sz) in &self.discards {
             buf.extend_from_slice(&eid.to_le_bytes());
@@ -120,7 +120,9 @@ impl MetaBlock {
         let stored = u32::from_le_bytes(crc_bytes.try_into().unwrap());
         let computed = crc32c::crc32c(payload);
         if stored != computed {
-            return Err(anyhow!("MetaBlock CRC mismatch: stored={stored:#x} computed={computed:#x}"));
+            return Err(anyhow!(
+                "MetaBlock CRC mismatch: stored={stored:#x} computed={computed:#x}"
+            ));
         }
 
         let mut c = 0usize;
@@ -138,7 +140,11 @@ impl MetaBlock {
             let key = read_bytes(payload, &mut c, key_len)?;
             let relative_offset = read_u32(payload, &mut c)?;
             let block_len = read_u32(payload, &mut c)?;
-            block_offsets.push(BlockOffset { key, relative_offset, block_len });
+            block_offsets.push(BlockOffset {
+                key,
+                relative_offset,
+                block_len,
+            });
         }
 
         let bloom_len = read_u32(payload, &mut c)? as usize;
@@ -166,8 +172,17 @@ impl MetaBlock {
             }
         }
 
-        Ok(MetaBlock { block_offsets, bloom_data, smallest_key, biggest_key,
-                       estimated_size, seq_num, vp_extent_id, vp_offset, discards })
+        Ok(MetaBlock {
+            block_offsets,
+            bloom_data,
+            smallest_key,
+            biggest_key,
+            estimated_size,
+            seq_num,
+            vp_extent_id,
+            vp_offset,
+            discards,
+        })
     }
 }
 
@@ -199,14 +214,16 @@ impl DecodedBlock {
         let stored_crc = u32::from_le_bytes(crc_b.try_into().unwrap());
         let computed_crc = crc32c::crc32c(payload);
         if stored_crc != computed_crc {
-            return Err(anyhow!("block CRC mismatch: stored={stored_crc:#x} computed={computed_crc:#x}"));
+            return Err(anyhow!(
+                "block CRC mismatch: stored={stored_crc:#x} computed={computed_crc:#x}"
+            ));
         }
         // Next 4 bytes before CRC: num_entries
         let n = payload.len();
         if n < 8 {
             return Err(anyhow!("block payload too short"));
         }
-        let num_entries = u32::from_le_bytes(payload[n-4..n].try_into().unwrap()) as usize;
+        let num_entries = u32::from_le_bytes(payload[n - 4..n].try_into().unwrap()) as usize;
         // Before num_entries: num_entries * 4 bytes of offsets
         let offsets_start = n - 4 - num_entries * 4;
         if offsets_start > n - 4 {
@@ -214,12 +231,20 @@ impl DecodedBlock {
         }
         let mut entry_offsets = Vec::with_capacity(num_entries);
         for i in 0..num_entries {
-            let off = u32::from_le_bytes(payload[offsets_start + i*4..offsets_start + i*4 + 4].try_into().unwrap());
+            let off = u32::from_le_bytes(
+                payload[offsets_start + i * 4..offsets_start + i * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            );
             entry_offsets.push(off);
         }
         // base_key from hint (MetaBlock block index)
         let base_key = base_key_hint.to_vec();
-        Ok(DecodedBlock { data: payload.to_vec(), entry_offsets, base_key })
+        Ok(DecodedBlock {
+            data: payload.to_vec(),
+            entry_offsets,
+            base_key,
+        })
     }
 
     pub fn num_entries(&self) -> usize {
@@ -254,11 +279,14 @@ impl DecodedBlock {
             return Err(anyhow!("entry value header out of bounds at idx={idx}"));
         }
         let op = data[vs];
-        let val_len = u32::from_le_bytes(data[vs+1..vs+5].try_into().unwrap()) as usize;
-        let expires_at = u64::from_le_bytes(data[vs+5..vs+13].try_into().unwrap());
+        let val_len = u32::from_le_bytes(data[vs + 1..vs + 5].try_into().unwrap()) as usize;
+        let expires_at = u64::from_le_bytes(data[vs + 5..vs + 13].try_into().unwrap());
         let ve = vs + ENTRY_VALUE_HEADER + val_len;
         if ve > data.len() {
-            return Err(anyhow!("entry value out of bounds at idx={idx} ve={ve} len={}", data.len()));
+            return Err(anyhow!(
+                "entry value out of bounds at idx={idx} ve={ve} len={}",
+                data.len()
+            ));
         }
         let value = &data[vs + ENTRY_VALUE_HEADER..ve];
         Ok((full_key, op, value, expires_at))
@@ -270,36 +298,48 @@ impl DecodedBlock {
 // ---------------------------------------------------------------------------
 
 fn read_u16(data: &[u8], c: &mut usize) -> Result<u16> {
-    if *c + 2 > data.len() { return Err(anyhow!("MetaBlock: truncated at u16 offset={c}")); }
-    let v = u16::from_le_bytes(data[*c..*c+2].try_into().unwrap());
+    if *c + 2 > data.len() {
+        return Err(anyhow!("MetaBlock: truncated at u16 offset={c}"));
+    }
+    let v = u16::from_le_bytes(data[*c..*c + 2].try_into().unwrap());
     *c += 2;
     Ok(v)
 }
 
 fn read_u32(data: &[u8], c: &mut usize) -> Result<u32> {
-    if *c + 4 > data.len() { return Err(anyhow!("MetaBlock: truncated at u32 offset={c}")); }
-    let v = u32::from_le_bytes(data[*c..*c+4].try_into().unwrap());
+    if *c + 4 > data.len() {
+        return Err(anyhow!("MetaBlock: truncated at u32 offset={c}"));
+    }
+    let v = u32::from_le_bytes(data[*c..*c + 4].try_into().unwrap());
     *c += 4;
     Ok(v)
 }
 
 fn read_u64(data: &[u8], c: &mut usize) -> Result<u64> {
-    if *c + 8 > data.len() { return Err(anyhow!("MetaBlock: truncated at u64 offset={c}")); }
-    let v = u64::from_le_bytes(data[*c..*c+8].try_into().unwrap());
+    if *c + 8 > data.len() {
+        return Err(anyhow!("MetaBlock: truncated at u64 offset={c}"));
+    }
+    let v = u64::from_le_bytes(data[*c..*c + 8].try_into().unwrap());
     *c += 8;
     Ok(v)
 }
 
 fn read_i64(data: &[u8], c: &mut usize) -> Result<i64> {
-    if *c + 8 > data.len() { return Err(anyhow!("MetaBlock: truncated at i64 offset={c}")); }
-    let v = i64::from_le_bytes(data[*c..*c+8].try_into().unwrap());
+    if *c + 8 > data.len() {
+        return Err(anyhow!("MetaBlock: truncated at i64 offset={c}"));
+    }
+    let v = i64::from_le_bytes(data[*c..*c + 8].try_into().unwrap());
     *c += 8;
     Ok(v)
 }
 
 fn read_bytes(data: &[u8], c: &mut usize, len: usize) -> Result<Vec<u8>> {
-    if *c + len > data.len() { return Err(anyhow!("MetaBlock: truncated at bytes offset={c} len={len}")); }
-    let v = data[*c..*c+len].to_vec();
+    if *c + len > data.len() {
+        return Err(anyhow!(
+            "MetaBlock: truncated at bytes offset={c} len={len}"
+        ));
+    }
+    let v = data[*c..*c + len].to_vec();
     *c += len;
     Ok(v)
 }

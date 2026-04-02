@@ -11,7 +11,6 @@
 ///   read           --stream-id N  [--length N]  [--owner-key <key>]
 ///   alloc-extent   --node <addr>  --extent-id N
 ///   commit-length  --node <addr>  --extent-id N  [--revision N]
-
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Context, Result};
@@ -42,13 +41,36 @@ struct Args {
 }
 
 enum Sub {
-    RegisterNode { addr: String, disks: Vec<String> },
-    CreateStream { data_shard: u32, parity_shard: u32 },
-    StreamInfo { stream_id: u64 },
-    Append { stream_id: u64, data: String, owner_key: String },
-    Read { stream_id: u64, length: u32, owner_key: String },
-    AllocExtent { node: String, extent_id: u64 },
-    CommitLength { node: String, extent_id: u64, revision: u64 },
+    RegisterNode {
+        addr: String,
+        disks: Vec<String>,
+    },
+    CreateStream {
+        data_shard: u32,
+        parity_shard: u32,
+    },
+    StreamInfo {
+        stream_id: u64,
+    },
+    Append {
+        stream_id: u64,
+        data: String,
+        owner_key: String,
+    },
+    Read {
+        stream_id: u64,
+        length: u32,
+        owner_key: String,
+    },
+    AllocExtent {
+        node: String,
+        extent_id: u64,
+    },
+    CommitLength {
+        node: String,
+        extent_id: u64,
+        revision: u64,
+    },
 }
 
 fn parse_args() -> Result<Args> {
@@ -81,8 +103,12 @@ fn parse_args() -> Result<Args> {
                     other => return Err(anyhow!("unknown flag: {other}")),
                 }
             }
-            if addr.is_empty() { return Err(anyhow!("register-node requires --addr")); }
-            if disks.is_empty() { disks.push("disk-default".to_string()); }
+            if addr.is_empty() {
+                return Err(anyhow!("register-node requires --addr"));
+            }
+            if disks.is_empty() {
+                disks.push("disk-default".to_string());
+            }
             Sub::RegisterNode { addr, disks }
         }
         "create-stream" => {
@@ -90,12 +116,15 @@ fn parse_args() -> Result<Args> {
             let mut parity_shard = 0u32;
             while let Some(tok) = it.next() {
                 match tok.as_str() {
-                    "--data-shard"   => data_shard   = it.next().context("needs value")?.parse()?,
+                    "--data-shard" => data_shard = it.next().context("needs value")?.parse()?,
                     "--parity-shard" => parity_shard = it.next().context("needs value")?.parse()?,
                     other => return Err(anyhow!("unknown flag: {other}")),
                 }
             }
-            Sub::CreateStream { data_shard, parity_shard }
+            Sub::CreateStream {
+                data_shard,
+                parity_shard,
+            }
         }
         "stream-info" => {
             let mut stream_id = 0u64;
@@ -105,7 +134,9 @@ fn parse_args() -> Result<Args> {
                     other => return Err(anyhow!("unknown flag: {other}")),
                 }
             }
-            if stream_id == 0 { return Err(anyhow!("stream-info requires --stream-id")); }
+            if stream_id == 0 {
+                return Err(anyhow!("stream-info requires --stream-id"));
+            }
             Sub::StreamInfo { stream_id }
         }
         "append" => {
@@ -114,43 +145,61 @@ fn parse_args() -> Result<Args> {
             let mut owner_key = "cli-owner".to_string();
             while let Some(tok) = it.next() {
                 match tok.as_str() {
-                    "--stream-id"  => stream_id = it.next().context("needs value")?.parse()?,
-                    "--data"       => data      = it.next().context("needs value")?.clone(),
-                    "--owner-key"  => owner_key = it.next().context("needs value")?.clone(),
-                    other => return Err(anyhow!("unknown flag: {other}")),
-                }
-            }
-            if stream_id == 0 { return Err(anyhow!("append requires --stream-id")); }
-            if data.is_empty() { return Err(anyhow!("append requires --data")); }
-            Sub::Append { stream_id, data, owner_key }
-        }
-        "read" => {
-            let mut stream_id = 0u64;
-            let mut length = 0u32;   // 0 = all
-            let mut owner_key = "cli-owner".to_string();
-            while let Some(tok) = it.next() {
-                match tok.as_str() {
                     "--stream-id" => stream_id = it.next().context("needs value")?.parse()?,
-                    "--length"    => length    = it.next().context("needs value")?.parse()?,
+                    "--data" => data = it.next().context("needs value")?.clone(),
                     "--owner-key" => owner_key = it.next().context("needs value")?.clone(),
                     other => return Err(anyhow!("unknown flag: {other}")),
                 }
             }
-            if stream_id == 0 { return Err(anyhow!("read requires --stream-id")); }
-            Sub::Read { stream_id, length, owner_key }
+            if stream_id == 0 {
+                return Err(anyhow!("append requires --stream-id"));
+            }
+            if data.is_empty() {
+                return Err(anyhow!("append requires --data"));
+            }
+            Sub::Append {
+                stream_id,
+                data,
+                owner_key,
+            }
+        }
+        "read" => {
+            let mut stream_id = 0u64;
+            let mut length = 0u32; // 0 = all
+            let mut owner_key = "cli-owner".to_string();
+            while let Some(tok) = it.next() {
+                match tok.as_str() {
+                    "--stream-id" => stream_id = it.next().context("needs value")?.parse()?,
+                    "--length" => length = it.next().context("needs value")?.parse()?,
+                    "--owner-key" => owner_key = it.next().context("needs value")?.clone(),
+                    other => return Err(anyhow!("unknown flag: {other}")),
+                }
+            }
+            if stream_id == 0 {
+                return Err(anyhow!("read requires --stream-id"));
+            }
+            Sub::Read {
+                stream_id,
+                length,
+                owner_key,
+            }
         }
         "alloc-extent" => {
             let mut node = String::new();
             let mut extent_id = 0u64;
             while let Some(tok) = it.next() {
                 match tok.as_str() {
-                    "--node"      => node      = it.next().context("--node needs a value")?.clone(),
+                    "--node" => node = it.next().context("--node needs a value")?.clone(),
                     "--extent-id" => extent_id = it.next().context("needs value")?.parse()?,
                     other => return Err(anyhow!("unknown flag: {other}")),
                 }
             }
-            if node.is_empty() { return Err(anyhow!("alloc-extent requires --node")); }
-            if extent_id == 0 { return Err(anyhow!("alloc-extent requires --extent-id")); }
+            if node.is_empty() {
+                return Err(anyhow!("alloc-extent requires --node"));
+            }
+            if extent_id == 0 {
+                return Err(anyhow!("alloc-extent requires --extent-id"));
+            }
             Sub::AllocExtent { node, extent_id }
         }
         "commit-length" => {
@@ -159,15 +208,23 @@ fn parse_args() -> Result<Args> {
             let mut revision = 0i64;
             while let Some(tok) = it.next() {
                 match tok.as_str() {
-                    "--node"      => node      = it.next().context("--node needs a value")?.clone(),
+                    "--node" => node = it.next().context("--node needs a value")?.clone(),
                     "--extent-id" => extent_id = it.next().context("needs value")?.parse()?,
-                    "--revision"  => revision  = it.next().context("needs value")?.parse::<i64>()?,
+                    "--revision" => revision = it.next().context("needs value")?.parse::<i64>()?,
                     other => return Err(anyhow!("unknown flag: {other}")),
                 }
             }
-            if node.is_empty() { return Err(anyhow!("commit-length requires --node")); }
-            if extent_id == 0 { return Err(anyhow!("commit-length requires --extent-id")); }
-            Sub::CommitLength { node, extent_id, revision: revision as u64 }
+            if node.is_empty() {
+                return Err(anyhow!("commit-length requires --node"));
+            }
+            if extent_id == 0 {
+                return Err(anyhow!("commit-length requires --extent-id"));
+            }
+            Sub::CommitLength {
+                node,
+                extent_id,
+                revision: revision as u64,
+            }
         }
         other => return Err(anyhow!("unknown subcommand: {other}")),
     };
@@ -194,7 +251,10 @@ async fn cmd_register_node(manager: &str, addr: String, disks: Vec<String>) -> R
 async fn cmd_create_stream(manager: &str, data_shard: u32, parity_shard: u32) -> Result<()> {
     let mut client = StreamManagerServiceClient::connect(normalize(manager)).await?;
     let resp = client
-        .create_stream(Request::new(CreateStreamRequest { data_shard, parity_shard }))
+        .create_stream(Request::new(CreateStreamRequest {
+            data_shard,
+            parity_shard,
+        }))
         .await?
         .into_inner();
     if resp.code != Code::Ok as i32 {
@@ -211,7 +271,9 @@ async fn cmd_create_stream(manager: &str, data_shard: u32, parity_shard: u32) ->
 async fn cmd_stream_info(manager: &str, stream_id: u64) -> Result<()> {
     let mut client = StreamManagerServiceClient::connect(normalize(manager)).await?;
     let resp = client
-        .stream_info(Request::new(StreamInfoRequest { stream_ids: vec![stream_id] }))
+        .stream_info(Request::new(StreamInfoRequest {
+            stream_ids: vec![stream_id],
+        }))
         .await?
         .into_inner();
     if resp.code != Code::Ok as i32 {
@@ -222,8 +284,10 @@ async fn cmd_stream_info(manager: &str, stream_id: u64) -> Result<()> {
     println!("extent_ids : {:?}", stream.extent_ids);
     for eid in &stream.extent_ids {
         if let Some(ex) = resp.extents.get(eid) {
-            println!("  extent {}  replicates={:?}  eversion={}  sealed_length={}",
-                ex.extent_id, ex.replicates, ex.eversion, ex.sealed_length);
+            println!(
+                "  extent {}  replicates={:?}  eversion={}  sealed_length={}",
+                ex.extent_id, ex.replicates, ex.eversion, ex.sealed_length
+            );
         }
     }
     Ok(())
@@ -239,18 +303,15 @@ async fn cmd_append(manager: &str, stream_id: u64, data: String, owner_key: Stri
     Ok(())
 }
 
-async fn cmd_read(
-    manager: &str,
-    stream_id: u64,
-    length: u32,
-    owner_key: String,
-) -> Result<()> {
+async fn cmd_read(manager: &str, stream_id: u64, length: u32, owner_key: String) -> Result<()> {
     let _ = owner_key;
     // 1. get stream info + nodes map
     let mut mgr = StreamManagerServiceClient::connect(normalize(manager)).await?;
 
     let si = mgr
-        .stream_info(Request::new(StreamInfoRequest { stream_ids: vec![stream_id] }))
+        .stream_info(Request::new(StreamInfoRequest {
+            stream_ids: vec![stream_id],
+        }))
         .await?
         .into_inner();
     if si.code != Code::Ok as i32 {
@@ -350,7 +411,10 @@ async fn cmd_alloc_extent(node: &str, extent_id: u64) -> Result<()> {
 async fn cmd_commit_length(node: &str, extent_id: u64, revision: u64) -> Result<()> {
     let mut client = ExtentServiceClient::connect(normalize(node)).await?;
     let resp = client
-        .commit_length(Request::new(CommitLengthRequest { extent_id, revision: revision as i64 }))
+        .commit_length(Request::new(CommitLengthRequest {
+            extent_id,
+            revision: revision as i64,
+        }))
         .await?
         .into_inner();
     println!("length: {}", resp.length);
@@ -371,20 +435,28 @@ async fn main() -> Result<()> {
     let args = parse_args()?;
 
     match args.sub {
-        Sub::RegisterNode { addr, disks } =>
-            cmd_register_node(&args.manager, addr, disks).await?,
-        Sub::CreateStream { data_shard, parity_shard } =>
-            cmd_create_stream(&args.manager, data_shard, parity_shard).await?,
-        Sub::StreamInfo { stream_id } =>
-            cmd_stream_info(&args.manager, stream_id).await?,
-        Sub::Append { stream_id, data, owner_key } =>
-            cmd_append(&args.manager, stream_id, data, owner_key).await?,
-        Sub::Read { stream_id, length, owner_key } =>
-            cmd_read(&args.manager, stream_id, length, owner_key).await?,
-        Sub::AllocExtent { node, extent_id } =>
-            cmd_alloc_extent(&node, extent_id).await?,
-        Sub::CommitLength { node, extent_id, revision } =>
-            cmd_commit_length(&node, extent_id, revision).await?,
+        Sub::RegisterNode { addr, disks } => cmd_register_node(&args.manager, addr, disks).await?,
+        Sub::CreateStream {
+            data_shard,
+            parity_shard,
+        } => cmd_create_stream(&args.manager, data_shard, parity_shard).await?,
+        Sub::StreamInfo { stream_id } => cmd_stream_info(&args.manager, stream_id).await?,
+        Sub::Append {
+            stream_id,
+            data,
+            owner_key,
+        } => cmd_append(&args.manager, stream_id, data, owner_key).await?,
+        Sub::Read {
+            stream_id,
+            length,
+            owner_key,
+        } => cmd_read(&args.manager, stream_id, length, owner_key).await?,
+        Sub::AllocExtent { node, extent_id } => cmd_alloc_extent(&node, extent_id).await?,
+        Sub::CommitLength {
+            node,
+            extent_id,
+            revision,
+        } => cmd_commit_length(&node, extent_id, revision).await?,
     }
 
     Ok(())

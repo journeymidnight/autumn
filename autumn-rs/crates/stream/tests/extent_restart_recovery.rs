@@ -47,7 +47,10 @@ fn append_requests(
 async fn start_node(
     data_dir: &std::path::Path,
     addr: SocketAddr,
-) -> (tokio::task::JoinHandle<()>, ExtentServiceClient<tonic::transport::Channel>) {
+) -> (
+    tokio::task::JoinHandle<()>,
+    ExtentServiceClient<tonic::transport::Channel>,
+) {
     let node = ExtentNode::new(ExtentNodeConfig::new(
         data_dir.to_path_buf(),
         IoMode::Standard,
@@ -243,7 +246,11 @@ async fn restart_extent_remains_writable() {
         .await
         .expect("second append")
         .into_inner();
-    assert_eq!(resp2.code, Code::Ok as i32, "append after restart should succeed");
+    assert_eq!(
+        resp2.code,
+        Code::Ok as i32,
+        "append after restart should succeed"
+    );
     assert_eq!(resp2.end, 6, "total length should be 6 after second append");
 
     task2.abort();

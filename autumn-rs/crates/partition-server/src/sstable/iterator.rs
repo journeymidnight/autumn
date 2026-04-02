@@ -11,7 +11,7 @@ use super::reader::SstReader;
 
 #[derive(Debug, Clone)]
 pub struct IterItem {
-    pub key: Vec<u8>,   // internal key (user_key + 8-byte MVCC suffix)
+    pub key: Vec<u8>, // internal key (user_key + 8-byte MVCC suffix)
     pub op: u8,
     pub value: Vec<u8>,
     pub expires_at: u64,
@@ -29,7 +29,11 @@ pub struct BlockIterator {
 
 impl BlockIterator {
     pub fn new(block: Arc<DecodedBlock>) -> Self {
-        BlockIterator { block, idx: 0, current: None }
+        BlockIterator {
+            block,
+            idx: 0,
+            current: None,
+        }
     }
 
     pub fn valid(&self) -> bool {
@@ -69,7 +73,9 @@ impl BlockIterator {
                         hi = mid;
                     }
                 }
-                Err(_) => { hi = mid; }
+                Err(_) => {
+                    hi = mid;
+                }
             }
         }
         self.idx = lo;
@@ -89,9 +95,16 @@ impl BlockIterator {
         }
         match self.block.get_entry(self.idx) {
             Ok((key, op, value, expires_at)) => {
-                self.current = Some(IterItem { key, op, value: value.to_vec(), expires_at });
+                self.current = Some(IterItem {
+                    key,
+                    op,
+                    value: value.to_vec(),
+                    expires_at,
+                });
             }
-            Err(_) => { self.current = None; }
+            Err(_) => {
+                self.current = None;
+            }
         }
     }
 }
@@ -109,7 +122,12 @@ pub struct TableIterator {
 
 impl TableIterator {
     pub fn new(reader: Arc<SstReader>) -> Self {
-        TableIterator { reader, block_idx: 0, block_iter: None, err: None }
+        TableIterator {
+            reader,
+            block_idx: 0,
+            block_iter: None,
+            err: None,
+        }
     }
 
     pub fn valid(&self) -> bool {
@@ -123,7 +141,9 @@ impl TableIterator {
     pub fn next(&mut self) {
         if let Some(bi) = self.block_iter.as_mut() {
             bi.next();
-            if bi.valid() { return; }
+            if bi.valid() {
+                return;
+            }
         }
         // Move to next block
         self.block_idx += 1;
@@ -149,7 +169,10 @@ impl TableIterator {
                     self.block_iter = None;
                 }
             }
-            Err(e) => { self.err = Some(e); self.block_iter = None; }
+            Err(e) => {
+                self.err = Some(e);
+                self.block_iter = None;
+            }
         }
     }
 
@@ -174,14 +197,23 @@ impl TableIterator {
                     }
                     self.block_idx += 1;
                 }
-                Ok(None) => { self.block_iter = None; return; }
-                Err(e) => { self.err = Some(e); self.block_iter = None; return; }
+                Ok(None) => {
+                    self.block_iter = None;
+                    return;
+                }
+                Err(e) => {
+                    self.err = Some(e);
+                    self.block_iter = None;
+                    return;
+                }
             }
         }
     }
 
     fn load_block(&self, idx: usize) -> Result<Option<BlockIterator>> {
-        if idx >= self.reader.block_count() { return Ok(None); }
+        if idx >= self.reader.block_count() {
+            return Ok(None);
+        }
         let block = self.reader.read_block(idx)?;
         Ok(Some(BlockIterator::new(Arc::new(block))))
     }
@@ -220,7 +252,8 @@ impl MergeIterator {
         let mut best_iter_idx: Option<usize> = None;
         for (i, it) in self.iters.iter().enumerate() {
             if let Some(item) = it.item() {
-                if best.is_none() || item.key < best.unwrap().key
+                if best.is_none()
+                    || item.key < best.unwrap().key
                     || (item.key == best.unwrap().key && i < best_iter_idx.unwrap())
                 {
                     best = Some(item);

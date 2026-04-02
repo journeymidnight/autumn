@@ -6,7 +6,6 @@
 ///
 /// For the user key, the 8-byte MVCC timestamp suffix is stripped before hashing
 /// (matching Go's `farm.Fingerprint64(y.ParseKey(key))`).
-
 use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
 
 const SEED2: u64 = 0xC0FF_EE42_DEAD_BEEF;
@@ -36,7 +35,11 @@ impl BloomFilterBuilder {
         let k = ((m as f64 / n) * 2f64.ln()).round() as u32;
         let num_bits = m.max(8);
         let num_bytes = (num_bits + 7) / 8;
-        BloomFilterBuilder { num_bits, num_hashes: k.max(1), bits: vec![0u8; num_bytes] }
+        BloomFilterBuilder {
+            num_bits,
+            num_hashes: k.max(1),
+            bits: vec![0u8; num_bytes],
+        }
     }
 
     /// Add `user_key` (timestamp suffix already stripped) to the filter.
@@ -51,7 +54,11 @@ impl BloomFilterBuilder {
 
     /// Build and return the finished filter.
     pub fn finish(self) -> BloomFilter {
-        BloomFilter { bits: self.bits, num_bits: self.num_bits, num_hashes: self.num_hashes }
+        BloomFilter {
+            bits: self.bits,
+            num_bits: self.num_bits,
+            num_hashes: self.num_hashes,
+        }
     }
 }
 
@@ -92,11 +99,17 @@ impl BloomFilter {
 
     /// Decode from bytes produced by `encode()`.
     pub fn decode(data: &[u8]) -> Option<Self> {
-        if data.len() < 8 { return None; }
+        if data.len() < 8 {
+            return None;
+        }
         let num_bits = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
         let num_hashes = u32::from_le_bytes(data[4..8].try_into().ok()?);
         let bits = data[8..].to_vec();
-        Some(BloomFilter { bits, num_bits, num_hashes })
+        Some(BloomFilter {
+            bits,
+            num_bits,
+            num_hashes,
+        })
     }
 }
 
@@ -108,7 +121,9 @@ mod tests {
     fn no_false_negatives() {
         let keys: Vec<Vec<u8>> = (0..1000u64).map(|i| i.to_le_bytes().to_vec()).collect();
         let mut b = BloomFilterBuilder::new(keys.len(), 0.01);
-        for k in &keys { b.add_user_key(k); }
+        for k in &keys {
+            b.add_user_key(k);
+        }
         let f = b.finish();
         for k in &keys {
             assert!(f.may_contain(k), "false negative for key {k:?}");
@@ -118,7 +133,9 @@ mod tests {
     #[test]
     fn round_trip_encode_decode() {
         let mut b = BloomFilterBuilder::new(100, 0.01);
-        for i in 0u64..100 { b.add_user_key(&i.to_le_bytes()); }
+        for i in 0u64..100 {
+            b.add_user_key(&i.to_le_bytes());
+        }
         let f = b.finish();
         let encoded = f.encode();
         let f2 = BloomFilter::decode(&encoded).expect("decode");

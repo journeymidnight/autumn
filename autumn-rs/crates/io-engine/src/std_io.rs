@@ -156,8 +156,12 @@ mod tests {
         let engine = StdIoEngine;
 
         let file = engine.create(&path).await.expect("create file");
-        file.write_at(0, Bytes::from_static(b"hello")).await.expect("write 1");
-        file.write_at(10, Bytes::from_static(b"world")).await.expect("write 2");
+        file.write_at(0, Bytes::from_static(b"hello"))
+            .await
+            .expect("write 1");
+        file.write_at(10, Bytes::from_static(b"world"))
+            .await
+            .expect("write 2");
         file.sync_all().await.expect("sync");
 
         let first = file.read_at(0, 5).await.expect("read first");

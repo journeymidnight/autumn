@@ -43,7 +43,12 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    Args { port, data, disk_id, manager }
+    Args {
+        port,
+        data,
+        disk_id,
+        manager,
+    }
 }
 
 #[tokio::main]

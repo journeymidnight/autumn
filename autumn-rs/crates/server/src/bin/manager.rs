@@ -53,7 +53,9 @@ async fn main() -> Result<()> {
         .context("parse listen address")?;
 
     let manager = if args.etcd.is_empty() {
-        tracing::warn!("no --etcd endpoints given; running in-memory only (metadata will be lost on restart)");
+        tracing::warn!(
+            "no --etcd endpoints given; running in-memory only (metadata will be lost on restart)"
+        );
         AutumnManager::new()
     } else {
         tracing::info!("connecting to etcd: {:?}", args.etcd);

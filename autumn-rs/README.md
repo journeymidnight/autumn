@@ -222,7 +222,7 @@ Default manager address: `127.0.0.1:9001`
 | `gc <PARTID>` | Trigger auto GC on a partition |
 | `forcegc <PARTID> <EXTID>...` | Force GC of specific extent IDs |
 | `format --listen <ADDR> --advertise <ADDR> <DIR>...` | Format disk dirs and register a new extent node |
-| `wbench [--threads 4] [--duration 10] [--size 8192] [--nosync]` | Write benchmark; `--nosync` skips fsync; outputs `write_result.json` |
+| `wbench [--threads 4] [--duration 10] [--size 8192] [--nosync] [--report-interval 1] [--part-id ID] [--reuse-value true|false]` | Write benchmark; `--nosync` skips fsync; outputs `write_result.json` with config/summary/ops samples/results |
 | `rbench [--threads 40] [--duration 10] <RESULT_FILE>` | Read benchmark using keys from `write_result.json` |
 | `info` | Show cluster state (nodes / streams / partitions) |
 
@@ -320,11 +320,33 @@ $AC wbench --threads 4 --duration 10 --size 8192
 # Write benchmark without fsync (higher throughput, tests group-commit batching)
 $AC wbench --threads 16 --duration 10 --size 8192 --nosync
 
+# Pin the run to one partition and print one sample every 2 seconds
+$AC wbench --threads 256 --duration 10 --size 8192 --nosync --part-id <PARTID> --report-interval 2
+
+# Disable payload reuse to measure client-side allocation overhead explicitly
+$AC wbench --threads 64 --duration 10 --size 8192 --reuse-value false
+
 # Read benchmark: load keys from previous wbench
 $AC rbench --threads 40 --duration 10 write_result.json
 ```
 
 `--nosync` disables `must_sync` on the write request. The partition server will skip the fsync on `log_stream` appends for those writes (unless another write in the same batch requires sync).
+
+`write_result.json` now stores benchmark metadata in addition to per-op results:
+
+```json
+{
+  "version": 1,
+  "config": { "...": "..." },
+  "summary": { "...": "..." },
+  "ops_samples": [{ "second": 1, "ops": 22000, "cumulative_ops": 22000 }],
+  "results": [{ "key": "bench_0_0", "start_time": 0.001, "elapsed": 0.011 }]
+}
+```
+
+`rbench` accepts both the new wrapper format and the legacy top-level result array.
+
+For write-path profiling, run the partition server and client with `RUST_LOG=info`. The partition server emits `partition write summary` once per second with queue wait, batch fill ratio, and phase 1/2/3 timings; the stream client emits `stream append summary` with mutex wait, extent lookup, fanout append, and retry counts.
 
 ### Add a new extent node to a running cluster
 
