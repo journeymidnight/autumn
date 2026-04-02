@@ -248,8 +248,8 @@ Operates on **user keys only** (8-byte MVCC suffix stripped before hashing). 1% 
 | Constant | Value | Meaning |
 |----------|-------|---------|
 | `VALUE_THROTTLE` | 4 KB | Large value threshold (store as VP) |
-| `FLUSH_MEM_BYTES` | 64 MB | Memtable size trigger for rotation |
-| `MAX_SKIP_LIST` | 64 MB | Maximum skip list size |
+| `FLUSH_MEM_BYTES` | 256 MB | Memtable size trigger for rotation |
+| `MAX_SKIP_LIST` | 256 MB | Maximum skip list size |
 | `MAX_WRITE_BATCH` | 256 | Max requests per group-commit batch |
 | `BLOCK_SIZE_TARGET` | 64 KB | Target SSTable block size |
 | `GC_DISCARD_RATIO` | 0.4 (40%) | Min discard ratio to trigger GC |
