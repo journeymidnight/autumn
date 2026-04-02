@@ -88,8 +88,13 @@ impl ClusterClient {
                 .connect()
                 .await
                 .with_context(|| format!("connect PS {endpoint}"))?;
-            self.ps_conns
-                .insert(addr.clone(), PartitionKvClient::new(channel));
+            const GRPC_MAX_MSG: usize = 64 * 1024 * 1024;
+            self.ps_conns.insert(
+                addr.clone(),
+                PartitionKvClient::new(channel)
+                    .max_decoding_message_size(GRPC_MAX_MSG)
+                    .max_encoding_message_size(GRPC_MAX_MSG),
+            );
         }
         Ok(self.ps_conns.get_mut(&addr).unwrap())
     }

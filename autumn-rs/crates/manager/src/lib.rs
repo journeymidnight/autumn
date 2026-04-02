@@ -1054,9 +1054,18 @@ impl AutumnManager {
     }
 
     pub async fn serve(self, addr: SocketAddr) -> Result<()> {
+        const GRPC_MAX_MSG: usize = 8 * 1024 * 1024;
         tonic::transport::Server::builder()
-            .add_service(StreamManagerServiceServer::new(self.clone()))
-            .add_service(PartitionManagerServiceServer::new(self))
+            .add_service(
+                StreamManagerServiceServer::new(self.clone())
+                    .max_decoding_message_size(GRPC_MAX_MSG)
+                    .max_encoding_message_size(GRPC_MAX_MSG),
+            )
+            .add_service(
+                PartitionManagerServiceServer::new(self)
+                    .max_decoding_message_size(GRPC_MAX_MSG)
+                    .max_encoding_message_size(GRPC_MAX_MSG),
+            )
             .serve(addr)
             .await?;
         Ok(())

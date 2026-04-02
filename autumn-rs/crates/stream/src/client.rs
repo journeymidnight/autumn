@@ -106,7 +106,12 @@ impl StreamClient {
     async fn extent_client(&mut self, addr: &str) -> Result<&mut ExtentServiceClient<Channel>> {
         if !self.extent_clients.contains_key(addr) {
             let endpoint = normalize_endpoint(addr);
-            let client = ExtentServiceClient::connect(endpoint).await?;
+            let channel = tonic::transport::Endpoint::from_shared(endpoint)?
+                .connect().await?;
+            const GRPC_MAX_MSG: usize = 64 * 1024 * 1024;
+            let client = ExtentServiceClient::new(channel)
+                .max_decoding_message_size(GRPC_MAX_MSG)
+                .max_encoding_message_size(GRPC_MAX_MSG);
             self.extent_clients.insert(addr.to_string(), client);
         }
         self.extent_clients

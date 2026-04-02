@@ -467,8 +467,12 @@ impl PartitionServer {
                 };
 
                 let sst_arc = Arc::new(sst_bytes);
-                let reader = SstReader::from_bytes(sst_arc)
-                    .with_context(|| format!("open SST extent={} offset={}", loc.extent_id, loc.offset))?;
+                let reader = SstReader::from_bytes(sst_arc.clone())
+                    .with_context(|| {
+                        let preview_len = sst_arc.len().min(32);
+                        format!("open SST extent={} offset={} read_len={} preview={:02x?}",
+                            loc.extent_id, loc.offset, sst_arc.len(), &sst_arc[..preview_len])
+                    })?;
 
                 let tbl_last_seq = reader.seq_num();
                 if tbl_last_seq > max_seq { max_seq = tbl_last_seq; }
@@ -1549,8 +1553,13 @@ impl PartitionServer {
     }
 
     pub async fn serve(self, addr: SocketAddr) -> Result<()> {
+        const GRPC_MAX_MSG: usize = 64 * 1024 * 1024;
         Server::builder()
-            .add_service(PartitionKvServer::new(self))
+            .add_service(
+                PartitionKvServer::new(self)
+                    .max_decoding_message_size(GRPC_MAX_MSG)
+                    .max_encoding_message_size(GRPC_MAX_MSG),
+            )
             .serve(addr).await?;
         Ok(())
     }
@@ -2051,7 +2060,7 @@ fn internal_to_status<E: std::fmt::Display>(err: E) -> Status {
 }
 
 fn part_lookup_to_status(part_id: u64, err: anyhow::Error) -> Status {
-    let msg = err.to_string();
+    let msg = format!("{:#}", err); // full error chain
     if msg.contains("not found") { Status::not_found(format!("part {part_id} not found")) }
     else { Status::internal(msg) }
 }

@@ -182,8 +182,13 @@ impl ExtentNode {
     }
 
     pub async fn serve(self, addr: SocketAddr) -> Result<()> {
+        const GRPC_MAX_MSG: usize = 64 * 1024 * 1024;
         tonic::transport::Server::builder()
-            .add_service(ExtentServiceServer::new(self))
+            .add_service(
+                ExtentServiceServer::new(self)
+                    .max_decoding_message_size(GRPC_MAX_MSG)
+                    .max_encoding_message_size(GRPC_MAX_MSG),
+            )
             .serve(addr)
             .await?;
         Ok(())
