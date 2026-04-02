@@ -475,7 +475,7 @@ impl PartitionServer {
 
         let pm_client = PartitionManagerServiceClient::new(channel);
         let owner_key = format!("ps-{ps_id}");
-        let sc = StreamClient::connect(manager_endpoint, owner_key, 128 * 1024 * 1024, pool.clone()).await?;
+        let sc = StreamClient::connect(manager_endpoint, owner_key, 3 * 1024 * 1024 * 1024, pool.clone()).await?;
 
         let server = Self {
             ps_id,
@@ -668,7 +668,7 @@ impl PartitionServer {
             &self.manager_endpoint,
             self.stream_client.owner_key().to_string(),
             self.stream_client.revision(),
-            128 * 1024 * 1024,
+            3 * 1024 * 1024 * 1024,
             self.pool.clone(),
         )
         .await

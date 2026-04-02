@@ -134,7 +134,7 @@ async fn benchmark_append_stream_throughput() {
         .into_inner();
     let stream_id = created.stream.expect("stream").stream_id;
 
-    let max_extent_size = 512 * 1024 * 1024;
+    let max_extent_size = 3 * 1024 * 1024 * 1024;
     let payload = Arc::new(vec![b'x'; payload_size]);
     const BATCH_SIZE: usize = 16;
     let client = Arc::new(
