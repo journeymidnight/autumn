@@ -304,6 +304,7 @@ enum Command {
         threads: usize,
         duration_secs: u64,
         value_size: usize,
+        nosync: bool,
         baseline_file: String,
         /// Warn if current ops/sec < baseline * threshold (default 0.8 = 20% regression).
         threshold: f64,
@@ -339,7 +340,7 @@ fn usage() -> ! {
     eprintln!("                                    Write benchmark (--nosync skips fsync)");
     eprintln!("  rbench [--threads 40] [--duration 10] <RESULT_FILE>");
     eprintln!("                                    Read benchmark");
-    eprintln!("  perf-check [--threads 4] [--duration 5] [--size 8192] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline]");
+    eprintln!("  perf-check [--threads 256] [--duration 10] [--size 4096] [--nosync] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline]");
     eprintln!("                                    Quick write+read bench; warns if >threshold regression vs baseline");
     eprintln!("  info                              Show cluster info");
     std::process::exit(1);
@@ -652,9 +653,10 @@ fn parse_args() -> Args {
             }
         }
         "perf-check" => {
-            let mut threads = 4usize;
-            let mut duration_secs = 5u64;
-            let mut value_size = 8192usize;
+            let mut threads = 256usize;
+            let mut duration_secs = 10u64;
+            let mut value_size = 4096usize;
+            let mut nosync = false;
             let mut baseline_file = "perf_baseline.json".to_string();
             let mut threshold = 0.8f64;
             let mut update_baseline = false;
@@ -671,6 +673,9 @@ fn parse_args() -> Args {
                     "--size" => {
                         i += 1;
                         value_size = raw[i].parse().expect("--size must be a number");
+                    }
+                    "--nosync" => {
+                        nosync = true;
                     }
                     "--baseline" => {
                         i += 1;
@@ -690,7 +695,7 @@ fn parse_args() -> Args {
                 }
                 i += 1;
             }
-            Command::PerfCheck { threads, duration_secs, value_size, baseline_file, threshold, update_baseline }
+            Command::PerfCheck { threads, duration_secs, value_size, nosync, baseline_file, threshold, update_baseline }
         }
         "info" => Command::Info,
         other => {
@@ -1695,11 +1700,11 @@ async fn main() -> Result<()> {
             threads,
             duration_secs,
             value_size,
+            nosync,
             baseline_file,
             threshold,
             update_baseline,
         } => {
-            let nosync = false;
 
             // ---- Write phase ----
             println!("==> perf-check: write ({threads} threads, {duration_secs}s, {value_size}B)");

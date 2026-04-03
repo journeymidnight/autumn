@@ -27,11 +27,13 @@ bash "$SCRIPT_DIR/cluster.sh" clean
 bash "$SCRIPT_DIR/cluster.sh" start 3
 
 # Run perf-check (baseline file lives next to this script)
+# Parameters match production-style load: 256 threads, 4KB values, nosync (group-commit path)
 echo "[perf-check] running perf-check (baseline: $BASELINE)..."
 "$AC" --manager 127.0.0.1:9001 \
     perf-check \
-    --threads 4 \
+    --nosync \
+    --threads 256 \
     --duration 10 \
-    --size 8192 \
+    --size 4096 \
     --baseline "$BASELINE" \
     $UPDATE_BASELINE
