@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
+#[cfg(unix)]
+extern crate libc;
 use autumn_partition_server::PartitionServer;
 
 struct Args {
@@ -74,6 +76,15 @@ async fn main() -> Result<()> {
         .init();
 
     let args = parse_args();
+
+    #[cfg(unix)]
+    unsafe {
+        let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 && rl.rlim_cur < 65535 {
+            rl.rlim_cur = rl.rlim_max.min(65535);
+            libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+        }
+    }
     let addr: SocketAddr = format!("0.0.0.0:{}", args.port)
         .parse()
         .context("parse listen address")?;

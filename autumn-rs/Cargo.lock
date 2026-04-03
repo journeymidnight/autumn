@@ -157,6 +157,7 @@ dependencies = [
  "autumn-proto",
  "autumn-stream",
  "bytes",
+ "libc",
  "rand",
  "serde",
  "serde_json",

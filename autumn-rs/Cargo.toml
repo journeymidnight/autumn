@@ -30,3 +30,10 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 crc32c = "0.6"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

@@ -13,6 +13,20 @@ use tonic::Request;
 
 const GRPC_MAX_MSG: usize = 64 * 1024 * 1024;
 const ECHO_DURATION: Duration = Duration::from_secs(2);
+
+/// Build a tonic [`Endpoint`] with project-wide HTTP/2 tuning:
+/// large adaptive windows, tcp_nodelay, and keepalives.
+pub fn make_endpoint(addr: &str) -> Result<Endpoint> {
+    Ok(Endpoint::from_shared(normalize_endpoint(addr))?
+        .tcp_nodelay(true)
+        .http2_adaptive_window(true)
+        .initial_connection_window_size(Some(256 * 1024 * 1024u32))
+        .initial_stream_window_size(Some(32 * 1024 * 1024u32))
+        .keep_alive_while_idle(true)
+        .http2_keep_alive_interval(Duration::from_secs(15))
+        .keep_alive_timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(5)))
+}
 /// Connection is considered healthy if last echo was within 4 * ECHO_DURATION.
 const HEALTH_WINDOW_MS: i64 = 8_000;
 
@@ -52,7 +66,7 @@ impl ConnPool {
         if let Some(entry) = self.entries.get(&key) {
             return Ok(entry.channel.clone());
         }
-        let channel = Endpoint::from_shared(key.clone())?.connect().await?;
+        let channel = make_endpoint(addr)?.connect().await?;
         let entry = Arc::new(PoolEntry {
             channel: channel.clone(),
             last_echo: AtomicI64::new(now_millis()),

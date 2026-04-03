@@ -1,3 +1,6 @@
+#[cfg(unix)]
+extern crate libc;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -33,7 +36,7 @@ fn normalize(addr: &str) -> String {
 
 async fn connect_ps_client(ps_addr: &str) -> Result<PartitionKvClient<Channel>> {
     let endpoint = normalize(ps_addr);
-    let channel = Endpoint::from_shared(endpoint.clone())?
+    let channel = autumn_stream::conn_pool::make_endpoint(ps_addr)?
         .connect()
         .await
         .with_context(|| format!("connect PS {endpoint}"))?;
@@ -269,7 +272,6 @@ enum Command {
         report_interval_secs: u64,
         part_id: Option<u64>,
         reuse_value: bool,
-        channels_per_ps: usize,
     },
     RBench {
         threads: usize,
@@ -302,7 +304,7 @@ fn usage() -> ! {
     eprintln!("  forcegc <PARTID> <EXTID>...       Force GC specific extents");
     eprintln!("  format --listen <ADDR> --advertise <ADDR> <DIR>...");
     eprintln!("                                    Format disks and register node");
-    eprintln!("  wbench [--threads 4] [--duration 10] [--size 8192] [--nosync] [--report-interval 1] [--part-id ID] [--reuse-value true|false] [--channels-per-ps 1]");
+    eprintln!("  wbench [--threads 4] [--duration 10] [--size 8192] [--nosync] [--report-interval 1] [--part-id ID] [--reuse-value true|false]");
     eprintln!("                                    Write benchmark (--nosync skips fsync)");
     eprintln!("  rbench [--threads 40] [--duration 10] <RESULT_FILE>");
     eprintln!("                                    Read benchmark");
@@ -541,7 +543,6 @@ fn parse_args() -> Args {
             let mut report_interval_secs: u64 = 1;
             let mut part_id: Option<u64> = None;
             let mut reuse_value = true;
-            let mut channels_per_ps: usize = 1;
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--threads" | "-t" => {
@@ -572,11 +573,6 @@ fn parse_args() -> Args {
                         reuse_value = parse_bool_flag(&raw[i], "--reuse-value")
                             .expect("--reuse-value must be true or false");
                     }
-                    "--channels-per-ps" => {
-                        i += 1;
-                        channels_per_ps = parse_positive_usize_flag(&raw[i], "--channels-per-ps")
-                            .expect("--channels-per-ps must be a positive number");
-                    }
                     "--nosync" => {
                         nosync = true;
                     }
@@ -592,7 +588,6 @@ fn parse_args() -> Args {
                 report_interval_secs,
                 part_id,
                 reuse_value,
-                channels_per_ps,
             }
         }
         "rbench" => {
@@ -681,12 +676,6 @@ struct BenchConfig {
     report_interval_secs: u64,
     part_id: Option<u64>,
     reuse_value: bool,
-    #[serde(default = "default_channels_per_ps")]
-    channels_per_ps: usize,
-}
-
-fn default_channels_per_ps() -> usize {
-    1
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -858,7 +847,6 @@ mod tests {
                 report_interval_secs: 1,
                 part_id: Some(7),
                 reuse_value: true,
-                channels_per_ps: 4,
             },
             summary: BenchSummaryRecord {
                 total_ops: 1,
@@ -1303,8 +1291,23 @@ async fn main() -> Result<()> {
             report_interval_secs,
             part_id,
             reuse_value,
-            channels_per_ps,
         } => {
+            // Raise the file-descriptor limit so that one connection per thread
+            // doesn't hit the default macOS/Linux ulimit (often 256 or 1024).
+            #[cfg(unix)]
+            {
+                let needed = (threads * 4 + 512) as u64; // each connection uses several fds
+                unsafe {
+                    let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+                    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
+                        if rl.rlim_cur < needed {
+                            rl.rlim_cur = needed.min(rl.rlim_max);
+                            libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+                        }
+                    }
+                }
+            }
+
             // Gather partition list for routing.
             let partitions = if let Some(part_id) = part_id {
                 vec![(part_id, client.resolve_part_id(part_id).await?)]
@@ -1315,30 +1318,15 @@ async fn main() -> Result<()> {
                 bail!("no partitions found, run bootstrap first");
             }
 
-            // Pre-connect independent channels per PS so the benchmark can
-            // distinguish single-connection gRPC/H2 limits from deeper
-            // server-side bottlenecks.
-            let mut ps_clients: HashMap<String, Vec<PartitionKvClient<Channel>>> = HashMap::new();
-            for (_, ps_addr) in &partitions {
-                if !ps_clients.contains_key(ps_addr) {
-                    let mut clients = Vec::with_capacity(channels_per_ps);
-                    for _ in 0..channels_per_ps {
-                        clients.push(connect_ps_client(ps_addr).await?);
-                    }
-                    ps_clients.insert(ps_addr.clone(), clients);
-                }
-            }
-
-            // Spread threads across each PS's channel set in round-robin order.
-            let mut ps_thread_counts: HashMap<String, usize> = HashMap::new();
+            // Each simulated user (thread) gets its own dedicated connection,
+            // matching real-world usage where N independent clients each hold
+            // one TCP/HTTP2 connection to the PS.
             let mut thread_targets: Vec<(u64, PartitionKvClient<Channel>)> =
                 Vec::with_capacity(threads);
             for tid in 0..threads {
                 let (part_id, ps_addr) = &partitions[tid % partitions.len()];
-                let thread_count = ps_thread_counts.entry(ps_addr.clone()).or_insert(0);
-                let channel_idx = *thread_count % channels_per_ps;
-                *thread_count += 1;
-                thread_targets.push((*part_id, ps_clients[ps_addr][channel_idx].clone()));
+                let ps = connect_ps_client(ps_addr).await?;
+                thread_targets.push((*part_id, ps));
             }
 
             let deadline =
@@ -1468,7 +1456,6 @@ async fn main() -> Result<()> {
                     report_interval_secs,
                     part_id,
                     reuse_value,
-                    channels_per_ps,
                 },
                 summary,
                 ops_samples: ops_samples.lock().await.drain(..).collect(),
