@@ -501,8 +501,10 @@ impl StreamClient {
                 state.commit = None;
                 state.tail = None;
                 retry += 1;
-                if retry <= 3 {
-                    // Reload tail; if it's sealed (e.g., after a stream split), allocate a new extent.
+                if retry <= 2 {
+                    // First 2 retries: sleep briefly for transient errors, then retry on the
+                    // same extent (or switch if it was sealed externally, e.g. after a split).
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     let fresh = self.load_stream_tail(stream_id).await?;
                     if fresh.extent.sealed_length > 0 {
                         let (_, new_tail_ext) = self.alloc_new_extent(stream_id, 0).await?;
@@ -516,15 +518,33 @@ impl StreamClient {
                     }
                     continue;
                 }
-                self.append_metrics.record(
-                    &self.owner_key,
-                    lock_wait,
-                    extent_lookup_elapsed,
-                    fanout_elapsed,
-                    append_started_at.elapsed(),
-                    retry as u64,
-                );
-                return Err(err);
+                // After 2 retries on the same extent, unconditionally seal and allocate a new
+                // extent on healthy nodes. This handles a downed replica that is still listed in
+                // the extent's replica set (the extent is not yet sealed by anyone).
+                // alloc_new_extent(stream_id, 0) asks the manager to query commit lengths on all
+                // replicas, seal at the minimum, and allocate a fresh extent on live nodes.
+                match self.alloc_new_extent(stream_id, 0).await {
+                    Ok((_, new_tail_ext)) => {
+                        let replica_addrs = self.replica_addrs_for_extent(&new_tail_ext).await?;
+                        state.tail = Some(StreamTail {
+                            extent: new_tail_ext,
+                            replica_addrs,
+                        });
+                        retry = 0; // new extent gets its own retry budget
+                        continue;
+                    }
+                    Err(alloc_err) => {
+                        self.append_metrics.record(
+                            &self.owner_key,
+                            lock_wait,
+                            extent_lookup_elapsed,
+                            fanout_elapsed,
+                            append_started_at.elapsed(),
+                            retry as u64,
+                        );
+                        return Err(alloc_err.context(format!("alloc_new_extent failed after append error: {err}")));
+                    }
+                }
             }
             let appended =
                 first_resp.ok_or_else(|| anyhow!("append failed: no replica response"))?;

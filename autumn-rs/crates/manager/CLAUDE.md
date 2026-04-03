@@ -55,7 +55,8 @@ create_stream(data_shard, parity_shard):
   2. Query commit_length on all replicas of current tail → take MINIMUM → sealed_length
   3. Update ExtentInfo: sealed_length, bump eversion, set avali=1
   4. alloc_ids(1) → new extent_id
-  5. Call alloc_extent on same nodes
+  5. Call alloc_extent on preferred nodes; if a node fails (dead), fall back to other
+     registered nodes until enough healthy nodes are found or all are exhausted
   6. Append new extent to stream's extent_ids list
   7. Mirror to etcd
 ```

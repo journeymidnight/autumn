@@ -120,8 +120,9 @@ append(stream_id, payload, must_sync):
        - Collect results
        - If any replica returns NotFound: alloc new extent, set as new tail, retry
        - If any replica returns error/mismatch: evict tail cache
-           - Reload tail; if sealed (e.g. after split), alloc new extent
-           - Retry (up to 3x)
+           - First 2 retries: sleep 100ms, reload tail, retry same extent (or alloc new if sealed)
+           - After 2 retries: unconditionally call alloc_new_extent(stream_id, 0) to seal the
+             broken extent and get a new extent on healthy nodes; reset retry counter
   5. If end >= max_extent_size: alloc_new_extent, cache new tail
   6. Return AppendResult{extent_id, offset, end}
 ```

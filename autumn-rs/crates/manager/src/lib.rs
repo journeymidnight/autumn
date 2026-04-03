@@ -1622,22 +1622,51 @@ impl StreamManagerService for AutumnManager {
         tail.eversion += 1;
         tail.avali = avali;
 
-        // allocate new extent on nodes
+        // allocate new extent on nodes, skipping any that fail (dead nodes) and
+        // falling back to other registered nodes so a single dead node doesn't
+        // block new extent allocation.
         let mut node_ids = Vec::with_capacity(selected.len());
         let mut disk_ids = Vec::with_capacity(selected.len());
+        // Build sorted fallback list: all registered nodes not in `selected`.
+        let mut fallback_nodes: Vec<NodeInfo> = {
+            let selected_ids: std::collections::HashSet<u64> =
+                selected.iter().map(|n| n.node_id).collect();
+            let mut v: Vec<NodeInfo> = nodes_map
+                .values()
+                .filter(|n| !selected_ids.contains(&n.node_id))
+                .cloned()
+                .collect();
+            v.sort_by_key(|n| n.node_id);
+            v
+        };
+        let mut fallback_iter = fallback_nodes.drain(..);
         for n in &selected {
-            node_ids.push(n.node_id);
-            let disk = match Self::alloc_extent_on_node(&n.address, extent_id).await {
-                Ok(v) => v,
-                Err(err) => {
-                    return Ok(Response::new(StreamAllocExtentResponse {
-                        code: Self::err_code(&err) as i32,
-                        code_des: err.to_string(),
-                        stream_info: None,
-                        last_ex_info: None,
-                    }));
+            let (node_id, disk) = {
+                // Try the preferred node first; on failure try fallbacks.
+                let mut candidate = n.clone();
+                loop {
+                    match Self::alloc_extent_on_node(&candidate.address, extent_id).await {
+                        Ok(disk) => break (candidate.node_id, disk),
+                        Err(_) => {
+                            match fallback_iter.next() {
+                                Some(alt) => { candidate = alt; }
+                                None => {
+                                    let err = AppError::Precondition(format!(
+                                        "no healthy node available to allocate extent {extent_id}"
+                                    ));
+                                    return Ok(Response::new(StreamAllocExtentResponse {
+                                        code: Self::err_code(&err) as i32,
+                                        code_des: err.to_string(),
+                                        stream_info: None,
+                                        last_ex_info: None,
+                                    }));
+                                }
+                            }
+                        }
+                    }
                 }
             };
+            node_ids.push(node_id);
             disk_ids.push(disk);
         }
 
