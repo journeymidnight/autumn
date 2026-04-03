@@ -8,16 +8,15 @@
 ///   create-stream  [--data-shard N]    [--parity-shard N]
 ///   stream-info    [--stream-id N]     (omit to list all streams)
 ///   append         --stream-id N  --data <string>  [--owner-key <key>]
-///   read           --stream-id N  [--length N]  [--owner-key <key>]
+///   read           --stream-id N  [--extent-id N]  [--offset N]  [--length N]  [--owner-key <key>]
+///                  Uses StreamClient so EC streams are decoded correctly.
 ///   alloc-extent   --node <addr>  --extent-id N
 ///   commit-length  --node <addr>  --extent-id N  [--revision N]
-use std::collections::HashMap;
-
 use anyhow::{anyhow, Context, Result};
 use autumn_proto::autumn::extent_service_client::ExtentServiceClient;
 use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
 use autumn_proto::autumn::{
-    AllocExtentRequest, Code, CommitLengthRequest, CreateStreamRequest, Empty, ReadBytesRequest,
+    AllocExtentRequest, Code, CommitLengthRequest, CreateStreamRequest,
     RegisterNodeRequest, StreamInfoRequest,
 };
 use autumn_stream::{ConnPool, StreamClient};
@@ -60,6 +59,8 @@ enum Sub {
     },
     Read {
         stream_id: u64,
+        extent_id: Option<u64>,
+        offset: u32,
         length: u32,
         owner_key: String,
     },
@@ -166,11 +167,15 @@ fn parse_args() -> Result<Args> {
         }
         "read" => {
             let mut stream_id = 0u64;
+            let mut extent_id: Option<u64> = None;
+            let mut offset = 0u32;
             let mut length = 0u32; // 0 = all
             let mut owner_key = "cli-owner".to_string();
             while let Some(tok) = it.next() {
                 match tok.as_str() {
                     "--stream-id" => stream_id = it.next().context("needs value")?.parse()?,
+                    "--extent-id" => extent_id = Some(it.next().context("needs value")?.parse()?),
+                    "--offset" => offset = it.next().context("needs value")?.parse()?,
                     "--length" => length = it.next().context("needs value")?.parse()?,
                     "--owner-key" => owner_key = it.next().context("needs value")?.clone(),
                     other => return Err(anyhow!("unknown flag: {other}")),
@@ -181,6 +186,8 @@ fn parse_args() -> Result<Args> {
             }
             Sub::Read {
                 stream_id,
+                extent_id,
+                offset,
                 length,
                 owner_key,
             }
@@ -305,98 +312,54 @@ async fn cmd_append(manager: &str, stream_id: u64, data: String, owner_key: Stri
     Ok(())
 }
 
-async fn cmd_read(manager: &str, stream_id: u64, length: u32, owner_key: String) -> Result<()> {
-    let _ = owner_key;
-    // 1. get stream info + nodes map
-    let mut mgr = StreamManagerServiceClient::connect(normalize(manager)).await?;
+/// Read via StreamClient so EC streams are decoded correctly.
+///
+/// If --extent-id is given, reads that specific extent at (offset, length).
+/// Otherwise reads the last non-empty extent of the stream.
+async fn cmd_read(
+    manager: &str,
+    stream_id: u64,
+    extent_id: Option<u64>,
+    offset: u32,
+    length: u32,
+    owner_key: String,
+) -> Result<()> {
+    let pool = Arc::new(ConnPool::new());
+    let client =
+        StreamClient::connect(manager, owner_key, 3 * 1024 * 1024 * 1024, pool).await?;
 
-    let si = mgr
-        .stream_info(Request::new(StreamInfoRequest {
-            stream_ids: vec![stream_id],
-        }))
-        .await?
-        .into_inner();
-    if si.code != Code::Ok as i32 {
-        return Err(anyhow!("stream_info failed: {}", si.code_des));
-    }
-    let stream = si.streams.get(&stream_id).context("stream not found")?;
-
-    let ni = mgr.nodes_info(Request::new(Empty {})).await?.into_inner();
-    if ni.code != Code::Ok as i32 {
-        return Err(anyhow!("nodes_info failed: {}", ni.code_des));
-    }
-    let node_addr: HashMap<u64, String> = ni
-        .nodes
-        .into_iter()
-        .map(|(id, n)| (id, n.address))
-        .collect();
-
-    if stream.extent_ids.is_empty() {
-        println!("stream {} has no extents", stream_id);
-        return Ok(());
-    }
-
-    // 2. read each extent in order
-    let mut total_bytes = 0usize;
-    for eid in &stream.extent_ids {
-        let extent = match si.extents.get(eid) {
-            Some(e) => e,
-            None => {
-                eprintln!("  extent {eid}: metadata missing, skipping");
-                continue;
-            }
-        };
-
-        // pick first available replica
-        let node_id = match extent.replicates.first() {
-            Some(id) => *id,
-            None => {
-                eprintln!("  extent {eid}: no replicas");
-                continue;
-            }
-        };
-        let addr = match node_addr.get(&node_id) {
-            Some(a) => a.clone(),
-            None => {
-                eprintln!("  extent {eid}: node {node_id} address unknown");
-                continue;
-            }
-        };
-
-        println!("--- extent {} (node {}  addr {}) ---", eid, node_id, addr);
-
-        let mut ec = ExtentServiceClient::connect(normalize(&addr)).await?;
-        let resp = ec
-            .read_bytes(Request::new(ReadBytesRequest {
-                extent_id: *eid,
-                offset: 0,
-                length, // 0 = read to end
-                eversion: 0,
-            }))
-            .await?;
-
-        let mut stream_resp = resp.into_inner();
-        let mut payload_buf: Vec<u8> = Vec::new();
-
-        use autumn_proto::autumn::read_bytes_response::Data;
-        while let Some(msg) = stream_resp.message().await? {
-            match msg.data {
-                Some(Data::Header(h)) => {
-                    println!("  end={}", h.end);
-                }
-                Some(Data::Payload(p)) => {
-                    total_bytes += p.len();
-                    payload_buf.extend_from_slice(&p);
-                }
-                None => {}
-            }
+    match extent_id {
+        Some(eid) => {
+            let (data, end) = client.read_bytes_from_extent(eid, offset, length).await?;
+            println!("extent_id : {eid}");
+            println!("offset    : {offset}");
+            println!("end       : {end}");
+            println!("bytes     : {}", data.len());
+            let text = String::from_utf8_lossy(&data);
+            println!("data      : {text}");
         }
-        let text = String::from_utf8_lossy(&payload_buf);
-        println!("  ({} bytes): {}", payload_buf.len(), text);
+        None => {
+            // Read last non-empty extent.
+            let info = client.get_stream_info(stream_id).await?;
+            if info.extent_ids.is_empty() {
+                println!("stream {stream_id} has no extents");
+                return Ok(());
+            }
+            let mut total = 0usize;
+            for eid in &info.extent_ids {
+                let (data, end) = client.read_bytes_from_extent(*eid, 0, 0).await?;
+                if data.is_empty() {
+                    continue;
+                }
+                total += data.len();
+                let text = String::from_utf8_lossy(&data);
+                println!("--- extent {eid} (end={end}, {} bytes) ---", data.len());
+                println!("{text}");
+            }
+            println!("---");
+            println!("total bytes: {total}");
+        }
     }
-
-    println!("---");
-    println!("total bytes read: {total_bytes}");
     Ok(())
 }
 
@@ -450,9 +413,11 @@ async fn main() -> Result<()> {
         } => cmd_append(&args.manager, stream_id, data, owner_key).await?,
         Sub::Read {
             stream_id,
+            extent_id,
+            offset,
             length,
             owner_key,
-        } => cmd_read(&args.manager, stream_id, length, owner_key).await?,
+        } => cmd_read(&args.manager, stream_id, extent_id, offset, length, owner_key).await?,
         Sub::AllocExtent { node, extent_id } => cmd_alloc_extent(&node, extent_id).await?,
         Sub::CommitLength {
             node,
