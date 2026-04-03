@@ -300,6 +300,15 @@ enum Command {
         duration_secs: u64,
         result_file: String,
     },
+    PerfCheck {
+        threads: usize,
+        duration_secs: u64,
+        value_size: usize,
+        baseline_file: String,
+        /// Warn if current ops/sec < baseline * threshold (default 0.8 = 20% regression).
+        threshold: f64,
+        update_baseline: bool,
+    },
     Info,
 }
 
@@ -330,6 +339,8 @@ fn usage() -> ! {
     eprintln!("                                    Write benchmark (--nosync skips fsync)");
     eprintln!("  rbench [--threads 40] [--duration 10] <RESULT_FILE>");
     eprintln!("                                    Read benchmark");
+    eprintln!("  perf-check [--threads 4] [--duration 5] [--size 8192] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline]");
+    eprintln!("                                    Quick write+read bench; warns if >threshold regression vs baseline");
     eprintln!("  info                              Show cluster info");
     std::process::exit(1);
 }
@@ -640,6 +651,48 @@ fn parse_args() -> Args {
                 result_file,
             }
         }
+        "perf-check" => {
+            let mut threads = 4usize;
+            let mut duration_secs = 5u64;
+            let mut value_size = 8192usize;
+            let mut baseline_file = "perf_baseline.json".to_string();
+            let mut threshold = 0.8f64;
+            let mut update_baseline = false;
+            i += 1;
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--threads" | "-t" => {
+                        i += 1;
+                        threads = raw[i].parse().expect("--threads must be a number");
+                    }
+                    "--duration" | "-d" => {
+                        i += 1;
+                        duration_secs = raw[i].parse().expect("--duration must be a number");
+                    }
+                    "--size" => {
+                        i += 1;
+                        value_size = raw[i].parse().expect("--size must be a number");
+                    }
+                    "--baseline" => {
+                        i += 1;
+                        baseline_file = raw[i].clone();
+                    }
+                    "--threshold" => {
+                        i += 1;
+                        threshold = raw[i].parse().expect("--threshold must be a float");
+                    }
+                    "--update-baseline" => {
+                        update_baseline = true;
+                    }
+                    other => {
+                        eprintln!("unknown perf-check flag: {other}");
+                        usage();
+                    }
+                }
+                i += 1;
+            }
+            Command::PerfCheck { threads, duration_secs, value_size, baseline_file, threshold, update_baseline }
+        }
         "info" => Command::Info,
         other => {
             eprintln!("unknown command: {other}");
@@ -725,6 +778,16 @@ struct WriteBenchReport {
     summary: BenchSummaryRecord,
     ops_samples: Vec<BenchSample>,
     results: Vec<BenchResult>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PerfBaseline {
+    version: u32,
+    write: BenchSummaryRecord,
+    read: BenchSummaryRecord,
+    config: BenchConfig,
+    /// Unix seconds when this baseline was recorded.
+    recorded_at: u64,
 }
 
 struct LatencyHist {
@@ -1627,6 +1690,267 @@ async fn main() -> Result<()> {
             let mut hist = LatencyHist::new();
             hist.samples_ms = all_latencies;
             let _ = print_bench_summary("Read", threads, 0, elapsed, ops, &mut hist);
+        }
+
+        Command::PerfCheck {
+            threads,
+            duration_secs,
+            value_size,
+            baseline_file,
+            threshold,
+            update_baseline,
+        } => {
+            let nosync = false;
+
+            // ---- Write phase ----
+            println!("==> perf-check: write ({threads} threads, {duration_secs}s, {value_size}B)");
+
+            let partitions = client.all_partitions().await?;
+            if partitions.is_empty() {
+                bail!("no partitions found, run bootstrap first");
+            }
+
+            let mut thread_targets: Vec<(u64, PartitionKvClient<Channel>)> =
+                Vec::with_capacity(threads);
+            for tid in 0..threads {
+                let (part_id, ps_addr) = &partitions[tid % partitions.len()];
+                let ps = connect_ps_client(ps_addr).await?;
+                thread_targets.push((*part_id, ps));
+            }
+
+            let deadline =
+                Arc::new(std::time::SystemTime::now() + Duration::from_secs(duration_secs));
+            let total_ops = Arc::new(AtomicU64::new(0));
+            let bench_start = Instant::now();
+
+            let mut write_handles = Vec::new();
+            for (tid, (part_id, mut ps)) in thread_targets.into_iter().enumerate() {
+                let deadline = Arc::clone(&deadline);
+                let total_ops = Arc::clone(&total_ops);
+                let value_bytes = Bytes::from((0..value_size).map(|i| (i % 256) as u8).collect::<Vec<u8>>());
+
+                let handle = tokio::spawn(async move {
+                    let mut seq: u64 = 0;
+                    let mut local_latencies: Vec<f64> = Vec::new();
+                    let mut local_keys: Vec<String> = Vec::new();
+                    loop {
+                        if std::time::SystemTime::now() >= *deadline { break; }
+                        let key = format!("pc_{tid}_{seq}");
+                        seq += 1;
+                        let t0 = Instant::now();
+                        let res = ps
+                            .put(Request::new(PutRequest {
+                                key: Bytes::copy_from_slice(key.as_bytes()),
+                                value: value_bytes.clone(),
+                                expires_at: 0,
+                                part_id,
+                                must_sync: !nosync,
+                            }))
+                            .await;
+                        let elapsed = t0.elapsed();
+                        if res.is_ok() {
+                            total_ops.fetch_add(1, Ordering::Relaxed);
+                            local_latencies.push(elapsed.as_secs_f64() * 1000.0);
+                            local_keys.push(key);
+                        }
+                    }
+                    (local_latencies, local_keys)
+                });
+                write_handles.push(handle);
+            }
+
+            let total_ops_w = Arc::clone(&total_ops);
+            let progress_w = tokio::spawn(async move {
+                let mut last = 0u64;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let cur = total_ops_w.load(Ordering::Relaxed);
+                    eprint!("\r[write] ops/s={}", cur - last);
+                    last = cur;
+                }
+            });
+
+            let mut all_write_latencies: Vec<f64> = Vec::new();
+            let mut all_write_keys: Vec<String> = Vec::new();
+            for h in write_handles {
+                if let Ok((lats, keys)) = h.await {
+                    all_write_latencies.extend(lats);
+                    all_write_keys.extend(keys);
+                }
+            }
+            progress_w.abort();
+            eprintln!();
+
+            let write_elapsed = bench_start.elapsed();
+            let write_ops = total_ops.load(Ordering::Relaxed);
+            let mut write_hist = LatencyHist { samples_ms: all_write_latencies };
+            let write_summary =
+                print_bench_summary("Write", threads, value_size, write_elapsed, write_ops, &mut write_hist);
+
+            if all_write_keys.is_empty() {
+                bail!("write phase produced no keys — is the cluster running?");
+            }
+
+            // ---- Read phase ----
+            println!("\n==> perf-check: read ({threads} threads, {duration_secs}s)");
+
+            let pc_keys = Arc::new(all_write_keys);
+            let manager_addr = Arc::new(args.manager.clone());
+            let deadline =
+                Arc::new(std::time::SystemTime::now() + Duration::from_secs(duration_secs));
+            let total_ops = Arc::new(AtomicU64::new(0));
+            let bench_start = Instant::now();
+            let keys_per_thread = (pc_keys.len() + threads - 1) / threads;
+
+            let mut read_handles = Vec::new();
+            for tid in 0..threads {
+                let pc_keys = Arc::clone(&pc_keys);
+                let manager_addr = Arc::clone(&manager_addr);
+                let deadline = Arc::clone(&deadline);
+                let total_ops = Arc::clone(&total_ops);
+
+                let handle = tokio::spawn(async move {
+                    let mut cc = match ClusterClient::connect(&manager_addr).await {
+                        Ok(c) => c,
+                        Err(e) => { eprintln!("thread {tid} connect error: {e}"); return Vec::new(); }
+                    };
+                    let start_idx = tid * keys_per_thread;
+                    let end_idx = (start_idx + keys_per_thread).min(pc_keys.len());
+                    if start_idx >= end_idx { return Vec::new(); }
+                    let my_keys = &pc_keys[start_idx..end_idx];
+                    let mut ki = 0usize;
+                    let mut local_latencies: Vec<f64> = Vec::new();
+
+                    loop {
+                        if std::time::SystemTime::now() >= *deadline { break; }
+                        let key = &my_keys[ki % my_keys.len()];
+                        ki += 1;
+                        let Ok((part_id, ps_addr)) = cc.resolve_key(key.as_bytes()).await else { continue };
+                        let Ok(ps) = cc.get_ps_client(&ps_addr).await else { continue };
+                        let t0 = Instant::now();
+                        let res = ps
+                            .get(Request::new(GetRequest {
+                                key: key.as_bytes().to_vec(),
+                                part_id,
+                            }))
+                            .await;
+                        let elapsed = t0.elapsed();
+                        if res.is_ok() {
+                            total_ops.fetch_add(1, Ordering::Relaxed);
+                            local_latencies.push(elapsed.as_secs_f64() * 1000.0);
+                        }
+                    }
+                    local_latencies
+                });
+                read_handles.push(handle);
+            }
+
+            let total_ops_r = Arc::clone(&total_ops);
+            let progress_r = tokio::spawn(async move {
+                let mut last = 0u64;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let cur = total_ops_r.load(Ordering::Relaxed);
+                    eprint!("\r[read] ops/s={}", cur - last);
+                    last = cur;
+                }
+            });
+
+            let mut all_read_latencies: Vec<f64> = Vec::new();
+            for h in read_handles {
+                if let Ok(lats) = h.await { all_read_latencies.extend(lats); }
+            }
+            progress_r.abort();
+            eprintln!();
+
+            let read_elapsed = bench_start.elapsed();
+            let read_ops = total_ops.load(Ordering::Relaxed);
+            let mut read_hist = LatencyHist { samples_ms: all_read_latencies };
+            let read_summary =
+                print_bench_summary("Read", threads, 0, read_elapsed, read_ops, &mut read_hist);
+
+            // ---- Regression check ----
+            let mut regressed = false;
+            let baseline_opt: Option<PerfBaseline> = std::fs::read_to_string(&baseline_file)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok());
+
+            if let Some(ref bl) = baseline_opt {
+                // Throughput: warn if current < baseline * threshold.
+                // Latency: warn if current > baseline * (2 - threshold), i.e. 120% for threshold=0.8.
+                let lat_ceil = 2.0 - threshold;
+
+                macro_rules! check_throughput {
+                    ($label:expr, $cur:expr, $base:expr) => {
+                        let pct = $cur / $base;
+                        if pct < threshold {
+                            println!(
+                                "WARNING: {} ops/sec regressed: {:.0} vs baseline {:.0} ({:.0}%)",
+                                $label, $cur, $base, pct * 100.0
+                            );
+                            regressed = true;
+                        }
+                    };
+                }
+                macro_rules! check_latency {
+                    ($label:expr, $cur:expr, $base:expr) => {
+                        if $base > 0.0 {
+                            let ratio = $cur / $base;
+                            if ratio > lat_ceil {
+                                println!(
+                                    "WARNING: {} p99 latency spiked: {:.2}ms vs baseline {:.2}ms ({:.0}%)",
+                                    $label, $cur, $base, ratio * 100.0
+                                );
+                                regressed = true;
+                            }
+                        }
+                    };
+                }
+
+                check_throughput!("write", write_summary.ops_per_sec, bl.write.ops_per_sec);
+                check_throughput!("read",  read_summary.ops_per_sec,  bl.read.ops_per_sec);
+                check_latency!("write", write_summary.p99_ms, bl.write.p99_ms);
+                check_latency!("read",  read_summary.p99_ms,  bl.read.p99_ms);
+
+                if !regressed {
+                    println!(
+                        "perf-check OK (write={:.0} ops/s read={:.0} ops/s, within {:.0}% of baseline)",
+                        write_summary.ops_per_sec, read_summary.ops_per_sec, threshold * 100.0
+                    );
+                }
+            } else {
+                println!("no baseline at '{baseline_file}' — run with --update-baseline to create one");
+            }
+
+            // ---- Optionally update baseline ----
+            if update_baseline {
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let bl = PerfBaseline {
+                    version: 1,
+                    write: write_summary,
+                    read: read_summary,
+                    config: BenchConfig {
+                        threads,
+                        duration_secs,
+                        value_size,
+                        nosync,
+                        report_interval_secs: 1,
+                        part_id: None,
+                        reuse_value: true,
+                    },
+                    recorded_at: now_secs,
+                };
+                let json = serde_json::to_string_pretty(&bl)?;
+                tokio::fs::write(&baseline_file, json).await?;
+                println!("baseline saved to {baseline_file}");
+            }
+
+            if regressed {
+                std::process::exit(2);
+            }
         }
 
         Command::Info => {

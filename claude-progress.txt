@@ -1,19 +1,22 @@
 Date: 2026-04-02
 TaskStatus: completed
-Task scope: F039 — client-side partition routing (binary search + contiguity validation)
+Task scope: F041 — perf-check benchmark with regression warning
 
 Current summary:
-  Implemented F039 interim solution in autumn-rs/crates/server/src/bin/autumn_client.rs:
-  - lookup_key(): replaced O(n) linear scan with O(log n) partition_point() binary search
-    matching Go's sort.Search pattern (find first region with end_key > key)
-  - refresh_regions(): added contiguity validation loop after sort — warns on gaps
-    between adjacent region end_key/start_key (Go saveRegion lines 61-65)
-  - Cache-then-refresh-once pattern retained (no etcd watch — deferred)
-  - Thread safety skipped — ClusterClient is CLI-only, no concurrent access
+  F039 (binary search routing) and F041 (perf-check) both implemented in
+  autumn-rs/crates/server/src/bin/autumn_client.rs.
 
-  Also committed separately: HTTP/2 tuning (adaptive window, keepalive),
-  fd limit bump via libc, release profile (LTO+codegen-units=1+panic=abort),
-  removed channels_per_ps (each wbench thread gets its own connection).
+  F039:
+  - lookup_key(): O(log n) partition_point() binary search (Go sort.Search pattern)
+  - refresh_regions(): contiguity validation with eprintln! warning on gaps
+
+  F041 (perf-check subcommand):
+  - Write phase: same loop as wbench, keys prefixed pc_
+  - Read phase: same loop as rbench, uses written keys
+  - PerfBaseline struct persisted to perf_baseline.json
+  - Comparison: warn+exit(2) if ops/sec < baseline*threshold or p99 > baseline*(2-threshold)
+  - --update-baseline flag saves current results as new baseline
+  - --threshold (default 0.8), --duration (default 5s), --threads (default 4)
 
 All tests pass:
   cargo test --workspace → all tests pass (0 failures)

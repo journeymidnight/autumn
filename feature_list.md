@@ -132,6 +132,12 @@
 - **Notes:** Implemented. `PutRequest`/`PutResponse` now use `bytes::Bytes`, allowing `wbench` to reuse payloads cheaply with `--reuse-value true|false` and optional `--part-id` / `--report-interval`. `write_result.json` now stores config/summary/ops_samples/results and `rbench` accepts both the new wrapper and legacy array format. Partition server logs `partition write summary` (queue wait, batch fill ratio, phase1/2/3, end-to-end), and stream client logs `stream append summary` (lock wait, extent lookup, fanout append, retries). `autumn-client` unit tests for bool parsing + result-file compatibility pass; compile path updated through manager integration tests.
 - **passes:** true
 
+### F041 · perf-check: quick write+read benchmark with regression warning
+- **Target:** `autumn-client perf-check` runs a short wbench+rbench cycle and compares throughput/latency against a stored baseline. Warns (and exits with code 2) if write or read ops/sec drops below threshold (default 80%) or p99 latency spikes above 120% of baseline. Baseline created/updated via `--update-baseline`.
+- **Evidence:** `autumn-rs/crates/server/src/bin/autumn_client.rs`
+- **Notes:** Implemented. `PerfBaseline` struct reuses `BenchSummaryRecord`+`BenchConfig`. Handler: write phase (same loop as wbench, keys prefixed `pc_`), read phase (same loop as rbench), comparison with configurable `--threshold`/`--baseline` flags. No new dependencies. Exit code 2 on regression for CI use. `--update-baseline` serializes baseline to JSON.
+- **passes:** true
+
 ---
 
 ## P2 — Distributed Capabilities & Operations
