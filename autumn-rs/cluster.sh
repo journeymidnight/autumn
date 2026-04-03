@@ -2,10 +2,10 @@
 # cluster.sh — dev cluster management for autumn-rs
 #
 # Usage:
-#   ./cluster.sh start [1|3]    # start 1-replica (default) or 3-replica cluster
+#   ./cluster.sh start [N]      # start N extent-node cluster (default 1, e.g. 3, 4, 5)
 #   ./cluster.sh stop           # kill all cluster processes
 #   ./cluster.sh clean          # stop + wipe data dirs
-#   ./cluster.sh restart [1|3]  # clean + start
+#   ./cluster.sh restart [N]    # clean + start
 #   ./cluster.sh status         # show running processes
 #   ./cluster.sh logs           # tail log files (Ctrl-C to exit)
 
@@ -92,7 +92,7 @@ wait_port() {
 
 do_start() {
     local replicas="${1:-1}"
-    [[ "$replicas" == "1" || "$replicas" == "3" ]] || die "replicas must be 1 or 3"
+    [[ "$replicas" =~ ^[0-9]+$ ]] && (( replicas >= 1 )) || die "replicas must be a positive integer"
 
     # Stop any leftover processes from a previous run to avoid port conflicts
     do_stop
@@ -103,7 +103,10 @@ do_start() {
     need_bin "$SC"
     need_bin "$AC"
 
-    mkdir -p "$DATA_ROOT"/{etcd,d1,d2,d3,ps}
+    # Create data dirs for all nodes (d1..dN)
+    local data_dirs=("$DATA_ROOT/etcd" "$DATA_ROOT/ps")
+    for (( i=1; i<=replicas; i++ )); do data_dirs+=("$DATA_ROOT/d$i"); done
+    mkdir -p "${data_dirs[@]}"
 
     # etcd
     start_proc etcd \
@@ -118,26 +121,19 @@ do_start() {
         "$MANAGER" --port 9001 --etcd 127.0.0.1:2379
     wait_port 9001 manager
 
-    # extent node(s)
-    start_proc node1 \
-        "$NODE" --port 9101 --disk-id 1 --data "$DATA_ROOT/d1" --manager "$MANAGER_ADDR"
-    wait_port 9101 node1
-
-    if [[ "$replicas" == "3" ]]; then
-        start_proc node2 \
-            "$NODE" --port 9102 --disk-id 2 --data "$DATA_ROOT/d2" --manager "$MANAGER_ADDR"
-        start_proc node3 \
-            "$NODE" --port 9103 --disk-id 3 --data "$DATA_ROOT/d3" --manager "$MANAGER_ADDR"
-        wait_port 9102 node2
-        wait_port 9103 node3
-    fi
+    # extent node(s): node1=9101, node2=9102, ...
+    for (( i=1; i<=replicas; i++ )); do
+        local port=$(( 9100 + i ))
+        start_proc "node$i" \
+            "$NODE" --port "$port" --disk-id "$i" --data "$DATA_ROOT/d$i" --manager "$MANAGER_ADDR"
+        wait_port "$port" "node$i"
+    done
 
     # register extent node(s)
-    "$SC" --manager "$MANAGER_ADDR" register-node --addr 127.0.0.1:9101 --disk disk-1
-    if [[ "$replicas" == "3" ]]; then
-        "$SC" --manager "$MANAGER_ADDR" register-node --addr 127.0.0.1:9102 --disk disk-2
-        "$SC" --manager "$MANAGER_ADDR" register-node --addr 127.0.0.1:9103 --disk disk-3
-    fi
+    for (( i=1; i<=replicas; i++ )); do
+        local port=$(( 9100 + i ))
+        "$SC" --manager "$MANAGER_ADDR" register-node --addr "127.0.0.1:$port" --disk "disk-$i"
+    done
     echo "[cluster] extent node(s) registered"
 
     # partition server
@@ -153,8 +149,9 @@ do_start() {
     if [[ -f "$bootstrap_marker" ]]; then
         echo "[cluster] skipping bootstrap (already done — use 'restart' for a fresh cluster)"
     else
-        local repl="1+0"
-        [[ "$replicas" == "3" ]] && repl="3+0"
+        # Use 3+0 replication when >= 3 nodes, otherwise match node count
+        local repl
+        if (( replicas >= 3 )); then repl="3+0"; else repl="${replicas}+0"; fi
         sleep 2  # give PS a moment to register with manager
         "$AC" --manager "$MANAGER_ADDR" bootstrap --replication "$repl"
         touch "$bootstrap_marker"
@@ -179,9 +176,15 @@ do_start() {
 # ---------------------------------------------------------------------------
 
 do_stop() {
-    for name in ps node3 node2 node1 manager etcd; do
+    kill_proc ps
+    # Stop any node1..nodeN by scanning pid files
+    for pf in "$DATA_ROOT"/pids/node*.pid; do
+        [[ -f "$pf" ]] || continue
+        local name; name="$(basename "$pf" .pid)"
         kill_proc "$name"
     done
+    kill_proc manager
+    kill_proc etcd
     echo "[cluster] all processes stopped"
 }
 
@@ -200,7 +203,12 @@ do_clean() {
 # ---------------------------------------------------------------------------
 
 do_status() {
-    for name in etcd manager node1 node2 node3 ps; do
+    local names=(etcd manager)
+    for pf in "$DATA_ROOT"/pids/node*.pid; do
+        [[ -f "$pf" ]] && names+=("$(basename "$pf" .pid)")
+    done
+    names+=(ps)
+    for name in "${names[@]}"; do
         local pf; pf="$(pid_file "$name")"
         if [[ -f "$pf" ]]; then
             local pid; pid="$(cat "$pf")"
@@ -221,8 +229,7 @@ do_status() {
 
 do_logs() {
     local logs=()
-    for name in etcd manager node1 node2 node3 ps; do
-        local log="$LOG_DIR/${name}.log"
+    for log in "$LOG_DIR"/*.log; do
         [[ -f "$log" ]] && logs+=("$log")
     done
     if [[ ${#logs[@]} -eq 0 ]]; then
@@ -247,7 +254,7 @@ case "$CMD" in
     status)  do_status ;;
     logs)    do_logs ;;
     *)
-        echo "Usage: $0 {start [1|3] | stop | clean | restart [1|3] | status | logs}"
+        echo "Usage: $0 {start [N] | stop | clean | restart [N] | status | logs}"
         exit 1
         ;;
 esac
