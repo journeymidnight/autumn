@@ -99,6 +99,19 @@ impl ClusterClient {
                         .unwrap_or(&[]),
                 )
         });
+        // Validate contiguity: each region's end_key must equal the next region's
+        // start_key. Matches Go saveRegion lines 61-65. Warn rather than panic since
+        // this is a CLI tool, not a long-running service.
+        for i in 0..sorted.len().saturating_sub(1) {
+            let end_key = sorted[i].1.rg.as_ref().map(|r| r.end_key.as_slice()).unwrap_or(&[]);
+            let next_start = sorted[i + 1].1.rg.as_ref().map(|r| r.start_key.as_slice()).unwrap_or(&[]);
+            if end_key != next_start {
+                eprintln!(
+                    "WARNING: region gap: partition {} end_key != partition {} start_key",
+                    sorted[i].1.part_id, sorted[i + 1].1.part_id
+                );
+            }
+        }
         self.regions = sorted;
         self.ps_details = resp.ps_details;
         Ok(())
@@ -114,16 +127,25 @@ impl ClusterClient {
     }
 
     fn lookup_key(&self, key: &[u8]) -> Option<(u64, String)> {
-        for (_, region) in &self.regions {
-            let rg = region.rg.as_ref()?;
-            let in_range = key >= rg.start_key.as_slice()
-                && (rg.end_key.is_empty() || key < rg.end_key.as_slice());
-            if in_range {
-                let addr = self.ps_details.get(&region.ps_id)?.address.clone();
-                return Some((region.part_id, addr));
-            }
+        if self.regions.is_empty() {
+            return None;
         }
-        None
+        // Binary search matching Go's sort.Search in autumn_clientv1/lib.go:217.
+        // Find the first region whose end_key > key (empty end_key = +infinity).
+        // Because regions are sorted by start_key and contiguous, this is the
+        // unique region containing key.
+        let idx = self.regions.partition_point(|(_, region)| {
+            match region.rg.as_ref() {
+                Some(rg) if !rg.end_key.is_empty() => rg.end_key.as_slice() <= key,
+                _ => false, // empty end_key (unbounded last region) — stop here
+            }
+        });
+        if idx >= self.regions.len() {
+            return None;
+        }
+        let (_, region) = &self.regions[idx];
+        let addr = self.ps_details.get(&region.ps_id)?.address.clone();
+        Some((region.part_id, addr))
     }
 
     async fn resolve_key(&mut self, key: &[u8]) -> Result<(u64, String)> {

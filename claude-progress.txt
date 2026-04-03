@@ -1,42 +1,22 @@
 Date: 2026-04-02
 TaskStatus: completed
-Task scope: F020 — gRPC connection pool with health check
+Task scope: F039 — client-side partition routing (binary search + contiguity validation)
 
 Current summary:
-  Implemented ConnPool in autumn-rs/crates/stream/src/conn_pool.rs:
-  - DashMap<String, Arc<PoolEntry>> — one Channel per unique remote address
-  - AtomicI64 last_echo (unix millis) updated by streaming heartbeat task
-  - connect(addr) — get-or-create, no heartbeat (for manager connections)
-  - connect_extent(addr) — get-or-create + start heartbeat monitor
-  - extent_client(addr) — convenience wrapper returning ExtentServiceClient
-  - is_healthy(addr) — true if last_echo within 8s (4 × 2s ECHO_DURATION)
-  - background monitor_health loop: reconnects on stream error, logs transitions
+  Implemented F039 interim solution in autumn-rs/crates/server/src/bin/autumn_client.rs:
+  - lookup_key(): replaced O(n) linear scan with O(log n) partition_point() binary search
+    matching Go's sort.Search pattern (find first region with end_key > key)
+  - refresh_regions(): added contiguity validation loop after sort — warns on gaps
+    between adjacent region end_key/start_key (Go saveRegion lines 61-65)
+  - Cache-then-refresh-once pattern retained (no etcd watch — deferred)
+  - Thread safety skipped — ClusterClient is CLI-only, no concurrent access
 
-  Wired into StreamClient (client.rs):
-  - Removed per-instance extent_clients DashMap field
-  - Added pool: Arc<ConnPool> field
-  - connect() and new_with_revision() both accept pool: Arc<ConnPool>
-  - extent_client() delegates to pool.extent_client()
-  - is_extent_healthy() public helper added
-
-  Wired into PartitionServer (partition-server/src/lib.rs):
-  - Added pool: Arc<ConnPool> field
-  - connect_with_advertise() creates ConnPool, uses it for PM channel and StreamClient
-  - open_partition() passes self.pool.clone() to new_with_revision()
-  - Connection reduction: (P+2 + P*E) → (1 + E) channels
-
-  Connection reduction: previously each of P partitions had its own manager channel
-  and its own extent-node channel map. Now all share one Channel per address.
-
-  Updated all call sites:
-  - stream_cli.rs
-  - manager/tests/integration.rs (4 sites)
-  - manager/tests/etcd_stream_integration.rs
-  - manager/tests/append_benchmark.rs
+  Also committed separately: HTTP/2 tuning (adaptive window, keepalive),
+  fd limit bump via libc, release profile (LTO+codegen-units=1+panic=abort),
+  removed channels_per_ps (each wbench thread gets its own connection).
 
 All tests pass:
-  cargo test --workspace → all 43+ tests pass (0 failures)
+  cargo test --workspace → all tests pass (0 failures)
 
 Next steps:
-  Deploy to cluster and verify heartbeat health logs appear in production.
-  F039 (client-side partition routing via etcd watch) is the next logical P1 feature.
+  F035 (extent node WAL for small-write durability) — next P1 item not yet implemented.
