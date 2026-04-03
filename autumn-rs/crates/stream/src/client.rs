@@ -421,13 +421,29 @@ impl StreamClient {
             extent_lookup_elapsed += extent_lookup_started_at.elapsed();
 
             // Fan out to all replicas in parallel.
+            // For EC streams, encode the payload into per-shard byte slices first.
             let extent_id = tail.extent.extent_id;
+            let is_ec = !tail.extent.parity.is_empty();
+            let per_node_payloads: Vec<Bytes> = if is_ec {
+                let data_shards = tail.extent.replicates.len();
+                let parity_shards = tail.extent.parity.len();
+                match crate::erasure::ec_encode(&payload, data_shards, parity_shards) {
+                    Ok(shards) => shards.into_iter().map(Bytes::from).collect(),
+                    Err(e) => {
+                        return Err(anyhow!("EC encode failed: {e}"));
+                    }
+                }
+            } else {
+                vec![payload.clone(); clients.len()]
+            };
+
             let fanout_started_at = Instant::now();
             let handles: Vec<_> = clients
                 .into_iter()
-                .map(|(addr, mut client)| {
+                .enumerate()
+                .map(|(i, (addr, mut client))| {
                     let hdr = header.clone();
-                    let p = payload.clone(); // O(1) Bytes clone
+                    let p = per_node_payloads[i].clone(); // O(1) Bytes clone
                     tokio::spawn(async move {
                         let reqs = vec![
                             AppendRequest {
@@ -773,70 +789,145 @@ impl StreamClient {
         length: u32,
     ) -> Result<(Vec<u8>, u32)> {
         let ex = self.fetch_extent_info(extent_id).await?;
+
+        if !ex.parity.is_empty() {
+            return self.ec_read_from_extent(extent_id, offset, length, &ex).await;
+        }
+
         let addrs = self.replica_addrs_for_extent(&ex).await?;
 
         let mut last_err = anyhow!("no replicas for extent {}", extent_id);
         for addr in &addrs {
-            let mut stream = {
-                let mut client = self.extent_client(addr).await?;
-                match client
-                    .read_bytes(Request::new(ReadBytesRequest {
-                        extent_id,
-                        offset,
-                        length,
-                        eversion: 0,
-                    }))
-                    .await
-                {
-                    Ok(r) => r.into_inner(),
-                    Err(e) => {
-                        last_err = anyhow!(e);
-                        continue;
-                    }
+            match Self::read_shard_from_addr(addr, extent_id, offset, length, self.extent_client(addr).await?).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    last_err = e;
+                    self.extent_info_cache.remove(&extent_id);
                 }
-            };
+            }
+        }
+        Err(last_err)
+    }
 
-            let mut header: Option<ReadBytesResponseHeader> = None;
-            let mut payload = Vec::new();
-            let mut read_ok = true;
-            loop {
-                match stream.message().await {
-                    Ok(Some(msg)) => match msg.data {
-                        Some(read_bytes_response::Data::Header(h)) => {
-                            if h.code != Code::Ok as i32 {
-                                last_err = anyhow!("read_bytes error: {}", h.code_des);
-                                read_ok = false;
-                                break;
-                            }
-                            header = Some(h);
+    /// Read raw shard bytes from a single replica address.
+    async fn read_shard_from_addr(
+        addr: &str,
+        extent_id: u64,
+        offset: u32,
+        length: u32,
+        mut client: ExtentServiceClient<Channel>,
+    ) -> Result<(Vec<u8>, u32)> {
+        let mut stream = client
+            .read_bytes(Request::new(ReadBytesRequest {
+                extent_id,
+                offset,
+                length,
+                eversion: 0,
+            }))
+            .await
+            .map_err(|e| anyhow!(e))?
+            .into_inner();
+
+        let mut header: Option<ReadBytesResponseHeader> = None;
+        let mut payload = Vec::new();
+        loop {
+            match stream.message().await {
+                Ok(Some(msg)) => match msg.data {
+                    Some(read_bytes_response::Data::Header(h)) => {
+                        if h.code != Code::Ok as i32 {
+                            return Err(anyhow!("read_bytes error from {addr}: {}", h.code_des));
                         }
-                        Some(read_bytes_response::Data::Payload(p)) => {
-                            payload.extend_from_slice(&p);
-                        }
-                        None => {}
-                    },
-                    Ok(None) => break,
-                    Err(e) => {
-                        last_err = anyhow!(e);
-                        read_ok = false;
-                        break;
+                        header = Some(h);
                     }
-                }
+                    Some(read_bytes_response::Data::Payload(p)) => {
+                        payload.extend_from_slice(&p);
+                    }
+                    None => {}
+                },
+                Ok(None) => break,
+                Err(e) => return Err(anyhow!(e)),
             }
-            if !read_ok {
-                self.extent_info_cache.remove(&extent_id);
-                continue;
-            }
-            let header = match header {
-                Some(h) => h,
-                None => {
-                    last_err = anyhow!("read_bytes: missing header from {}", addr);
+        }
+        let h = header.ok_or_else(|| anyhow!("read_bytes: missing header from {addr}"))?;
+        Ok((payload, h.end))
+    }
+
+    /// EC-aware read: fire parallel reads to all shard nodes, collect data_shards
+    /// successful responses, decode to recover original payload.
+    ///
+    /// Parity shard reads are delayed 20ms (hedging) — only needed if a data shard
+    /// is slow or unavailable.
+    async fn ec_read_from_extent(
+        &self,
+        extent_id: u64,
+        offset: u32,
+        length: u32,
+        ex: &ExtentInfo,
+    ) -> Result<(Vec<u8>, u32)> {
+        let data_shards = ex.replicates.len();
+        let parity_shards = ex.parity.len();
+        let n = data_shards + parity_shards;
+
+        let addrs = self.replica_addrs_for_extent(ex).await?;
+        debug_assert_eq!(addrs.len(), n);
+
+        // Channel to collect (shard_index, Result<(shard_bytes, end)>) from all tasks.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, Result<(Vec<u8>, u32)>)>(n);
+
+        for (i, addr) in addrs.into_iter().enumerate() {
+            let tx = tx.clone();
+            let client = match self.extent_client(&addr).await {
+                Ok(c) => c,
+                Err(e) => {
+                    // Can't even get a client connection — report immediately.
+                    let _ = tx.send((i, Err(e))).await;
                     continue;
                 }
             };
-            return Ok((payload, header.end));
+            let delay = if i >= data_shards {
+                Duration::from_millis(20)
+            } else {
+                Duration::ZERO
+            };
+            tokio::spawn(async move {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                let result =
+                    Self::read_shard_from_addr(&addr, extent_id, offset, length, client).await;
+                let _ = tx.send((i, result)).await;
+            });
         }
-        Err(last_err)
+        drop(tx); // So rx.recv() returns None when all tasks finish.
+
+        let mut shard_data: Vec<Option<Vec<u8>>> = vec![None; n];
+        let mut end_val: Option<u32> = None;
+        let mut success = 0usize;
+        let mut last_err = anyhow!("no shard responses for extent {}", extent_id);
+
+        while let Some((idx, result)) = rx.recv().await {
+            match result {
+                Ok((data, end)) => {
+                    shard_data[idx] = Some(data);
+                    end_val = Some(end);
+                    success += 1;
+                    if success >= data_shards {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    last_err = e;
+                }
+            }
+        }
+
+        if success < data_shards {
+            return Err(last_err
+                .context(format!("only {success}/{data_shards} shards available for EC decode")));
+        }
+
+        let decoded = crate::erasure::ec_decode(shard_data, data_shards, parity_shards)?;
+        Ok((decoded, end_val.unwrap()))
     }
 
     /// Read all bytes from the last non-empty extent of the given stream.

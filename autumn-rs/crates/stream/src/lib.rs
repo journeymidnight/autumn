@@ -1,5 +1,6 @@
 pub mod client;
 pub mod conn_pool;
+pub mod erasure;
 pub mod extent_node;
 
 pub use client::{AppendResult, StreamClient};

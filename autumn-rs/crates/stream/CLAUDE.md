@@ -2,11 +2,12 @@
 
 ## Purpose
 
-Two distinct components in one crate:
+Three components in one crate:
 1. **`ExtentNode`** (`extent_node.rs`) — the server-side storage daemon that holds extents on local disk, implements `ExtentService` gRPC.
 2. **`StreamClient`** (`client.rs`) — the client library used by `PartitionServer` to read/write streams.
+3. **`erasure`** (`erasure.rs`) — Reed-Solomon EC codec (`ec_encode`, `ec_decode`, `ec_reconstruct_shard`), wrapping `reed-solomon-erasure` crate.
 
-Both are exported from `src/lib.rs`.
+All are exported from `src/lib.rs`.
 
 ---
 
@@ -115,16 +116,19 @@ append(stream_id, payload, must_sync):
   1. Acquire per-stream state lock (stream_states DashMap → Arc<Mutex<StreamAppendState>>)
   2. stream_tail: return cached tail, or load from manager
   3. current_commit: use cached commit or query commit_length on ALL replicas, take MINIMUM
-  4. Parallel fan-out to all replica addresses (tokio::spawn per replica):
-       - Send AppendRequest (header + payload)
-       - Collect results
+  4. If EC stream (parity.len() > 0): ec_encode(payload) → per-shard byte slices
+     If replication: per-shard payload = same payload for all nodes
+  5. Parallel fan-out to all replica/shard addresses (tokio::spawn per node):
+       - Each node receives its own shard bytes (or full payload for replication)
+       - Collect results (all shards have same byte length so offsets are consistent)
        - If any replica returns NotFound: alloc new extent, set as new tail, retry
        - If any replica returns error/mismatch: evict tail cache
            - First 2 retries: sleep 100ms, reload tail, retry same extent (or alloc new if sealed)
            - After 2 retries: unconditionally call alloc_new_extent(stream_id, 0) to seal the
              broken extent and get a new extent on healthy nodes; reset retry counter
-  5. If end >= max_extent_size: alloc_new_extent, cache new tail
-  6. Return AppendResult{extent_id, offset, end}
+  6. If end >= max_extent_size: alloc_new_extent, cache new tail
+  7. Return AppendResult{extent_id, offset, end}  ← shard-level offsets for EC, identical to
+     original offsets for replication since all shards have equal byte length
 ```
 
 **Parallel fan-out**: all replicas are written concurrently via `tokio::spawn`. Different stream IDs are fully concurrent; the same stream ID is serialized by the per-stream Mutex (required for commit protocol correctness).
@@ -150,7 +154,7 @@ All caches use `DashMap` for lock-free concurrent access.
 |--------|---------|
 | `append_batch(stream_id, blocks[], must_sync)` | Concatenate multiple blocks, single append |
 | `append_batch_repeated(stream_id, block, count, must_sync)` | Repeat one block N times |
-| `read_bytes_from_extent(extent_id, offset, length)` | Read from specific extent, try replicas in order |
+| `read_bytes_from_extent(extent_id, offset, length)` | Read from extent; replication: try replicas in order; EC: parallel shard reads with decode |
 | `read_last_extent_data(stream_id)` | Read last non-empty extent of a stream |
 | `punch_holes(stream_id, extent_ids[])` | GC: remove extents from stream |
 | `truncate(stream_id, extent_id)` | Remove all extents before extent_id |
@@ -171,3 +175,9 @@ All caches use `DashMap` for lock-free concurrent access.
 4. **`must_sync` cost** — triggers `sync_all()` on all replicas sequentially. Only set for records that require guaranteed durability (e.g., WAL entries). SSTable data doesn't need `must_sync` since replication provides durability.
 
 5. **StreamClient is not `Clone` without `Arc`** — it holds `&mut` access to internal caches. Wrap in `Arc<Mutex<StreamClient>>` when sharing across tasks (as `PartitionServer` does).
+
+6. **EC vs replication compatibility** — EC is a per-stream property. `log_stream` (value log with VP sub-range reads) must use replication (`parity_shard=0`). `row_stream` and `meta_stream` are suitable for EC since each SSTable/checkpoint is one append read back in full.
+
+7. **EC offset semantics** — In EC mode, `AppendResult.offset/end` are shard-level byte offsets. Each shard has `shard_size(payload_len, data_shards)` bytes. Upper layers treat these as opaque — they pass them unchanged to `read_bytes_from_extent`. The EC read path handles the decode transparently.
+
+8. **EC shard index = position in replicates++parity** — `replica_addrs_from_cache` chains `replicates` then `parity` node IDs. Shard index `i` corresponds to address `i` in this combined list. The encode output shard `i` is sent to the `i`-th node. The recovery `replacing_index` uses the same ordering.

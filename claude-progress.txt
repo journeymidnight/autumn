@@ -1,25 +1,56 @@
-Date: 2026-04-02
+Date: 2026-04-03
 TaskStatus: completed
-Task scope: F041 — perf-check benchmark with regression warning
+Task scope: F012 — Erasure coding parity with Go implementation
 
 Current summary:
-  F039 (binary search routing) and F041 (perf-check) both implemented in
-  autumn-rs/crates/server/src/bin/autumn_client.rs.
+  F012 (erasure coding) fully implemented in autumn-rs.
 
-  F039:
-  - lookup_key(): O(log n) partition_point() binary search (Go sort.Search pattern)
-  - refresh_regions(): contiguity validation with eprintln! warning on gaps
+  New erasure.rs module (autumn-rs/crates/stream/src/erasure.rs):
+  - ec_encode(payload, data_shards, parity_shards) -> Vec<Vec<u8>>
+    Same formula as Go: per_shard = (size+data_shards+4-1)/data_shards, min 4
+    Length trailer: big-endian u32 at last 4 bytes of last data shard
+  - ec_decode(shards, data_shards, parity_shards) -> Vec<u8>
+    Uses reconstruct_data() for missing shard recovery, reads length from trailer
+  - ec_reconstruct_shard(shards, data_shards, parity_shards, missing_index) -> Vec<u8>
+    For recovery: reconstructs exactly the shard bytes the failed node held
+  - Crate: reed-solomon-erasure = "6" (pure Rust, SIMD)
 
-  F041 (perf-check subcommand):
-  - Write phase: same loop as wbench, keys prefixed pc_
-  - Read phase: same loop as rbench, uses written keys
-  - PerfBaseline struct persisted to perf_baseline.json
-  - Comparison: warn+exit(2) if ops/sec < baseline*threshold or p99 > baseline*(2-threshold)
-  - --update-baseline flag saves current results as new baseline
-  - --threshold (default 0.8), --duration (default 5s), --threads (default 4)
+  StreamClient write path (append_payload):
+  - Checks parity.is_empty() to detect EC mode
+  - If EC: ec_encode → per-node shard payloads; fan-out indexed by shard position
+  - If replication: same payload to all nodes (unchanged)
+  - All shards have equal byte length → offsets consistent across nodes
+
+  StreamClient read path (read_bytes_from_extent):
+  - If EC: parallel reads to all data+parity nodes, parity reads delayed 20ms
+  - Wait for data_shards successes, then ec_decode → original payload
+  - If replication: existing sequential fallback (unchanged)
+
+  ExtentNode recovery (run_recovery_task):
+  - If replication: existing full-copy path (unchanged)
+  - If EC: copies individual shards from healthy peers (data_shards needed)
+    Calls ec_reconstruct_shard to rebuild the missing shard
+    Writes reconstructed shard to local extent file
 
 All tests pass:
   cargo test --workspace → all tests pass (0 failures)
+  - 10 erasure unit tests (erasure::tests)
+  - 4 EC integration tests (manager/tests/ec_integration.rs):
+    f012_ec_write_read_roundtrip
+    f012_ec_multiple_appends
+    f012_ec_large_payload
+    f012_replication_still_works (regression check)
+
+Files changed:
+  autumn-rs/crates/stream/Cargo.toml (added reed-solomon-erasure)
+  autumn-rs/crates/stream/src/lib.rs (registered erasure module)
+  autumn-rs/crates/stream/src/erasure.rs (NEW)
+  autumn-rs/crates/stream/src/client.rs (EC write + read paths)
+  autumn-rs/crates/stream/src/extent_node.rs (EC recovery)
+  autumn-rs/crates/manager/tests/ec_integration.rs (NEW integration tests)
+  autumn-rs/crates/stream/CLAUDE.md (updated)
+  feature_list.md (F012 passes: true)
 
 Next steps:
   F035 (extent node WAL for small-write durability) — next P1 item not yet implemented.
+  F019 (partition manager complete implementation) — P2.

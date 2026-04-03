@@ -422,13 +422,21 @@ impl ExtentNode {
 
     async fn run_recovery_task(&self, task: RecoveryTask) -> Result<RecoveryTaskStatus, Status> {
         let extent_info = self.resolve_recovery_extent(&task).await?;
-        let payload = self
-            .fetch_full_extent_from_sources(&extent_info, &[task.node_id, task.replace_id])
-            .await?;
-        let payload = if extent_info.sealed_length > 0 {
-            payload[..(extent_info.sealed_length as usize)].to_vec()
+
+        let payload = if extent_info.parity.is_empty() {
+            // Replication recovery: copy full extent from any healthy peer.
+            let raw = self
+                .fetch_full_extent_from_sources(&extent_info, &[task.node_id, task.replace_id])
+                .await?;
+            if extent_info.sealed_length > 0 {
+                raw[..(extent_info.sealed_length as usize)].to_vec()
+            } else {
+                raw
+            }
         } else {
-            payload
+            // EC recovery: read individual shards from healthy peers and reconstruct
+            // the missing shard for this node's slot in the extent.
+            self.run_ec_recovery_payload(&task, &extent_info).await?
         };
 
         let extent = self.ensure_extent(task.extent_id).await?;
@@ -464,6 +472,87 @@ impl ExtentNode {
             task: Some(task),
             ready_disk_id: self.disk_id,
         })
+    }
+
+    /// For an EC extent: copy one shard from each of the `data_shards` healthy peers,
+    /// then reconstruct the shard that belongs to the recovering node's slot.
+    async fn run_ec_recovery_payload(
+        &self,
+        task: &RecoveryTask,
+        extent_info: &ExtentInfo,
+    ) -> Result<Vec<u8>, Status> {
+        let data_shards = extent_info.replicates.len();
+        let parity_shards = extent_info.parity.len();
+        let n = data_shards + parity_shards;
+
+        // Build ordered list of all node IDs (data shards first, then parity shards).
+        let all_node_ids: Vec<u64> = extent_info
+            .replicates
+            .iter()
+            .chain(extent_info.parity.iter())
+            .copied()
+            .collect();
+
+        // Determine which shard index this recovery is rebuilding.
+        // `replace_id` is the failed node that needs to be replaced.
+        let replacing_index = all_node_ids
+            .iter()
+            .position(|&id| id == task.replace_id)
+            .ok_or_else(|| {
+                Status::internal(format!(
+                    "replace_id {} not found in extent {} node list",
+                    task.replace_id, task.extent_id
+                ))
+            })?;
+
+        let nodes = self.nodes_map_from_manager().await?;
+
+        // Copy the shard stored at each peer into the corresponding slot.
+        // Skip the failed node (replace_id) and ourselves (node_id / disk_id).
+        let mut shards: Vec<Option<Vec<u8>>> = vec![None; n];
+        let mut collected = 0usize;
+
+        for (i, &node_id) in all_node_ids.iter().enumerate() {
+            if i == replacing_index {
+                // This is the missing shard slot — leave as None.
+                continue;
+            }
+            if node_id == task.node_id {
+                // Skip ourselves.
+                continue;
+            }
+            let Some(addr) = nodes.get(&node_id) else {
+                continue;
+            };
+            match Self::copy_bytes_from_source(addr, task.extent_id, extent_info.eversion).await {
+                Ok(shard_bytes) => {
+                    // Trim to sealed length if the extent is sealed.
+                    let shard = if extent_info.sealed_length > 0
+                        && shard_bytes.len() > extent_info.sealed_length as usize
+                    {
+                        shard_bytes[..extent_info.sealed_length as usize].to_vec()
+                    } else {
+                        shard_bytes
+                    };
+                    shards[i] = Some(shard);
+                    collected += 1;
+                    if collected >= data_shards {
+                        break; // Enough shards to reconstruct.
+                    }
+                }
+                Err(_) => continue, // Unavailable peer — try next.
+            }
+        }
+
+        if collected < data_shards {
+            return Err(Status::failed_precondition(format!(
+                "EC recovery: only {collected}/{data_shards} shards available for extent {}",
+                task.extent_id
+            )));
+        }
+
+        crate::erasure::ec_reconstruct_shard(shards, data_shards, parity_shards, replacing_index)
+            .map_err(|e| Status::internal(format!("EC reconstruct failed: {e}")))
     }
 }
 

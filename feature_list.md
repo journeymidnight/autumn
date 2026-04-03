@@ -145,8 +145,8 @@
 ### F012 · Erasure coding parity with Go implementation
 - **Target:** EC encode/decode/recovery path equivalent to Go `erasure_code` package (Reed-Solomon, K-of-N recovery).
 - **Evidence:** `erasure_code/*.go` · `autumn-rs/crates/stream/src/*`
-- **Notes:** No Rust EC module yet. Go uses `klauspost/reedsolomon`. Consider `reed-solomon-erasure` crate.
-- **passes:** false
+- **Notes:** Implemented. New `erasure.rs` module wraps `reed-solomon-erasure` crate with Go-compatible API: `ec_encode`/`ec_decode`/`ec_reconstruct_shard`. Same shard-size formula and big-endian u32 length trailer as Go. `StreamClient.append_payload`: EC streams encode payload → per-shard bytes before fan-out; all shards equal length so offsets stay consistent. `read_bytes_from_extent`: EC branch fires parallel shard reads with 20ms parity hedging, decodes via `ec_decode`. `ExtentNode.run_recovery_task`: branches on EC — copies individual shards from peers, reconstructs missing shard via `ec_reconstruct_shard`. 10 unit tests + 4 integration tests pass.
+- **passes:** true
 
 ### F019 · Partition Manager complete implementation
 - **Target:** Partition allocation policy, PS load tracking, region assignment/rebalancing, etcd region watch. Equivalent to Go `manager/partition_manager`.
