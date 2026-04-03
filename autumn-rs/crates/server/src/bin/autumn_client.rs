@@ -658,7 +658,6 @@ fn parse_args() -> Args {
             let mut baseline_file = "perf_baseline.json".to_string();
             let mut threshold = 0.8f64;
             let mut update_baseline = false;
-            i += 1;
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--threads" | "-t" => {

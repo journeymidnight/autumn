@@ -1,0 +1,2 @@
+# Override root *.json exclusion for tracked config files
+!perf_baseline.json
