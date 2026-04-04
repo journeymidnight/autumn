@@ -293,8 +293,8 @@ async fn cmd_stream_info(manager: &str, stream_id: u64) -> Result<()> {
     for eid in &stream.extent_ids {
         if let Some(ex) = resp.extents.get(eid) {
             println!(
-                "  extent {}  replicates={:?}  eversion={}  sealed_length={}",
-                ex.extent_id, ex.replicates, ex.eversion, ex.sealed_length
+                "  extent {}  replicates={:?}  parity={:?}  eversion={}  sealed_length={}",
+                ex.extent_id, ex.replicates, ex.parity, ex.eversion, ex.sealed_length
             );
         }
     }
