@@ -2,10 +2,11 @@
 
 ## Purpose
 
-Three components in one crate:
+Four components in one crate:
 1. **`ExtentNode`** (`extent_node.rs`) — the server-side storage daemon that holds extents on local disk, implements `ExtentService` gRPC.
 2. **`StreamClient`** (`client.rs`) — the client library used by `PartitionServer` to read/write streams.
 3. **`erasure`** (`erasure.rs`) — Reed-Solomon EC codec (`ec_encode`, `ec_decode`, `ec_reconstruct_shard`), wrapping `reed-solomon-erasure` crate.
+4. **`wal`** (`wal.rs`) — Extent node WAL for small-write durability (F035).
 
 All are exported from `src/lib.rs`.
 
@@ -59,16 +60,33 @@ Append(stream of AppendRequest):
        - If local file len > header.commit: TRUNCATE file to header.commit
          (rolls back divergent writes from previous failed leader)
   7. Collect payload chunks from stream
-  8. Write payload at current end, advance len
-  9. If must_sync: sync_all()
-  10. Return (offset=commit, end=commit+payload_len)
+  8. Write payload:
+       - WAL path (must_sync=true AND payload ≤ 2MB AND WAL enabled):
+           tokio::join!(wal.write(record), file.write_at(start, payload))
+           WAL is synced; extent file write is async (no sync_all needed)
+       - Direct path (large payload or must_sync=false or WAL disabled):
+           file.write_at(start, payload)
+           if must_sync: file.sync_all()
+  9. Advance extent.len
+  10. Return (offset=start, end=start+payload_len)
 ```
 
-Step 6 (commit-based truncation) is the key to consistency: it effectively replaces a traditional WAL by using the data files themselves as journals.
+Step 6 (commit-based truncation) is the key to consistency: it effectively replaces a traditional WAL by using the data files themselves as journals. The per-extent WAL (F035) adds an extra durability layer specifically for small must_sync writes, reducing latency by making sequential WAL sync cheaper than random extent sync.
+
+### WAL (wal.rs)
+
+Small must_sync writes (≤ 2MB) use the WAL for lower-latency durability:
+
+- **Format**: Pebble/LevelDB-style 128KB block framing. Each chunk has a 9-byte header: `[CRC32C: 4B][len: 4B][type: 1B]`. Chunk types: FULL=1, FIRST=2, MIDDLE=3, LAST=4.
+- **Record**: `[uvarint extent_id][uvarint start][i64 revision][uvarint payload_len][payload]`
+- **Async writes**: `Wal` holds a tokio mpsc channel; a background task serializes all disk writes and `sync_all()`.
+- **Rotation**: at 250MB; old WAL files are kept for replay then deleted.
+- **Startup replay**: `replay_wal_files()` called in `ExtentNode::new()` after `load_extents()`. Each record is written back to the extent file at `record.start`; idempotent if extent already has the data.
+- **Config**: `ExtentNodeConfig::with_wal_dir(PathBuf)`. Binary defaults to `data_dir/wal/`.
 
 ### Commit Protocol Explained
 
-The `StreamClient` computes `commit = min(commit_length on all replicas)` before each append. Any replica that got ahead (e.g., partially acknowledged data before a crash) is truncated back to the consensus point on the next append. No separate WAL exists in the stream layer.
+The `StreamClient` computes `commit = min(commit_length on all replicas)` before each append. Any replica that got ahead (e.g., partially acknowledged data before a crash) is truncated back to the consensus point on the next append. The WAL provides per-node durability on top of this protocol.
 
 ### Recovery (`require_recovery` RPC)
 
@@ -172,7 +190,7 @@ All caches use `DashMap` for lock-free concurrent access.
 
 3. **Sequential fan-out latency** — for a 3-replica stream, each append sends 3 sequential RPCs. If adding parallelism here, the offset-consistency check must be preserved.
 
-4. **`must_sync` cost** — triggers `sync_all()` on all replicas sequentially. Only set for records that require guaranteed durability (e.g., WAL entries). SSTable data doesn't need `must_sync` since replication provides durability.
+4. **`must_sync` cost** — for small payloads (≤ 2MB) with WAL enabled, triggers parallel WAL sync + async extent write; the WAL sequential write is faster than random `sync_all()` on the extent file. For large payloads or WAL-disabled nodes, falls back to `sync_all()` on the extent file. Only set for records requiring guaranteed durability (e.g., partition WAL entries). SSTable data doesn't need `must_sync` since replication provides durability.
 
 5. **StreamClient is not `Clone` without `Arc`** — it holds `&mut` access to internal caches. Wrap in `Arc<Mutex<StreamClient>>` when sharing across tasks (as `PartitionServer` does).
 

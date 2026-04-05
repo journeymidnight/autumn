@@ -173,5 +173,5 @@ cargo test --workspace
 - `crossbeam-skiplist`: concurrent ordered memtable
 - `etcd-client`: manager leader election + metadata persistence
 - `dashmap`: concurrent hash map (ExtentNode extent registry)
-- `xxhash-rust` + `crc32c`: bloom filter hashing + block checksums
+- `xxhash-rust` + `crc32c`: bloom filter hashing + block checksums (also WAL chunk CRC)
 - `tokio`: async runtime throughout
