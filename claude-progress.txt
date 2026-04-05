@@ -1,56 +1,37 @@
-Date: 2026-04-03
+Date: 2026-04-04
 TaskStatus: completed
-Task scope: F012 — Erasure coding parity with Go implementation
+Task scope: F035 — Extent node WAL for small-write durability
 
 Current summary:
-  F012 (erasure coding) fully implemented in autumn-rs.
+  WAL fully implemented for the extent node. Small must_sync writes (≤2MB)
+  now go through a WAL for lower latency: WAL is synced, extent file write
+  happens in parallel without sync_all(). On startup, old WAL files are
+  replayed into extent files before accepting new connections.
 
-  New erasure.rs module (autumn-rs/crates/stream/src/erasure.rs):
-  - ec_encode(payload, data_shards, parity_shards) -> Vec<Vec<u8>>
-    Same formula as Go: per_shard = (size+data_shards+4-1)/data_shards, min 4
-    Length trailer: big-endian u32 at last 4 bytes of last data shard
-  - ec_decode(shards, data_shards, parity_shards) -> Vec<u8>
-    Uses reconstruct_data() for missing shard recovery, reads length from trailer
-  - ec_reconstruct_shard(shards, data_shards, parity_shards, missing_index) -> Vec<u8>
-    For recovery: reconstructs exactly the shard bytes the failed node held
-  - Crate: reed-solomon-erasure = "6" (pure Rust, SIMD)
+  Key changes:
+  - crates/stream/src/wal.rs (new): Pebble/LevelDB-style 128KB block framing,
+    9-byte CRC32C headers (FULL/FIRST/MIDDLE/LAST), async Wal via tokio mpsc,
+    WalRecord encode/decode, replay_wal_files, should_use_wal(must_sync, len).
+  - crates/stream/src/lib.rs: pub mod wal added.
+  - crates/stream/Cargo.toml: crc32c.workspace = true added.
+  - crates/stream/src/extent_node.rs:
+      ExtentNodeConfig::wal_dir + with_wal_dir() builder;
+      ExtentNode::wal: Option<Wal> field;
+      new(): Wal::open() → replay_wal() → cleanup_old_wals();
+      replay_wal(): writes each WAL record to extent file, advances len;
+      append(): WAL path with tokio::join!(wal.write, file.write_at) when
+        should_use_wal; falls back to direct sync for large writes.
+  - crates/server/src/bin/extent_node.rs: WAL enabled at data_dir/wal.
+  - crates/stream/tests/wal_recovery.rs (new): 3 integration tests.
 
-  StreamClient write path (append_payload):
-  - Checks parity.is_empty() to detect EC mode
-  - If EC: ec_encode → per-node shard payloads; fan-out indexed by shard position
-  - If replication: same payload to all nodes (unchanged)
-  - All shards have equal byte length → offsets consistent across nodes
+  All tests pass: 17 stream unit tests, 5 stream integration tests (including
+  3 new WAL recovery tests), 13 manager integration tests, 4 EC integration tests.
 
-  StreamClient read path (read_bytes_from_extent):
-  - If EC: parallel reads to all data+parity nodes, parity reads delayed 20ms
-  - Wait for data_shards successes, then ec_decode → original payload
-  - If replication: existing sequential fallback (unchanged)
-
-  ExtentNode recovery (run_recovery_task):
-  - If replication: existing full-copy path (unchanged)
-  - If EC: copies individual shards from healthy peers (data_shards needed)
-    Calls ec_reconstruct_shard to rebuild the missing shard
-    Writes reconstructed shard to local extent file
-
-All tests pass:
-  cargo test --workspace → all tests pass (0 failures)
-  - 10 erasure unit tests (erasure::tests)
-  - 4 EC integration tests (manager/tests/ec_integration.rs):
-    f012_ec_write_read_roundtrip
-    f012_ec_multiple_appends
-    f012_ec_large_payload
-    f012_replication_still_works (regression check)
-
-Files changed:
-  autumn-rs/crates/stream/Cargo.toml (added reed-solomon-erasure)
-  autumn-rs/crates/stream/src/lib.rs (registered erasure module)
-  autumn-rs/crates/stream/src/erasure.rs (NEW)
-  autumn-rs/crates/stream/src/client.rs (EC write + read paths)
-  autumn-rs/crates/stream/src/extent_node.rs (EC recovery)
-  autumn-rs/crates/manager/tests/ec_integration.rs (NEW integration tests)
-  autumn-rs/crates/stream/CLAUDE.md (updated)
-  feature_list.md (F012 passes: true)
+Main gaps:
+  F019 (partition manager allocation policy) - not implemented
+  F021 (multi-disk support) - not implemented
 
 Next steps:
-  F035 (extent node WAL for small-write durability) — next P1 item not yet implemented.
-  F019 (partition manager complete implementation) — P2.
+  F019 — Partition manager allocation policy (node scoring, rebalancing)
+  or
+  F021 — Multi-disk support (multiple data dirs per extent node)

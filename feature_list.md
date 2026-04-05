@@ -99,8 +99,8 @@
 ### F035 · Extent node WAL for small-write durability
 - **Target:** Rotating WAL (250MB max) with record framing (4KB block-aligned). MustSync small writes (<2MB) go to WAL(sync) + extent(async) in parallel.
 - **Evidence:** `extent/wal/wal.go` · `extent/record/record_writer.go` · `autumn-rs/crates/stream/src/extent_node.rs`
-- **Notes:** Go: small MustSync writes use WAL for latency; large/non-sync writes skip WAL. Rust writes directly to extent file.
-- **passes:** false
+- **Notes:** Implemented. Pebble/LevelDB-style 128KB block framing with 9-byte CRC32C chunk headers (FULL/FIRST/MIDDLE/LAST chunk types). Async Wal struct with tokio mpsc channel background task. Rotation at 250MB. WAL replay on startup after load_extents(). should_use_wal(must_sync, payload_len) gates the WAL path. WAL+extent writes are parallel (tokio::join!); only WAL is synced, extent file skips sync_all(). ExtentNodeConfig::with_wal_dir() enables WAL. Binary defaults to data_dir/wal. 8 unit tests + 3 integration tests (replay recovery, large write bypass, multiple appends) all pass.
+- **passes:** true
 
 ### F037 · Partition split with overlap detection and major compaction
 - **Target:** Split requires major compaction to clear overlapping keys before split is safe. hasOverlap flag blocks split until compaction completes.

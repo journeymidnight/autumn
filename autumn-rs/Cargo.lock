@@ -190,6 +190,7 @@ dependencies = [
  "autumn-manager",
  "autumn-proto",
  "bytes",
+ "crc32c",
  "dashmap",
  "futures",
  "reed-solomon-erasure",

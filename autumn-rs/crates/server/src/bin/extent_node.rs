@@ -65,7 +65,9 @@ async fn main() -> Result<()> {
         .parse()
         .context("parse listen address")?;
 
-    let mut config = ExtentNodeConfig::new(args.data.clone(), IoMode::Standard, args.disk_id);
+    let wal_dir = args.data.join("wal");
+    let mut config = ExtentNodeConfig::new(args.data.clone(), IoMode::Standard, args.disk_id)
+        .with_wal_dir(wal_dir);
     if let Some(mgr) = args.manager {
         config = config.with_manager_endpoint(mgr);
     }

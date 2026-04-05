@@ -2,6 +2,7 @@ pub mod client;
 pub mod conn_pool;
 pub mod erasure;
 pub mod extent_node;
+pub mod wal;
 
 pub use client::{AppendResult, StreamClient};
 pub use conn_pool::{normalize_endpoint, ConnPool};

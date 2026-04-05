@@ -5,6 +5,8 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::wal::{replay_wal_files, should_use_wal, Wal, WalRecord};
+
 use anyhow::Result;
 use autumn_io_engine::{build_engine, Bytes, IoEngine, IoFile, IoMode};
 use autumn_proto::autumn::extent_service_client::ExtentServiceClient;
@@ -31,6 +33,8 @@ pub struct ExtentNodeConfig {
     pub io_mode: IoMode,
     pub disk_id: u64,
     pub manager_endpoint: Option<String>,
+    /// If Some, WAL is enabled at this directory.
+    pub wal_dir: Option<PathBuf>,
 }
 
 impl ExtentNodeConfig {
@@ -40,11 +44,17 @@ impl ExtentNodeConfig {
             io_mode,
             disk_id,
             manager_endpoint: None,
+            wal_dir: None,
         }
     }
 
     pub fn with_manager_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.manager_endpoint = Some(endpoint.into());
+        self
+    }
+
+    pub fn with_wal_dir(mut self, wal_dir: PathBuf) -> Self {
+        self.wal_dir = Some(wal_dir);
         self
     }
 }
@@ -69,6 +79,8 @@ pub struct ExtentNode {
     manager_channel: Arc<OnceCell<tonic::transport::Channel>>,
     recovery_done: Arc<Mutex<Vec<RecoveryTaskStatus>>>,
     recovery_inflight: Arc<DashMap<u64, RecoveryTask>>,
+    /// WAL for small must_sync writes. None if WAL is disabled.
+    wal: Option<Wal>,
 }
 
 impl ExtentNode {
@@ -77,6 +89,14 @@ impl ExtentNode {
 
     pub async fn new(config: ExtentNodeConfig) -> Result<Self> {
         tokio::fs::create_dir_all(&config.data_dir).await?;
+
+        // Open WAL before loading extents so we can replay into freshly loaded files.
+        let wal_result = if let Some(wal_dir) = config.wal_dir {
+            Some(Wal::open(wal_dir)?)
+        } else {
+            None
+        };
+
         let node = Self {
             extents: Arc::new(DashMap::new()),
             io: build_engine(config.io_mode)?,
@@ -86,9 +106,63 @@ impl ExtentNode {
             manager_channel: Arc::new(OnceCell::new()),
             recovery_done: Arc::new(Mutex::new(Vec::new())),
             recovery_inflight: Arc::new(DashMap::new()),
+            wal: wal_result.as_ref().map(|(w, _)| w.clone()),
         };
+
+        // Load existing extents from disk.
         node.load_extents().await?;
+
+        // Replay WAL records into extent files.
+        if let Some((wal, replay_files)) = wal_result {
+            node.replay_wal(&replay_files).await;
+            wal.cleanup_old_wals().await;
+        }
+
         Ok(node)
+    }
+
+    /// Replay WAL records into extent files. Called on startup after load_extents().
+    async fn replay_wal(&self, replay_files: &[std::path::PathBuf]) {
+        let mut records = Vec::new();
+        replay_wal_files(replay_files, |rec| records.push(rec));
+
+        for rec in records {
+            let extent = match self.ensure_extent(rec.extent_id).await {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        "WAL replay: cannot get extent {}: {}",
+                        rec.extent_id,
+                        e.message()
+                    );
+                    continue;
+                }
+            };
+
+            let start = rec.start as u64;
+            let payload_len = rec.payload.len() as u64;
+            let end = start + payload_len;
+
+            // Write is idempotent: if extent file already has this data, we just overwrite.
+            if let Err(e) = extent
+                .file
+                .write_at(start, bytes::Bytes::from(rec.payload))
+                .await
+            {
+                tracing::warn!("WAL replay: write_at failed for extent {}: {e}", rec.extent_id);
+                continue;
+            }
+
+            // Advance len if needed.
+            let _ = extent.len.fetch_max(end, Ordering::SeqCst);
+
+            tracing::debug!(
+                "WAL replay: extent {} start={} len={}",
+                rec.extent_id,
+                start,
+                payload_len
+            );
+        }
     }
 
     fn extent_path(&self, extent_id: u64) -> PathBuf {
@@ -743,17 +817,48 @@ impl ExtentService for ExtentNode {
             start = extent.len.load(Ordering::SeqCst);
         }
 
-        extent
-            .file
-            .write_at(start, payload.clone())
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        if header.must_sync {
+        if let Some(wal) = &self.wal {
+            if should_use_wal(header.must_sync, payload.len()) {
+                // Fast path: WAL sync + extent write in parallel. The WAL is the
+                // durability source; the extent file doesn't need sync_all().
+                let wal_record = WalRecord {
+                    extent_id: header.extent_id,
+                    start: start as u32,
+                    revision: header.revision,
+                    payload: payload.to_vec(),
+                };
+                let wal_fut = wal.write(wal_record);
+                let file_fut = extent.file.write_at(start, payload.clone());
+                let (wal_res, file_res) = tokio::join!(wal_fut, file_fut);
+                wal_res.map_err(|e| Status::internal(e.to_string()))?;
+                file_res.map_err(|e| Status::internal(e.to_string()))?;
+            } else {
+                extent
+                    .file
+                    .write_at(start, payload.clone())
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                if header.must_sync {
+                    extent
+                        .file
+                        .sync_all()
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                }
+            }
+        } else {
             extent
                 .file
-                .sync_all()
+                .write_at(start, payload.clone())
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?;
+            if header.must_sync {
+                extent
+                    .file
+                    .sync_all()
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+            }
         }
 
         let start_offset = start as u32;
