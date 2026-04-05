@@ -126,6 +126,9 @@ impl ExtentNode {
         let mut records = Vec::new();
         replay_wal_files(replay_files, |rec| records.push(rec));
 
+        let mut replayed_extents: std::collections::HashSet<u64> =
+            std::collections::HashSet::new();
+
         for rec in records {
             let extent = match self.ensure_extent(rec.extent_id).await {
                 Ok(e) => e,
@@ -156,12 +159,29 @@ impl ExtentNode {
             // Advance len if needed.
             let _ = extent.len.fetch_max(end, Ordering::SeqCst);
 
+            // Restore last_revision: take max so stale clients are still rejected after restart.
+            let _ = extent.last_revision.fetch_max(rec.revision, Ordering::SeqCst);
+
+            replayed_extents.insert(rec.extent_id);
+
             tracing::debug!(
                 "WAL replay: extent {} start={} len={}",
                 rec.extent_id,
                 start,
                 payload_len
             );
+        }
+
+        // Persist updated metadata (including last_revision) for every replayed extent so that
+        // the on-disk .meta file reflects the recovered revision before we start serving traffic.
+        for extent_id in replayed_extents {
+            if let Some(entry) = self.extents.get(&extent_id) {
+                if let Err(e) = self.save_meta(extent_id, &entry).await {
+                    tracing::warn!(
+                        "WAL replay: save_meta failed for extent {extent_id}: {e:?}"
+                    );
+                }
+            }
         }
     }
 

@@ -341,7 +341,7 @@ impl WalInner {
                 dir: dir.to_path_buf(),
                 writer: RecordWriter::new(file),
                 current_id: next_id,
-                old_wals: Vec::new(),
+                old_wals: old_wals.clone(), // populated so cleanup_old_wals() actually deletes them
             },
             old_wals,
         ))
