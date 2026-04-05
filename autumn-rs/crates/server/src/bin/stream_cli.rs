@@ -46,8 +46,9 @@ enum Sub {
         disks: Vec<String>,
     },
     CreateStream {
-        data_shard: u32,
-        parity_shard: u32,
+        replicates: u32,
+        ec_data_shard: u32,
+        ec_parity_shard: u32,
     },
     StreamInfo {
         stream_id: u64,
@@ -114,18 +115,21 @@ fn parse_args() -> Result<Args> {
             Sub::RegisterNode { addr, disks }
         }
         "create-stream" => {
-            let mut data_shard = 1u32;
-            let mut parity_shard = 0u32;
+            let mut replicates = 3u32;
+            let mut ec_data_shard = 0u32;
+            let mut ec_parity_shard = 0u32;
             while let Some(tok) = it.next() {
                 match tok.as_str() {
-                    "--data-shard" => data_shard = it.next().context("needs value")?.parse()?,
-                    "--parity-shard" => parity_shard = it.next().context("needs value")?.parse()?,
+                    "--replicates" => replicates = it.next().context("needs value")?.parse()?,
+                    "--ec-data-shard" => ec_data_shard = it.next().context("needs value")?.parse()?,
+                    "--ec-parity-shard" => ec_parity_shard = it.next().context("needs value")?.parse()?,
                     other => return Err(anyhow!("unknown flag: {other}")),
                 }
             }
             Sub::CreateStream {
-                data_shard,
-                parity_shard,
+                replicates,
+                ec_data_shard,
+                ec_parity_shard,
             }
         }
         "stream-info" => {
@@ -256,12 +260,14 @@ async fn cmd_register_node(manager: &str, addr: String, disks: Vec<String>) -> R
     Ok(())
 }
 
-async fn cmd_create_stream(manager: &str, data_shard: u32, parity_shard: u32) -> Result<()> {
+async fn cmd_create_stream(manager: &str, replicates: u32, ec_data_shard: u32, ec_parity_shard: u32) -> Result<()> {
     let mut client = StreamManagerServiceClient::connect(normalize(manager)).await?;
     let resp = client
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard,
-            parity_shard,
+            replicates,
+            ec_data_shard,
+            ec_parity_shard,
+            ..Default::default()
         }))
         .await?
         .into_inner();
@@ -402,9 +408,10 @@ async fn main() -> Result<()> {
     match args.sub {
         Sub::RegisterNode { addr, disks } => cmd_register_node(&args.manager, addr, disks).await?,
         Sub::CreateStream {
-            data_shard,
-            parity_shard,
-        } => cmd_create_stream(&args.manager, data_shard, parity_shard).await?,
+            replicates,
+            ec_data_shard,
+            ec_parity_shard,
+        } => cmd_create_stream(&args.manager, replicates, ec_data_shard, ec_parity_shard).await?,
         Sub::StreamInfo { stream_id } => cmd_stream_info(&args.manager, stream_id).await?,
         Sub::Append {
             stream_id,

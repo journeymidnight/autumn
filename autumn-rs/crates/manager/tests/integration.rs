@@ -105,8 +105,8 @@ async fn stream_manager_alloc_and_truncate_flow() {
 
     let created = stream
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create stream")
@@ -208,8 +208,8 @@ async fn partition_server_put_get_and_split_flow() {
 
     let log_stream = stream
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create log stream")
@@ -220,8 +220,8 @@ async fn partition_server_put_get_and_split_flow() {
 
     let row_stream = stream
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create row stream")
@@ -232,8 +232,8 @@ async fn partition_server_put_get_and_split_flow() {
 
     let meta_stream = stream
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create meta stream")
@@ -391,8 +391,8 @@ async fn partition_server_recovery_replays_table_and_wal() {
 
     let log_stream = stream
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create log stream")
@@ -403,8 +403,8 @@ async fn partition_server_recovery_replays_table_and_wal() {
 
     let row_stream = stream
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create row stream")
@@ -415,8 +415,8 @@ async fn partition_server_recovery_replays_table_and_wal() {
 
     let meta_stream = stream
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create meta stream")
@@ -592,8 +592,8 @@ async fn stream_append_commit_punchhole_truncate_flow() {
 
     let created = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create stream")
@@ -697,8 +697,8 @@ async fn stream_append_and_read_blocks_flow() {
 
     let created = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create stream")
@@ -882,8 +882,8 @@ async fn f030_flush_writes_sst_to_row_stream() {
         .expect("connect sm");
     let log_stream = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create log stream")
@@ -893,8 +893,8 @@ async fn f030_flush_writes_sst_to_row_stream() {
         .stream_id;
     let row_stream = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create row stream")
@@ -904,8 +904,8 @@ async fn f030_flush_writes_sst_to_row_stream() {
         .stream_id;
     let meta_stream = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create meta stream")
@@ -1005,8 +1005,8 @@ async fn f030_recovery_from_meta_and_row_streams() {
         .expect("connect sm");
     let log_stream = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create log stream")
@@ -1016,8 +1016,8 @@ async fn f030_recovery_from_meta_and_row_streams() {
         .stream_id;
     let row_stream = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create row stream")
@@ -1027,8 +1027,8 @@ async fn f030_recovery_from_meta_and_row_streams() {
         .stream_id;
     let meta_stream = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create meta stream")
@@ -1150,8 +1150,8 @@ async fn f029_compaction_merges_small_tables() {
         .expect("connect sm");
     let log_stream = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create log stream")
@@ -1161,8 +1161,8 @@ async fn f029_compaction_merges_small_tables() {
         .stream_id;
     let row_stream = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create row stream")
@@ -1172,8 +1172,8 @@ async fn f029_compaction_merges_small_tables() {
         .stream_id;
     let meta_stream = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create meta stream")
@@ -1305,8 +1305,8 @@ async fn f031_large_value_stored_in_log_stream() {
         .expect("connect sm");
     let log_stream = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create log stream")
@@ -1316,8 +1316,8 @@ async fn f031_large_value_stored_in_log_stream() {
         .stream_id;
     let row_stream = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create row stream")
@@ -1327,8 +1327,8 @@ async fn f031_large_value_stored_in_log_stream() {
         .stream_id;
     let meta_stream = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create meta stream")
@@ -1436,8 +1436,8 @@ async fn f031_recovery_replays_log_stream() {
         .expect("connect sm");
     let log_stream = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create log stream")
@@ -1447,8 +1447,8 @@ async fn f031_recovery_replays_log_stream() {
         .stream_id;
     let row_stream = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create row stream")
@@ -1458,8 +1458,8 @@ async fn f031_recovery_replays_log_stream() {
         .stream_id;
     let meta_stream = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create meta stream")
@@ -1585,8 +1585,8 @@ async fn f031_compaction_preserves_value_pointers() {
         .expect("connect sm");
     let log_stream = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create log stream")
@@ -1596,8 +1596,8 @@ async fn f031_compaction_preserves_value_pointers() {
         .stream_id;
     let row_stream = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create row stream")
@@ -1607,8 +1607,8 @@ async fn f031_compaction_preserves_value_pointers() {
         .stream_id;
     let meta_stream = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create meta stream")
@@ -1706,8 +1706,8 @@ async fn f033_gc_reclaims_log_stream_extents() {
         .expect("connect sm");
     let log_stream = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create log stream")
@@ -1717,8 +1717,8 @@ async fn f033_gc_reclaims_log_stream_extents() {
         .stream_id;
     let row_stream = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create row stream")
@@ -1728,8 +1728,8 @@ async fn f033_gc_reclaims_log_stream_extents() {
         .stream_id;
     let meta_stream = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create meta stream")
@@ -1848,8 +1848,8 @@ async fn f037_overlap_detected_after_split_and_cleared_by_compaction() {
         .expect("connect sm");
     let log_stream = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create log stream")
@@ -1859,8 +1859,8 @@ async fn f037_overlap_detected_after_split_and_cleared_by_compaction() {
         .stream_id;
     let row_stream = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create row stream")
@@ -1870,8 +1870,8 @@ async fn f037_overlap_detected_after_split_and_cleared_by_compaction() {
         .stream_id;
     let meta_stream = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create meta stream")

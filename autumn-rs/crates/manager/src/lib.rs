@@ -18,10 +18,10 @@ use autumn_proto::autumn::stream_manager_service_server::{
 };
 use autumn_proto::autumn::{
     AcquireOwnerLockRequest, AcquireOwnerLockResponse, AllocExtentRequest,
-    CheckCommitLengthRequest, CheckCommitLengthResponse, Code, CreateStreamRequest,
-    CreateStreamResponse, DfRequest, Empty, ExtentInfo, ExtentInfoRequest, ExtentInfoResponse,
-    GetRegionsResponse, MultiModifySplitRequest, MultiModifySplitResponse, NodeInfo,
-    NodesInfoResponse, PsDetail, PunchHolesRequest, PunchHolesResponse, ReAvaliRequest,
+    CheckCommitLengthRequest, CheckCommitLengthResponse, Code, ConvertToEcRequest,
+    CreateStreamRequest, CreateStreamResponse, DfRequest, Empty, ExtentInfo, ExtentInfoRequest,
+    ExtentInfoResponse, GetRegionsResponse, MultiModifySplitRequest, MultiModifySplitResponse,
+    NodeInfo, NodesInfoResponse, PsDetail, PunchHolesRequest, PunchHolesResponse, ReAvaliRequest,
     RecoveryTask, RecoveryTaskStatus, RegionInfo, Regions, RegisterNodeRequest,
     RegisterNodeResponse, RegisterPsRequest, RegisterPsResponse, RequireRecoveryRequest,
     StatusResponse, StreamAllocExtentRequest, StreamAllocExtentResponse, StreamInfo,
@@ -98,6 +98,8 @@ pub struct AutumnManager {
     etcd: Option<EtcdMirror>,
     instance_id: String,
     recovery_tasks: Arc<Mutex<HashMap<u64, RecoveryTask>>>,
+    /// extent_ids currently being EC-converted (coordinator dispatched, not yet done).
+    ec_conversion_inflight: Arc<Mutex<HashSet<u64>>>,
     runtime_started: Arc<AtomicBool>,
 }
 
@@ -115,6 +117,7 @@ impl AutumnManager {
             etcd: None,
             instance_id: uuid::Uuid::new_v4().to_string(),
             recovery_tasks: Arc::new(Mutex::new(HashMap::new())),
+            ec_conversion_inflight: Arc::new(Mutex::new(HashSet::new())),
             runtime_started: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -162,6 +165,11 @@ impl AutumnManager {
         let mgr = self.clone();
         tokio::spawn(async move {
             mgr.recovery_collect_loop().await;
+        });
+
+        let mgr = self.clone();
+        tokio::spawn(async move {
+            mgr.ec_conversion_dispatch_loop().await;
         });
     }
 
@@ -525,6 +533,8 @@ impl AutumnManager {
         let mut dst = StreamInfo {
             stream_id: dst_stream_id,
             extent_ids: vec![],
+            ec_data_shard: src.ec_data_shard,
+            ec_parity_shard: src.ec_parity_shard,
         };
 
         for (idx, extent_id) in src.extent_ids.iter().enumerate() {
@@ -865,6 +875,219 @@ impl AutumnManager {
         }
     }
 
+    /// Background loop that converts sealed replicated extents to EC.
+    ///
+    /// Every 5 seconds, scans all extents. For each sealed extent that:
+    ///   - has no parity nodes yet (original_replicates == 0 → not yet converted)
+    ///   - belongs to a stream with ec_data_shard > 0
+    ///   - is not currently being converted
+    /// → dispatches ConvertToEc to one of the existing replica nodes (coordinator).
+    ///
+    /// If k+m > current replica count, allocates extra nodes before dispatching.
+    async fn ec_conversion_dispatch_loop(self) {
+        loop {
+            sleep(Duration::from_secs(5)).await;
+            if !self.leader.load(Ordering::SeqCst) {
+                continue;
+            }
+
+            // Collect (extent, stream) pairs that need EC conversion.
+            let candidates: Vec<(ExtentInfo, StreamInfo)> = {
+                let s = self.store.inner.read();
+                let mut out = Vec::new();
+                for stream in s.streams.values() {
+                    if stream.ec_data_shard == 0 {
+                        continue;
+                    }
+                    for &eid in &stream.extent_ids {
+                        if let Some(ex) = s.extents.get(&eid) {
+                            // Skip tail (unsealed) and already-converted extents.
+                            if ex.sealed_length == 0 || ex.original_replicates != 0 {
+                                continue;
+                            }
+                            out.push((ex.clone(), stream.clone()));
+                        }
+                    }
+                }
+                out
+            };
+
+            for (ex, stream) in candidates {
+                let extent_id = ex.extent_id;
+                let data_shards = stream.ec_data_shard as usize;
+                let parity_shards = stream.ec_parity_shard as usize;
+                let total_shards = data_shards + parity_shards;
+
+                // Skip if already inflight.
+                {
+                    let inflight = self.ec_conversion_inflight.lock().await;
+                    if inflight.contains(&extent_id) {
+                        continue;
+                    }
+                }
+
+                // Build target_addrs: reuse existing replicas first, add new if needed.
+                let mut target_nodes: Vec<u64> = ex.replicates.clone();
+                let mut target_addrs: Vec<String> = Vec::new();
+                let mut extra_disk_ids: Vec<u64> = Vec::new();
+
+                // Get addresses of existing replica nodes.
+                let node_addrs: HashMap<u64, String> = {
+                    let s = self.store.inner.read();
+                    s.nodes.iter().map(|(id, n)| (*id, n.address.clone())).collect()
+                };
+
+                for &nid in &target_nodes {
+                    if let Some(addr) = node_addrs.get(&nid) {
+                        target_addrs.push(addr.clone());
+                    } else {
+                        // Node unknown — skip this extent for now.
+                        target_addrs.clear();
+                        break;
+                    }
+                }
+                if target_addrs.is_empty() {
+                    continue;
+                }
+
+                // Allocate extra nodes if k+m > current replica count.
+                if total_shards > target_nodes.len() {
+                    let extra_needed = total_shards - target_nodes.len();
+                    let extra_candidates: Vec<_> = {
+                        let s = self.store.inner.read();
+                        // Pick nodes not already in target_nodes.
+                        let existing: HashSet<u64> = target_nodes.iter().copied().collect();
+                        s.nodes
+                            .values()
+                            .filter(|n| !existing.contains(&n.node_id))
+                            .take(extra_needed)
+                            .cloned()
+                            .collect()
+                    };
+                    if extra_candidates.len() < extra_needed {
+                        // Not enough nodes — skip until more nodes register.
+                        continue;
+                    }
+                    for node in &extra_candidates {
+                        match Self::alloc_extent_on_node(&node.address, extent_id).await {
+                            Ok(disk_id) => {
+                                target_nodes.push(node.node_id);
+                                target_addrs.push(node.address.clone());
+                                extra_disk_ids.push(disk_id);
+                            }
+                            Err(_) => {
+                                // Allocation failed — skip this extent.
+                                target_nodes.clear();
+                                break;
+                            }
+                        }
+                    }
+                    if target_nodes.len() < total_shards {
+                        continue;
+                    }
+                }
+
+                // Trim to exactly total_shards (in case we had more replicas than k+m).
+                target_nodes.truncate(total_shards);
+                target_addrs.truncate(total_shards);
+
+                // Mark inflight.
+                self.ec_conversion_inflight.lock().await.insert(extent_id);
+
+                // Dispatch ConvertToEc to the first replica (coordinator).
+                let coordinator_addr = target_addrs[0].clone();
+                let ec_target_addrs = target_addrs.clone();
+                let target_nodes_clone = target_nodes.clone();
+                let extra_disk_ids_clone = extra_disk_ids.clone();
+                let mgr = self.clone();
+                let orig_replica_count = ex.replicates.len() as u32;
+
+                tokio::spawn(async move {
+                    let result = async {
+                        let endpoint = Self::normalize_endpoint(&coordinator_addr);
+                        let mut client = ExtentServiceClient::connect(endpoint).await?;
+                        let resp = client
+                            .convert_to_ec(Request::new(ConvertToEcRequest {
+                                extent_id,
+                                data_shards: data_shards as u32,
+                                parity_shards: parity_shards as u32,
+                                target_addrs: ec_target_addrs,
+                            }))
+                            .await?
+                            .into_inner();
+                        if resp.code != Code::Ok as i32 {
+                            return Err(anyhow::anyhow!("ConvertToEc failed: {}", resp.code_des));
+                        }
+                        Ok(())
+                    }
+                    .await;
+
+                    // Remove from inflight regardless of success/failure.
+                    mgr.ec_conversion_inflight.lock().await.remove(&extent_id);
+
+                    if let Err(e) = result {
+                        tracing::warn!("EC conversion failed for extent {extent_id}: {e}");
+                        return;
+                    }
+
+                    // Apply the conversion result: update ExtentInfo.
+                    let _ = mgr
+                        .apply_ec_conversion_done(
+                            extent_id,
+                            orig_replica_count,
+                            target_nodes_clone,
+                            extra_disk_ids_clone,
+                            data_shards,
+                        )
+                        .await;
+                });
+            }
+        }
+    }
+
+    /// Update ExtentInfo after successful EC conversion.
+    /// Sets original_replicates, splits replicates/parity, bumps eversion.
+    async fn apply_ec_conversion_done(
+        &self,
+        extent_id: u64,
+        original_replicates: u32,
+        target_nodes: Vec<u64>,
+        extra_disk_ids: Vec<u64>,
+        data_shards: usize,
+    ) -> Result<(), AppError> {
+        let updated = {
+            let mut s = self.store.inner.write();
+            let ex = s
+                .extents
+                .get_mut(&extent_id)
+                .ok_or_else(|| AppError::NotFound(format!("extent {extent_id}")))?;
+
+            // Build disk_id mapping for extra nodes: existing replicate_disks + extra.
+            let mut all_disks = ex.replicate_disks.clone();
+            all_disks.extend_from_slice(&extra_disk_ids);
+            all_disks.truncate(target_nodes.len());
+
+            ex.original_replicates = original_replicates;
+            ex.replicates = target_nodes[..data_shards].to_vec();
+            ex.parity = target_nodes[data_shards..].to_vec();
+            ex.replicate_disks = all_disks[..data_shards].to_vec();
+            ex.parity_disks = all_disks[data_shards..].to_vec();
+            ex.eversion += 1;
+            ex.clone()
+        };
+
+        if let Some(etcd) = &self.etcd {
+            let key = format!("extents/{}", extent_id);
+            let val = EtcdMirror::encode_msg(&updated)
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            etcd.put_msgs_txn(vec![(key, val)])
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+        }
+
+        Ok(())
+    }
+
     async fn mirror_register_node(
         &self,
         node: &NodeInfo,
@@ -1185,21 +1408,28 @@ impl StreamManagerService for AutumnManager {
         }
 
         let req = request.into_inner();
-        let data = req.data_shard as usize;
-        let parity = req.parity_shard as usize;
-        if data == 0 {
-            let err = AppError::InvalidArgument("data_shard cannot be zero".to_string());
-            return Ok(Response::new(CreateStreamResponse {
-                code: Self::err_code(&err) as i32,
-                code_des: err.to_string(),
-                stream: None,
-                extent: None,
-            }));
+        let ec_data = req.ec_data_shard;
+        let ec_parity = req.ec_parity_shard;
+
+        // Validate EC conversion policy if specified.
+        if ec_data > 0 || ec_parity > 0 {
+            if ec_data < 2 || ec_parity == 0 {
+                let err = AppError::InvalidArgument(
+                    "ec_data_shard >= 2 and ec_parity_shard >= 1 required for EC conversion".to_string(),
+                );
+                return Ok(Response::new(CreateStreamResponse {
+                    code: Self::err_code(&err) as i32,
+                    code_des: err.to_string(),
+                    stream: None,
+                    extent: None,
+                }));
+            }
         }
-        if parity > 0 && data < 2 {
-            let err = AppError::InvalidArgument(
-                "data_shard must be >= 2 when parity_shard > 0".to_string(),
-            );
+
+        // replicates controls the write-time replica count, independent of EC shape.
+        let total_replicas = req.replicates as usize;
+        if total_replicas == 0 {
+            let err = AppError::InvalidArgument("replicates cannot be zero".to_string());
             return Ok(Response::new(CreateStreamResponse {
                 code: Self::err_code(&err) as i32,
                 code_des: err.to_string(),
@@ -1210,7 +1440,7 @@ impl StreamManagerService for AutumnManager {
 
         let (stream_id, extent_id, selected) = {
             let mut s = self.store.inner.write();
-            let selected = match Self::select_nodes(&s.nodes, data + parity) {
+            let selected = match Self::select_nodes(&s.nodes, total_replicas) {
                 Ok(v) => v,
                 Err(err) => {
                     return Ok(Response::new(CreateStreamResponse {
@@ -1249,17 +1479,22 @@ impl StreamManagerService for AutumnManager {
         let stream = StreamInfo {
             stream_id,
             extent_ids: vec![extent_id],
+            ec_data_shard: ec_data,
+            ec_parity_shard: ec_parity,
         };
+        // All nodes start as replicates (no write-time EC). After seal, the manager
+        // EC conversion loop will move some nodes to parity.
         let extent = ExtentInfo {
             extent_id,
-            replicates: node_ids[..data].to_vec(),
-            parity: node_ids[data..].to_vec(),
+            replicates: node_ids,
+            parity: vec![],
             eversion: 1,
             refs: 1,
             sealed_length: 0,
             avali: 0,
-            replicate_disks: disk_ids[..data].to_vec(),
-            parity_disks: disk_ids[data..].to_vec(),
+            replicate_disks: disk_ids,
+            parity_disks: vec![],
+            original_replicates: 0,
         };
 
         {
@@ -1680,6 +1915,7 @@ impl StreamManagerService for AutumnManager {
             avali: 0,
             replicate_disks: disk_ids[..data].to_vec(),
             parity_disks: disk_ids[data..].to_vec(),
+            original_replicates: 0,
         };
 
         let out = {

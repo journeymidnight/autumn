@@ -126,8 +126,8 @@ async fn benchmark_append_stream_throughput() {
 
     let created = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create stream")

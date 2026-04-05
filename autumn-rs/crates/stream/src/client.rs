@@ -420,22 +420,11 @@ impl StreamClient {
             }
             extent_lookup_elapsed += extent_lookup_started_at.elapsed();
 
-            // Fan out to all replicas in parallel.
-            // For EC streams, encode the payload into per-shard byte slices first.
+            // Fan out identical payload to all replicas in parallel.
+            // All active extents are replicated — EC conversion only happens after seal
+            // (by the manager background loop). Parity is always empty on active extents.
             let extent_id = tail.extent.extent_id;
-            let is_ec = !tail.extent.parity.is_empty();
-            let per_node_payloads: Vec<Bytes> = if is_ec {
-                let data_shards = tail.extent.replicates.len();
-                let parity_shards = tail.extent.parity.len();
-                match crate::erasure::ec_encode(&payload, data_shards, parity_shards) {
-                    Ok(shards) => shards.into_iter().map(Bytes::from).collect(),
-                    Err(e) => {
-                        return Err(anyhow!("EC encode failed: {e}"));
-                    }
-                }
-            } else {
-                vec![payload.clone(); clients.len()]
-            };
+            let per_node_payloads: Vec<Bytes> = vec![payload.clone(); clients.len()];
 
             let fanout_started_at = Instant::now();
             let handles: Vec<_> = clients
@@ -791,7 +780,8 @@ impl StreamClient {
         let ex = self.fetch_extent_info(extent_id).await?;
 
         if !ex.parity.is_empty() {
-            return self.ec_read_from_extent(extent_id, offset, length, &ex).await;
+            // EC-converted sealed extent: use sub-range read (no decode needed for aligned reads).
+            return self.ec_subrange_read(extent_id, offset, length, &ex).await;
         }
 
         let addrs = self.replica_addrs_for_extent(&ex).await?;
@@ -850,6 +840,91 @@ impl StreamClient {
         }
         let h = header.ok_or_else(|| anyhow!("read_bytes: missing header from {addr}"))?;
         Ok((payload, h.end))
+    }
+
+    /// Seal-after-write EC sub-range read.
+    ///
+    /// RS data shards ARE the raw bytes split into k equal parts (identity matrix property).
+    /// For a read entirely within one data shard: read directly from that shard node —
+    /// no EC decode needed, same latency as replication.
+    /// For reads spanning two shards: read both halves and concatenate.
+    /// On data shard failure: fall back to full EC decode via `ec_read_from_extent`.
+    async fn ec_subrange_read(
+        &self,
+        extent_id: u64,
+        offset: u32,
+        length: u32,
+        ex: &ExtentInfo,
+    ) -> Result<(Vec<u8>, u32)> {
+        let data_shards = ex.replicates.len();
+        if data_shards == 0 {
+            return Err(anyhow!("EC extent {extent_id} has no data shards"));
+        }
+
+        let sealed_length = ex.sealed_length;
+        let shard_size = crate::erasure::shard_size(sealed_length as usize, data_shards) as u64;
+        let read_len = if length == 0 { sealed_length - offset as u64 } else { length as u64 };
+
+        let start = offset as u64;
+        let end = start + read_len;
+
+        let start_shard = (start / shard_size) as usize;
+        let end_shard = ((end.saturating_sub(1)) / shard_size) as usize;
+
+        let addrs = self.replica_addrs_for_extent(ex).await?;
+
+        if start_shard == end_shard && start_shard < data_shards {
+            // Fast path: entire read fits within one data shard.
+            let shard_offset = (start % shard_size) as u32;
+            let shard_len = read_len as u32;
+            let addr = &addrs[start_shard];
+            match Self::read_shard_from_addr(
+                addr,
+                extent_id,
+                shard_offset,
+                shard_len,
+                self.extent_client(addr).await?,
+            )
+            .await
+            {
+                Ok(result) => return Ok(result),
+                Err(_) => {
+                    // Data shard unavailable — fall back to full EC decode.
+                    return self.ec_read_from_extent(extent_id, offset, length, ex).await;
+                }
+            }
+        }
+
+        if end_shard < data_shards {
+            // Read spans two consecutive data shards — fetch both and concatenate.
+            let offset_in_first = (start % shard_size) as u32;
+            let first_len = (shard_size - start % shard_size) as u32;
+            let second_len = (read_len - first_len as u64) as u32;
+
+            let addr0 = addrs[start_shard].clone();
+            let addr1 = addrs[end_shard].clone();
+            let client0 = self.extent_client(&addr0).await?;
+            let client1 = self.extent_client(&addr1).await?;
+
+            let (r0, r1) = tokio::join!(
+                Self::read_shard_from_addr(&addr0, extent_id, offset_in_first, first_len, client0),
+                Self::read_shard_from_addr(&addr1, extent_id, 0, second_len, client1),
+            );
+
+            match (r0, r1) {
+                (Ok((mut d0, end_val)), Ok((d1, _))) => {
+                    d0.extend_from_slice(&d1);
+                    return Ok((d0, end_val));
+                }
+                _ => {
+                    // One or both shards unavailable — fall back to full EC decode.
+                    return self.ec_read_from_extent(extent_id, offset, length, ex).await;
+                }
+            }
+        }
+
+        // Read spans parity shards or out of range — fall back to full decode.
+        self.ec_read_from_extent(extent_id, offset, length, ex).await
     }
 
     /// EC-aware read: fire parallel reads to all shard nodes, collect data_shards

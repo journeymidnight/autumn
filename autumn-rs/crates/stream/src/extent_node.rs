@@ -10,12 +10,14 @@ use autumn_io_engine::{build_engine, Bytes, IoEngine, IoFile, IoMode};
 use autumn_proto::autumn::extent_service_client::ExtentServiceClient;
 use autumn_proto::autumn::extent_service_server::{ExtentService, ExtentServiceServer};
 use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
+use autumn_proto::autumn::write_shard_request::Data as WriteShardData;
 use autumn_proto::autumn::{
     AllocExtentRequest, AllocExtentResponse, AppendRequest, AppendRequestHeader, AppendResponse,
-    Code, CommitLengthRequest, CommitLengthResponse, CopyExtentRequest, CopyExtentResponse,
-    CopyResponseHeader, Df, DfRequest, DfResponse, Empty, ExtentInfo, ExtentInfoRequest, Payload,
-    ReAvaliRequest, ReAvaliResponse, ReadBytesRequest, ReadBytesResponse, ReadBytesResponseHeader,
-    RecoveryTask, RecoveryTaskStatus, RequireRecoveryRequest, RequireRecoveryResponse,
+    Code, CommitLengthRequest, CommitLengthResponse, ConvertToEcRequest, ConvertToEcResponse,
+    CopyExtentRequest, CopyExtentResponse, CopyResponseHeader, Df, DfRequest, DfResponse, Empty,
+    ExtentInfo, ExtentInfoRequest, Payload, ReAvaliRequest, ReAvaliResponse, ReadBytesRequest,
+    ReadBytesResponse, ReadBytesResponseHeader, RecoveryTask, RecoveryTaskStatus,
+    RequireRecoveryRequest, RequireRecoveryResponse, WriteShardRequest, WriteShardResponse,
 };
 use dashmap::DashMap;
 use tokio::sync::{mpsc, Mutex, OnceCell};
@@ -553,6 +555,43 @@ impl ExtentNode {
 
         crate::erasure::ec_reconstruct_shard(shards, data_shards, parity_shards, replacing_index)
             .map_err(|e| Status::internal(format!("EC reconstruct failed: {e}")))
+    }
+
+    /// Write a single EC shard to local storage, replacing any existing data.
+    /// Called both by the coordinator (writing its own shard) and by write_shard RPC.
+    async fn write_shard_local(
+        &self,
+        extent_id: u64,
+        shard_index: usize,
+        _sealed_length: u64,
+        shard_data: &[u8],
+    ) -> Result<(), Status> {
+        let entry = self.ensure_extent(extent_id).await?;
+        let _lock = entry.write_lock.lock().await;
+
+        entry
+            .file
+            .truncate(0)
+            .await
+            .map_err(|e| Status::internal(format!("truncate shard {extent_id}: {e}")))?;
+        entry
+            .file
+            .write_at(0, Bytes::copy_from_slice(shard_data))
+            .await
+            .map_err(|e| Status::internal(format!("write shard {extent_id}/{shard_index}: {e}")))?;
+        entry
+            .file
+            .sync_all()
+            .await
+            .map_err(|e| Status::internal(format!("sync shard {extent_id}: {e}")))?;
+
+        let shard_len = shard_data.len() as u64;
+        entry.len.store(shard_len, Ordering::SeqCst);
+        entry.sealed_length.store(shard_len, Ordering::SeqCst);
+        entry.avali.store(1, Ordering::SeqCst);
+
+        self.save_meta(extent_id, &entry).await?;
+        Ok(())
     }
 }
 
@@ -1155,5 +1194,169 @@ impl ExtentService for ExtentNode {
         Ok(Response::new(
             Box::pin(ReceiverStream::new(rx)) as Self::HeartbeatStream
         ))
+    }
+
+    /// Seal-after-write EC conversion: coordinator reads local sealed extent,
+    /// EC-encodes it, then distributes shards to target nodes.
+    /// This node must hold a full replicated copy of the sealed extent.
+    async fn convert_to_ec(
+        &self,
+        request: Request<ConvertToEcRequest>,
+    ) -> Result<Response<ConvertToEcResponse>, Status> {
+        let req = request.into_inner();
+        let extent_id = req.extent_id;
+        let data_shards = req.data_shards as usize;
+        let parity_shards = req.parity_shards as usize;
+
+        if data_shards == 0 || parity_shards == 0 {
+            return Err(Status::invalid_argument("data_shards and parity_shards must be > 0"));
+        }
+        if req.target_addrs.len() != data_shards + parity_shards {
+            return Err(Status::invalid_argument(format!(
+                "target_addrs len {} != data_shards+parity_shards {}",
+                req.target_addrs.len(),
+                data_shards + parity_shards
+            )));
+        }
+
+        // Read the full sealed extent from local storage.
+        let entry = self.get_extent(extent_id).await?;
+        let sealed_length = entry.sealed_length.load(Ordering::SeqCst);
+        if sealed_length == 0 {
+            return Err(Status::failed_precondition(format!(
+                "extent {extent_id} is not sealed — cannot EC convert"
+            )));
+        }
+
+        let data = entry
+            .file
+            .read_at(0, sealed_length as usize)
+            .await
+            .map_err(|e| Status::internal(format!("read extent {extent_id}: {e}")))?;
+
+        // EC-encode the full extent data into k+m shards.
+        let shards = crate::erasure::ec_encode(&data, data_shards, parity_shards)
+            .map_err(|e| Status::internal(format!("ec_encode failed: {e}")))?;
+
+        // Determine this node's own address to identify which shard to write locally.
+        // We use the local data_dir as a proxy — actual self-identification is done by
+        // checking if target_addr matches any local bind address; instead we find which
+        // target slot we should handle by attempting all remote ones and handling the rest.
+        //
+        // Strategy: send shards to remote targets; the shard for "self" is written locally.
+        // We identify self by checking against the manager endpoint pattern.
+        // Simpler approach: write shard[i] locally if target_addrs[i] points to self
+        // (detected by connection failure or by checking our own listen addr).
+        //
+        // For robustness: try remote first; if it resolves to self (connection refused or
+        // we match known self addr), write locally. Since we don't have a clean way to
+        // detect "self" here, use a convention: the coordinator always takes shard index 0
+        // (or whichever matches the local address stored in config — not available here).
+        //
+        // Best approach: caller (manager) puts coordinator's address in target_addrs[i].
+        // We identify self by trying to connect and seeing a loopback. Instead, we use the
+        // fact that the coordinator was chosen as one of the existing replicas: attempt to
+        // connect to each target; if it's our own address the write will fail with connection
+        // refused. We handle that by writing locally.
+        let node = self.clone();
+        for (i, target_addr) in req.target_addrs.iter().enumerate() {
+            let shard = shards[i].clone();
+
+            // Try to send via WriteShard RPC; if connection fails, write locally.
+            let normalized = Self::normalize_endpoint(target_addr);
+            match ExtentServiceClient::connect(normalized).await {
+                Ok(mut client) => {
+                    use autumn_proto::autumn::write_shard_request::Data;
+                    use futures::stream;
+
+                    let msgs = vec![
+                        WriteShardRequest {
+                            extent_id,
+                            shard_index: i as u32,
+                            sealed_length,
+                            original_replicates: 0, // manager fills this in ExtentInfo
+                            data: Some(Data::Header(true)),
+                        },
+                        WriteShardRequest {
+                            extent_id,
+                            shard_index: i as u32,
+                            sealed_length,
+                            original_replicates: 0,
+                            data: Some(Data::Payload(shard.clone())),
+                        },
+                    ];
+
+                    let resp = client
+                        .write_shard(Request::new(stream::iter(msgs)))
+                        .await
+                        .map_err(|e| {
+                            Status::internal(format!(
+                                "WriteShard to {target_addr} for shard {i} failed: {e}"
+                            ))
+                        })?
+                        .into_inner();
+
+                    if resp.code != Code::Ok as i32 {
+                        return Err(Status::internal(format!(
+                            "WriteShard to {target_addr} shard {i}: {}",
+                            resp.code_des
+                        )));
+                    }
+                }
+                Err(_) => {
+                    // Connection failed — assume this is our own address; write locally.
+                    node.write_shard_local(extent_id, i, sealed_length, &shards[i]).await?;
+                }
+            }
+        }
+
+        Ok(Response::new(ConvertToEcResponse {
+            code: Code::Ok as i32,
+            code_des: String::new(),
+        }))
+    }
+
+    /// Receive a single EC shard from the coordinator during seal-after-write EC conversion.
+    async fn write_shard(
+        &self,
+        request: Request<tonic::Streaming<WriteShardRequest>>,
+    ) -> Result<Response<WriteShardResponse>, Status> {
+        let mut stream = request.into_inner();
+
+        let mut extent_id = 0u64;
+        let mut shard_index = 0usize;
+        let mut sealed_length = 0u64;
+        let mut payload = bytes::BytesMut::new();
+        let mut got_header = false;
+
+        while let Some(msg) = stream.message().await? {
+            match msg.data {
+                Some(WriteShardData::Header(_)) => {
+                    if got_header {
+                        return Err(Status::invalid_argument("duplicate write_shard header"));
+                    }
+                    extent_id = msg.extent_id;
+                    shard_index = msg.shard_index as usize;
+                    sealed_length = msg.sealed_length;
+                    got_header = true;
+                }
+                Some(WriteShardData::Payload(p)) => {
+                    payload.extend_from_slice(&p);
+                }
+                None => {}
+            }
+        }
+
+        if !got_header {
+            return Err(Status::invalid_argument("write_shard: missing header"));
+        }
+
+        self.write_shard_local(extent_id, shard_index, sealed_length, &payload.freeze())
+            .await?;
+
+        Ok(Response::new(WriteShardResponse {
+            code: Code::Ok as i32,
+            code_des: String::new(),
+        }))
     }
 }

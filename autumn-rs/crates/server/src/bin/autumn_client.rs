@@ -707,14 +707,15 @@ fn parse_args() -> Args {
     Args { manager, command }
 }
 
-fn parse_replication(s: &str) -> Result<(u32, u32)> {
-    let parts: Vec<&str> = s.split('+').collect();
-    if parts.len() != 2 {
-        bail!("replication format must be N+M (e.g. 3+0)");
+/// Parse replication string "N" or "N+M" (M is ignored — write-time EC removed).
+/// Returns the replica count N.
+fn parse_replication(s: &str) -> Result<u32> {
+    let n_str = s.split('+').next().unwrap_or(s);
+    let n: u32 = n_str.parse().context("parse replica count")?;
+    if n == 0 {
+        bail!("replication count must be >= 1");
     }
-    let data: u32 = parts[0].parse().context("parse data shard count")?;
-    let parity: u32 = parts[1].parse().context("parse parity shard count")?;
-    Ok((data, parity))
+    Ok(n)
 }
 
 fn parse_bool_flag(value: &str, flag: &str) -> Result<bool> {
@@ -1019,7 +1020,7 @@ async fn main() -> Result<()> {
             replication,
             presplit,
         } => {
-            let (data_shard, parity_shard) = parse_replication(&replication)?;
+            let replicates = parse_replication(&replication)?;
 
             // Parse presplit: "1:normal" or "N:hexstring"
             let ranges: Vec<(Vec<u8>, Vec<u8>)> = {
@@ -1033,12 +1034,14 @@ async fn main() -> Result<()> {
             };
 
             for (idx, (start_key, end_key)) in ranges.iter().enumerate() {
-                // Create 3 streams per partition: log, row, meta
+                // Create 3 streams per partition: log, row, meta.
+                // All use replication at write time. Seal-after-write EC can be
+                // configured per stream via ec_data_shard/ec_parity_shard.
                 let log_resp = client
                     .sm
                     .create_stream(Request::new(CreateStreamRequest {
-                        data_shard,
-                        parity_shard,
+                        replicates,
+                        ..Default::default()
                     }))
                     .await
                     .context("create log stream")?
@@ -1048,8 +1051,8 @@ async fn main() -> Result<()> {
                 let row_resp = client
                     .sm
                     .create_stream(Request::new(CreateStreamRequest {
-                        data_shard,
-                        parity_shard,
+                        replicates,
+                        ..Default::default()
                     }))
                     .await
                     .context("create row stream")?
@@ -1059,8 +1062,8 @@ async fn main() -> Result<()> {
                 let meta_resp = client
                     .sm
                     .create_stream(Request::new(CreateStreamRequest {
-                        data_shard,
-                        parity_shard: 0,
+                        replicates,
+                        ..Default::default()
                     }))
                     .await
                     .context("create meta stream")?

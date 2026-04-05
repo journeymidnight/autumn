@@ -175,8 +175,8 @@ async fn stream_manager_with_real_etcd() {
 
     let created = stream
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create stream")
@@ -279,8 +279,8 @@ async fn etcd_replay_owner_lock_allows_check_commit_length_without_reacquire() {
 
     let created = sm1
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create stream")
@@ -420,8 +420,8 @@ async fn etcd_replicated_append_and_recovery_flow() {
 
     let created = sm
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 2,
-            parity_shard: 0,
+            replicates: 2,
+        ..Default::default()
         }))
         .await
         .expect("create stream")
@@ -564,8 +564,8 @@ async fn etcd_election_and_replay_on_second_manager() {
 
     let created = sm1
         .create_stream(Request::new(CreateStreamRequest {
-            data_shard: 1,
-            parity_shard: 0,
+            replicates: 1,
+        ..Default::default()
         }))
         .await
         .expect("create stream")

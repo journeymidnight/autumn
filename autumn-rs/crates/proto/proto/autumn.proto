@@ -56,11 +56,20 @@ message ExtentInfo {
   uint32 avali = 7;
   repeated uint64 replicate_disks = 8;
   repeated uint64 parity_disks = 9;
+  // Non-zero after seal-to-EC conversion: the original replication count
+  // before the extent was converted. Used by StreamClient to distinguish
+  // write-time EC (0) from seal-after-write EC (>0) for sub-range reads.
+  uint32 original_replicates = 10;
 }
 
 message StreamInfo {
   uint64 stream_id = 1;
   repeated uint64 extent_ids = 2;
+  // EC conversion policy: when both > 0, the manager will convert sealed
+  // replicated extents of this stream to EC (seal-after-write EC).
+  // 0 = no EC conversion (stream stays replicated or was created as write-time EC).
+  uint32 ec_data_shard = 3;
+  uint32 ec_parity_shard = 4;
 }
 
 message AcquireOwnerLockRequest {
@@ -86,8 +95,17 @@ message RegisterNodeResponse {
 }
 
 message CreateStreamRequest {
-  uint32 data_shard = 1;
-  uint32 parity_shard = 2;
+  // Write-time replication count. Always used for initial extent creation.
+  // Independent of EC fields: e.g. replicates=3, ec_data_shard=5, ec_parity_shard=1
+  // creates 3 replicas at write time, converts to 5+1 EC after seal.
+  uint32 replicates = 1;
+  // Field 2 removed (was parity_shard). Write-time EC no longer supported.
+  // Seal-after-write EC policy. When both > 0:
+  //   after seal, manager converts extent to ec_data_shard+ec_parity_shard EC.
+  //   If k+m > replicates, extra nodes are allocated during conversion.
+  // When 0: pure replication, no EC conversion.
+  uint32 ec_data_shard = 3;
+  uint32 ec_parity_shard = 4;
 }
 
 message CreateStreamResponse {
@@ -462,6 +480,38 @@ message AllocExtentResponse {
   uint64 disk_id = 3;
 }
 
+// Seal-after-write EC conversion: sent to a coordinator extent node to
+// read the full sealed extent, EC-encode it, and distribute shards.
+message ConvertToEcRequest {
+  uint64 extent_id = 1;
+  uint32 data_shards = 2;
+  uint32 parity_shards = 3;
+  // k+m target node addresses (data shard nodes first, then parity)
+  repeated string target_addrs = 4;
+}
+
+message ConvertToEcResponse {
+  Code code = 1;
+  string code_des = 2;
+}
+
+// Used by the coordinator during ConvertToEc to push a shard to a remote node.
+message WriteShardRequest {
+  uint64 extent_id = 1;
+  uint32 shard_index = 2;     // position in the combined replicates+parity list
+  uint64 sealed_length = 3;   // original replicated sealed_length (for validation)
+  uint32 original_replicates = 4; // how many replicas the extent had before conversion
+  oneof data {
+    bool header = 5;          // true = first message (header frame)
+    bytes payload = 6;
+  }
+}
+
+message WriteShardResponse {
+  Code code = 1;
+  string code_des = 2;
+}
+
 service StreamManagerService {
   rpc Status(Empty) returns (StatusResponse);
   rpc AcquireOwnerLock(AcquireOwnerLockRequest) returns (AcquireOwnerLockResponse);
@@ -519,4 +569,8 @@ service ExtentService {
   rpc CommitLength(CommitLengthRequest) returns (CommitLengthResponse);
   rpc Heartbeat(Payload) returns (stream Payload);
   rpc AllocExtent(AllocExtentRequest) returns (AllocExtentResponse);
+  // Seal-after-write EC: coordinator reads local extent, EC-encodes, distributes shards
+  rpc ConvertToEc(ConvertToEcRequest) returns (ConvertToEcResponse);
+  // Receive a single EC shard from coordinator during conversion
+  rpc WriteShard(stream WriteShardRequest) returns (WriteShardResponse);
 }
