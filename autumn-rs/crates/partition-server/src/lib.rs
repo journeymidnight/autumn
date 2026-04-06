@@ -11,9 +11,9 @@ use autumn_proto::autumn::partition_kv_server::{PartitionKv, PartitionKvServer};
 use autumn_proto::autumn::partition_manager_service_client::PartitionManagerServiceClient;
 use autumn_proto::autumn::{
     Code, DeleteRequest, DeleteResponse, Empty, GetRequest, GetResponse, HeadInfo, HeadRequest,
-    HeadResponse, Location, MaintenanceRequest, MaintenanceResponse, MultiModifySplitRequest,
-    PutRequest, PutResponse, Range, RangeRequest, RangeResponse, RegisterPsRequest,
-    SplitPartRequest, SplitPartResponse, StreamPutRequest, TableLocations,
+    HeadResponse, HeartbeatPsRequest, Location, MaintenanceRequest, MaintenanceResponse,
+    MultiModifySplitRequest, PutRequest, PutResponse, Range, RangeRequest, RangeResponse,
+    RegisterPsRequest, SplitPartRequest, SplitPartResponse, StreamPutRequest, TableLocations,
 };
 use autumn_stream::{ConnPool, StreamClient};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -438,6 +438,15 @@ impl PartitionServer {
 
         server.register_ps().await?;
         server.sync_regions_once().await?;
+
+        // Heartbeat loop: tell the manager we're alive every 5s.
+        let s = server.clone();
+        tokio::spawn(async move { s.heartbeat_loop().await });
+
+        // Region sync loop: pick up region reassignments every 5s.
+        let s = server.clone();
+        tokio::spawn(async move { s.region_sync_loop().await });
+
         Ok(server)
     }
 
@@ -455,6 +464,32 @@ impl PartitionServer {
             .await
             .context("register ps")?;
         Ok(())
+    }
+
+    /// Send heartbeat to manager every 5s so it knows we're alive.
+    async fn heartbeat_loop(&self) {
+        const INTERVAL: Duration = Duration::from_secs(5);
+        loop {
+            tokio::time::sleep(INTERVAL).await;
+            let mut client = self.pm_client.lock().await;
+            if let Err(e) = client
+                .heartbeat_ps(Request::new(HeartbeatPsRequest { ps_id: self.ps_id }))
+                .await
+            {
+                tracing::warn!("PS {} heartbeat failed: {e}", self.ps_id);
+            }
+        }
+    }
+
+    /// Poll GetRegions every 5s to pick up reassignments from the manager.
+    async fn region_sync_loop(&self) {
+        const INTERVAL: Duration = Duration::from_secs(5);
+        loop {
+            tokio::time::sleep(INTERVAL).await;
+            if let Err(e) = self.sync_regions_once().await {
+                tracing::warn!("PS {} region sync failed: {e}", self.ps_id);
+            }
+        }
     }
 
     fn in_range(rg: &Range, key: &[u8]) -> bool {

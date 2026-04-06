@@ -151,8 +151,8 @@
 ### F019 · Partition Manager complete implementation
 - **Target:** Partition allocation policy, PS load tracking, region assignment/rebalancing, etcd region watch. Equivalent to Go `manager/partition_manager`.
 - **Evidence:** `manager/partition_manager/pm.go` · `manager/partition_manager/policy.go` · `autumn-rs/crates/manager/src/lib.rs`
-- **Notes:** Rust has basic RegisterPs/UpsertPartition/GetRegions RPCs but lacks allocation policy, watch dispatch, and rebalancing.
-- **passes:** false
+- **Notes:** Implemented. Least-loaded allocation policy (replaces first-fit). PS liveness via heartbeat RPC (PS sends every 5s; manager evicts after 30s timeout in ps_liveness_check_loop). Region dispatch via polling (PS polls GetRegions every 5s via region_sync_loop). rebalance_regions always refreshes rg from PartitionMeta (critical for post-split range). 3 new unit tests + all 13 integration tests pass.
+- **passes:** true
 
 ### F021 · Multi-disk support and disk format
 - **Target:** Extent node supports multiple disks with UUID identification, per-disk extent placement. Equivalent to Go `node/diskfs.go`.

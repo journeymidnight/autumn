@@ -1,37 +1,39 @@
-Date: 2026-04-04
+Date: 2026-04-05
 TaskStatus: completed
-Task scope: F035 — Extent node WAL for small-write durability
+Task scope: F019 — Partition Manager complete implementation
 
 Current summary:
-  WAL fully implemented for the extent node. Small must_sync writes (≤2MB)
-  now go through a WAL for lower latency: WAL is synced, extent file write
-  happens in parallel without sync_all(). On startup, old WAL files are
-  replayed into extent files before accepting new connections.
+  F019 fully implemented. Key additions:
 
-  Key changes:
-  - crates/stream/src/wal.rs (new): Pebble/LevelDB-style 128KB block framing,
-    9-byte CRC32C headers (FULL/FIRST/MIDDLE/LAST), async Wal via tokio mpsc,
-    WalRecord encode/decode, replay_wal_files, should_use_wal(must_sync, len).
-  - crates/stream/src/lib.rs: pub mod wal added.
-  - crates/stream/Cargo.toml: crc32c.workspace = true added.
-  - crates/stream/src/extent_node.rs:
-      ExtentNodeConfig::wal_dir + with_wal_dir() builder;
-      ExtentNode::wal: Option<Wal> field;
-      new(): Wal::open() → replay_wal() → cleanup_old_wals();
-      replay_wal(): writes each WAL record to extent file, advances len;
-      append(): WAL path with tokio::join!(wal.write, file.write_at) when
-        should_use_wal; falls back to direct sync for large writes.
-  - crates/server/src/bin/extent_node.rs: WAL enabled at data_dir/wal.
-  - crates/stream/tests/wal_recovery.rs (new): 3 integration tests.
+  1. Proto (autumn.proto):
+     - Added HeartbeatPsRequest / HeartbeatPsResponse messages
+     - Added HeartbeatPs RPC to PartitionManagerService
 
-  All tests pass: 17 stream unit tests, 5 stream integration tests (including
-  3 new WAL recovery tests), 13 manager integration tests, 4 EC integration tests.
+  2. Manager (crates/manager/src/lib.rs):
+     - ps_last_heartbeat: Arc<Mutex<HashMap<u64, Instant>>> field on AutumnManager
+     - register_ps: records initial heartbeat timestamp
+     - heartbeat_ps RPC: updates timestamp for known PS
+     - ps_liveness_check_loop (10s interval): evicts PSes with no heartbeat in 30s,
+       calls rebalance_regions, mirrors to etcd
+     - rebalance_regions: upgraded to least-loaded allocation (min partition count);
+       always refreshes rg from PartitionMeta (critical for post-split range update)
+
+  3. Partition Server (crates/partition-server/src/lib.rs):
+     - heartbeat_loop: sends HeartbeatPs to manager every 5s
+     - region_sync_loop: polls GetRegions every 5s to pick up reassignments
+     - Both loops spawned in connect_with_advertise
+
+  4. Tests (manager/src/lib.rs unit tests):
+     - f019_least_loaded_allocation: 2 PSes, 4 partitions → each gets 2
+     - f019_ps_eviction_reassigns_regions: remove dead PS → all regions move to survivor
+     - f019_heartbeat_updates_timestamp: heartbeat_ps records recent timestamp
+
+  5. Documentation: crates/manager/CLAUDE.md updated
+
+  All tests pass: 5 manager unit tests, 13 manager integration tests, full workspace.
 
 Main gaps:
-  F019 (partition manager allocation policy) - not implemented
   F021 (multi-disk support) - not implemented
 
 Next steps:
-  F019 — Partition manager allocation policy (node scoring, rebalancing)
-  or
   F021 — Multi-disk support (multiple data dirs per extent node)

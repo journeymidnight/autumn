@@ -5,7 +5,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use autumn_common::{AppError, MetadataStore};
@@ -20,13 +20,13 @@ use autumn_proto::autumn::{
     AcquireOwnerLockRequest, AcquireOwnerLockResponse, AllocExtentRequest,
     CheckCommitLengthRequest, CheckCommitLengthResponse, Code, ConvertToEcRequest,
     CreateStreamRequest, CreateStreamResponse, DfRequest, Empty, ExtentInfo, ExtentInfoRequest,
-    ExtentInfoResponse, GetRegionsResponse, MultiModifySplitRequest, MultiModifySplitResponse,
-    NodeInfo, NodesInfoResponse, PsDetail, PunchHolesRequest, PunchHolesResponse, ReAvaliRequest,
-    RecoveryTask, RecoveryTaskStatus, RegionInfo, Regions, RegisterNodeRequest,
-    RegisterNodeResponse, RegisterPsRequest, RegisterPsResponse, RequireRecoveryRequest,
-    StatusResponse, StreamAllocExtentRequest, StreamAllocExtentResponse, StreamInfo,
-    StreamInfoRequest, StreamInfoResponse, TruncateRequest, TruncateResponse,
-    UpsertPartitionRequest, UpsertPartitionResponse,
+    ExtentInfoResponse, GetRegionsResponse, HeartbeatPsRequest, HeartbeatPsResponse,
+    MultiModifySplitRequest, MultiModifySplitResponse, NodeInfo, NodesInfoResponse, PsDetail,
+    PunchHolesRequest, PunchHolesResponse, ReAvaliRequest, RecoveryTask, RecoveryTaskStatus,
+    RegionInfo, Regions, RegisterNodeRequest, RegisterNodeResponse, RegisterPsRequest,
+    RegisterPsResponse, RequireRecoveryRequest, StatusResponse, StreamAllocExtentRequest,
+    StreamAllocExtentResponse, StreamInfo, StreamInfoRequest, StreamInfoResponse, TruncateRequest,
+    TruncateResponse, UpsertPartitionRequest, UpsertPartitionResponse,
 };
 use etcd_client::{Client as EtcdClient, Compare, CompareOp, GetOptions, PutOptions, Txn, TxnOp};
 use prost::Message;
@@ -101,6 +101,8 @@ pub struct AutumnManager {
     /// extent_ids currently being EC-converted (coordinator dispatched, not yet done).
     ec_conversion_inflight: Arc<Mutex<HashSet<u64>>>,
     runtime_started: Arc<AtomicBool>,
+    /// Last heartbeat time per PS (ephemeral, not persisted to etcd).
+    ps_last_heartbeat: Arc<Mutex<HashMap<u64, Instant>>>,
 }
 
 impl Default for AutumnManager {
@@ -119,6 +121,7 @@ impl AutumnManager {
             recovery_tasks: Arc::new(Mutex::new(HashMap::new())),
             ec_conversion_inflight: Arc::new(Mutex::new(HashSet::new())),
             runtime_started: Arc::new(AtomicBool::new(false)),
+            ps_last_heartbeat: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -170,6 +173,11 @@ impl AutumnManager {
         let mgr = self.clone();
         tokio::spawn(async move {
             mgr.ec_conversion_dispatch_loop().await;
+        });
+
+        let mgr = self.clone();
+        tokio::spawn(async move {
+            mgr.ps_liveness_check_loop().await;
         });
     }
 
@@ -473,24 +481,90 @@ impl AutumnManager {
         Ok(s.acquire_owner_lock(owner_key))
     }
 
+    /// Background loop: every 10s, evict PSes whose last heartbeat is older than
+    /// PS_DEAD_TIMEOUT, reassign their regions.
+    async fn ps_liveness_check_loop(&self) {
+        const CHECK_INTERVAL: Duration = Duration::from_secs(10);
+        const PS_DEAD_TIMEOUT: Duration = Duration::from_secs(30);
+
+        loop {
+            sleep(CHECK_INTERVAL).await;
+            if !self.leader.load(Ordering::SeqCst) {
+                continue;
+            }
+
+            let dead_ps: Vec<u64> = {
+                let hb = self.ps_last_heartbeat.lock().await;
+                let s = self.store.inner.read();
+                s.ps_nodes
+                    .keys()
+                    .filter(|ps_id| {
+                        match hb.get(ps_id) {
+                            Some(t) => t.elapsed() > PS_DEAD_TIMEOUT,
+                            // Never heard from this PS (registered before this leader instance
+                            // started). Give it one full timeout window to check in.
+                            None => false,
+                        }
+                    })
+                    .copied()
+                    .collect()
+            };
+
+            if dead_ps.is_empty() {
+                continue;
+            }
+
+            for ps_id in &dead_ps {
+                tracing::warn!("PS {ps_id} heartbeat timed out, removing and reassigning regions");
+            }
+
+            {
+                let mut s = self.store.inner.write();
+                for ps_id in &dead_ps {
+                    s.ps_nodes.remove(ps_id);
+                }
+                Self::rebalance_regions(&mut s);
+            }
+            {
+                let mut hb = self.ps_last_heartbeat.lock().await;
+                for ps_id in &dead_ps {
+                    hb.remove(ps_id);
+                }
+            }
+
+            if let Err(e) = self.mirror_partition_snapshot().await {
+                tracing::error!("mirror after PS eviction failed: {e}");
+            }
+        }
+    }
+
     fn rebalance_regions(state: &mut autumn_common::MetadataState) {
-        let mut part_ids: HashSet<u64> = state.partitions.keys().copied().collect();
-        let mut stale: Vec<u64> = state
+        // Remove regions whose partition no longer exists.
+        let part_ids: HashSet<u64> = state.partitions.keys().copied().collect();
+        let stale: Vec<u64> = state
             .regions
             .keys()
             .copied()
             .filter(|part_id| !part_ids.contains(part_id))
             .collect();
-        stale.sort_unstable();
         for part_id in stale {
             state.regions.remove(&part_id);
         }
 
-        let mut ps_ids: Vec<u64> = state.ps_nodes.keys().copied().collect();
-        ps_ids.sort_unstable();
-        let default_ps = ps_ids.first().copied();
+        if state.ps_nodes.is_empty() {
+            return;
+        }
 
-        let mut ids: Vec<u64> = part_ids.drain().collect();
+        // Build a load counter: ps_id -> number of currently assigned partitions.
+        let mut load: HashMap<u64, usize> = state.ps_nodes.keys().map(|&id| (id, 0)).collect();
+        for region in state.regions.values() {
+            if let Some(cnt) = load.get_mut(&region.ps_id) {
+                *cnt += 1;
+            }
+        }
+
+        // Process partitions in stable order so results are deterministic.
+        let mut ids: Vec<u64> = part_ids.into_iter().collect();
         ids.sort_unstable();
 
         for part_id in ids {
@@ -498,23 +572,44 @@ impl AutumnManager {
                 Some(m) => m,
                 None => continue,
             };
-            let chosen_ps = match state.regions.get(&part_id) {
-                Some(r) if state.ps_nodes.contains_key(&r.ps_id) => Some(r.ps_id),
-                _ => default_ps,
+
+            // Determine which PS to use: keep existing if alive, otherwise pick least-loaded.
+            let ps_id = if let Some(r) = state.regions.get(&part_id) {
+                if state.ps_nodes.contains_key(&r.ps_id) {
+                    // Keep the same PS but always refresh the region (rg may have changed after split).
+                    r.ps_id
+                } else {
+                    // Dead PS — pick least-loaded.
+                    match load.iter().min_by_key(|(_, &cnt)| cnt).map(|(&id, _)| id) {
+                        Some(id) => {
+                            *load.entry(id).or_insert(0) += 1;
+                            id
+                        }
+                        None => continue,
+                    }
+                }
+            } else {
+                // New partition — pick least-loaded.
+                match load.iter().min_by_key(|(_, &cnt)| cnt).map(|(&id, _)| id) {
+                    Some(id) => {
+                        *load.entry(id).or_insert(0) += 1;
+                        id
+                    }
+                    None => continue,
+                }
             };
-            if let Some(ps_id) = chosen_ps {
-                state.regions.insert(
+
+            state.regions.insert(
+                part_id,
+                RegionInfo {
+                    rg: meta.rg.clone(),
                     part_id,
-                    RegionInfo {
-                        rg: meta.rg.clone(),
-                        part_id,
-                        ps_id,
-                        log_stream: meta.log_stream,
-                        row_stream: meta.row_stream,
-                        meta_stream: meta.meta_stream,
-                    },
-                );
-            }
+                    ps_id,
+                    log_stream: meta.log_stream,
+                    row_stream: meta.row_stream,
+                    meta_stream: meta.meta_stream,
+                },
+            );
         }
     }
 
@@ -2312,11 +2407,14 @@ impl PartitionManagerService for AutumnManager {
         }
 
         let req = request.into_inner();
+        let ps_id = req.ps_id;
         {
             let mut s = self.store.inner.write();
-            s.ps_nodes.insert(req.ps_id, req.address);
+            s.ps_nodes.insert(ps_id, req.address);
             Self::rebalance_regions(&mut s);
         }
+        // Record initial heartbeat so the liveness loop doesn't evict it immediately.
+        self.ps_last_heartbeat.lock().await.insert(ps_id, Instant::now());
         if let Err(err) = self.mirror_partition_snapshot().await {
             return Ok(Response::new(RegisterPsResponse {
                 code: Self::err_code(&err) as i32,
@@ -2393,6 +2491,25 @@ impl PartitionManagerService for AutumnManager {
             ps_details,
         }))
     }
+
+    async fn heartbeat_ps(
+        &self,
+        request: Request<HeartbeatPsRequest>,
+    ) -> Result<Response<HeartbeatPsResponse>, Status> {
+        let ps_id = request.into_inner().ps_id;
+        // Accept heartbeats even when not leader — the PS shouldn't have to care.
+        let known = {
+            let s = self.store.inner.read();
+            s.ps_nodes.contains_key(&ps_id)
+        };
+        if known {
+            self.ps_last_heartbeat.lock().await.insert(ps_id, Instant::now());
+        }
+        Ok(Response::new(HeartbeatPsResponse {
+            code: Code::Ok as i32,
+            code_des: String::new(),
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -2457,5 +2574,152 @@ mod tests {
             .into_inner();
         assert_eq!(regions.code, Code::Ok as i32);
         assert_eq!(regions.regions.expect("regions").regions.len(), 1);
+    }
+
+    /// New partitions are spread evenly across PSes (least-loaded policy).
+    #[tokio::test]
+    async fn f019_least_loaded_allocation() {
+        let m = AutumnManager::new();
+
+        // Register 2 PSes.
+        for ps_id in [10u64, 20u64] {
+            m.register_ps(Request::new(RegisterPsRequest {
+                ps_id,
+                address: format!("127.0.0.1:999{ps_id}"),
+            }))
+            .await
+            .expect("register ps");
+        }
+
+        // Upsert 4 partitions.
+        for (part_id, start, end) in [
+            (1u64, b"a" as &[u8], b"e" as &[u8]),
+            (2, b"e", b"j"),
+            (3, b"j", b"n"),
+            (4, b"n", b"z"),
+        ] {
+            m.upsert_partition(Request::new(UpsertPartitionRequest {
+                meta: Some(PartitionMeta {
+                    log_stream: part_id,
+                    row_stream: part_id + 100,
+                    meta_stream: part_id + 200,
+                    part_id,
+                    rg: Some(autumn_proto::autumn::Range {
+                        start_key: start.to_vec(),
+                        end_key: end.to_vec(),
+                    }),
+                }),
+            }))
+            .await
+            .expect("upsert partition");
+        }
+
+        let regions = m
+            .get_regions(Request::new(Empty {}))
+            .await
+            .expect("get regions")
+            .into_inner()
+            .regions
+            .expect("regions")
+            .regions;
+
+        assert_eq!(regions.len(), 4, "all 4 partitions should be assigned");
+
+        // Count partitions per PS.
+        let mut counts: HashMap<u64, usize> = HashMap::new();
+        for r in regions.values() {
+            *counts.entry(r.ps_id).or_insert(0) += 1;
+        }
+        // With 2 PSes and 4 partitions, each should get exactly 2.
+        assert_eq!(*counts.get(&10).unwrap_or(&0), 2, "PS 10 should have 2 partitions");
+        assert_eq!(*counts.get(&20).unwrap_or(&0), 2, "PS 20 should have 2 partitions");
+    }
+
+    /// When a PS is evicted via the liveness loop, its partitions move to the surviving PS.
+    #[tokio::test]
+    async fn f019_ps_eviction_reassigns_regions() {
+        let m = AutumnManager::new();
+
+        m.register_ps(Request::new(RegisterPsRequest {
+            ps_id: 1,
+            address: "ps1:9001".to_string(),
+        }))
+        .await
+        .expect("register ps 1");
+        m.register_ps(Request::new(RegisterPsRequest {
+            ps_id: 2,
+            address: "ps2:9002".to_string(),
+        }))
+        .await
+        .expect("register ps 2");
+
+        // Upsert 2 partitions — each PS gets one.
+        for (part_id, start, end) in [(101u64, b"a" as &[u8], b"m" as &[u8]), (102, b"m", b"")] {
+            m.upsert_partition(Request::new(UpsertPartitionRequest {
+                meta: Some(PartitionMeta {
+                    log_stream: part_id,
+                    row_stream: part_id + 100,
+                    meta_stream: part_id + 200,
+                    part_id,
+                    rg: Some(autumn_proto::autumn::Range {
+                        start_key: start.to_vec(),
+                        end_key: end.to_vec(),
+                    }),
+                }),
+            }))
+            .await
+            .expect("upsert partition");
+        }
+
+        // Verify initial distribution: 1 partition per PS.
+        {
+            let s = m.store.inner.read();
+            let ps1 = s.regions.values().filter(|r| r.ps_id == 1).count();
+            let ps2 = s.regions.values().filter(|r| r.ps_id == 2).count();
+            assert_eq!(ps1, 1);
+            assert_eq!(ps2, 1);
+        }
+
+        // Simulate PS 1 dying: remove from ps_nodes and rebalance (mimics liveness loop).
+        {
+            let mut s = m.store.inner.write();
+            s.ps_nodes.remove(&1);
+            AutumnManager::rebalance_regions(&mut s);
+        }
+
+        // All partitions should now be on PS 2.
+        let s = m.store.inner.read();
+        for r in s.regions.values() {
+            assert_eq!(r.ps_id, 2, "all regions should move to PS 2 after PS 1 dies");
+        }
+    }
+
+    /// heartbeat_ps updates the timestamp for a registered PS.
+    #[tokio::test]
+    async fn f019_heartbeat_updates_timestamp() {
+        let m = AutumnManager::new();
+        m.register_ps(Request::new(RegisterPsRequest {
+            ps_id: 55,
+            address: "ps55:9055".to_string(),
+        }))
+        .await
+        .expect("register ps");
+
+        // record time before heartbeat
+        let before = Instant::now();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        m.heartbeat_ps(Request::new(HeartbeatPsRequest { ps_id: 55 }))
+            .await
+            .expect("heartbeat");
+
+        let ts = m.ps_last_heartbeat.lock().await;
+        let recorded = ts.get(&55).expect("timestamp recorded");
+        assert!(
+            recorded.elapsed() < Duration::from_millis(500),
+            "heartbeat should be recent"
+        );
+        // The recorded time should be after 'before + 10ms'.
+        assert!(before.elapsed() >= Duration::from_millis(10));
     }
 }

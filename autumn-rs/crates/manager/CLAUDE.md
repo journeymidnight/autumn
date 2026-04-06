@@ -115,9 +115,19 @@ Polls all registered nodes with the `df` RPC. The response includes completed re
 
 ## Partition Assignment: `rebalance_regions`
 
-Simple first-fit: for each partition, if its current PS is still registered → keep it; otherwise assign to the first registered PS. Called after `register_ps`, `upsert_partition`, and `multi_modify_split`.
+Least-loaded allocation: for each partition, keep the existing PS if it is still registered (always refreshing `rg` from the current `PartitionMeta`); otherwise assign to the PS with the fewest current partitions. Called after `register_ps`, `upsert_partition`, and `multi_modify_split`.
 
-No load balancing, no rack awareness. Future improvement area.
+The `rg` refresh on keep is critical: after a split, `multi_modify_split` updates the left partition's key range and calls `rebalance_regions`. Without refreshing `rg`, `GetRegions` would return the stale pre-split range to partition servers.
+
+## PS Liveness Detection
+
+`AutumnManager` tracks `ps_last_heartbeat: Arc<Mutex<HashMap<u64, Instant>>>` (ephemeral, not persisted to etcd).
+
+- **`register_ps`** records an initial timestamp so the PS isn't immediately evicted.
+- **`heartbeat_ps` RPC** (new): PS calls this every 5s to update its timestamp.
+- **`ps_liveness_check_loop`** (background, 10s interval): if a PS hasn't heartbeated in 30s, it is removed from `ps_nodes`, `rebalance_regions` is called, and the updated state is mirrored to etcd.
+
+The partition server side sends heartbeats from a `heartbeat_loop` spawned in `connect_with_advertise`, and polls `GetRegions` every 5s via `region_sync_loop` to pick up reassignments.
 
 ## Etcd Mirroring
 

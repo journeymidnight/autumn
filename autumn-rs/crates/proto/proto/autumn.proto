@@ -263,6 +263,15 @@ message GetRegionsResponse {
   map<uint64, PsDetail> ps_details = 4;
 }
 
+message HeartbeatPsRequest {
+  uint64 ps_id = 1;
+}
+
+message HeartbeatPsResponse {
+  Code code = 1;
+  string code_des = 2;
+}
+
 message PutRequest {
   bytes key = 1;
   bytes value = 2;
@@ -531,6 +540,7 @@ service PartitionManagerService {
   rpc RegisterPs(RegisterPsRequest) returns (RegisterPsResponse);
   rpc UpsertPartition(UpsertPartitionRequest) returns (UpsertPartitionResponse);
   rpc GetRegions(Empty) returns (GetRegionsResponse);
+  rpc HeartbeatPs(HeartbeatPsRequest) returns (HeartbeatPsResponse);
 }
 
 message CompactOp {}
