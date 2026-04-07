@@ -17,7 +17,9 @@ tonic.workspace = true
 tracing.workspace = true
 autumn-proto = { path = "../proto" }
 autumn-io-engine = { path = "../io-engine" }
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
 autumn-manager = { path = "../manager" }
+crc32c = "0.6"

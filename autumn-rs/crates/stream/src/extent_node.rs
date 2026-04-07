@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::wal::{replay_wal_files, should_use_wal, Wal, WalRecord};
@@ -22,27 +22,210 @@ use autumn_proto::autumn::{
     RequireRecoveryRequest, RequireRecoveryResponse, WriteShardRequest, WriteShardResponse,
 };
 use dashmap::DashMap;
+#[allow(unused_imports)]
+use libc;
 use tokio::sync::{mpsc, Mutex, OnceCell};
 use tokio::time::{interval, Duration};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
+// ─── DiskFS ──────────────────────────────────────────────────────────────────
+
+/// Represents one physical disk (data directory) on an extent node.
+///
+/// Two layout modes:
+/// - **flat** (single-disk / test mode): files are stored directly in `base_dir` as
+///   `extent-{id}.dat` / `extent-{id}.meta`. Used when constructing from `new()` for
+///   backward compatibility with existing tests.
+/// - **hashed** (multi-disk / production mode): files are placed in a two-level hash
+///   directory `{base_dir}/{hash_byte:02x}/extent-{id}.dat`. Matches the layout created
+///   by `autumn-client format` (256 subdirs 00..ff). The hash byte is the lowest byte of
+///   `crc32c(extent_id_le_bytes)` — simple, dependency-free, good spread.
+struct DiskFS {
+    base_dir: PathBuf,
+    disk_id: u64,
+    io: Arc<dyn IoEngine>,
+    online: AtomicBool,
+    use_hash_dirs: bool,
+}
+
+impl DiskFS {
+    /// Open a disk directory formatted by `autumn-client format`.
+    /// Reads `disk_id` from `{base_dir}/disk_id`.
+    async fn open(base_dir: PathBuf, io_mode: IoMode) -> Result<Self> {
+        let disk_id_path = base_dir.join("disk_id");
+        let disk_id_str = tokio::fs::read_to_string(&disk_id_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("read disk_id in {}: {e}", base_dir.display()))?;
+        let disk_id: u64 = disk_id_str
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid disk_id in {}", base_dir.display()))?;
+        Ok(Self {
+            base_dir,
+            disk_id,
+            io: build_engine(io_mode)?,
+            online: AtomicBool::new(true),
+            use_hash_dirs: true,
+        })
+    }
+
+    /// Create a single-disk entry directly (no `disk_id` file required). Used by tests
+    /// and the backward-compatible `ExtentNodeConfig::new()` constructor.
+    fn from_single(base_dir: PathBuf, disk_id: u64, io_mode: IoMode) -> Result<Self> {
+        Ok(Self {
+            base_dir,
+            disk_id,
+            io: build_engine(io_mode)?,
+            online: AtomicBool::new(true),
+            use_hash_dirs: false,
+        })
+    }
+
+    fn online(&self) -> bool {
+        self.online.load(Ordering::Relaxed)
+    }
+
+    fn set_offline(&self) {
+        self.online.store(false, Ordering::Relaxed);
+    }
+
+    /// Low byte of crc32c over extent_id little-endian bytes, used as hash subdir.
+    fn hash_byte(extent_id: u64) -> u8 {
+        let bytes = extent_id.to_le_bytes();
+        (crc32c::crc32c(&bytes) & 0xFF) as u8
+    }
+
+    fn extent_path(&self, extent_id: u64) -> PathBuf {
+        if self.use_hash_dirs {
+            let subdir = format!("{:02x}", Self::hash_byte(extent_id));
+            self.base_dir
+                .join(&subdir)
+                .join(format!("extent-{extent_id}.dat"))
+        } else {
+            self.base_dir.join(format!("extent-{extent_id}.dat"))
+        }
+    }
+
+    fn meta_path(&self, extent_id: u64) -> PathBuf {
+        if self.use_hash_dirs {
+            let subdir = format!("{:02x}", Self::hash_byte(extent_id));
+            self.base_dir
+                .join(&subdir)
+                .join(format!("extent-{extent_id}.meta"))
+        } else {
+            self.base_dir.join(format!("extent-{extent_id}.meta"))
+        }
+    }
+
+    /// Return (total_bytes, free_bytes) for this disk via statvfs.
+    fn disk_stats(&self) -> (u64, u64) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let c_path =
+                match std::ffi::CString::new(self.base_dir.as_os_str().as_bytes()) {
+                    Ok(p) => p,
+                    Err(_) => return (0, 0),
+                };
+            unsafe {
+                let mut stat: libc::statvfs = std::mem::zeroed();
+                if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
+                    let total =
+                        stat.f_blocks as u64 * stat.f_frsize as u64;
+                    let free = stat.f_bavail as u64 * stat.f_frsize as u64;
+                    return (total, free);
+                }
+            }
+        }
+        // Fallback (non-unix or statvfs failure).
+        (1u64 << 40, 1u64 << 39)
+    }
+
+    /// Scan this disk directory for all extent data files and call the callback for each.
+    /// Handles both flat layout (single dir) and hashed layout (256 subdirs).
+    async fn scan_extents<F>(&self, mut callback: F) -> Result<()>
+    where
+        F: FnMut(u64, PathBuf),
+    {
+        if self.use_hash_dirs {
+            // Iterate 256 hash subdirs.
+            for byte in 0u8..=255 {
+                let subdir = self.base_dir.join(format!("{byte:02x}"));
+                let mut dir = match tokio::fs::read_dir(&subdir).await {
+                    Ok(d) => d,
+                    Err(_) => continue, // subdir may not exist yet
+                };
+                while let Some(entry) = dir.next_entry().await? {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if let Some(id) = Self::parse_extent_id(&name) {
+                        callback(id, entry.path());
+                    }
+                }
+            }
+        } else {
+            // Flat layout: scan base_dir directly.
+            let mut dir = tokio::fs::read_dir(&self.base_dir).await?;
+            while let Some(entry) = dir.next_entry().await? {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if let Some(id) = Self::parse_extent_id(&name) {
+                    callback(id, entry.path());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_extent_id(name: &str) -> Option<u64> {
+        if name.starts_with("extent-") && name.ends_with(".dat") {
+            let id_str = &name["extent-".len()..name.len() - ".dat".len()];
+            id_str.parse().ok()
+        } else {
+            None
+        }
+    }
+}
+
+// ─── ExtentNodeConfig ─────────────────────────────────────────────────────────
+
+/// Configuration for an ExtentNode.
+///
+/// **Single-disk (test / backward-compat) mode**: use `new(data_dir, io_mode, disk_id)`.
+/// Files are stored flat in `data_dir`; no `disk_id` file is required.
+///
+/// **Multi-disk (production) mode**: use `new_multi(data_dirs, io_mode)`.
+/// Each directory must have been formatted by `autumn-client format` (which writes
+/// `disk_id` files and creates 256 hash subdirs). Files are stored in hash subdirs.
 #[derive(Clone)]
 pub struct ExtentNodeConfig {
-    pub data_dir: PathBuf,
-    pub io_mode: IoMode,
-    pub disk_id: u64,
+    /// Internal: list of (dir, disk_id, use_hash_dirs).
+    disks: Vec<(PathBuf, Option<u64>)>, // None disk_id → read from file
+    io_mode: IoMode,
     pub manager_endpoint: Option<String>,
     /// If Some, WAL is enabled at this directory.
     pub wal_dir: Option<PathBuf>,
 }
 
 impl ExtentNodeConfig {
+    /// Single-disk backward-compatible constructor. Tests and simple deployments use this.
+    /// `disk_id` is used directly (no `disk_id` file needed). Flat file layout.
     pub fn new(data_dir: PathBuf, io_mode: IoMode, disk_id: u64) -> Self {
         Self {
-            data_dir,
+            disks: vec![(data_dir, Some(disk_id))],
             io_mode,
-            disk_id,
+            manager_endpoint: None,
+            wal_dir: None,
+        }
+    }
+
+    /// Multi-disk constructor. Each directory must have a `disk_id` file written by
+    /// `autumn-client format`. Files are placed in hash subdirs (00..ff).
+    pub fn new_multi(data_dirs: Vec<PathBuf>, io_mode: IoMode) -> Self {
+        Self {
+            disks: data_dirs.into_iter().map(|d| (d, None)).collect(),
+            io_mode,
             manager_endpoint: None,
             wal_dir: None,
         }
@@ -59,6 +242,8 @@ impl ExtentNodeConfig {
     }
 }
 
+// ─── ExtentEntry ─────────────────────────────────────────────────────────────
+
 struct ExtentEntry {
     file: Arc<dyn IoFile>,
     len: AtomicU64,
@@ -67,14 +252,17 @@ struct ExtentEntry {
     sealed_length: AtomicU64,
     avali: AtomicU32,
     last_revision: AtomicI64,
+    /// Which disk this extent lives on. Used to resolve file paths.
+    disk_id: u64,
 }
+
+// ─── ExtentNode ───────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct ExtentNode {
     extents: Arc<DashMap<u64, Arc<ExtentEntry>>>,
-    io: Arc<dyn IoEngine>,
-    disk_id: u64,
-    data_dir: Arc<PathBuf>,
+    /// All disks attached to this node, keyed by disk_id.
+    disks: Arc<HashMap<u64, Arc<DiskFS>>>,
     manager_endpoint: Option<String>,
     manager_channel: Arc<OnceCell<tonic::transport::Channel>>,
     recovery_done: Arc<Mutex<Vec<RecoveryTaskStatus>>>,
@@ -88,7 +276,20 @@ impl ExtentNode {
     const META_SIZE: usize = 40;
 
     pub async fn new(config: ExtentNodeConfig) -> Result<Self> {
-        tokio::fs::create_dir_all(&config.data_dir).await?;
+        // Build DiskFS instances for all configured disks.
+        let mut disk_map: HashMap<u64, Arc<DiskFS>> = HashMap::new();
+        for (dir, maybe_disk_id) in config.disks {
+            tokio::fs::create_dir_all(&dir).await?;
+            let disk = if let Some(disk_id) = maybe_disk_id {
+                // Single-disk / test mode: disk_id provided directly, flat layout.
+                DiskFS::from_single(dir, disk_id, config.io_mode)?
+            } else {
+                // Multi-disk / production mode: read disk_id from file, hash layout.
+                DiskFS::open(dir, config.io_mode).await?
+            };
+            let disk_id = disk.disk_id;
+            disk_map.insert(disk_id, Arc::new(disk));
+        }
 
         // Open WAL before loading extents so we can replay into freshly loaded files.
         let wal_result = if let Some(wal_dir) = config.wal_dir {
@@ -99,9 +300,7 @@ impl ExtentNode {
 
         let node = Self {
             extents: Arc::new(DashMap::new()),
-            io: build_engine(config.io_mode)?,
-            disk_id: config.disk_id,
-            data_dir: Arc::new(config.data_dir),
+            disks: Arc::new(disk_map),
             manager_endpoint: config.manager_endpoint,
             manager_channel: Arc::new(OnceCell::new()),
             recovery_done: Arc::new(Mutex::new(Vec::new())),
@@ -109,7 +308,7 @@ impl ExtentNode {
             wal: wal_result.as_ref().map(|(w, _)| w.clone()),
         };
 
-        // Load existing extents from disk.
+        // Load existing extents from all disks.
         node.load_extents().await?;
 
         // Replay WAL records into extent files.
@@ -119,6 +318,18 @@ impl ExtentNode {
         }
 
         Ok(node)
+    }
+
+    /// Return the first online disk, or None if all are offline.
+    fn choose_disk(&self) -> Option<Arc<DiskFS>> {
+        self.disks.values().find(|d| d.online()).cloned()
+    }
+
+    /// Resolve DiskFS for an extent by its disk_id. Returns error if disk is unknown.
+    fn disk_for(&self, disk_id: u64) -> Result<Arc<DiskFS>, Status> {
+        self.disks.get(&disk_id).cloned().ok_or_else(|| {
+            Status::internal(format!("unknown disk_id {disk_id}"))
+        })
     }
 
     /// Replay WAL records into extent files. Called on startup after load_extents().
@@ -185,14 +396,6 @@ impl ExtentNode {
         }
     }
 
-    fn extent_path(&self, extent_id: u64) -> PathBuf {
-        self.data_dir.join(format!("extent-{extent_id}.dat"))
-    }
-
-    fn meta_path(&self, extent_id: u64) -> PathBuf {
-        self.data_dir.join(format!("extent-{extent_id}.meta"))
-    }
-
     async fn save_meta(&self, extent_id: u64, entry: &ExtentEntry) -> Result<(), Status> {
         let sealed_length = entry.sealed_length.load(Ordering::SeqCst);
         let eversion = entry.eversion.load(Ordering::SeqCst);
@@ -205,7 +408,8 @@ impl ExtentNode {
         buf[24..32].copy_from_slice(&eversion.to_le_bytes());
         buf[32..40].copy_from_slice(&last_revision.to_le_bytes());
 
-        tokio::fs::write(self.meta_path(extent_id), &buf)
+        let disk = self.disk_for(entry.disk_id)?;
+        tokio::fs::write(disk.meta_path(extent_id), &buf)
             .await
             .map_err(|e| Status::internal(format!("save meta for extent {extent_id}: {e}")))?;
         Ok(())
@@ -229,50 +433,55 @@ impl ExtentNode {
     }
 
     pub async fn load_extents(&self) -> Result<()> {
-        let mut dir = tokio::fs::read_dir(&*self.data_dir).await?;
-        while let Some(entry) = dir.next_entry().await? {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !name.starts_with("extent-") || !name.ends_with(".dat") {
-                continue;
-            }
-            let id_str = &name["extent-".len()..name.len() - ".dat".len()];
-            let extent_id: u64 = match id_str.parse() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+        for disk in self.disks.values() {
+            let disk = Arc::clone(disk);
+            let extents = Arc::clone(&self.extents);
 
-            let path = self.extent_path(extent_id);
-            let file = match self.io.create(&path).await {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::warn!("load_extents: cannot open extent {extent_id}: {e}");
-                    continue;
-                }
-            };
-            let len = file.len().await.unwrap_or(0);
+            // Collect extent IDs from this disk (scan_extents needs &mut callback).
+            let mut found: Vec<u64> = Vec::new();
+            disk.scan_extents(|id, _path| {
+                found.push(id);
+            })
+            .await?;
 
-            let (sealed_length, eversion, last_revision) =
-                match tokio::fs::read(self.meta_path(extent_id)).await {
-                    Ok(buf) => Self::parse_meta(&buf, extent_id).unwrap_or((0, 1, 0)),
-                    Err(_) => (0, 1, 0),
+            for extent_id in found {
+                let path = disk.extent_path(extent_id);
+                let file = match disk.io.create(&path).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::warn!(
+                            "load_extents: cannot open extent {extent_id} on disk {}: {e}",
+                            disk.disk_id
+                        );
+                        continue;
+                    }
                 };
+                let len = file.len().await.unwrap_or(0);
 
-            self.extents.insert(
-                extent_id,
-                Arc::new(ExtentEntry {
-                    file,
-                    len: AtomicU64::new(len),
-                    write_lock: Mutex::new(()),
-                    eversion: AtomicU64::new(eversion),
-                    sealed_length: AtomicU64::new(sealed_length),
-                    avali: AtomicU32::new(if sealed_length > 0 { 1 } else { 0 }),
-                    last_revision: AtomicI64::new(last_revision),
-                }),
-            );
-            tracing::info!(
-                "loaded extent {extent_id}: len={len}, sealed_length={sealed_length}, eversion={eversion}"
-            );
+                let (sealed_length, eversion, last_revision) =
+                    match tokio::fs::read(disk.meta_path(extent_id)).await {
+                        Ok(buf) => Self::parse_meta(&buf, extent_id).unwrap_or((0, 1, 0)),
+                        Err(_) => (0, 1, 0),
+                    };
+
+                extents.insert(
+                    extent_id,
+                    Arc::new(ExtentEntry {
+                        file,
+                        len: AtomicU64::new(len),
+                        write_lock: Mutex::new(()),
+                        eversion: AtomicU64::new(eversion),
+                        sealed_length: AtomicU64::new(sealed_length),
+                        avali: AtomicU32::new(if sealed_length > 0 { 1 } else { 0 }),
+                        last_revision: AtomicI64::new(last_revision),
+                        disk_id: disk.disk_id,
+                    }),
+                );
+                tracing::info!(
+                    "loaded extent {extent_id} from disk {}: len={len}, sealed_length={sealed_length}, eversion={eversion}",
+                    disk.disk_id
+                );
+            }
         }
         Ok(())
     }
@@ -308,8 +517,11 @@ impl ExtentNode {
             return Ok(Arc::clone(v.value()));
         }
 
-        let path = self.extent_path(extent_id);
-        let file = self
+        let disk = self
+            .choose_disk()
+            .ok_or_else(|| Status::unavailable("no online disk available"))?;
+        let path = disk.extent_path(extent_id);
+        let file = disk
             .io
             .create(&path)
             .await
@@ -319,6 +531,7 @@ impl ExtentNode {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        let disk_id = disk.disk_id;
         self.extents.insert(
             extent_id,
             Arc::new(ExtentEntry {
@@ -329,6 +542,7 @@ impl ExtentNode {
                 sealed_length: AtomicU64::new(0),
                 avali: AtomicU32::new(0),
                 last_revision: AtomicI64::new(0),
+                disk_id,
             }),
         );
         self.get_extent(extent_id).await
@@ -566,7 +780,7 @@ impl ExtentNode {
 
         Ok(RecoveryTaskStatus {
             task: Some(task),
-            ready_disk_id: self.disk_id,
+            ready_disk_id: extent.disk_id,
         })
     }
 
@@ -703,8 +917,13 @@ impl ExtentService for ExtentNode {
         request: Request<AllocExtentRequest>,
     ) -> Result<Response<AllocExtentResponse>, Status> {
         let req = request.into_inner();
-        let path = self.extent_path(req.extent_id);
-        let file = self
+        let disk = self
+            .choose_disk()
+            .ok_or_else(|| Status::unavailable("no online disk available"))?;
+        let disk_id = disk.disk_id;
+
+        let path = disk.extent_path(req.extent_id);
+        let file = disk
             .io
             .create(&path)
             .await
@@ -724,6 +943,7 @@ impl ExtentService for ExtentNode {
                 sealed_length: AtomicU64::new(0),
                 avali: AtomicU32::new(0),
                 last_revision: AtomicI64::new(0),
+                disk_id,
             }),
         );
 
@@ -733,7 +953,7 @@ impl ExtentService for ExtentNode {
         Ok(Response::new(AllocExtentResponse {
             code: Code::Ok as i32,
             code_des: String::new(),
-            disk_id: self.disk_id,
+            disk_id,
         }))
     }
 
@@ -1158,24 +1378,31 @@ impl ExtentService for ExtentNode {
         let req = request.into_inner();
         let mut disk_status = std::collections::HashMap::new();
         if req.disk_ids.is_empty() {
-            disk_status.insert(
-                self.disk_id,
-                Df {
-                    total: 1 << 40,
-                    free: 1 << 39,
-                    online: true,
-                },
-            );
-        } else {
-            for disk_id in req.disk_ids {
+            // Report all known disks.
+            for disk in self.disks.values() {
+                let (total, free) = disk.disk_stats();
                 disk_status.insert(
-                    disk_id,
+                    disk.disk_id,
                     Df {
-                        total: 1 << 40,
-                        free: 1 << 39,
-                        online: true,
+                        total,
+                        free,
+                        online: disk.online(),
                     },
                 );
+            }
+        } else {
+            for disk_id in req.disk_ids {
+                if let Some(disk) = self.disks.get(&disk_id) {
+                    let (total, free) = disk.disk_stats();
+                    disk_status.insert(
+                        disk_id,
+                        Df {
+                            total,
+                            free,
+                            online: disk.online(),
+                        },
+                    );
+                }
             }
         }
 

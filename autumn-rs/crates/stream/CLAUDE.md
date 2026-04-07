@@ -14,9 +14,15 @@ All are exported from `src/lib.rs`.
 
 ## ExtentNode — Server Side
 
-### Data Model
+### Data Model (F021: Multi-Disk)
 
-Each extent lives as two files in the data directory:
+An `ExtentNode` can manage **multiple disk directories**. Each directory is represented by a `DiskFS` struct (disk_id, base_dir, io engine, online flag).
+
+Two layout modes:
+- **Flat** (single-disk / test mode): `{data_dir}/extent-{id}.dat` + `.meta`. Used by `ExtentNodeConfig::new()`.
+- **Hashed** (multi-disk / production mode): `{data_dir}/{hash:02x}/extent-{id}.dat` + `.meta`. Hash = `crc32c(extent_id_le_bytes) & 0xFF`. Matches the 256 subdirs created by `autumn-client format`. Used by `ExtentNodeConfig::new_multi()`.
+
+Each extent file pair:
 - `extent-{id}.dat` — raw data (append-only during active use)
 - `extent-{id}.meta` — 40-byte binary sidecar:
 
@@ -27,6 +33,22 @@ Each extent lives as two files in the data directory:
 | 16–23 | `sealed_length` (le u64) |
 | 24–31 | `eversion` (le u64) |
 | 32–39 | `last_revision` (le i64) |
+
+`ExtentEntry` stores `disk_id` for path resolution. `choose_disk()` returns the first online disk (matches Go's strategy). `df()` returns real `statvfs` stats per disk.
+
+**Multi-disk usage** (production):
+```bash
+# Format disks and register with manager
+autumn-client --manager ... format --listen :9101 --advertise host:9101 /disk1 /disk2
+
+# Start node with multiple disks (comma-separated or repeated)
+autumn-extent-node --data /disk1,/disk2 --manager ... [--wal-dir /nvme/wal]
+```
+
+**Single-disk usage** (tests / backward compat):
+```bash
+autumn-extent-node --data /tmp/data --disk-id 1 --manager ...
+```
 
 In memory, `ExtentNode` holds a `DashMap<u64, Arc<ExtentEntry>>`:
 

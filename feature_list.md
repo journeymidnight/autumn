@@ -157,8 +157,8 @@
 ### F021 · Multi-disk support and disk format
 - **Target:** Extent node supports multiple disks with UUID identification, per-disk extent placement. Equivalent to Go `node/diskfs.go`.
 - **Evidence:** `node/diskfs.go` · `node/node.go` (diskFSs map) · `autumn-rs/crates/stream/src/extent_node.rs`
-- **Notes:** Rust uses a single `--data` directory. Go supports multiple dirs with disk UUIDs and TOML config generation.
-- **passes:** false
+- **Notes:** Implemented. `DiskFS` struct per disk directory: disk_id (from `disk_id` file), online flag, real `statvfs` stats. Two layout modes: flat (single-disk/test, `ExtentNodeConfig::new`) and hashed (multi-disk/production, `ExtentNodeConfig::new_multi`, 256 hash subdirs matching `autumn-client format`). `choose_disk()` picks first online disk (matches Go). `df()` reports real per-disk capacity. `autumn-extent-node` binary accepts `--data /d1,/d2` and independent `--wal-dir`. 3 new F021 tests pass, all 13 integration tests pass.
+- **passes:** true
 
 ---
 
