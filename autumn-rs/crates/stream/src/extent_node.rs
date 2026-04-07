@@ -33,20 +33,15 @@ use tonic::{Request, Response, Status};
 
 /// Represents one physical disk (data directory) on an extent node.
 ///
-/// Two layout modes:
-/// - **flat** (single-disk / test mode): files are stored directly in `base_dir` as
-///   `extent-{id}.dat` / `extent-{id}.meta`. Used when constructing from `new()` for
-///   backward compatibility with existing tests.
-/// - **hashed** (multi-disk / production mode): files are placed in a two-level hash
-///   directory `{base_dir}/{hash_byte:02x}/extent-{id}.dat`. Matches the layout created
-///   by `autumn-client format` (256 subdirs 00..ff). The hash byte is the lowest byte of
-///   `crc32c(extent_id_le_bytes)` — simple, dependency-free, good spread.
+/// Files are stored in a hash-based layout:
+/// `{base_dir}/{crc32c(extent_id_le)&0xFF:02x}/extent-{id}.dat`
+/// This matches the 256 subdirs created by `autumn-client format`.
+/// Hash subdirs are created on-demand when the first extent is written.
 struct DiskFS {
     base_dir: PathBuf,
     disk_id: u64,
     io: Arc<dyn IoEngine>,
     online: AtomicBool,
-    use_hash_dirs: bool,
 }
 
 impl DiskFS {
@@ -66,19 +61,17 @@ impl DiskFS {
             disk_id,
             io: build_engine(io_mode)?,
             online: AtomicBool::new(true),
-            use_hash_dirs: true,
         })
     }
 
-    /// Create a single-disk entry directly (no `disk_id` file required). Used by tests
-    /// and the backward-compatible `ExtentNodeConfig::new()` constructor.
-    fn from_single(base_dir: PathBuf, disk_id: u64, io_mode: IoMode) -> Result<Self> {
+    /// Create a disk entry with an explicit disk_id (no `disk_id` file required).
+    /// Used by `ExtentNodeConfig::new()` for tests and single-disk deployments.
+    fn with_disk_id(base_dir: PathBuf, disk_id: u64, io_mode: IoMode) -> Result<Self> {
         Ok(Self {
             base_dir,
             disk_id,
             io: build_engine(io_mode)?,
             online: AtomicBool::new(true),
-            use_hash_dirs: false,
         })
     }
 
@@ -90,32 +83,21 @@ impl DiskFS {
         self.online.store(false, Ordering::Relaxed);
     }
 
-    /// Low byte of crc32c over extent_id little-endian bytes, used as hash subdir.
+    /// Low byte of crc32c over extent_id little-endian bytes → hash subdir name.
     fn hash_byte(extent_id: u64) -> u8 {
-        let bytes = extent_id.to_le_bytes();
-        (crc32c::crc32c(&bytes) & 0xFF) as u8
+        (crc32c::crc32c(&extent_id.to_le_bytes()) & 0xFF) as u8
     }
 
     fn extent_path(&self, extent_id: u64) -> PathBuf {
-        if self.use_hash_dirs {
-            let subdir = format!("{:02x}", Self::hash_byte(extent_id));
-            self.base_dir
-                .join(&subdir)
-                .join(format!("extent-{extent_id}.dat"))
-        } else {
-            self.base_dir.join(format!("extent-{extent_id}.dat"))
-        }
+        self.base_dir
+            .join(format!("{:02x}", Self::hash_byte(extent_id)))
+            .join(format!("extent-{extent_id}.dat"))
     }
 
     fn meta_path(&self, extent_id: u64) -> PathBuf {
-        if self.use_hash_dirs {
-            let subdir = format!("{:02x}", Self::hash_byte(extent_id));
-            self.base_dir
-                .join(&subdir)
-                .join(format!("extent-{extent_id}.meta"))
-        } else {
-            self.base_dir.join(format!("extent-{extent_id}.meta"))
-        }
+        self.base_dir
+            .join(format!("{:02x}", Self::hash_byte(extent_id)))
+            .join(format!("extent-{extent_id}.meta"))
     }
 
     /// Return (total_bytes, free_bytes) for this disk via statvfs.
@@ -123,50 +105,34 @@ impl DiskFS {
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
-            let c_path =
-                match std::ffi::CString::new(self.base_dir.as_os_str().as_bytes()) {
-                    Ok(p) => p,
-                    Err(_) => return (0, 0),
-                };
-            unsafe {
-                let mut stat: libc::statvfs = std::mem::zeroed();
-                if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
-                    let total =
-                        stat.f_blocks as u64 * stat.f_frsize as u64;
-                    let free = stat.f_bavail as u64 * stat.f_frsize as u64;
-                    return (total, free);
+            if let Ok(c_path) =
+                std::ffi::CString::new(self.base_dir.as_os_str().as_bytes())
+            {
+                unsafe {
+                    let mut stat: libc::statvfs = std::mem::zeroed();
+                    if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
+                        let total = stat.f_blocks as u64 * stat.f_frsize as u64;
+                        let free = stat.f_bavail as u64 * stat.f_frsize as u64;
+                        return (total, free);
+                    }
                 }
             }
         }
-        // Fallback (non-unix or statvfs failure).
         (1u64 << 40, 1u64 << 39)
     }
 
-    /// Scan this disk directory for all extent data files and call the callback for each.
-    /// Handles both flat layout (single dir) and hashed layout (256 subdirs).
+    /// Scan all extent data files across the 256 hash subdirs.
+    /// Subdirs that don't exist yet are silently skipped.
     async fn scan_extents<F>(&self, mut callback: F) -> Result<()>
     where
         F: FnMut(u64, PathBuf),
     {
-        if self.use_hash_dirs {
-            // Iterate 256 hash subdirs.
-            for byte in 0u8..=255 {
-                let subdir = self.base_dir.join(format!("{byte:02x}"));
-                let mut dir = match tokio::fs::read_dir(&subdir).await {
-                    Ok(d) => d,
-                    Err(_) => continue, // subdir may not exist yet
-                };
-                while let Some(entry) = dir.next_entry().await? {
-                    let name = entry.file_name();
-                    let name = name.to_string_lossy();
-                    if let Some(id) = Self::parse_extent_id(&name) {
-                        callback(id, entry.path());
-                    }
-                }
-            }
-        } else {
-            // Flat layout: scan base_dir directly.
-            let mut dir = tokio::fs::read_dir(&self.base_dir).await?;
+        for byte in 0u8..=255 {
+            let subdir = self.base_dir.join(format!("{byte:02x}"));
+            let mut dir = match tokio::fs::read_dir(&subdir).await {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
             while let Some(entry) = dir.next_entry().await? {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
@@ -192,25 +158,24 @@ impl DiskFS {
 
 /// Configuration for an ExtentNode.
 ///
-/// **Single-disk (test / backward-compat) mode**: use `new(data_dir, io_mode, disk_id)`.
-/// Files are stored flat in `data_dir`; no `disk_id` file is required.
+/// All layouts use the hash-based file layout:
+/// `{data_dir}/{hash_byte:02x}/extent-{id}.dat`.
+/// Hash subdirs are created on-demand; no pre-formatting required.
 ///
-/// **Multi-disk (production) mode**: use `new_multi(data_dirs, io_mode)`.
-/// Each directory must have been formatted by `autumn-client format` (which writes
-/// `disk_id` files and creates 256 hash subdirs). Files are stored in hash subdirs.
+/// - `new(data_dir, io_mode, disk_id)`: single disk with explicit disk_id (tests, simple deploys).
+/// - `new_multi(data_dirs, io_mode)`: multiple disks; each dir must have a `disk_id` file
+///   written by `autumn-client format`.
 #[derive(Clone)]
 pub struct ExtentNodeConfig {
-    /// Internal: list of (dir, disk_id, use_hash_dirs).
-    disks: Vec<(PathBuf, Option<u64>)>, // None disk_id → read from file
+    /// (dir, disk_id): None disk_id → read from `disk_id` file in dir.
+    disks: Vec<(PathBuf, Option<u64>)>,
     io_mode: IoMode,
     pub manager_endpoint: Option<String>,
-    /// If Some, WAL is enabled at this directory.
     pub wal_dir: Option<PathBuf>,
 }
 
 impl ExtentNodeConfig {
-    /// Single-disk backward-compatible constructor. Tests and simple deployments use this.
-    /// `disk_id` is used directly (no `disk_id` file needed). Flat file layout.
+    /// Single-disk constructor. `disk_id` is used directly (no file needed).
     pub fn new(data_dir: PathBuf, io_mode: IoMode, disk_id: u64) -> Self {
         Self {
             disks: vec![(data_dir, Some(disk_id))],
@@ -220,8 +185,8 @@ impl ExtentNodeConfig {
         }
     }
 
-    /// Multi-disk constructor. Each directory must have a `disk_id` file written by
-    /// `autumn-client format`. Files are placed in hash subdirs (00..ff).
+    /// Multi-disk constructor. Each directory must have a `disk_id` file
+    /// written by `autumn-client format`.
     pub fn new_multi(data_dirs: Vec<PathBuf>, io_mode: IoMode) -> Self {
         Self {
             disks: data_dirs.into_iter().map(|d| (d, None)).collect(),
@@ -281,10 +246,8 @@ impl ExtentNode {
         for (dir, maybe_disk_id) in config.disks {
             tokio::fs::create_dir_all(&dir).await?;
             let disk = if let Some(disk_id) = maybe_disk_id {
-                // Single-disk / test mode: disk_id provided directly, flat layout.
-                DiskFS::from_single(dir, disk_id, config.io_mode)?
+                DiskFS::with_disk_id(dir, disk_id, config.io_mode)?
             } else {
-                // Multi-disk / production mode: read disk_id from file, hash layout.
                 DiskFS::open(dir, config.io_mode).await?
             };
             let disk_id = disk.disk_id;
@@ -521,6 +484,11 @@ impl ExtentNode {
             .choose_disk()
             .ok_or_else(|| Status::unavailable("no online disk available"))?;
         let path = disk.extent_path(extent_id);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
         let file = disk
             .io
             .create(&path)
@@ -923,6 +891,11 @@ impl ExtentService for ExtentNode {
         let disk_id = disk.disk_id;
 
         let path = disk.extent_path(req.extent_id);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
         let file = disk
             .io
             .create(&path)

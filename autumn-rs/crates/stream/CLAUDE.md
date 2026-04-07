@@ -18,9 +18,7 @@ All are exported from `src/lib.rs`.
 
 An `ExtentNode` can manage **multiple disk directories**. Each directory is represented by a `DiskFS` struct (disk_id, base_dir, io engine, online flag).
 
-Two layout modes:
-- **Flat** (single-disk / test mode): `{data_dir}/extent-{id}.dat` + `.meta`. Used by `ExtentNodeConfig::new()`.
-- **Hashed** (multi-disk / production mode): `{data_dir}/{hash:02x}/extent-{id}.dat` + `.meta`. Hash = `crc32c(extent_id_le_bytes) & 0xFF`. Matches the 256 subdirs created by `autumn-client format`. Used by `ExtentNodeConfig::new_multi()`.
+All extents use the hashed layout: `{data_dir}/{hash:02x}/extent-{id}.dat` + `.meta`. Hash = `crc32c(extent_id_le_bytes) & 0xFF` (low byte). Hash subdirs are created on-demand — no pre-formatting required. Matches the 256 subdirs created by `autumn-client format`.
 
 Each extent file pair:
 - `extent-{id}.dat` — raw data (append-only during active use)

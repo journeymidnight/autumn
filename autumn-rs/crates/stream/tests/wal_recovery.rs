@@ -15,6 +15,17 @@ use autumn_proto::autumn::{
     ReadBytesRequest,
 };
 use autumn_stream::{ExtentNode, ExtentNodeConfig};
+
+/// Mirror DiskFS::hash_byte: low byte of crc32c(extent_id_le).
+fn extent_hash_byte(extent_id: u64) -> u8 {
+    (crc32c::crc32c(&extent_id.to_le_bytes()) & 0xFF) as u8
+}
+
+fn extent_path(data_dir: &std::path::Path, extent_id: u64) -> std::path::PathBuf {
+    data_dir
+        .join(format!("{:02x}", extent_hash_byte(extent_id)))
+        .join(format!("extent-{extent_id}.dat"))
+}
 use tokio::time::sleep;
 use tokio_stream::iter;
 use tonic::Request;
@@ -113,7 +124,7 @@ async fn wal_replay_recovers_truncated_extent() {
     }
 
     // Phase 2: truncate the extent .dat file to simulate data loss (crash before sync)
-    let extent_file = data_dir.join(format!("extent-{extent_id}.dat"));
+    let extent_file = extent_path(data_dir, extent_id);
     assert!(extent_file.exists(), "extent file should exist");
     {
         let f = std::fs::OpenOptions::new()
@@ -237,7 +248,7 @@ async fn wal_replay_multiple_appends() {
     }
 
     // Phase 2: truncate extent file to simulate data loss
-    let extent_file = data_dir.join(format!("extent-{extent_id}.dat"));
+    let extent_file = extent_path(data_dir, extent_id);
     std::fs::OpenOptions::new()
         .write(true)
         .open(&extent_file)

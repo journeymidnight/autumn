@@ -21,13 +21,10 @@ fn pick_addr() -> SocketAddr {
     addr
 }
 
-/// Prepare a disk directory as if `autumn-client format` had run:
-/// write disk_id file and create 256 hash subdirectories.
+/// Prepare a disk directory: write disk_id file.
+/// Hash subdirs are created on-demand by the extent node.
 fn format_disk(dir: &std::path::Path, disk_id: u64) {
     std::fs::write(dir.join("disk_id"), disk_id.to_string()).expect("write disk_id");
-    for byte in 0u8..=255 {
-        std::fs::create_dir_all(dir.join(format!("{byte:02x}"))).expect("create hash subdir");
-    }
 }
 
 async fn start_node_multi(
@@ -105,19 +102,15 @@ async fn f021_multi_disk_load_extents() {
     // Manually place extent files in correct hash subdirs.
     // Extent 100 on disk1.
     let hash_100 = hash_byte_for_extent(100);
-    let ext_100 = d1
-        .path()
-        .join(format!("{hash_100:02x}"))
-        .join("extent-100.dat");
-    std::fs::write(&ext_100, b"hello").expect("write extent-100.dat");
+    let subdir_100 = d1.path().join(format!("{hash_100:02x}"));
+    std::fs::create_dir_all(&subdir_100).expect("create hash subdir");
+    std::fs::write(subdir_100.join("extent-100.dat"), b"hello").expect("write extent-100.dat");
 
     // Extent 200 on disk2.
     let hash_200 = hash_byte_for_extent(200);
-    let ext_200 = d2
-        .path()
-        .join(format!("{hash_200:02x}"))
-        .join("extent-200.dat");
-    std::fs::write(&ext_200, b"world").expect("write extent-200.dat");
+    let subdir_200 = d2.path().join(format!("{hash_200:02x}"));
+    std::fs::create_dir_all(&subdir_200).expect("create hash subdir");
+    std::fs::write(subdir_200.join("extent-200.dat"), b"world").expect("write extent-200.dat");
 
     let addr = pick_addr();
     let (task, mut client) = start_node_multi(

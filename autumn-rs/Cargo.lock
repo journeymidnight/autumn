@@ -193,6 +193,7 @@ dependencies = [
  "crc32c",
  "dashmap",
  "futures",
+ "libc",
  "reed-solomon-erasure",
  "tempfile",
  "tokio",
