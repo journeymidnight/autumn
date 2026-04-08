@@ -109,10 +109,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "autumn-common",
- "autumn-io-engine",
- "autumn-partition-server",
  "autumn-proto",
- "autumn-stream",
  "dashmap",
  "etcd-client",
  "parking_lot 0.12.5",
@@ -361,7 +358,6 @@ dependencies = [
  "ciborium",
  "clap",
  "criterion-plot",
- "futures",
  "is-terminal",
  "itertools 0.10.5",
  "num-traits",
@@ -374,7 +370,6 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "tinytemplate",
- "tokio",
  "walkdir",
 ]
 

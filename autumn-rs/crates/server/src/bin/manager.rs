@@ -72,6 +72,8 @@ async fn main() -> Result<()> {
     tracing::info!("autumn-manager-server listening on {addr}");
 
     tonic::transport::Server::builder()
+        .http2_max_pending_accept_reset_streams(Some(1024))
+        .max_concurrent_streams(Some(1000))
         .add_service(reflection)
         .add_service(StreamManagerServiceServer::new(manager.clone()))
         .add_service(PartitionManagerServiceServer::new(manager))
