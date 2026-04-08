@@ -7,6 +7,9 @@
 
 set -euo pipefail
 
+# macOS default is 256 open files — far too few for 256-thread benchmarks
+ulimit -n 65536 2>/dev/null || true
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AC="$SCRIPT_DIR/target/release/autumn-client"
 BASELINE="$SCRIPT_DIR/perf_baseline.json"

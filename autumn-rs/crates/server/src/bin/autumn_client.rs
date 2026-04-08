@@ -1393,8 +1393,18 @@ async fn main() -> Result<()> {
                     let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
                     if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
                         if rl.rlim_cur < needed {
-                            rl.rlim_cur = needed.min(rl.rlim_max);
-                            libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+                            let target = needed.min(rl.rlim_max);
+                            rl.rlim_cur = target;
+                            if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) != 0
+                                || target < needed
+                            {
+                                eprintln!(
+                                    "warning: need {} open files for {} threads, \
+                                     but limit is {} (hard limit {}). \
+                                     Run: ulimit -n 65536",
+                                    needed, threads, target, rl.rlim_max
+                                );
+                            }
                         }
                     }
                 }
