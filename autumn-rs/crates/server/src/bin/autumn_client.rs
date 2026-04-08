@@ -860,16 +860,20 @@ fn print_bench_summary(
     }
 }
 
-fn parse_write_results(json: &str) -> Result<Vec<BenchResult>> {
+/// Returns (results, value_size). Legacy format returns value_size=0.
+fn parse_write_results(json: &str) -> Result<(Vec<BenchResult>, usize)> {
     let trimmed = json.trim_start();
     if trimmed.starts_with('[') {
-        return serde_json::from_str(trimmed).context("parse legacy result file");
+        let results: Vec<BenchResult> =
+            serde_json::from_str(trimmed).context("parse legacy result file")?;
+        return Ok((results, 0));
     }
     let report: WriteBenchReport = serde_json::from_str(trimmed).context("parse result report")?;
     if report.results.is_empty() {
         bail!("no keys in result file");
     }
-    Ok(report.results)
+    let value_size = report.config.value_size;
+    Ok((report.results, value_size))
 }
 
 // ---------------------------------------------------------------------------
@@ -920,9 +924,10 @@ mod tests {
             elapsed: 1.0,
         }])
         .unwrap();
-        let parsed = parse_write_results(&json).unwrap();
+        let (parsed, vs) = parse_write_results(&json).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].key, "k1");
+        assert_eq!(vs, 0); // legacy format has no value_size
     }
 
     #[test]
@@ -959,9 +964,10 @@ mod tests {
             }],
         })
         .unwrap();
-        let parsed = parse_write_results(&json).unwrap();
+        let (parsed, vs) = parse_write_results(&json).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].key, "k2");
+        assert_eq!(vs, 8192);
     }
 
     #[test]
@@ -993,9 +999,10 @@ mod tests {
                 { "key": "k3", "start_time": 0.1, "elapsed": 0.2 }
             ]
         }"#;
-        let parsed = parse_write_results(json).unwrap();
+        let (parsed, vs) = parse_write_results(json).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].key, "k3");
+        assert_eq!(vs, 8192);
     }
 }
 
@@ -1578,7 +1585,7 @@ async fn main() -> Result<()> {
             let json = tokio::fs::read_to_string(&result_file)
                 .await
                 .with_context(|| format!("read {result_file}"))?;
-            let write_results = parse_write_results(&json)?;
+            let (write_results, value_size) = parse_write_results(&json)?;
             let keys: Vec<String> = write_results.into_iter().map(|r| r.key).collect();
             if keys.is_empty() {
                 bail!("no keys in result file");
@@ -1706,7 +1713,7 @@ async fn main() -> Result<()> {
 
             let mut hist = LatencyHist::new();
             hist.samples_ms = all_latencies;
-            let _ = print_bench_summary("Read", threads, 0, elapsed, ops, &mut hist);
+            let _ = print_bench_summary("Read", threads, value_size, elapsed, ops, &mut hist);
         }
 
         Command::PerfCheck {
