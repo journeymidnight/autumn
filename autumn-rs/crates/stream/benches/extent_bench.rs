@@ -119,6 +119,90 @@ async fn run_bench() {
 
     println!("\n=== 32 tasks, 4KB Append + Sync ===");
     bench_concurrent(listen_addr, 32, 2_000, true).await;
+
+    // ── Read benchmarks ─────────────────────────────────────────────────────
+    println!("\n=== 1 task, 4KB Read ===");
+    bench_read(listen_addr, 1, 10_000).await;
+
+    println!("\n=== 32 tasks, 4KB Read ===");
+    bench_read(listen_addr, 32, 10_000).await;
+}
+
+async fn bench_read(addr: SocketAddr, num_tasks: usize, ops_per_task: u64) {
+    let base_extent = 5000u64;
+    let payload = Bytes::from(vec![0xCDu8; 4096]);
+    let total_ops = Rc::new(Cell::new(0u64));
+    let total_bytes = Rc::new(Cell::new(0u64));
+
+    // Pre-fill extents with data (each extent gets ops_per_task * 4096 bytes).
+    for t in 0..num_tasks {
+        let extent_id = base_extent + t as u64;
+        let mut conn = BenchConn::connect(addr).await;
+
+        let alloc_req = rkyv_encode(&AllocExtentReq { extent_id });
+        let resp = conn.call(MSG_ALLOC_EXTENT, alloc_req).await;
+        let r: AllocExtentResp = rkyv_decode(&resp).unwrap();
+        assert_eq!(r.code, CODE_OK, "alloc {extent_id} failed: {}", r.message);
+
+        // Write enough data.
+        let mut commit = 0u32;
+        let write_count = ops_per_task.min(1000); // write at least 1000 blocks
+        for _ in 0..write_count {
+            let req = AppendReq {
+                extent_id, eversion: 1, commit, revision: 1,
+                must_sync: false, payload: payload.clone(),
+            };
+            let resp = AppendResp::decode(conn.call(MSG_APPEND, req.encode()).await).unwrap();
+            commit = resp.end;
+        }
+    }
+
+    // Benchmark reads.
+    let start = Instant::now();
+    let mut handles = Vec::with_capacity(num_tasks);
+
+    for t in 0..num_tasks {
+        let extent_id = base_extent + t as u64;
+        let total_ops = total_ops.clone();
+        let total_bytes = total_bytes.clone();
+
+        handles.push(compio::runtime::spawn(async move {
+            let mut conn = BenchConn::connect(addr).await;
+            let mut done = 0u64;
+            let mut bytes = 0u64;
+
+            for i in 0..ops_per_task {
+                let offset = ((i % 1000) * 4096) as u32;
+                let req = ReadBytesReq {
+                    extent_id,
+                    eversion: 0,
+                    offset,
+                    length: 4096,
+                };
+                let resp_bytes = conn.call(MSG_READ_BYTES, req.encode()).await;
+                let resp = ReadBytesResp::decode(resp_bytes).unwrap();
+                assert_eq!(resp.code, CODE_OK, "task {t} read failed");
+                bytes += resp.payload.len() as u64;
+                done += 1;
+            }
+            total_ops.set(total_ops.get() + done);
+            total_bytes.set(total_bytes.get() + bytes);
+        }));
+    }
+
+    for h in handles {
+        h.await;
+    }
+    let elapsed = start.elapsed();
+    let total = total_ops.get();
+    let ops = total as f64 / elapsed.as_secs_f64();
+    let throughput = total_bytes.get() as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
+    let avg_lat = elapsed.as_micros() as f64 / total as f64;
+    println!("  Total ops:   {total}");
+    println!("  Elapsed:     {:.2}s", elapsed.as_secs_f64());
+    println!("  Ops/sec:     {ops:.0}");
+    println!("  Throughput:  {throughput:.1} MB/s");
+    println!("  Avg latency: {avg_lat:.1} µs/op");
 }
 
 async fn bench_concurrent(addr: SocketAddr, num_tasks: usize, ops_per_task: u64, must_sync: bool) {

@@ -196,7 +196,7 @@ impl ExtentNodeConfig {
 // ─── ExtentEntry ─────────────────────────────────────────────────────────────
 
 struct ExtentEntry {
-    file: RefCell<CompioFile>,
+    file: std::cell::UnsafeCell<CompioFile>,
     len: AtomicU64,
     eversion: AtomicU64,
     sealed_length: AtomicU64,
@@ -251,16 +251,24 @@ async fn rpc_oneshot(addr: std::net::SocketAddr, msg_type: u8, payload: Bytes) -
     }
 }
 
-/// Helper: write data at offset using compio, returning anyhow::Result.
-async fn file_write_at(file: &RefCell<CompioFile>, offset: u64, data: impl compio::buf::IoBuf) -> Result<()> {
-    let BufResult(result, _) = file.borrow_mut().write_all_at(data, offset).await;
+/// Shared ref to file inside UnsafeCell (single-threaded compio).
+fn file_ref(file: &std::cell::UnsafeCell<CompioFile>) -> &CompioFile {
+    unsafe { &*file.get() }
+}
+
+/// Positional write (pwrite) at reserved offset — safe for concurrent
+/// non-overlapping offsets (each caller uses fetch_add to reserve).
+async fn file_pwrite(file: &std::cell::UnsafeCell<CompioFile>, offset: u64, data: impl compio::buf::IoBuf) -> Result<()> {
+    let f = unsafe { &mut *file.get() };
+    let BufResult(result, _) = f.write_all_at(data, offset).await;
     result.map_err(|e| anyhow::anyhow!(e))
 }
 
-/// Helper: read data at offset using compio, returning anyhow::Result<Vec<u8>>.
-async fn file_read_at(file: &RefCell<CompioFile>, offset: u64, len: usize) -> Result<Vec<u8>> {
+/// Positional read (pread).
+async fn file_pread(file: &std::cell::UnsafeCell<CompioFile>, offset: u64, len: usize) -> Result<Vec<u8>> {
+    let f = unsafe { &*file.get() };
     let buf = vec![0u8; len];
-    let BufResult(result, buf) = file.borrow().read_exact_at(buf, offset).await;
+    let BufResult(result, buf) = f.read_exact_at(buf, offset).await;
     result.map_err(|e| anyhow::anyhow!(e))?;
     Ok(buf)
 }
@@ -349,7 +357,7 @@ impl ExtentNode {
             let end = start + payload_len;
 
             // Write is idempotent: if extent file already has this data, we just overwrite.
-            if let Err(e) = file_write_at(&extent.file, start, rec.payload).await {
+            if let Err(e) = file_pwrite(&extent.file, start, rec.payload).await {
                 tracing::warn!("WAL replay: write_at failed for extent {}: {e}", rec.extent_id);
                 continue;
             }
@@ -459,7 +467,7 @@ impl ExtentNode {
                 extents.insert(
                     extent_id,
                     Rc::new(ExtentEntry {
-                        file: RefCell::new(file),
+                        file: std::cell::UnsafeCell::new(file),
                         len: AtomicU64::new(len),
                                 eversion: AtomicU64::new(eversion),
                         sealed_length: AtomicU64::new(sealed_length),
@@ -498,13 +506,17 @@ impl ExtentNode {
         }
     }
 
-    /// Handle one TCP connection: read frames, dispatch, write responses.
+    /// Handle one TCP connection.
+    ///
+    /// Appends are processed sequentially to guarantee the `end` watermark:
+    /// returning end=N means all data in 0..N is written. Reads are spawned
+    /// for concurrent I/O (they don't affect the watermark).
     pub async fn handle_connection(
         stream: compio::net::TcpStream,
         node: ExtentNode,
     ) -> Result<()> {
         let (mut reader, writer) = stream.into_split();
-        let writer = Rc::new(RefCell::new(writer));
+        let writer = Rc::new(std::cell::UnsafeCell::new(writer));
         let mut decoder = FrameDecoder::new();
         let mut buf = vec![0u8; 64 * 1024];
 
@@ -524,13 +536,30 @@ impl ExtentNode {
                         if frame.req_id == 0 {
                             continue;
                         }
-
-                        let node = node.clone();
-                        let writer = writer.clone();
                         let req_id = frame.req_id;
                         let msg_type = frame.msg_type;
 
-                        compio::runtime::spawn(async move {
+                        if msg_type == MSG_READ_BYTES {
+                            // Read: spawn for concurrent disk I/O.
+                            let node = node.clone();
+                            let writer = writer.clone();
+                            compio::runtime::spawn(async move {
+                                let resp_frame = match node.handle_read_bytes(frame.payload).await {
+                                    Ok(payload) => Frame::response(req_id, msg_type, payload),
+                                    Err((code, message)) => {
+                                        let payload = autumn_rpc::RpcError::encode_status(code, &message);
+                                        Frame::error(req_id, msg_type, payload)
+                                    }
+                                };
+                                let w = unsafe { &mut *writer.get() };
+                                let BufResult(result, _) = w.write_all(resp_frame.encode()).await;
+                                if let Err(e) = result {
+                                    tracing::debug!(req_id, error = %e, "write response failed");
+                                }
+                            })
+                            .detach();
+                        } else {
+                            // Append + control RPCs: sequential to preserve end watermark.
                             let resp_frame = match node.dispatch(msg_type, frame.payload).await {
                                 Ok(payload) => Frame::response(req_id, msg_type, payload),
                                 Err((code, message)) => {
@@ -538,15 +567,10 @@ impl ExtentNode {
                                     Frame::error(req_id, msg_type, payload)
                                 }
                             };
-
-                            let data = resp_frame.encode();
-                            let mut w = writer.borrow_mut();
-                            let BufResult(result, _) = w.write_all(data).await;
-                            if let Err(e) = result {
-                                tracing::debug!(req_id, error = %e, "failed to write response");
-                            }
-                        })
-                        .detach();
+                            let w = unsafe { &mut *writer.get() };
+                            let BufResult(result, _) = w.write_all(resp_frame.encode()).await;
+                            result?;
+                        }
                     }
                     None => break,
                 }
@@ -605,7 +629,7 @@ impl ExtentNode {
         self.extents.insert(
             extent_id,
             Rc::new(ExtentEntry {
-                        file: RefCell::new(file),
+                        file: std::cell::UnsafeCell::new(file),
                 len: AtomicU64::new(len),
                 eversion: AtomicU64::new(1),
                 sealed_length: AtomicU64::new(0),
@@ -632,8 +656,7 @@ impl ExtentNode {
     }
 
     async fn truncate_to_commit(extent: &Rc<ExtentEntry>, commit: u32) -> Result<(), String> {
-        extent
-            .file.borrow()
+        file_ref(&extent.file)
             .set_len(commit as u64)
             .await
             .map_err(|e| e.to_string())?;
@@ -739,15 +762,14 @@ impl ExtentNode {
 
         let extent = self.ensure_extent(task.extent_id).await?;
 
-        extent
-            .file.borrow()
+        file_ref(&extent.file)
             .set_len(0)
             .await
             .map_err(|e| e.to_string())?;
         let payload_len = payload.len() as u64;
-        file_write_at(&extent.file, 0, payload).await
+        file_pwrite(&extent.file, 0, payload).await
             .map_err(|e| e.to_string())?;
-        extent.file.borrow().sync_all().await
+        file_ref(&extent.file).sync_all().await
             .map_err(|e| e.to_string())?;
         extent.len.store(payload_len, Ordering::SeqCst);
         extent
@@ -860,14 +882,13 @@ impl ExtentNode {
             .map_err(|e| (StatusCode::Internal, e))?;
 
 
-        entry
-            .file.borrow()
+        file_ref(&entry.file)
             .set_len(0)
             .await
             .map_err(|e| (StatusCode::Internal, format!("truncate shard {extent_id}: {e}")))?;
-        file_write_at(&entry.file, 0, shard_data.to_vec()).await
+        file_pwrite(&entry.file, 0, shard_data.to_vec()).await
             .map_err(|e| (StatusCode::Internal, format!("write shard {extent_id}/{shard_index}: {e}")))?;
-        entry.file.borrow().sync_all().await
+        file_ref(&entry.file).sync_all().await
             .map_err(|e| (StatusCode::Internal, format!("sync shard {extent_id}: {e}")))?;
 
         let shard_len = shard_data.len() as u64;
@@ -981,8 +1002,6 @@ impl ExtentNode {
 
         if let Some(wal) = &self.wal {
             if should_use_wal(req.must_sync, data_payload.len()) {
-                // Fast path: WAL sync + extent write in parallel. The WAL is the
-                // durability source; the extent file doesn't need sync_all().
                 let wal_record = WalRecord {
                     extent_id: req.extent_id,
                     start: start as u32,
@@ -990,23 +1009,23 @@ impl ExtentNode {
                     payload: data_payload.to_vec(),
                 };
                 let wal_fut = wal.write(wal_record);
-                let file_fut = file_write_at(&extent.file, start, data_payload.clone());
+                let file_fut = file_pwrite(&extent.file, start, data_payload.clone());
                 let (wal_res, file_res) = futures::join!(wal_fut, file_fut);
                 wal_res.map_err(|e| (StatusCode::Internal, e.to_string()))?;
                 file_res.map_err(|e| (StatusCode::Internal, e.to_string()))?;
             } else {
-                file_write_at(&extent.file, start, data_payload.clone()).await
+                file_pwrite(&extent.file, start, data_payload.clone()).await
                     .map_err(|e| (StatusCode::Internal, e.to_string()))?;
                 if req.must_sync {
-                    extent.file.borrow().sync_all().await
+                    file_ref(&extent.file).sync_all().await
                         .map_err(|e| (StatusCode::Internal, e.to_string()))?;
                 }
             }
         } else {
-            file_write_at(&extent.file, start, data_payload.clone()).await
+            file_pwrite(&extent.file, start, data_payload.clone()).await
                 .map_err(|e| (StatusCode::Internal, e.to_string()))?;
             if req.must_sync {
-                extent.file.borrow().sync_all().await
+                file_ref(&extent.file).sync_all().await
                     .map_err(|e| (StatusCode::Internal, e.to_string()))?;
             }
         }
@@ -1055,7 +1074,7 @@ impl ExtentNode {
         };
 
         // Read the entire data in one shot (no streaming).
-        let data = file_read_at(&extent.file, read_offset, read_size as usize).await
+        let data = file_pread(&extent.file, read_offset, read_size as usize).await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
 
         Ok(ReadBytesResp {
@@ -1130,7 +1149,7 @@ impl ExtentNode {
         self.extents.insert(
             req.extent_id,
             Rc::new(ExtentEntry {
-                        file: RefCell::new(file),
+                        file: std::cell::UnsafeCell::new(file),
                 len: AtomicU64::new(len),
                 eversion: AtomicU64::new(1),
                 sealed_length: AtomicU64::new(0),
@@ -1339,15 +1358,14 @@ impl ExtentNode {
         let write_payload = Bytes::from(raw_payload[..want].to_vec());
 
 
-        extent
-            .file.borrow()
+        file_ref(&extent.file)
             .set_len(0)
             .await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
         let payload_len = write_payload.len() as u64;
-        file_write_at(&extent.file, 0, write_payload.to_vec()).await
+        file_pwrite(&extent.file, 0, write_payload.to_vec()).await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
-        extent.file.borrow().sync_all().await
+        file_ref(&extent.file).sync_all().await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
         extent.len.store(payload_len, Ordering::SeqCst);
 
@@ -1420,7 +1438,7 @@ impl ExtentNode {
         };
 
         // Read the entire data in one shot (no streaming).
-        let data = file_read_at(&extent.file, offset, size as usize).await
+        let data = file_pread(&extent.file, offset, size as usize).await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
 
         Ok(CopyExtentResp {
@@ -1465,7 +1483,7 @@ impl ExtentNode {
             ));
         }
 
-        let data = file_read_at(&entry.file, 0, sealed_length as usize).await
+        let data = file_pread(&entry.file, 0, sealed_length as usize).await
             .map_err(|e| (StatusCode::Internal, format!("read extent {extent_id}: {e}")))?;
 
         // EC-encode the full extent data into k+m shards.
