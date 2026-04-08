@@ -173,15 +173,8 @@ dependencies = [
 name = "autumn-rpc"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "bytes",
- "compio",
- "compio-buf",
- "compio-io",
- "dashmap",
  "thiserror",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -233,6 +226,7 @@ dependencies = [
  "tokio-stream",
  "tonic 0.11.0",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

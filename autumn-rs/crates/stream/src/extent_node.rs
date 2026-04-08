@@ -220,6 +220,37 @@ pub struct ExtentNode {
     wal: Option<Wal>,
 }
 
+/// Helper: one-shot RPC call (connect → send → recv → close).
+async fn rpc_oneshot(addr: std::net::SocketAddr, msg_type: u8, payload: Bytes) -> Result<Bytes> {
+    let stream = compio::net::TcpStream::connect(addr).await?;
+    stream.set_nodelay(true)?;
+    let (mut reader, mut writer) = stream.into_split();
+
+    let req_id = 1u32;
+    let frame = Frame::request(req_id, msg_type, payload);
+    let BufResult(result, _) = writer.write_all(frame.encode()).await;
+    result?;
+
+    let mut decoder = FrameDecoder::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let BufResult(result, buf_back) = reader.read(buf).await;
+        buf = buf_back;
+        let n = result?;
+        if n == 0 {
+            return Err(anyhow::anyhow!("connection closed before response"));
+        }
+        decoder.feed(&buf[..n]);
+        if let Some(resp) = decoder.try_decode().map_err(|e| anyhow::anyhow!("{e}"))? {
+            if resp.is_error() {
+                let (code, msg) = autumn_rpc::RpcError::decode_status(&resp.payload);
+                return Err(anyhow::anyhow!("rpc error ({:?}): {}", code, msg));
+            }
+            return Ok(resp.payload);
+        }
+    }
+}
+
 /// Helper: write data at offset using compio, returning anyhow::Result.
 async fn file_write_at(file: &RefCell<CompioFile>, offset: u64, data: impl compio::buf::IoBuf) -> Result<()> {
     let BufResult(result, _) = file.borrow_mut().write_all_at(data, offset).await;
@@ -468,7 +499,7 @@ impl ExtentNode {
     }
 
     /// Handle one TCP connection: read frames, dispatch, write responses.
-    async fn handle_connection(
+    pub async fn handle_connection(
         stream: compio::net::TcpStream,
         node: ExtentNode,
     ) -> Result<()> {
@@ -618,17 +649,13 @@ impl ExtentNode {
     ) -> Result<Vec<u8>, String> {
         let sock: std::net::SocketAddr = parse_addr(addr)
             .map_err(|e| e.to_string())?;
-        let client = autumn_rpc::RpcClient::connect(sock)
-            .await
-            .map_err(|e| format!("connect to {addr}: {e}"))?;
         let req = ReadBytesReq {
             extent_id,
-            eversion: eversion,
+            eversion,
             offset: 0,
             length: 0,
         };
-        let resp_bytes = client
-            .call(MSG_READ_BYTES, req.encode())
+        let resp_bytes = rpc_oneshot(sock, MSG_READ_BYTES, req.encode())
             .await
             .map_err(|e| format!("read_bytes from {addr}: {e}"))?;
         let resp = ReadBytesResp::decode(resp_bytes)
@@ -1458,17 +1485,8 @@ impl ExtentNode {
 
             let sock = parse_addr(target_addr)
                 .map_err(|e| (StatusCode::Internal, format!("parse addr {target_addr}: {e}")))?;
-            match autumn_rpc::RpcClient::connect(sock).await {
-                Ok(client) => {
-                    let resp_bytes = client
-                        .call(MSG_WRITE_SHARD, ws_req.encode())
-                        .await
-                        .map_err(|e| {
-                            (
-                                StatusCode::Internal,
-                                format!("WriteShard to {target_addr} for shard {i} failed: {e}"),
-                            )
-                        })?;
+            match rpc_oneshot(sock, MSG_WRITE_SHARD, ws_req.encode()).await {
+                Ok(resp_bytes) => {
                     let resp = WriteShardResp::decode(resp_bytes)
                         .map_err(|e| (StatusCode::Internal, format!("decode write_shard resp: {e}")))?;
                     if resp.code != CODE_OK {

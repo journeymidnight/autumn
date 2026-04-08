@@ -30,7 +30,12 @@ autumn-rpc = { path = "../rpc" }
 autumn-io-engine = { path = "../io-engine" }
 crc32c = "0.6"
 tokio-stream = "0.1"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [[bench]]
 name = "append_bench"
+harness = false
+
+[[bench]]
+name = "extent_bench"
 harness = false

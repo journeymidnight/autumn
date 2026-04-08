@@ -224,12 +224,9 @@ impl CommitLengthResp {
 
 // ── rkyv helpers ────────────────────────────────────────────────────────────
 
-use rkyv::api::high::{HighSerializer, HighValidator};
-use rkyv::bytecheck::CheckBytes;
-use rkyv::de::Pool;
-use rkyv::rancor::{Error as RkyvError, Strategy};
+use rkyv::api::high::{HighDeserializer, HighSerializer};
+use rkyv::rancor::Error as RkyvError;
 use rkyv::ser::allocator::ArenaHandle;
-use rkyv::Portable;
 
 /// Serialize a value to Bytes using rkyv.
 pub fn rkyv_encode<T>(val: &T) -> Bytes
@@ -240,13 +237,15 @@ where
     Bytes::copy_from_slice(&buf)
 }
 
-/// Deserialize a value from bytes using rkyv.
+/// Deserialize a value from bytes using rkyv (unchecked — we control both sides).
 pub fn rkyv_decode<T>(data: &[u8]) -> Result<T, String>
 where
     T: Archive,
-    T::Archived: Portable + for<'a> CheckBytes<HighValidator<'a, RkyvError>> + Deserialize<T, Strategy<Pool, RkyvError>>,
+    T::Archived: Deserialize<T, HighDeserializer<RkyvError>>,
 {
-    rkyv::from_bytes::<T, RkyvError>(data).map_err(|e| format!("rkyv decode: {e}"))
+    // SAFETY: data was serialized by rkyv_encode on the same side of the wire.
+    unsafe { rkyv::from_bytes_unchecked::<T, RkyvError>(data) }
+        .map_err(|e| format!("rkyv decode: {e}"))
 }
 
 // ── Status code constants ────────────────────────────────────────────────────
