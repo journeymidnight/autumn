@@ -39,7 +39,10 @@ struct StreamTail {
 /// while appends to different streams are fully concurrent.
 struct StreamAppendState {
     tail: Option<StreamTail>,
-    commit: Option<u32>,
+    /// Locally-tracked commit offset (matches Go's `sc.end`).
+    /// Starts at 0 for a new extent; updated to `appended.end` after each
+    /// successful append.  Never queried from replicas in the hot path.
+    commit: u32,
 }
 
 #[derive(Default)]
@@ -280,7 +283,7 @@ impl StreamClient {
         }
         let state = Arc::new(Mutex::new(StreamAppendState {
             tail: None,
-            commit: None,
+            commit: 0,
         }));
         self.stream_states.insert(stream_id, state.clone());
         state
@@ -382,6 +385,8 @@ impl StreamClient {
         let lock_wait = lock_started_at.elapsed();
 
         let mut retry = 0usize;
+        let mut alloc_count = 0u32;
+        const MAX_ALLOC_PER_APPEND: u32 = 3;
         let mut extent_lookup_elapsed = Duration::default();
         let mut fanout_elapsed = Duration::default();
         loop {
@@ -396,11 +401,10 @@ impl StreamClient {
             };
 
             let revision = self.revision;
-            // Use cached commit if available.
-            let commit = match state.commit {
-                Some(c) => c,
-                None => self.current_commit(&tail).await?,
-            };
+            // Use locally-tracked commit offset (matches Go's sc.end pattern).
+            // current_commit() RPCs are only used at partition load time, not in
+            // the hot append path.  On a new extent, commit starts at 0.
+            let commit = state.commit;
 
             let header = AppendRequestHeader {
                 extent_id: tail.extent.extent_id,
@@ -492,10 +496,14 @@ impl StreamClient {
 
             if saw_not_found {
                 retry += 1;
-                state.commit = None;
+                alloc_count += 1;
+                if alloc_count > MAX_ALLOC_PER_APPEND {
+                    return Err(anyhow!("too many extent allocations ({alloc_count}) for single append, giving up"));
+                }
                 state.tail = None;
                 let (_, new_tail_ext) = self.alloc_new_extent(stream_id, 0).await?;
                 let replica_addrs = self.replica_addrs_for_extent(&new_tail_ext).await?;
+                state.commit = 0;
                 state.tail = Some(StreamTail {
                     extent: new_tail_ext,
                     replica_addrs,
@@ -503,7 +511,8 @@ impl StreamClient {
                 continue;
             }
             if let Some(err) = append_error {
-                state.commit = None;
+                // Keep commit value — it's still valid for the same extent.
+                // Only clear the tail so we re-resolve it.
                 state.tail = None;
                 retry += 1;
                 if retry <= 2 {
@@ -512,8 +521,13 @@ impl StreamClient {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     let fresh = self.load_stream_tail(stream_id).await?;
                     if fresh.extent.sealed_length > 0 {
+                        alloc_count += 1;
+                        if alloc_count > MAX_ALLOC_PER_APPEND {
+                            return Err(anyhow!("too many extent allocations ({alloc_count}) for single append, giving up"));
+                        }
                         let (_, new_tail_ext) = self.alloc_new_extent(stream_id, 0).await?;
                         let replica_addrs = self.replica_addrs_for_extent(&new_tail_ext).await?;
+                        state.commit = 0;
                         state.tail = Some(StreamTail {
                             extent: new_tail_ext,
                             replica_addrs,
@@ -526,11 +540,14 @@ impl StreamClient {
                 // After 2 retries on the same extent, unconditionally seal and allocate a new
                 // extent on healthy nodes. This handles a downed replica that is still listed in
                 // the extent's replica set (the extent is not yet sealed by anyone).
-                // alloc_new_extent(stream_id, 0) asks the manager to query commit lengths on all
-                // replicas, seal at the minimum, and allocate a fresh extent on live nodes.
+                alloc_count += 1;
+                if alloc_count > MAX_ALLOC_PER_APPEND {
+                    return Err(anyhow!("too many extent allocations ({alloc_count}) for single append, giving up"));
+                }
                 match self.alloc_new_extent(stream_id, 0).await {
                     Ok((_, new_tail_ext)) => {
                         let replica_addrs = self.replica_addrs_for_extent(&new_tail_ext).await?;
+                        state.commit = 0;
                         state.tail = Some(StreamTail {
                             extent: new_tail_ext,
                             replica_addrs,
@@ -555,13 +572,12 @@ impl StreamClient {
                 first_resp.ok_or_else(|| anyhow!("append failed: no replica response"))?;
 
             // Update cached commit for next append.
-            state.commit = Some(appended.end);
+            state.commit = appended.end;
 
             if appended.end >= self.max_extent_size {
-                state.commit = None;
-                state.tail = None;
                 let (_, new_tail_ext) = self.alloc_new_extent(stream_id, appended.end).await?;
                 let replica_addrs = self.replica_addrs_for_extent(&new_tail_ext).await?;
+                state.commit = 0; // new extent starts at 0
                 state.tail = Some(StreamTail {
                     extent: new_tail_ext,
                     replica_addrs,
@@ -595,6 +611,9 @@ impl StreamClient {
         }
     }
 
+    /// Query commit length from all replicas (min).  Used at partition load
+    /// time (checkCommitLength equivalent), NOT in the hot append path.
+    #[allow(dead_code)]
     async fn current_commit(&self, tail: &StreamTail) -> Result<u32> {
         let mut min_len: Option<u32> = None;
         let revision = self.revision;
