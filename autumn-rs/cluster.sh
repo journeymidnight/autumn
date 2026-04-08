@@ -32,7 +32,7 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 
 need_bin() {
     local b="$1"
-    [[ -x "$b" ]] || die "Binary not found: $b — run: cargo build --workspace"
+    [[ -x "$b" ]] || die "Binary not found: $b — run: cargo build --release --workspace"
 }
 
 pid_file() { echo "$DATA_ROOT/pids/$1.pid"; }
