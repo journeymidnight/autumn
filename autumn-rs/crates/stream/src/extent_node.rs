@@ -11,7 +11,7 @@ use bytes::Bytes;
 use autumn_rpc::{Frame, FrameDecoder, HandlerResult, StatusCode};
 use compio::BufResult;
 use compio::fs::{File as CompioFile, OpenOptions};
-use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
+use compio::io::{AsyncReadAtExt, AsyncWriteAt, AsyncWriteAtExt};
 use compio::net::TcpListener;
 use compio::io::{AsyncRead, AsyncWriteExt};
 use dashmap::DashMap;
@@ -530,49 +530,74 @@ impl ExtentNode {
 
             decoder.feed(&buf[..n]);
 
+            // Collect all decoded frames before processing — allows batching
+            // consecutive append requests into one vectored write.
+            let mut frames = Vec::new();
             loop {
                 match decoder.try_decode().map_err(|e| anyhow::anyhow!(e))? {
-                    Some(frame) => {
-                        if frame.req_id == 0 {
-                            continue;
-                        }
-                        let req_id = frame.req_id;
-                        let msg_type = frame.msg_type;
-
-                        if msg_type == MSG_READ_BYTES {
-                            // Read: spawn for concurrent disk I/O.
-                            let node = node.clone();
-                            let writer = writer.clone();
-                            compio::runtime::spawn(async move {
-                                let resp_frame = match node.handle_read_bytes(frame.payload).await {
-                                    Ok(payload) => Frame::response(req_id, msg_type, payload),
-                                    Err((code, message)) => {
-                                        let payload = autumn_rpc::RpcError::encode_status(code, &message);
-                                        Frame::error(req_id, msg_type, payload)
-                                    }
-                                };
-                                let w = unsafe { &mut *writer.get() };
-                                let BufResult(result, _) = w.write_all(resp_frame.encode()).await;
-                                if let Err(e) = result {
-                                    tracing::debug!(req_id, error = %e, "write response failed");
-                                }
-                            })
-                            .detach();
-                        } else {
-                            // Append + control RPCs: sequential to preserve end watermark.
-                            let resp_frame = match node.dispatch(msg_type, frame.payload).await {
-                                Ok(payload) => Frame::response(req_id, msg_type, payload),
-                                Err((code, message)) => {
-                                    let payload = autumn_rpc::RpcError::encode_status(code, &message);
-                                    Frame::error(req_id, msg_type, payload)
-                                }
-                            };
-                            let w = unsafe { &mut *writer.get() };
-                            let BufResult(result, _) = w.write_all(resp_frame.encode()).await;
-                            result?;
-                        }
-                    }
+                    Some(frame) if frame.req_id != 0 => frames.push(frame),
+                    Some(_) => continue,
                     None => break,
+                }
+            }
+
+            // Process frames, coalescing consecutive MSG_APPEND into batches.
+            let mut i = 0;
+            while i < frames.len() {
+                let msg_type = frames[i].msg_type;
+
+                if msg_type == MSG_READ_BYTES {
+                    // Read: spawn for concurrent disk I/O.
+                    let req_id = frames[i].req_id;
+                    let payload = frames[i].payload.clone();
+                    let node = node.clone();
+                    let writer = writer.clone();
+                    compio::runtime::spawn(async move {
+                        let resp_frame = match node.handle_read_bytes(payload).await {
+                            Ok(p) => Frame::response(req_id, msg_type, p),
+                            Err((code, message)) => {
+                                let p = autumn_rpc::RpcError::encode_status(code, &message);
+                                Frame::error(req_id, msg_type, p)
+                            }
+                        };
+                        let w = unsafe { &mut *writer.get() };
+                        let BufResult(result, _) = w.write_all(resp_frame.encode()).await;
+                        if let Err(e) = result {
+                            tracing::debug!(req_id, error = %e, "write response failed");
+                        }
+                    })
+                    .detach();
+                    i += 1;
+                } else if msg_type == MSG_APPEND {
+                    // Collect all consecutive MSG_APPEND frames (any extent_id) into one batch.
+                    let batch_start = i;
+                    while i < frames.len() && frames[i].msg_type == MSG_APPEND {
+                        i += 1;
+                    }
+                    let batch = &frames[batch_start..i];
+
+                    // Process the batch: sequential validation, one vectored write per extent.
+                    let responses = node.handle_append_batch(batch).await;
+                    let w = unsafe { &mut *writer.get() };
+                    for resp_frame in responses {
+                        let BufResult(result, _) = w.write_all(resp_frame.encode()).await;
+                        result?;
+                    }
+                } else {
+                    // Other control RPCs: sequential.
+                    let req_id = frames[i].req_id;
+                    let payload = frames[i].payload.clone();
+                    let resp_frame = match node.dispatch(msg_type, payload).await {
+                        Ok(p) => Frame::response(req_id, msg_type, p),
+                        Err((code, message)) => {
+                            let p = autumn_rpc::RpcError::encode_status(code, &message);
+                            Frame::error(req_id, msg_type, p)
+                        }
+                    };
+                    let w = unsafe { &mut *writer.get() };
+                    let BufResult(result, _) = w.write_all(resp_frame.encode()).await;
+                    result?;
+                    i += 1;
                 }
             }
         }
@@ -1044,6 +1069,212 @@ impl ExtentNode {
             end: end as u32,
         }
         .encode())
+    }
+
+    /// Process a batch of MSG_APPEND frames in one vectored write per extent.
+    ///
+    /// Within the batch, requests are grouped by extent_id and validated in order.
+    /// Payloads for the same extent are written with a single `write_vectored_at`
+    /// call (pwritev) — zero extra copy, one syscall per extent.
+    ///
+    /// Returns one `Frame` per input frame, in order.
+    async fn handle_append_batch(&self, frames: &[autumn_rpc::Frame]) -> Vec<Frame> {
+        // Group consecutive frames by extent_id to maximize coalescing.
+        // We process them extent-by-extent while preserving per-frame order.
+        let mut out: Vec<Frame> = Vec::with_capacity(frames.len());
+
+        let mut i = 0;
+        while i < frames.len() {
+            // Decode the first request to get the extent_id for this sub-batch.
+            let first_req = match AppendReq::decode(frames[i].payload.clone()) {
+                Ok(r) => r,
+                Err(e) => {
+                    out.push(Frame::error(
+                        frames[i].req_id, MSG_APPEND,
+                        autumn_rpc::RpcError::encode_status(StatusCode::InvalidArgument, &e.to_string()),
+                    ));
+                    i += 1;
+                    continue;
+                }
+            };
+            let extent_id = first_req.extent_id;
+
+            // Find contiguous frames for the same extent_id.
+            let sub_start = i;
+            let mut sub_end = i + 1;
+            while sub_end < frames.len() {
+                // Peek at next req's extent_id without full decode.
+                match AppendReq::decode(frames[sub_end].payload.clone()) {
+                    Ok(r) if r.extent_id == extent_id => sub_end += 1,
+                    _ => break,
+                }
+            }
+
+            // Decode all requests in this sub-batch.
+            let mut reqs: Vec<AppendReq> = Vec::with_capacity(sub_end - sub_start);
+            let mut decode_err: Option<(usize, String)> = None;
+            reqs.push(first_req);
+            for k in (sub_start + 1)..sub_end {
+                match AppendReq::decode(frames[k].payload.clone()) {
+                    Ok(r) => reqs.push(r),
+                    Err(e) => {
+                        decode_err = Some((k - sub_start, e.to_string()));
+                        break;
+                    }
+                }
+            }
+            let valid_count = if let Some((idx, _)) = &decode_err { *idx } else { reqs.len() };
+
+            // Get extent (shared for all reqs in this sub-batch).
+            let extent = match self.get_extent(extent_id).await {
+                Ok(e) => e,
+                Err((code, msg)) => {
+                    let payload = autumn_rpc::RpcError::encode_status(code, &msg);
+                    for k in sub_start..sub_end {
+                        out.push(Frame::error(frames[k].req_id, MSG_APPEND, payload.clone()));
+                    }
+                    i = sub_end;
+                    continue;
+                }
+            };
+
+            // Validate eversion / sealed / revision for the first request.
+            // All requests in the batch share the same extent so these checks
+            // apply once (eversion and sealed are stable within a batch).
+            let first = &reqs[0];
+            let local_eversion = extent.eversion.load(Ordering::SeqCst);
+            if first.eversion > local_eversion {
+                // Eversion mismatch — fall back to per-request path for the whole sub-batch.
+                for k in 0..valid_count {
+                    let req_id = frames[sub_start + k].req_id;
+                    let resp = self.handle_append(frames[sub_start + k].payload.clone()).await;
+                    let frame = match resp {
+                        Ok(p) => Frame::response(req_id, MSG_APPEND, p),
+                        Err((code, msg)) => Frame::error(req_id, MSG_APPEND,
+                            autumn_rpc::RpcError::encode_status(code, &msg)),
+                    };
+                    out.push(frame);
+                }
+                i = sub_end;
+                continue;
+            }
+            if local_eversion > first.eversion
+                || extent.sealed_length.load(Ordering::SeqCst) > 0
+                || extent.avali.load(Ordering::SeqCst) > 0
+            {
+                let resp_payload = AppendResp { code: CODE_PRECONDITION, offset: 0, end: 0 }.encode();
+                for k in sub_start..sub_end {
+                    out.push(Frame::response(frames[k].req_id, MSG_APPEND, resp_payload.clone()));
+                }
+                i = sub_end;
+                continue;
+            }
+
+            // Revision fencing (first request sets the tone for the whole batch).
+            let last_revision = extent.last_revision.load(Ordering::SeqCst);
+            if first.revision < last_revision {
+                let resp_payload = AppendResp { code: CODE_PRECONDITION, offset: 0, end: 0 }.encode();
+                for k in sub_start..sub_end {
+                    out.push(Frame::response(frames[k].req_id, MSG_APPEND, resp_payload.clone()));
+                }
+                i = sub_end;
+                continue;
+            }
+            let revision_changed = first.revision > last_revision;
+            if revision_changed {
+                extent.last_revision.store(first.revision, Ordering::SeqCst);
+            }
+
+            // Commit reconciliation (only first request carries commit from client).
+            let mut file_start = extent.len.load(Ordering::SeqCst);
+            if file_start < first.commit as u64 {
+                let resp_payload = AppendResp { code: CODE_PRECONDITION, offset: 0, end: 0 }.encode();
+                for k in sub_start..sub_end {
+                    out.push(Frame::response(frames[k].req_id, MSG_APPEND, resp_payload.clone()));
+                }
+                i = sub_end;
+                continue;
+            }
+            if file_start > first.commit as u64 {
+                if let Err(e) = Self::truncate_to_commit(&extent, first.commit).await {
+                    let payload = autumn_rpc::RpcError::encode_status(StatusCode::Internal, &e);
+                    for k in sub_start..sub_end {
+                        out.push(Frame::error(frames[k].req_id, MSG_APPEND, payload.clone()));
+                    }
+                    i = sub_end;
+                    continue;
+                }
+                file_start = extent.len.load(Ordering::SeqCst);
+            }
+
+            // Compute per-request offsets and collect payloads for vectored write.
+            let mut offsets: Vec<u32> = Vec::with_capacity(valid_count);
+            let mut bufs: Vec<Bytes> = Vec::with_capacity(valid_count);
+            let mut cursor = file_start;
+            let must_sync = reqs[..valid_count].iter().any(|r| r.must_sync);
+
+            for req in &reqs[..valid_count] {
+                offsets.push(cursor as u32);
+                cursor += req.payload.len() as u64;
+                bufs.push(req.payload.clone());
+            }
+            let total_end = cursor;
+
+            // Single vectored write — one pwritev syscall, zero extra copies.
+            let f = unsafe { &mut *extent.file.get() };
+            let BufResult(wr, _) = f.write_vectored_at(bufs, file_start).await;
+            if let Err(e) = wr {
+                let payload = autumn_rpc::RpcError::encode_status(
+                    StatusCode::Internal, &e.to_string(),
+                );
+                for k in sub_start..sub_end {
+                    out.push(Frame::error(frames[k].req_id, MSG_APPEND, payload.clone()));
+                }
+                i = sub_end;
+                continue;
+            }
+
+            if must_sync {
+                if let Err(e) = file_ref(&extent.file).sync_all().await {
+                    let payload = autumn_rpc::RpcError::encode_status(
+                        StatusCode::Internal, &e.to_string(),
+                    );
+                    for k in sub_start..sub_end {
+                        out.push(Frame::error(frames[k].req_id, MSG_APPEND, payload.clone()));
+                    }
+                    i = sub_end;
+                    continue;
+                }
+            }
+
+            extent.len.store(total_end, Ordering::SeqCst);
+
+            if revision_changed {
+                let _ = self.save_meta(extent_id, &extent).await;
+            }
+
+            // Emit per-request responses.
+            for k in 0..valid_count {
+                let end = if k + 1 < valid_count {
+                    offsets[k + 1]
+                } else {
+                    total_end as u32
+                };
+                let resp = AppendResp { code: CODE_OK, offset: offsets[k], end };
+                out.push(Frame::response(frames[sub_start + k].req_id, MSG_APPEND, resp.encode()));
+            }
+            // If there was a decode error partway through, emit error for that frame.
+            if let Some((idx, msg)) = decode_err {
+                let payload = autumn_rpc::RpcError::encode_status(
+                    StatusCode::InvalidArgument, &msg,
+                );
+                out.push(Frame::error(frames[sub_start + idx].req_id, MSG_APPEND, payload));
+            }
+
+            i = sub_end;
+        }
+
+        out
     }
 
     async fn handle_read_bytes(&self, payload: Bytes) -> HandlerResult {

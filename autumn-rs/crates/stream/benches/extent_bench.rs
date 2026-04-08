@@ -1,11 +1,8 @@
 //! Benchmark: ExtentNode 4KB append throughput via autumn-rpc wire protocol.
 //!
-//! Everything runs on a single compio runtime thread.
-//! Server + clients are all lightweight spawned tasks.
+//! Single compio runtime thread. One extent, one connection, varying I/O depth.
 
-use std::cell::Cell;
 use std::net::SocketAddr;
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use autumn_rpc::{Frame, FrameDecoder, RpcError};
@@ -48,23 +45,30 @@ impl BenchConn {
     }
 
     async fn call(&mut self, msg_type: u8, payload: Bytes) -> Bytes {
+        self.send(msg_type, payload).await;
+        self.recv().await
+    }
+
+    /// Send a request without waiting for the response.
+    async fn send(&mut self, msg_type: u8, payload: Bytes) {
         let req_id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
-
         let frame = Frame::request(req_id, msg_type, payload);
         let BufResult(result, _) = self.writer.write_all(frame.encode()).await;
         result.unwrap();
+    }
 
+    /// Receive the next response in order.
+    async fn recv(&mut self) -> Bytes {
         loop {
             match self.decoder.try_decode().unwrap() {
-                Some(resp) if resp.req_id == req_id => {
+                Some(resp) => {
                     if resp.is_error() {
                         let (code, msg) = RpcError::decode_status(&resp.payload);
                         panic!("rpc error ({:?}): {}", code, msg);
                     }
                     return resp.payload;
                 }
-                Some(_) => continue,
                 None => {}
             }
             let BufResult(result, buf_back) = self.reader.read(std::mem::take(&mut self.buf)).await;
@@ -106,171 +110,76 @@ async fn run_bench() {
 
     compio::time::sleep(Duration::from_millis(10)).await;
 
-    // ── Single client ───────────────────────────────────────────────────────
-    println!("=== 1 task, 4KB Append (no sync) ===");
-    bench_concurrent(listen_addr, 1, 10_000, false).await;
-
-    println!("\n=== 1 task, 4KB Append + Sync ===");
-    bench_concurrent(listen_addr, 1, 1_000, true).await;
-
-    // ── 32 tasks ────────────────────────────────────────────────────────────
-    println!("\n=== 32 tasks, 4KB Append (no sync) ===");
-    bench_concurrent(listen_addr, 32, 10_000, false).await;
-
-    println!("\n=== 32 tasks, 4KB Append + Sync ===");
-    bench_concurrent(listen_addr, 32, 2_000, true).await;
-
-    // ── Read benchmarks ─────────────────────────────────────────────────────
-    println!("\n=== 1 task, 4KB Read ===");
-    bench_read(listen_addr, 1, 10_000).await;
-
-    println!("\n=== 32 tasks, 4KB Read ===");
-    bench_read(listen_addr, 32, 10_000).await;
-}
-
-async fn bench_read(addr: SocketAddr, num_tasks: usize, ops_per_task: u64) {
-    let base_extent = 5000u64;
-    let payload = Bytes::from(vec![0xCDu8; 4096]);
-    let total_ops = Rc::new(Cell::new(0u64));
-    let total_bytes = Rc::new(Cell::new(0u64));
-
-    // Pre-fill extents with data (each extent gets ops_per_task * 4096 bytes).
-    for t in 0..num_tasks {
-        let extent_id = base_extent + t as u64;
-        let mut conn = BenchConn::connect(addr).await;
-
+    // Allocate one extent for all tests.
+    let extent_id = 1u64;
+    {
+        let mut conn = BenchConn::connect(listen_addr).await;
         let alloc_req = rkyv_encode(&AllocExtentReq { extent_id });
         let resp = conn.call(MSG_ALLOC_EXTENT, alloc_req).await;
         let r: AllocExtentResp = rkyv_decode(&resp).unwrap();
-        assert_eq!(r.code, CODE_OK, "alloc {extent_id} failed: {}", r.message);
-
-        // Write enough data.
-        let mut commit = 0u32;
-        let write_count = ops_per_task.min(1000); // write at least 1000 blocks
-        for _ in 0..write_count {
-            let req = AppendReq {
-                extent_id, eversion: 1, commit, revision: 1,
-                must_sync: false, payload: payload.clone(),
-            };
-            let resp = AppendResp::decode(conn.call(MSG_APPEND, req.encode()).await).unwrap();
-            commit = resp.end;
-        }
+        assert_eq!(r.code, CODE_OK, "alloc failed: {}", r.message);
     }
 
-    // Benchmark reads.
-    let start = Instant::now();
-    let mut handles = Vec::with_capacity(num_tasks);
-
-    for t in 0..num_tasks {
-        let extent_id = base_extent + t as u64;
-        let total_ops = total_ops.clone();
-        let total_bytes = total_bytes.clone();
-
-        handles.push(compio::runtime::spawn(async move {
-            let mut conn = BenchConn::connect(addr).await;
-            let mut done = 0u64;
-            let mut bytes = 0u64;
-
-            for i in 0..ops_per_task {
-                let offset = ((i % 1000) * 4096) as u32;
-                let req = ReadBytesReq {
-                    extent_id,
-                    eversion: 0,
-                    offset,
-                    length: 4096,
-                };
-                let resp_bytes = conn.call(MSG_READ_BYTES, req.encode()).await;
-                let resp = ReadBytesResp::decode(resp_bytes).unwrap();
-                assert_eq!(resp.code, CODE_OK, "task {t} read failed");
-                bytes += resp.payload.len() as u64;
-                done += 1;
-            }
-            total_ops.set(total_ops.get() + done);
-            total_bytes.set(total_bytes.get() + bytes);
-        }));
+    // ── Single extent, varying I/O depth ──────────────────────────────────
+    let ops = 50_000u64;
+    for depth in [1, 2, 4, 8, 16, 32, 64] {
+        println!("=== 4KB Append, depth={depth} ===");
+        bench_pipelined(listen_addr, extent_id, depth, ops).await;
+        println!();
     }
-
-    for h in handles {
-        h.await;
-    }
-    let elapsed = start.elapsed();
-    let total = total_ops.get();
-    let ops = total as f64 / elapsed.as_secs_f64();
-    let throughput = total_bytes.get() as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
-    let avg_lat = elapsed.as_micros() as f64 / total as f64;
-    println!("  Total ops:   {total}");
-    println!("  Elapsed:     {:.2}s", elapsed.as_secs_f64());
-    println!("  Ops/sec:     {ops:.0}");
-    println!("  Throughput:  {throughput:.1} MB/s");
-    println!("  Avg latency: {avg_lat:.1} µs/op");
 }
 
-async fn bench_concurrent(addr: SocketAddr, num_tasks: usize, ops_per_task: u64, must_sync: bool) {
-    let base_extent = 1000 + num_tasks as u64 * if must_sync { 100 } else { 0 };
+/// Pipelined append: keeps `depth` requests in-flight on one connection.
+///
+/// Sliding window: prefill `depth` sends, then for each recv, send one more.
+/// This feeds the server's batch handler with multiple frames per TCP read,
+/// triggering coalesced vectored pwritev.
+async fn bench_pipelined(addr: SocketAddr, extent_id: u64, depth: usize, total_ops: u64) {
     let payload = Bytes::from(vec![0xABu8; 4096]);
-    let total_ops = Rc::new(Cell::new(0u64));
+    let mut conn = BenchConn::connect(addr).await;
 
-    // Pre-allocate extents and warm up.
-    for t in 0..num_tasks {
-        let extent_id = base_extent + t as u64;
-        let mut conn = BenchConn::connect(addr).await;
+    // Fetch current commit.
+    let cl_req = CommitLengthReq { extent_id, revision: 1 };
+    let resp = CommitLengthResp::decode(
+        conn.call(MSG_COMMIT_LENGTH, cl_req.encode()).await
+    ).unwrap();
+    let commit = resp.length;
 
-        let alloc_req = rkyv_encode(&AllocExtentReq { extent_id });
-        let resp = conn.call(MSG_ALLOC_EXTENT, alloc_req).await;
-        let r: AllocExtentResp = rkyv_decode(&resp).unwrap();
-        assert_eq!(r.code, CODE_OK, "alloc extent {extent_id} failed: {}", r.message);
+    let mut sent = 0u64;
+    let mut done = 0u64;
 
-        let mut commit = 0u32;
-        for _ in 0..20 {
+    let start = Instant::now();
+
+    // Prefill pipeline.
+    let prefill = (depth as u64).min(total_ops);
+    for _ in 0..prefill {
+        let req = AppendReq {
+            extent_id, eversion: 1, commit, revision: 1,
+            must_sync: false, payload: payload.clone(),
+        };
+        conn.send(MSG_APPEND, req.encode()).await;
+        sent += 1;
+    }
+
+    // Sliding window: recv one → send one more.
+    while done < total_ops {
+        let resp_bytes = conn.recv().await;
+        let resp = AppendResp::decode(resp_bytes).unwrap();
+        assert_eq!(resp.code, CODE_OK, "append failed at op {done}");
+        done += 1;
+
+        if sent < total_ops {
             let req = AppendReq {
-                extent_id, eversion: 1, commit, revision: 1,
+                extent_id, eversion: 1, commit: resp.end, revision: 1,
                 must_sync: false, payload: payload.clone(),
             };
-            let resp = AppendResp::decode(conn.call(MSG_APPEND, req.encode()).await).unwrap();
-            commit = resp.end;
+            conn.send(MSG_APPEND, req.encode()).await;
+            sent += 1;
         }
     }
 
-    // Spawn all tasks and wait.
-    let start = Instant::now();
-    let mut handles = Vec::with_capacity(num_tasks);
-
-    for t in 0..num_tasks {
-        let extent_id = base_extent + t as u64;
-        let payload = payload.clone();
-        let total_ops = total_ops.clone();
-
-        handles.push(compio::runtime::spawn(async move {
-            let mut conn = BenchConn::connect(addr).await;
-
-            // Get current commit.
-            let cl_req = CommitLengthReq { extent_id, revision: 1 };
-            let resp = CommitLengthResp::decode(
-                conn.call(MSG_COMMIT_LENGTH, cl_req.encode()).await
-            ).unwrap();
-            let mut commit = resp.length;
-
-            let mut done = 0u64;
-            for _ in 0..ops_per_task {
-                let req = AppendReq {
-                    extent_id, eversion: 1, commit, revision: 1,
-                    must_sync, payload: payload.clone(),
-                };
-                let resp = AppendResp::decode(conn.call(MSG_APPEND, req.encode()).await).unwrap();
-                assert_eq!(resp.code, CODE_OK, "task {t} append failed");
-                commit = resp.end;
-                done += 1;
-            }
-            total_ops.set(total_ops.get() + done);
-        }));
-    }
-
-    for h in handles {
-        h.await;
-    }
     let elapsed = start.elapsed();
-    let total = total_ops.get();
-    print_stats(total, elapsed);
+    print_stats(done, elapsed);
 }
 
 fn print_stats(count: u64, elapsed: Duration) {
