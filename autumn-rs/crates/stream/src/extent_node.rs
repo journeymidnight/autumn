@@ -515,8 +515,7 @@ impl ExtentNode {
         stream: compio::net::TcpStream,
         node: ExtentNode,
     ) -> Result<()> {
-        let (mut reader, writer) = stream.into_split();
-        let writer = Rc::new(std::cell::UnsafeCell::new(writer));
+        let (mut reader, mut writer) = stream.into_split();
         let mut decoder = FrameDecoder::new();
         let mut buf = vec![0u8; 64 * 1024];
 
@@ -530,8 +529,7 @@ impl ExtentNode {
 
             decoder.feed(&buf[..n]);
 
-            // Collect all decoded frames before processing — allows batching
-            // consecutive append requests into one vectored write.
+            // Decode all frames from this TCP read.
             let mut frames = Vec::new();
             loop {
                 match decoder.try_decode().map_err(|e| anyhow::anyhow!(e))? {
@@ -541,50 +539,36 @@ impl ExtentNode {
                 }
             }
 
-            // Process frames, coalescing consecutive MSG_APPEND into batches.
+            // Process all frames, collect ALL responses into one buffer.
+            // Then write everything with one write_vectored_all — one syscall per TCP read.
+            let mut all_responses: Vec<Bytes> = Vec::with_capacity(frames.len());
+
             let mut i = 0;
             while i < frames.len() {
                 let msg_type = frames[i].msg_type;
 
                 if msg_type == MSG_READ_BYTES {
-                    // Read: spawn for concurrent disk I/O.
-                    let req_id = frames[i].req_id;
-                    let payload = frames[i].payload.clone();
-                    let node = node.clone();
-                    let writer = writer.clone();
-                    compio::runtime::spawn(async move {
-                        let resp_frame = match node.handle_read_bytes(payload).await {
-                            Ok(p) => Frame::response(req_id, msg_type, p),
-                            Err((code, message)) => {
-                                let p = autumn_rpc::RpcError::encode_status(code, &message);
-                                Frame::error(req_id, msg_type, p)
-                            }
-                        };
-                        let w = unsafe { &mut *writer.get() };
-                        let BufResult(result, _) = w.write_all(resp_frame.encode()).await;
-                        if let Err(e) = result {
-                            tracing::debug!(req_id, error = %e, "write response failed");
-                        }
-                    })
-                    .detach();
-                    i += 1;
+                    // Batch consecutive reads.
+                    let batch_start = i;
+                    while i < frames.len() && frames[i].msg_type == MSG_READ_BYTES {
+                        i += 1;
+                    }
+                    let responses = node.handle_read_batch(&frames[batch_start..i]).await;
+                    for f in responses {
+                        all_responses.push(f.encode());
+                    }
                 } else if msg_type == MSG_APPEND {
-                    // Collect all consecutive MSG_APPEND frames (any extent_id) into one batch.
+                    // Batch consecutive appends → one vectored pwritev per extent.
                     let batch_start = i;
                     while i < frames.len() && frames[i].msg_type == MSG_APPEND {
                         i += 1;
                     }
-                    let batch = &frames[batch_start..i];
-
-                    // Process the batch: sequential validation, one vectored write per extent.
-                    let responses = node.handle_append_batch(batch).await;
-                    let w = unsafe { &mut *writer.get() };
-                    for resp_frame in responses {
-                        let BufResult(result, _) = w.write_all(resp_frame.encode()).await;
-                        result?;
+                    let responses = node.handle_append_batch(&frames[batch_start..i]).await;
+                    for f in responses {
+                        all_responses.push(f.encode());
                     }
                 } else {
-                    // Other control RPCs: sequential.
+                    // Control RPCs: one at a time.
                     let req_id = frames[i].req_id;
                     let payload = frames[i].payload.clone();
                     let resp_frame = match node.dispatch(msg_type, payload).await {
@@ -594,11 +578,15 @@ impl ExtentNode {
                             Frame::error(req_id, msg_type, p)
                         }
                     };
-                    let w = unsafe { &mut *writer.get() };
-                    let BufResult(result, _) = w.write_all(resp_frame.encode()).await;
-                    result?;
+                    all_responses.push(resp_frame.encode());
                     i += 1;
                 }
+            }
+
+            // ONE write_vectored_all for all responses from this TCP read batch.
+            if !all_responses.is_empty() {
+                let BufResult(result, _) = writer.write_vectored_all(all_responses).await;
+                result?;
             }
         }
     }
@@ -1314,6 +1302,27 @@ impl ExtentNode {
             payload: Bytes::from(data),
         }
         .encode())
+    }
+
+    /// Process a batch of MSG_READ_BYTES frames sequentially, return one Frame per input.
+    ///
+    /// Sequential preads are faster than N spawned tasks for page-cache hits:
+    /// each pread completes in ~1µs, and responses are written back together,
+    /// saving per-request TCP write overhead.
+    async fn handle_read_batch(&self, frames: &[autumn_rpc::Frame]) -> Vec<Frame> {
+        let mut out = Vec::with_capacity(frames.len());
+        for frame in frames {
+            let req_id = frame.req_id;
+            let resp_frame = match self.handle_read_bytes(frame.payload.clone()).await {
+                Ok(p) => Frame::response(req_id, MSG_READ_BYTES, p),
+                Err((code, msg)) => Frame::error(
+                    req_id, MSG_READ_BYTES,
+                    autumn_rpc::RpcError::encode_status(code, &msg),
+                ),
+            };
+            out.push(resp_frame);
+        }
+        out
     }
 
     async fn handle_commit_length(&self, payload: Bytes) -> HandlerResult {
