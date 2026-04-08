@@ -1,57 +1,31 @@
-Date: 2026-04-07
-TaskStatus: completed
-Task scope: F021 — Multi-disk support for extent nodes
+Date: 2026-04-08
+TaskStatus: not_completed
+Task scope: F043 — Migrate ExtentService to autumn-rpc (data plane hot path)
 
 Current summary:
-  F021 fully implemented. Key additions:
-
-  1. DiskFS struct (extent_node.rs):
-     - Per-disk abstraction: base_dir, disk_id, io engine, online flag
-     - Two layout modes:
-       * flat: extent-{id}.dat directly in base_dir (single-disk / test backward compat)
-       * hashed: {base_dir}/{crc32c_low_byte:02x}/extent-{id}.dat (multi-disk / production)
-       * Hash = crc32c(extent_id_le_bytes) & 0xFF → 256 subdirs matching `autumn-client format`
-     - disk_stats() via libc::statvfs (real per-disk capacity)
-     - scan_extents() handles both flat and hashed layout
-     - DiskFS::open() reads disk_id from file (production mode)
-     - DiskFS::from_single() uses explicit disk_id (test/compat mode)
-
-  2. ExtentNodeConfig changes:
-     - new(data_dir, io_mode, disk_id): single-disk backward compat (flat layout)
-     - new_multi(data_dirs, io_mode): multi-disk production mode (hashed layout)
-     - wal_dir: now fully independent parameter
-
-  3. ExtentNode changes:
-     - disks: Arc<HashMap<u64, Arc<DiskFS>>> replaces io + data_dir + disk_id
-     - choose_disk(): returns first online disk (matches Go chooseDisktoAlloc)
-     - disk_for(disk_id): resolves DiskFS for path computation
-     - ExtentEntry gains disk_id field
-     - alloc_extent, ensure_extent: use choose_disk() for placement
-     - save_meta, load_extents: route through correct DiskFS
-     - run_recovery_task: ready_disk_id from extent.disk_id
-     - df(): real statvfs stats per disk, reports all disks
-
-  4. autumn-extent-node binary (extent_node.rs):
-     - --data accepts comma-separated dirs: --data /d1,/d2
-     - --wal-dir is independent: --wal-dir /nvme/wal
-     - Legacy mode: single --data + --disk-id → flat layout, backward compat
-     - Multi-disk mode: multiple --data dirs → reads disk_id files, hashed layout
-
-  5. Tests (crates/stream/tests/f021_multi_disk.rs):
-     - f021_multi_disk_alloc: 2 disks, alloc 4 extents, verify disk_id valid + files exist
-     - f021_multi_disk_load_extents: pre-populate hash subdirs, verify all extents loaded
-     - f021_df_reports_per_disk_stats: df() reports both disks with real stats
-
-  6. Documentation: crates/stream/CLAUDE.md updated with multi-disk section
-
-  All tests: 3 new F021 tests + all existing stream/manager/integration tests pass.
+  Major progress on F043. Core migration complete:
+  - extent_rpc.rs: rkyv message types + binary codecs for all 10 RPCs (done)
+  - conn_pool.rs: replaced gRPC ConnPool with autumn_rpc::ConnPool wrapper (done)
+  - extent_node.rs: migrated to single-threaded compio server, all handlers converted (done)
+    - Removed tonic/gRPC, tokio, autumn-io-engine, protobuf
+    - Using compio::fs::File for disk I/O
+    - Single-threaded TCP accept loop (no Dispatcher)
+    - Rc/RefCell instead of Arc/Mutex
+  - client.rs: migrated to autumn-rpc binary protocol (done)
+    - Manager calls stubbed as TODO(F044)
+    - futures::lock::Mutex for stream state
+  - extent_node binary: #[compio::main] (done)
+  - All 17 stream lib tests pass
+  - autumn-stream crate compiles clean
 
 Main gaps:
-  F023 (gRPC Gateway REST API) - not implemented
-  F024 (Observability: distributed tracing) - not implemented
-  F025 (Stream benchmark CLI) - not implemented
-  F011 (umbrella: F037 passes but F011 itself still false pending F033 completion confirmation)
+  1. Integration tests (crates/stream/tests/*.rs) need updating for new API
+  2. stream_cli.rs needs migration to compio
+  3. autumn-client.rs needs adaptation (F046 scope)
+  4. partition-server won't compile (expected, F045 scope)
+  5. WAL module still uses tokio internally — needs separate migration
+  6. Remove tonic/tokio/autumn-proto/prost from Cargo.toml deps
+  7. Update CLAUDE.md documentation
 
 Next steps:
-  Consider F023 (REST gateway), F024 (tracing), or F025 (stream benchmark CLI)
-  Or revisit F011 umbrella status
+  Fix integration tests, update stream_cli, clean up Cargo.toml deps

@@ -2,7 +2,6 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use autumn_io_engine::IoMode;
 use autumn_stream::{ExtentNode, ExtentNodeConfig};
 
 struct Args {
@@ -71,7 +70,7 @@ fn parse_args() -> Args {
     }
 }
 
-#[tokio::main]
+#[compio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -88,7 +87,7 @@ async fn main() -> Result<()> {
     let config = if args.data_dirs.len() == 1 && args.disk_id.is_some() {
         // Legacy single-disk mode: disk_id provided explicitly, flat layout, backward compat.
         let data = args.data_dirs.into_iter().next().unwrap();
-        let mut c = ExtentNodeConfig::new(data, IoMode::Standard, args.disk_id.unwrap());
+        let mut c = ExtentNodeConfig::new(data, args.disk_id.unwrap());
         if let Some(wal) = args.wal_dir {
             c = c.with_wal_dir(wal);
         }
@@ -99,7 +98,7 @@ async fn main() -> Result<()> {
     } else {
         // Multi-disk mode (or single-disk without explicit --disk-id):
         // disk_id is read from the disk_id file in each directory.
-        let mut c = ExtentNodeConfig::new_multi(args.data_dirs, IoMode::Standard);
+        let mut c = ExtentNodeConfig::new_multi(args.data_dirs);
         if let Some(wal) = args.wal_dir {
             c = c.with_wal_dir(wal);
         }

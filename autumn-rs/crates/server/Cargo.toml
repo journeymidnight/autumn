@@ -43,3 +43,5 @@ serde_json = "1"
 rand = "0.8"
 uuid.workspace = true
 libc = "0.2"
+compio = { version = "0.18.0", features = ["macros"] }
+autumn-rpc = { version = "0.1.0", path = "../rpc" }

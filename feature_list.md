@@ -1,6 +1,6 @@
 # autumn go→rust feature list
 
-**Last updated:** 2026-04-02
+**Last updated:** 2026-04-07
 
 **Rules:** `passes` and `notes` are the only mutable fields after a feature is created.
 
@@ -159,6 +159,47 @@
 - **Evidence:** `node/diskfs.go` · `node/node.go` (diskFSs map) · `autumn-rs/crates/stream/src/extent_node.rs`
 - **Notes:** Implemented. `DiskFS` struct per disk directory: disk_id (from `disk_id` file), online flag, real `statvfs` stats. Two layout modes: flat (single-disk/test, `ExtentNodeConfig::new`) and hashed (multi-disk/production, `ExtentNodeConfig::new_multi`, 256 hash subdirs matching `autumn-client format`). `choose_disk()` picks first online disk (matches Go). `df()` reports real per-disk capacity. `autumn-extent-node` binary accepts `--data /d1,/d2` and independent `--wal-dir`. 3 new F021 tests pass, all 13 integration tests pass.
 - **passes:** true
+
+---
+
+## P3 — Developer Experience & Operations
+
+---
+
+## P0.5 — Network Layer Migration (tonic/tokio → compio + custom RPC)
+
+Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 路径上开销过大。全面迁移到 compio (completion-based I/O, thread-per-core) + 自定义二进制 RPC 协议，消除 HTTP/2 帧开销和 gRPC streaming setup 延迟。IoEngine (磁盘 I/O) 保持不变。
+
+### F042 · autumn-rpc: custom binary RPC framework on compio
+- **Target:** 新 crate `autumn-rpc`，基于 compio-net 的自定义二进制 RPC 框架。10 字节帧头 `[req_id:u32][msg_type:u8][flags:u8][payload_len:u32]`，单 TCP 连接上通过 req_id 多路复用，server 用 Dispatcher 分发连接到 worker 线程（thread-per-core）。
+- **Evidence:** compio source at `compio/` · `crates/stream/src/conn_pool.rs` (current gRPC pool)
+- **Notes:** Wire format: 10-byte frame header. RpcServer: TcpListener + compio Dispatcher + handler dispatch. RpcClient: TCP connection + req_id multiplexing via `DashMap<u32, oneshot::Sender>`. ConnPool: per-address RpcClient with periodic ping heartbeat. 数据面消息用固定二进制编码（AppendRequest 29B header + raw payload），控制面消息用 protobuf payload。
+- **Deliverables:** `crates/rpc/src/{lib,frame,server,client,pool,error}.rs`. Unit tests: frame encode/decode round-trip, multiplexing, concurrent requests, connection pool health.
+- **passes:** true
+
+### F043 · Migrate ExtentService to autumn-rpc (data plane hot path)
+- **Target:** ExtentNode 服务端和 StreamClient/ConnPool 客户端从 tonic gRPC 迁移到 autumn-rpc。`append_payload_segments` fanout 使用 RpcClient::call() 替代 gRPC client-streaming。binary `autumn-extent-node` 切换到 `#[compio::main]`。
+- **Evidence:** `crates/stream/src/extent_node.rs` (ExtentService impl line 878, serve() line 452) · `crates/stream/src/client.rs` (append_payload_segments line 390, fanout line 450) · `crates/stream/src/conn_pool.rs` (gRPC Channel/ExtentServiceClient) · `crates/server/src/bin/extent_node.rs`
+- **Notes:** ExtentService 11 个 RPC 方法全部迁移：append, read_bytes, commit_length, alloc_extent, df, require_recovery, re_avali, copy_extent, heartbeat, convert_to_ec, write_shard。数据面消息（Append, ReadBytes, CommitLength）用固定二进制编码。其余用 protobuf payload。IoEngine 保持不变（BlockingIoEngine 使用 tokio::sync channel, runtime-agnostic）。Heartbeat 从 gRPC server-streaming 改为 periodic ping frame。`tokio::spawn` → `compio::runtime::spawn`，`tokio::join!` → `futures::join!`，`tokio::select!` → `futures::select!`，`tokio::time::sleep` → `compio::time::sleep`。
+- **passes:** false
+
+### F044 · Migrate Manager services to autumn-rpc (control plane)
+- **Target:** AutumnManager 的 StreamManagerService (12 RPC) + PartitionManagerService (4 RPC) 从 tonic 迁移到 autumn-rpc handler。Manager 内部的 ExtentServiceClient 调用改为 autumn-rpc RpcClient。etcd 通过 EtcdBridge 桥接（内嵌小型 tokio Runtime）。binary `autumn-manager-server` 切换到 `#[compio::main]`。
+- **Evidence:** `crates/manager/src/lib.rs` (StreamManagerService impl line 1394, PartitionManagerService impl line 2397, EtcdMirror line 39) · `crates/server/src/bin/manager.rs`
+- **Notes:** 16 个 RPC 全部 unary，payload 用 protobuf。EtcdBridge: 内嵌 `tokio::runtime::Runtime` (2 worker threads)，所有 etcd 调用通过 `compio::runtime::spawn_blocking` → `tokio_handle.block_on()` 桥接。leader_keepalive_loop 在内嵌 tokio Runtime 上 spawn。`crates/manager/Cargo.toml` 保留 tokio + etcd-client，移除 tonic。
+- **passes:** false
+
+### F045 · Migrate PartitionKv service to autumn-rpc
+- **Target:** PartitionServer 的 PartitionKv (8 RPC) 从 tonic 迁移到 autumn-rpc handler。PartitionManagerServiceClient 调用改为 autumn-rpc RpcClient。binary `autumn-ps` 切换到 `#[compio::main]`。
+- **Evidence:** `crates/partition-server/src/lib.rs` (PartitionKv impl line 2290, serve() line 2142, connect_with_advertise line 412) · `crates/server/src/bin/partition_server.rs`
+- **Notes:** 7 unary + 1 client-streaming (stream_put)。stream_put 改为 RpcClient::call() 单次发送完整 payload。后台循环（write_loop, flush_loop, compact_loop, gc_loop）的 tokio::spawn/select!/sleep 全部替换为 compio 等价物。tokio::sync::Mutex/RwLock/mpsc 保持不变（runtime-agnostic）。`tokio::task::block_in_place` → `compio::runtime::spawn_blocking`。
+- **passes:** false
+
+### F046 · Migrate CLI tools, proto codegen, and tests to compio
+- **Target:** `autumn-client`、`autumn-stream-cli` 的 gRPC client 全部替换为 autumn-rpc RpcClient。`autumn-proto` 的 build.rs 移除 tonic-build server/client codegen，只保留 prost 消息类型生成。所有集成测试从 `#[tokio::test]` 迁移到 compio runtime。
+- **Evidence:** `crates/server/src/bin/autumn_client.rs` · `crates/server/src/bin/stream_cli.rs` · `crates/proto/build.rs` · `crates/manager/tests/*.rs` · `crates/stream/tests/*.rs`
+- **Notes:** autumn-client ClusterClient 的 4 种 gRPC client (StreamManagerServiceClient, PartitionManagerServiceClient, PartitionKvClient, ExtentServiceClient) 全部换成 RpcClient。proto build.rs: `tonic_build::configure()` → `prost_build::Config::new()`，只生成 message struct，不生成 service trait/client/server。测试: `#[tokio::test]` → `compio::runtime::Runtime::new().unwrap().block_on(async { ... })`。workspace Cargo.toml 移除 tonic workspace dependency。
+- **passes:** false
 
 ---
 

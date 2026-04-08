@@ -17,9 +17,20 @@ tonic.workspace = true
 tracing.workspace = true
 autumn-proto = { path = "../proto" }
 autumn-io-engine = { path = "../io-engine" }
+autumn-rpc = { path = "../rpc" }
+compio = { version = "0.18", features = ["net", "time", "macros", "dispatcher", "fs"] }
+prost.workspace = true
 libc = "0.2"
+rkyv = { version = "0.8.15", features = ["alloc"] }
 
 [dev-dependencies]
 tempfile = "3"
 autumn-manager = { path = "../manager" }
+autumn-rpc = { path = "../rpc" }
+autumn-io-engine = { path = "../io-engine" }
 crc32c = "0.6"
+tokio-stream = "0.1"
+
+[[bench]]
+name = "append_bench"
+harness = false

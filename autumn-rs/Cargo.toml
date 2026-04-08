@@ -3,6 +3,7 @@ members = [
   "crates/proto",
   "crates/common",
   "crates/io-engine",
+  "crates/rpc",
   "crates/stream",
   "crates/manager",
   "crates/partition-server",

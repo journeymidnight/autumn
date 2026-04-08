@@ -1,33 +1,24 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
-
+use crate::conn_pool::parse_addr;
+use crate::extent_rpc::*;
 use crate::wal::{replay_wal_files, should_use_wal, Wal, WalRecord};
 
 use anyhow::Result;
-use autumn_io_engine::{build_engine, Bytes, IoEngine, IoFile, IoMode};
-use autumn_proto::autumn::extent_service_client::ExtentServiceClient;
-use autumn_proto::autumn::extent_service_server::{ExtentService, ExtentServiceServer};
-use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
-use autumn_proto::autumn::write_shard_request::Data as WriteShardData;
-use autumn_proto::autumn::{
-    AllocExtentRequest, AllocExtentResponse, AppendRequest, AppendRequestHeader, AppendResponse,
-    Code, CommitLengthRequest, CommitLengthResponse, ConvertToEcRequest, ConvertToEcResponse,
-    CopyExtentRequest, CopyExtentResponse, CopyResponseHeader, Df, DfRequest, DfResponse, Empty,
-    ExtentInfo, ExtentInfoRequest, Payload, ReAvaliRequest, ReAvaliResponse, ReadBytesRequest,
-    ReadBytesResponse, ReadBytesResponseHeader, RecoveryTask, RecoveryTaskStatus,
-    RequireRecoveryRequest, RequireRecoveryResponse, WriteShardRequest, WriteShardResponse,
-};
+use bytes::Bytes;
+use autumn_rpc::{Frame, FrameDecoder, HandlerResult, StatusCode};
+use compio::BufResult;
+use compio::fs::{File as CompioFile, OpenOptions};
+use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
+use compio::net::TcpListener;
+use compio::io::{AsyncRead, AsyncWriteExt};
 use dashmap::DashMap;
 #[allow(unused_imports)]
 use libc;
-use tokio::sync::{mpsc, Mutex, OnceCell};
-use tokio::time::{interval, Duration};
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Request, Response, Status};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 // ─── DiskFS ──────────────────────────────────────────────────────────────────
 
@@ -40,18 +31,18 @@ use tonic::{Request, Response, Status};
 struct DiskFS {
     base_dir: PathBuf,
     disk_id: u64,
-    io: Arc<dyn IoEngine>,
     online: AtomicBool,
 }
 
 impl DiskFS {
     /// Open a disk directory formatted by `autumn-client format`.
     /// Reads `disk_id` from `{base_dir}/disk_id`.
-    async fn open(base_dir: PathBuf, io_mode: IoMode) -> Result<Self> {
+    async fn open(base_dir: PathBuf) -> Result<Self> {
         let disk_id_path = base_dir.join("disk_id");
-        let disk_id_str = tokio::fs::read_to_string(&disk_id_path)
-            .await
+        let data = compio::fs::read(&disk_id_path).await
             .map_err(|e| anyhow::anyhow!("read disk_id in {}: {e}", base_dir.display()))?;
+        let disk_id_str = String::from_utf8(data)
+            .map_err(|e| anyhow::anyhow!("invalid utf8 disk_id in {}: {e}", base_dir.display()))?;
         let disk_id: u64 = disk_id_str
             .trim()
             .parse()
@@ -59,20 +50,17 @@ impl DiskFS {
         Ok(Self {
             base_dir,
             disk_id,
-            io: build_engine(io_mode)?,
             online: AtomicBool::new(true),
         })
     }
 
     /// Create a disk entry with an explicit disk_id (no `disk_id` file required).
-    /// Used by `ExtentNodeConfig::new()` for tests and single-disk deployments.
-    fn with_disk_id(base_dir: PathBuf, disk_id: u64, io_mode: IoMode) -> Result<Self> {
-        Ok(Self {
+    fn with_disk_id(base_dir: PathBuf, disk_id: u64) -> Self {
+        Self {
             base_dir,
             disk_id,
-            io: build_engine(io_mode)?,
             online: AtomicBool::new(true),
-        })
+        }
     }
 
     fn online(&self) -> bool {
@@ -129,11 +117,12 @@ impl DiskFS {
     {
         for byte in 0u8..=255 {
             let subdir = self.base_dir.join(format!("{byte:02x}"));
-            let mut dir = match tokio::fs::read_dir(&subdir).await {
+            let dir = match std::fs::read_dir(&subdir) {
                 Ok(d) => d,
                 Err(_) => continue,
             };
-            while let Some(entry) = dir.next_entry().await? {
+            for entry in dir {
+                let entry = entry?;
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 if let Some(id) = Self::parse_extent_id(&name) {
@@ -169,17 +158,15 @@ impl DiskFS {
 pub struct ExtentNodeConfig {
     /// (dir, disk_id): None disk_id → read from `disk_id` file in dir.
     disks: Vec<(PathBuf, Option<u64>)>,
-    io_mode: IoMode,
     pub manager_endpoint: Option<String>,
     pub wal_dir: Option<PathBuf>,
 }
 
 impl ExtentNodeConfig {
     /// Single-disk constructor. `disk_id` is used directly (no file needed).
-    pub fn new(data_dir: PathBuf, io_mode: IoMode, disk_id: u64) -> Self {
+    pub fn new(data_dir: PathBuf, disk_id: u64) -> Self {
         Self {
             disks: vec![(data_dir, Some(disk_id))],
-            io_mode,
             manager_endpoint: None,
             wal_dir: None,
         }
@@ -187,10 +174,9 @@ impl ExtentNodeConfig {
 
     /// Multi-disk constructor. Each directory must have a `disk_id` file
     /// written by `autumn-client format`.
-    pub fn new_multi(data_dirs: Vec<PathBuf>, io_mode: IoMode) -> Self {
+    pub fn new_multi(data_dirs: Vec<PathBuf>) -> Self {
         Self {
             disks: data_dirs.into_iter().map(|d| (d, None)).collect(),
-            io_mode,
             manager_endpoint: None,
             wal_dir: None,
         }
@@ -210,9 +196,8 @@ impl ExtentNodeConfig {
 // ─── ExtentEntry ─────────────────────────────────────────────────────────────
 
 struct ExtentEntry {
-    file: Arc<dyn IoFile>,
+    file: RefCell<CompioFile>,
     len: AtomicU64,
-    write_lock: Mutex<()>,
     eversion: AtomicU64,
     sealed_length: AtomicU64,
     avali: AtomicU32,
@@ -225,15 +210,28 @@ struct ExtentEntry {
 
 #[derive(Clone)]
 pub struct ExtentNode {
-    extents: Arc<DashMap<u64, Arc<ExtentEntry>>>,
+    extents: Rc<DashMap<u64, Rc<ExtentEntry>>>,
     /// All disks attached to this node, keyed by disk_id.
-    disks: Arc<HashMap<u64, Arc<DiskFS>>>,
+    disks: Rc<HashMap<u64, Rc<DiskFS>>>,
     manager_endpoint: Option<String>,
-    manager_channel: Arc<OnceCell<tonic::transport::Channel>>,
-    recovery_done: Arc<Mutex<Vec<RecoveryTaskStatus>>>,
-    recovery_inflight: Arc<DashMap<u64, RecoveryTask>>,
+    recovery_done: Rc<RefCell<Vec<RecoveryTaskDone>>>,
+    recovery_inflight: Rc<DashMap<u64, crate::extent_rpc::RecoveryTask>>,
     /// WAL for small must_sync writes. None if WAL is disabled.
     wal: Option<Wal>,
+}
+
+/// Helper: write data at offset using compio, returning anyhow::Result.
+async fn file_write_at(file: &RefCell<CompioFile>, offset: u64, data: impl compio::buf::IoBuf) -> Result<()> {
+    let BufResult(result, _) = file.borrow_mut().write_all_at(data, offset).await;
+    result.map_err(|e| anyhow::anyhow!(e))
+}
+
+/// Helper: read data at offset using compio, returning anyhow::Result<Vec<u8>>.
+async fn file_read_at(file: &RefCell<CompioFile>, offset: u64, len: usize) -> Result<Vec<u8>> {
+    let buf = vec![0u8; len];
+    let BufResult(result, buf) = file.borrow().read_exact_at(buf, offset).await;
+    result.map_err(|e| anyhow::anyhow!(e))?;
+    Ok(buf)
 }
 
 impl ExtentNode {
@@ -242,16 +240,16 @@ impl ExtentNode {
 
     pub async fn new(config: ExtentNodeConfig) -> Result<Self> {
         // Build DiskFS instances for all configured disks.
-        let mut disk_map: HashMap<u64, Arc<DiskFS>> = HashMap::new();
+        let mut disk_map: HashMap<u64, Rc<DiskFS>> = HashMap::new();
         for (dir, maybe_disk_id) in config.disks {
-            tokio::fs::create_dir_all(&dir).await?;
+            compio::fs::create_dir_all(&dir).await?;
             let disk = if let Some(disk_id) = maybe_disk_id {
-                DiskFS::with_disk_id(dir, disk_id, config.io_mode)?
+                DiskFS::with_disk_id(dir, disk_id)
             } else {
-                DiskFS::open(dir, config.io_mode).await?
+                DiskFS::open(dir).await?
             };
             let disk_id = disk.disk_id;
-            disk_map.insert(disk_id, Arc::new(disk));
+            disk_map.insert(disk_id, Rc::new(disk));
         }
 
         // Open WAL before loading extents so we can replay into freshly loaded files.
@@ -262,12 +260,11 @@ impl ExtentNode {
         };
 
         let node = Self {
-            extents: Arc::new(DashMap::new()),
-            disks: Arc::new(disk_map),
+            extents: Rc::new(DashMap::new()),
+            disks: Rc::new(disk_map),
             manager_endpoint: config.manager_endpoint,
-            manager_channel: Arc::new(OnceCell::new()),
-            recovery_done: Arc::new(Mutex::new(Vec::new())),
-            recovery_inflight: Arc::new(DashMap::new()),
+            recovery_done: Rc::new(std::cell::RefCell::new(Vec::new())),
+            recovery_inflight: Rc::new(DashMap::new()),
             wal: wal_result.as_ref().map(|(w, _)| w.clone()),
         };
 
@@ -284,14 +281,14 @@ impl ExtentNode {
     }
 
     /// Return the first online disk, or None if all are offline.
-    fn choose_disk(&self) -> Option<Arc<DiskFS>> {
+    fn choose_disk(&self) -> Option<Rc<DiskFS>> {
         self.disks.values().find(|d| d.online()).cloned()
     }
 
-    /// Resolve DiskFS for an extent by its disk_id. Returns error if disk is unknown.
-    fn disk_for(&self, disk_id: u64) -> Result<Arc<DiskFS>, Status> {
+    /// Resolve DiskFS for an extent by its disk_id. Returns error string if disk is unknown.
+    fn disk_for(&self, disk_id: u64) -> Result<Rc<DiskFS>, String> {
         self.disks.get(&disk_id).cloned().ok_or_else(|| {
-            Status::internal(format!("unknown disk_id {disk_id}"))
+            format!("unknown disk_id {disk_id}")
         })
     }
 
@@ -310,7 +307,7 @@ impl ExtentNode {
                     tracing::warn!(
                         "WAL replay: cannot get extent {}: {}",
                         rec.extent_id,
-                        e.message()
+                        e
                     );
                     continue;
                 }
@@ -321,11 +318,7 @@ impl ExtentNode {
             let end = start + payload_len;
 
             // Write is idempotent: if extent file already has this data, we just overwrite.
-            if let Err(e) = extent
-                .file
-                .write_at(start, bytes::Bytes::from(rec.payload))
-                .await
-            {
+            if let Err(e) = file_write_at(&extent.file, start, rec.payload).await {
                 tracing::warn!("WAL replay: write_at failed for extent {}: {e}", rec.extent_id);
                 continue;
             }
@@ -359,7 +352,7 @@ impl ExtentNode {
         }
     }
 
-    async fn save_meta(&self, extent_id: u64, entry: &ExtentEntry) -> Result<(), Status> {
+    async fn save_meta(&self, extent_id: u64, entry: &ExtentEntry) -> Result<(), String> {
         let sealed_length = entry.sealed_length.load(Ordering::SeqCst);
         let eversion = entry.eversion.load(Ordering::SeqCst);
         let last_revision = entry.last_revision.load(Ordering::SeqCst);
@@ -372,9 +365,8 @@ impl ExtentNode {
         buf[32..40].copy_from_slice(&last_revision.to_le_bytes());
 
         let disk = self.disk_for(entry.disk_id)?;
-        tokio::fs::write(disk.meta_path(extent_id), &buf)
-            .await
-            .map_err(|e| Status::internal(format!("save meta for extent {extent_id}: {e}")))?;
+        let BufResult(result, _) = compio::fs::write(disk.meta_path(extent_id), buf.to_vec()).await;
+        result.map_err(|e| format!("save meta for extent {extent_id}: {e}"))?;
         Ok(())
     }
 
@@ -397,8 +389,8 @@ impl ExtentNode {
 
     pub async fn load_extents(&self) -> Result<()> {
         for disk in self.disks.values() {
-            let disk = Arc::clone(disk);
-            let extents = Arc::clone(&self.extents);
+            let disk = Rc::clone(disk);
+            let extents = Rc::clone(&self.extents);
 
             // Collect extent IDs from this disk (scan_extents needs &mut callback).
             let mut found: Vec<u64> = Vec::new();
@@ -409,7 +401,13 @@ impl ExtentNode {
 
             for extent_id in found {
                 let path = disk.extent_path(extent_id);
-                let file = match disk.io.create(&path).await {
+                let file = match OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .await
+                {
                     Ok(f) => f,
                     Err(e) => {
                         tracing::warn!(
@@ -419,21 +417,20 @@ impl ExtentNode {
                         continue;
                     }
                 };
-                let len = file.len().await.unwrap_or(0);
+                let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
 
                 let (sealed_length, eversion, last_revision) =
-                    match tokio::fs::read(disk.meta_path(extent_id)).await {
+                    match compio::fs::read(disk.meta_path(extent_id)).await {
                         Ok(buf) => Self::parse_meta(&buf, extent_id).unwrap_or((0, 1, 0)),
                         Err(_) => (0, 1, 0),
                     };
 
                 extents.insert(
                     extent_id,
-                    Arc::new(ExtentEntry {
-                        file,
+                    Rc::new(ExtentEntry {
+                        file: RefCell::new(file),
                         len: AtomicU64::new(len),
-                        write_lock: Mutex::new(()),
-                        eversion: AtomicU64::new(eversion),
+                                eversion: AtomicU64::new(eversion),
                         sealed_length: AtomicU64::new(sealed_length),
                         avali: AtomicU32::new(if sealed_length > 0 { 1 } else { 0 }),
                         last_revision: AtomicI64::new(last_revision),
@@ -449,63 +446,136 @@ impl ExtentNode {
         Ok(())
     }
 
-    pub async fn serve(self, addr: SocketAddr) -> Result<()> {
-        const GRPC_MAX_MSG: usize = 512 * 1024 * 1024;
-        tonic::transport::Server::builder()
-            .tcp_nodelay(true)
-            .http2_adaptive_window(Some(true))
-            .initial_connection_window_size(Some(16 * 1024 * 1024u32))
-            .initial_stream_window_size(Some(2 * 1024 * 1024u32))
-            .http2_max_pending_accept_reset_streams(Some(1024))
-            .max_concurrent_streams(Some(1000))
-            .add_service(
-                ExtentServiceServer::new(self)
-                    .max_decoding_message_size(GRPC_MAX_MSG)
-                    .max_encoding_message_size(GRPC_MAX_MSG),
-            )
-            .serve(addr)
-            .await?;
-        Ok(())
+    /// Start the RPC server on a single-threaded compio runtime.
+    /// Accepts TCP connections and handles them cooperatively.
+    pub async fn serve(&self, addr: SocketAddr) -> Result<()> {
+        let listener = TcpListener::bind(addr).await?;
+        tracing::info!(addr = %addr, "extent node listening");
+        loop {
+            let (stream, peer) = listener.accept().await?;
+            if let Err(e) = stream.set_nodelay(true) {
+                tracing::warn!(peer = %peer, error = %e, "set_nodelay failed");
+            }
+            let node = self.clone();
+            compio::runtime::spawn(async move {
+                tracing::debug!(peer = %peer, "new rpc connection");
+                if let Err(e) = Self::handle_connection(stream, node).await {
+                    tracing::debug!(peer = %peer, error = %e, "rpc connection ended");
+                }
+            })
+            .detach();
+        }
     }
 
-    async fn get_extent(&self, extent_id: u64) -> Result<Arc<ExtentEntry>, Status> {
+    /// Handle one TCP connection: read frames, dispatch, write responses.
+    async fn handle_connection(
+        stream: compio::net::TcpStream,
+        node: ExtentNode,
+    ) -> Result<()> {
+        let (mut reader, writer) = stream.into_split();
+        let writer = Rc::new(RefCell::new(writer));
+        let mut decoder = FrameDecoder::new();
+        let mut buf = vec![0u8; 64 * 1024];
+
+        loop {
+            let BufResult(result, buf_back) = reader.read(buf).await;
+            buf = buf_back;
+            let n = result?;
+            if n == 0 {
+                return Ok(());
+            }
+
+            decoder.feed(&buf[..n]);
+
+            loop {
+                match decoder.try_decode().map_err(|e| anyhow::anyhow!(e))? {
+                    Some(frame) => {
+                        if frame.req_id == 0 {
+                            continue;
+                        }
+
+                        let node = node.clone();
+                        let writer = writer.clone();
+                        let req_id = frame.req_id;
+                        let msg_type = frame.msg_type;
+
+                        compio::runtime::spawn(async move {
+                            let resp_frame = match node.dispatch(msg_type, frame.payload).await {
+                                Ok(payload) => Frame::response(req_id, msg_type, payload),
+                                Err((code, message)) => {
+                                    let payload = autumn_rpc::RpcError::encode_status(code, &message);
+                                    Frame::error(req_id, msg_type, payload)
+                                }
+                            };
+
+                            let data = resp_frame.encode();
+                            let mut w = writer.borrow_mut();
+                            let BufResult(result, _) = w.write_all(data).await;
+                            if let Err(e) = result {
+                                tracing::debug!(req_id, error = %e, "failed to write response");
+                            }
+                        })
+                        .detach();
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    async fn dispatch(&self, msg_type: u8, payload: Bytes) -> HandlerResult {
+        match msg_type {
+            MSG_APPEND => self.handle_append(payload).await,
+            MSG_READ_BYTES => self.handle_read_bytes(payload).await,
+            MSG_COMMIT_LENGTH => self.handle_commit_length(payload).await,
+            MSG_ALLOC_EXTENT => self.handle_alloc_extent(payload).await,
+            MSG_DF => self.handle_df(payload).await,
+            MSG_REQUIRE_RECOVERY => self.handle_require_recovery(payload).await,
+            MSG_RE_AVALI => self.handle_re_avali(payload).await,
+            MSG_COPY_EXTENT => self.handle_copy_extent(payload).await,
+            MSG_CONVERT_TO_EC => self.handle_convert_to_ec(payload).await,
+            MSG_WRITE_SHARD => self.handle_write_shard(payload).await,
+            _ => Err((StatusCode::InvalidArgument, format!("unknown msg_type {msg_type}"))),
+        }
+    }
+
+    async fn get_extent(&self, extent_id: u64) -> Result<Rc<ExtentEntry>, (StatusCode, String)> {
         self.extents
             .get(&extent_id)
-            .map(|v| Arc::clone(v.value()))
-            .ok_or_else(|| Status::not_found(format!("extent {} not found", extent_id)))
+            .map(|v| Rc::clone(v.value()))
+            .ok_or_else(|| (StatusCode::NotFound, format!("extent {} not found", extent_id)))
     }
 
-    async fn ensure_extent(&self, extent_id: u64) -> Result<Arc<ExtentEntry>, Status> {
+    async fn ensure_extent(&self, extent_id: u64) -> Result<Rc<ExtentEntry>, String> {
         if let Some(v) = self.extents.get(&extent_id) {
-            return Ok(Arc::clone(v.value()));
+            return Ok(Rc::clone(v.value()));
         }
 
         let disk = self
             .choose_disk()
-            .ok_or_else(|| Status::unavailable("no online disk available"))?;
+            .ok_or_else(|| "no online disk available".to_string())?;
         let path = disk.extent_path(extent_id);
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+            compio::fs::create_dir_all(parent).await
+                .map_err(|e| e.to_string())?;
         }
-        let file = disk
-            .io
-            .create(&path)
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let len = file
-            .len()
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| e.to_string())?;
+        let len = file.metadata().await
+            .map(|m| m.len())
+            .map_err(|e| e.to_string())?;
 
         let disk_id = disk.disk_id;
         self.extents.insert(
             extent_id,
-            Arc::new(ExtentEntry {
-                file,
+            Rc::new(ExtentEntry {
+                        file: RefCell::new(file),
                 len: AtomicU64::new(len),
-                write_lock: Mutex::new(()),
                 eversion: AtomicU64::new(1),
                 sealed_length: AtomicU64::new(0),
                 avali: AtomicU32::new(0),
@@ -513,81 +583,10 @@ impl ExtentNode {
                 disk_id,
             }),
         );
-        self.get_extent(extent_id).await
-    }
-
-    fn normalize_endpoint(endpoint: &str) -> String {
-        if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-            endpoint.to_string()
-        } else {
-            format!("http://{endpoint}")
-        }
-    }
-
-    fn precondition_response(code_des: impl Into<String>) -> AppendResponse {
-        AppendResponse {
-            code: Code::PreconditionFailed as i32,
-            code_des: code_des.into(),
-            offset: 0,
-            end: 0,
-        }
-    }
-
-    async fn manager_client(
-        &self,
-    ) -> Result<StreamManagerServiceClient<tonic::transport::Channel>, Status> {
-        let endpoint = self
-            .manager_endpoint
-            .as_ref()
-            .ok_or_else(|| Status::failed_precondition("manager endpoint is not configured"))?;
-        let normalized = Self::normalize_endpoint(endpoint);
-        let channel = self
-            .manager_channel
-            .get_or_try_init(|| async {
-                tonic::transport::Channel::from_shared(normalized)
-                    .map_err(|e| Status::invalid_argument(e.to_string()))?
-                    .connect()
-                    .await
-                    .map_err(|e| Status::unavailable(e.to_string()))
-            })
-            .await?
-            .clone();
-        Ok(StreamManagerServiceClient::new(channel))
-    }
-
-    async fn extent_info_from_manager(&self, extent_id: u64) -> Result<Option<ExtentInfo>, Status> {
-        let Ok(mut sm) = self.manager_client().await else {
-            return Ok(None);
-        };
-        let ex = sm
-            .extent_info(Request::new(ExtentInfoRequest { extent_id }))
-            .await
-            .map_err(|e| Status::unavailable(e.to_string()))?
-            .into_inner();
-        if ex.code == Code::NotFound as i32 {
-            return Ok(None);
-        }
-        if ex.code != Code::Ok as i32 {
-            return Err(Status::failed_precondition(ex.code_des));
-        }
-        Ok(ex.ex_info)
-    }
-
-    async fn nodes_map_from_manager(&self) -> Result<HashMap<u64, String>, Status> {
-        let mut sm = self.manager_client().await?;
-        let nodes = sm
-            .nodes_info(Request::new(Empty {}))
-            .await
-            .map_err(|e| Status::unavailable(e.to_string()))?
-            .into_inner();
-        if nodes.code != Code::Ok as i32 {
-            return Err(Status::failed_precondition(nodes.code_des));
-        }
-        Ok(nodes
-            .nodes
-            .into_iter()
-            .map(|(id, info)| (id, info.address))
-            .collect())
+        self.extents
+            .get(&extent_id)
+            .map(|v| Rc::clone(v.value()))
+            .ok_or_else(|| format!("extent {} not found after insert", extent_id))
     }
 
     /// Apply extent metadata from manager. Returns true if sealed_length changed from 0 to nonzero.
@@ -601,66 +600,56 @@ impl ExtentNode {
         old_sealed == 0 && ex.sealed_length > 0
     }
 
-    async fn truncate_to_commit(extent: &Arc<ExtentEntry>, commit: u32) -> Result<(), Status> {
+    async fn truncate_to_commit(extent: &Rc<ExtentEntry>, commit: u32) -> Result<(), String> {
         extent
-            .file
-            .truncate(commit as u64)
+            .file.borrow()
+            .set_len(commit as u64)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| e.to_string())?;
         extent.len.store(commit as u64, Ordering::SeqCst);
         Ok(())
     }
 
+    /// Copy the full extent data from a remote source node using autumn-rpc.
     async fn copy_bytes_from_source(
-        source_addr: &str,
+        addr: &str,
         extent_id: u64,
         eversion: u64,
-    ) -> Result<Vec<u8>, Status> {
-        let mut source_client = ExtentServiceClient::connect(Self::normalize_endpoint(source_addr))
+    ) -> Result<Vec<u8>, String> {
+        let sock: std::net::SocketAddr = parse_addr(addr)
+            .map_err(|e| e.to_string())?;
+        let client = autumn_rpc::RpcClient::connect(sock)
             .await
-            .map_err(|e| Status::unavailable(e.to_string()))?;
-
-        let mut rb = source_client
-            .read_bytes(Request::new(ReadBytesRequest {
-                extent_id,
-                offset: 0,
-                length: 0,
-                eversion,
-            }))
+            .map_err(|e| format!("connect to {addr}: {e}"))?;
+        let req = ReadBytesReq {
+            extent_id,
+            eversion: eversion,
+            offset: 0,
+            length: 0,
+        };
+        let resp_bytes = client
+            .call(MSG_READ_BYTES, req.encode())
             .await
-            .map_err(|e| Status::unavailable(e.to_string()))?
-            .into_inner();
-
-        let mut header: Option<ReadBytesResponseHeader> = None;
-        let mut payload = Vec::new();
-        while let Some(msg) = rb.message().await? {
-            match msg.data {
-                Some(autumn_proto::autumn::read_bytes_response::Data::Header(h)) => {
-                    if h.code != Code::Ok as i32 {
-                        return Err(Status::failed_precondition(format!(
-                            "read_bytes header error from {source_addr}: {}",
-                            h.code_des
-                        )));
-                    }
-                    header = Some(h);
-                }
-                Some(autumn_proto::autumn::read_bytes_response::Data::Payload(p)) => {
-                    payload.extend_from_slice(&p);
-                }
-                None => {}
-            }
+            .map_err(|e| format!("read_bytes from {addr}: {e}"))?;
+        let resp = ReadBytesResp::decode(resp_bytes)
+            .map_err(|e| format!("decode: {e}"))?;
+        if resp.code != CODE_OK {
+            return Err(format!(
+                "read_bytes error from {addr}: code={}",
+                code_description(resp.code)
+            ));
         }
-
-        let _ = header.ok_or_else(|| Status::internal("read_bytes missing header"))?;
-        Ok(payload)
+        Ok(resp.payload.to_vec())
     }
 
     async fn fetch_full_extent_from_sources(
         &self,
         extent: &ExtentInfo,
         exclude_node_ids: &[u64],
-    ) -> Result<Vec<u8>, Status> {
-        let nodes = self.nodes_map_from_manager().await?;
+    ) -> Result<Vec<u8>, String> {
+        // TODO(F044): nodes_map_from_manager() stubbed
+        let nodes = self.nodes_map_from_manager().await
+            .map_err(|e| format!("nodes_map: {e}"))?;
         for node_id in extent.replicates.iter().chain(extent.parity.iter()) {
             if exclude_node_ids.contains(node_id) {
                 continue;
@@ -677,28 +666,32 @@ impl ExtentNode {
                 return Ok(payload);
             }
         }
-        Err(Status::failed_precondition(
-            "no source replica available for copy",
-        ))
+        Err("no source replica available for copy".to_string())
     }
 
-    async fn resolve_recovery_extent(&self, task: &RecoveryTask) -> Result<ExtentInfo, Status> {
-        let mut sm = self.manager_client().await?;
-        let ex = sm
-            .extent_info(Request::new(ExtentInfoRequest {
-                extent_id: task.extent_id,
-            }))
-            .await
-            .map_err(|e| Status::unavailable(e.to_string()))?
-            .into_inner();
-        if ex.code != Code::Ok as i32 {
-            return Err(Status::failed_precondition(ex.code_des));
-        }
-        ex.ex_info
-            .ok_or_else(|| Status::failed_precondition("extent info missing"))
+    /// Stub: manager client is not available yet (TODO(F044)).
+    async fn extent_info_from_manager(&self, _extent_id: u64) -> Result<Option<ExtentInfo>, String> {
+        tracing::debug!("extent_info_from_manager: TODO(F044) — manager RPC not yet implemented");
+        Ok(None)
     }
 
-    async fn run_recovery_task(&self, task: RecoveryTask) -> Result<RecoveryTaskStatus, Status> {
+    /// Stub: manager client is not available yet (TODO(F044)).
+    async fn nodes_map_from_manager(&self) -> Result<HashMap<u64, String>, String> {
+        Err("TODO(F044): manager RPC not yet implemented".to_string())
+    }
+
+    /// Stub: resolve_recovery_extent via manager (TODO(F044)).
+    async fn resolve_recovery_extent(
+        &self,
+        _task: &crate::extent_rpc::RecoveryTask,
+    ) -> Result<ExtentInfo, String> {
+        Err("TODO(F044): resolve_recovery_extent via manager not yet implemented".to_string())
+    }
+
+    async fn run_recovery_task(
+        &self,
+        task: crate::extent_rpc::RecoveryTask,
+    ) -> Result<RecoveryTaskDone, String> {
         let extent_info = self.resolve_recovery_extent(&task).await?;
 
         let payload = if extent_info.parity.is_empty() {
@@ -718,23 +711,17 @@ impl ExtentNode {
         };
 
         let extent = self.ensure_extent(task.extent_id).await?;
-        let _g = extent.write_lock.lock().await;
+
         extent
-            .file
-            .truncate(0)
+            .file.borrow()
+            .set_len(0)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| e.to_string())?;
         let payload_len = payload.len() as u64;
-        extent
-            .file
-            .write_at(0, Bytes::from(payload))
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        extent
-            .file
-            .sync_all()
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        file_write_at(&extent.file, 0, payload).await
+            .map_err(|e| e.to_string())?;
+        extent.file.borrow().sync_all().await
+            .map_err(|e| e.to_string())?;
         extent.len.store(payload_len, Ordering::SeqCst);
         extent
             .eversion
@@ -746,8 +733,8 @@ impl ExtentNode {
 
         let _ = self.save_meta(task.extent_id, &extent).await;
 
-        Ok(RecoveryTaskStatus {
-            task: Some(task),
+        Ok(RecoveryTaskDone {
+            task: task,
             ready_disk_id: extent.disk_id,
         })
     }
@@ -756,9 +743,9 @@ impl ExtentNode {
     /// then reconstruct the shard that belongs to the recovering node's slot.
     async fn run_ec_recovery_payload(
         &self,
-        task: &RecoveryTask,
+        task: &crate::extent_rpc::RecoveryTask,
         extent_info: &ExtentInfo,
-    ) -> Result<Vec<u8>, Status> {
+    ) -> Result<Vec<u8>, String> {
         let data_shards = extent_info.replicates.len();
         let parity_shards = extent_info.parity.len();
         let n = data_shards + parity_shards;
@@ -777,10 +764,10 @@ impl ExtentNode {
             .iter()
             .position(|&id| id == task.replace_id)
             .ok_or_else(|| {
-                Status::internal(format!(
+                format!(
                     "replace_id {} not found in extent {} node list",
                     task.replace_id, task.extent_id
-                ))
+                )
             })?;
 
         let nodes = self.nodes_map_from_manager().await?;
@@ -823,14 +810,14 @@ impl ExtentNode {
         }
 
         if collected < data_shards {
-            return Err(Status::failed_precondition(format!(
+            return Err(format!(
                 "EC recovery: only {collected}/{data_shards} shards available for extent {}",
                 task.extent_id
-            )));
+            ));
         }
 
         crate::erasure::ec_reconstruct_shard(shards, data_shards, parity_shards, replacing_index)
-            .map_err(|e| Status::internal(format!("EC reconstruct failed: {e}")))
+            .map_err(|e| format!("EC reconstruct failed: {e}"))
     }
 
     /// Write a single EC shard to local storage, replacing any existing data.
@@ -841,269 +828,194 @@ impl ExtentNode {
         shard_index: usize,
         _sealed_length: u64,
         shard_data: &[u8],
-    ) -> Result<(), Status> {
-        let entry = self.ensure_extent(extent_id).await?;
-        let _lock = entry.write_lock.lock().await;
+    ) -> Result<(), (StatusCode, String)> {
+        let entry = self.ensure_extent(extent_id).await
+            .map_err(|e| (StatusCode::Internal, e))?;
+
 
         entry
-            .file
-            .truncate(0)
+            .file.borrow()
+            .set_len(0)
             .await
-            .map_err(|e| Status::internal(format!("truncate shard {extent_id}: {e}")))?;
-        entry
-            .file
-            .write_at(0, Bytes::copy_from_slice(shard_data))
-            .await
-            .map_err(|e| Status::internal(format!("write shard {extent_id}/{shard_index}: {e}")))?;
-        entry
-            .file
-            .sync_all()
-            .await
-            .map_err(|e| Status::internal(format!("sync shard {extent_id}: {e}")))?;
+            .map_err(|e| (StatusCode::Internal, format!("truncate shard {extent_id}: {e}")))?;
+        file_write_at(&entry.file, 0, shard_data.to_vec()).await
+            .map_err(|e| (StatusCode::Internal, format!("write shard {extent_id}/{shard_index}: {e}")))?;
+        entry.file.borrow().sync_all().await
+            .map_err(|e| (StatusCode::Internal, format!("sync shard {extent_id}: {e}")))?;
 
         let shard_len = shard_data.len() as u64;
         entry.len.store(shard_len, Ordering::SeqCst);
         entry.sealed_length.store(shard_len, Ordering::SeqCst);
         entry.avali.store(1, Ordering::SeqCst);
 
-        self.save_meta(extent_id, &entry).await?;
+        self.save_meta(extent_id, &entry).await
+            .map_err(|e| (StatusCode::Internal, e))?;
         Ok(())
     }
-}
 
-type ResponseStream<T> =
-    Pin<Box<dyn tokio_stream::Stream<Item = Result<T, Status>> + Send + 'static>>;
+    // ─── RPC Handlers ────────────────────────────────────────────────────────
 
-#[tonic::async_trait]
-impl ExtentService for ExtentNode {
-    type ReadBytesStream = ResponseStream<ReadBytesResponse>;
-    type CopyExtentStream = ResponseStream<CopyExtentResponse>;
-    type HeartbeatStream = ResponseStream<Payload>;
+    async fn handle_append(&self, payload: Bytes) -> HandlerResult {
+        let req = AppendReq::decode(payload)
+            .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
 
-    async fn alloc_extent(
-        &self,
-        request: Request<AllocExtentRequest>,
-    ) -> Result<Response<AllocExtentResponse>, Status> {
-        let req = request.into_inner();
-        let disk = self
-            .choose_disk()
-            .ok_or_else(|| Status::unavailable("no online disk available"))?;
-        let disk_id = disk.disk_id;
-
-        let path = disk.extent_path(req.extent_id);
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-        }
-        let file = disk
-            .io
-            .create(&path)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let len = file
-            .len()
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        self.extents.insert(
-            req.extent_id,
-            Arc::new(ExtentEntry {
-                file,
-                len: AtomicU64::new(len),
-                write_lock: Mutex::new(()),
-                eversion: AtomicU64::new(1),
-                sealed_length: AtomicU64::new(0),
-                avali: AtomicU32::new(0),
-                last_revision: AtomicI64::new(0),
-                disk_id,
-            }),
-        );
-
-        let entry = self.get_extent(req.extent_id).await?;
-        self.save_meta(req.extent_id, &entry).await?;
-
-        Ok(Response::new(AllocExtentResponse {
-            code: Code::Ok as i32,
-            code_des: String::new(),
-            disk_id,
-        }))
-    }
-
-    async fn append(
-        &self,
-        request: Request<tonic::Streaming<AppendRequest>>,
-    ) -> Result<Response<AppendResponse>, Status> {
-        let mut stream = request.into_inner();
-        let mut header: Option<AppendRequestHeader> = None;
-        let mut payload = bytes::BytesMut::new();
-
-        while let Some(msg) = stream.message().await? {
-            match msg.data {
-                Some(autumn_proto::autumn::append_request::Data::Header(h)) => {
-                    if header.is_some() {
-                        return Err(Status::invalid_argument("duplicate append header"));
-                    }
-                    header = Some(h);
-                }
-                Some(autumn_proto::autumn::append_request::Data::Payload(p)) => {
-                    payload.extend_from_slice(&p);
-                }
-                None => {}
-            }
-        }
-        let payload = payload.freeze();
-
-        let header = header.ok_or_else(|| Status::invalid_argument("append header missing"))?;
-        let extent = self.get_extent(header.extent_id).await?;
+        let extent = self.get_extent(req.extent_id).await?;
 
         // Only fetch from manager when local eversion is behind what the client expects.
         // In the common case (eversions match) we trust local atomics -- no RPC needed.
         let local_eversion = extent.eversion.load(Ordering::SeqCst);
-        if header.eversion > local_eversion {
-            match self.extent_info_from_manager(header.extent_id).await? {
-                Some(ex) => {
+        if req.eversion > local_eversion {
+            // TODO(F044): manager RPC for eversion refresh not yet implemented
+            match self.extent_info_from_manager(req.extent_id).await {
+                Ok(Some(ex)) => {
                     let sealed_changed = Self::apply_extent_meta(&extent, &ex);
                     if sealed_changed {
-                        let _ = self.save_meta(header.extent_id, &extent).await;
+                        let _ = self.save_meta(req.extent_id, &extent).await;
                     }
                 }
-                None => {
+                Ok(None) => {
                     // Manager unreachable but we know local state is stale -- reject.
-                    return Err(Status::unavailable(format!(
-                        "cannot verify extent {} version: manager unreachable",
-                        header.extent_id
-                    )));
+                    return Err((
+                        StatusCode::Unavailable,
+                        format!(
+                            "cannot verify extent {} version: manager unreachable",
+                            req.extent_id
+                        ),
+                    ));
+                }
+                Err(_) => {
+                    return Err((
+                        StatusCode::Unavailable,
+                        format!(
+                            "cannot verify extent {} version: manager unreachable",
+                            req.extent_id
+                        ),
+                    ));
                 }
             }
         }
 
         // Validate eversion and sealed state from local atomics.
         let local_eversion = extent.eversion.load(Ordering::SeqCst);
-        if local_eversion > header.eversion {
-            return Ok(Response::new(Self::precondition_response(format!(
-                "extent {} eversion too low: got {}, expect >= {}",
-                header.extent_id, header.eversion, local_eversion
-            ))));
+        if local_eversion > req.eversion {
+            return Ok(AppendResp {
+                code: CODE_PRECONDITION,
+                offset: 0,
+                end: 0,
+            }
+            .encode());
         }
         if extent.sealed_length.load(Ordering::SeqCst) > 0
             || extent.avali.load(Ordering::SeqCst) > 0
         {
-            return Ok(Response::new(Self::precondition_response(format!(
-                "extent {} is sealed",
-                header.extent_id
-            ))));
+            return Ok(AppendResp {
+                code: CODE_PRECONDITION,
+                offset: 0,
+                end: 0,
+            }
+            .encode());
         }
 
-        let _g = extent.write_lock.lock().await;
+
 
         let last_revision = extent.last_revision.load(Ordering::SeqCst);
-        if header.revision < last_revision {
-            return Ok(Response::new(Self::precondition_response(format!(
-                "locked by newer revision: got {}, latest {}",
-                header.revision, last_revision
-            ))));
+        if req.revision < last_revision {
+            return Ok(AppendResp {
+                code: CODE_PRECONDITION,
+                offset: 0,
+                end: 0,
+            }
+            .encode());
         }
-        let revision_changed = header.revision > last_revision;
+        let revision_changed = req.revision > last_revision;
         if revision_changed {
             extent
                 .last_revision
-                .store(header.revision, Ordering::SeqCst);
+                .store(req.revision, Ordering::SeqCst);
         }
 
         let mut start = extent.len.load(Ordering::SeqCst);
-        if start < header.commit as u64 {
-            return Ok(Response::new(Self::precondition_response(format!(
-                "commit mismatch: local {}, request {}",
-                start, header.commit
-            ))));
-        }
-        if start > header.commit as u64 {
-            if let Err(err) = Self::truncate_to_commit(&extent, header.commit).await {
-                if err.code() == tonic::Code::FailedPrecondition {
-                    return Ok(Response::new(Self::precondition_response(
-                        err.message().to_string(),
-                    )));
-                }
-                return Err(err);
+        if start < req.commit as u64 {
+            return Ok(AppendResp {
+                code: CODE_PRECONDITION,
+                offset: 0,
+                end: 0,
             }
+            .encode());
+        }
+        if start > req.commit as u64 {
+            Self::truncate_to_commit(&extent, req.commit)
+                .await
+                .map_err(|e| (StatusCode::Internal, e))?;
             start = extent.len.load(Ordering::SeqCst);
         }
 
+        let data_payload = req.payload;
+
         if let Some(wal) = &self.wal {
-            if should_use_wal(header.must_sync, payload.len()) {
+            if should_use_wal(req.must_sync, data_payload.len()) {
                 // Fast path: WAL sync + extent write in parallel. The WAL is the
                 // durability source; the extent file doesn't need sync_all().
                 let wal_record = WalRecord {
-                    extent_id: header.extent_id,
+                    extent_id: req.extent_id,
                     start: start as u32,
-                    revision: header.revision,
-                    payload: payload.to_vec(),
+                    revision: req.revision,
+                    payload: data_payload.to_vec(),
                 };
                 let wal_fut = wal.write(wal_record);
-                let file_fut = extent.file.write_at(start, payload.clone());
-                let (wal_res, file_res) = tokio::join!(wal_fut, file_fut);
-                wal_res.map_err(|e| Status::internal(e.to_string()))?;
-                file_res.map_err(|e| Status::internal(e.to_string()))?;
+                let file_fut = file_write_at(&extent.file, start, data_payload.clone());
+                let (wal_res, file_res) = futures::join!(wal_fut, file_fut);
+                wal_res.map_err(|e| (StatusCode::Internal, e.to_string()))?;
+                file_res.map_err(|e| (StatusCode::Internal, e.to_string()))?;
             } else {
-                extent
-                    .file
-                    .write_at(start, payload.clone())
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
-                if header.must_sync {
-                    extent
-                        .file
-                        .sync_all()
-                        .await
-                        .map_err(|e| Status::internal(e.to_string()))?;
+                file_write_at(&extent.file, start, data_payload.clone()).await
+                    .map_err(|e| (StatusCode::Internal, e.to_string()))?;
+                if req.must_sync {
+                    extent.file.borrow().sync_all().await
+                        .map_err(|e| (StatusCode::Internal, e.to_string()))?;
                 }
             }
         } else {
-            extent
-                .file
-                .write_at(start, payload.clone())
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-            if header.must_sync {
-                extent
-                    .file
-                    .sync_all()
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
+            file_write_at(&extent.file, start, data_payload.clone()).await
+                .map_err(|e| (StatusCode::Internal, e.to_string()))?;
+            if req.must_sync {
+                extent.file.borrow().sync_all().await
+                    .map_err(|e| (StatusCode::Internal, e.to_string()))?;
             }
         }
 
         let start_offset = start as u32;
-        let end = start + payload.len() as u64;
+        let end = start + data_payload.len() as u64;
         extent.len.store(end, Ordering::SeqCst);
 
         if revision_changed {
-            let _ = self.save_meta(header.extent_id, &extent).await;
+            let _ = self.save_meta(req.extent_id, &extent).await;
         }
 
-        Ok(Response::new(AppendResponse {
-            code: Code::Ok as i32,
-            code_des: String::new(),
+        Ok(AppendResp {
+            code: CODE_OK,
             offset: start_offset,
             end: end as u32,
-        }))
+        }
+        .encode())
     }
 
-    async fn read_bytes(
-        &self,
-        request: Request<ReadBytesRequest>,
-    ) -> Result<Response<Self::ReadBytesStream>, Status> {
-        let req = request.into_inner();
+    async fn handle_read_bytes(&self, payload: Bytes) -> HandlerResult {
+        let req = ReadBytesReq::decode(payload)
+            .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
+
         let extent = self.get_extent(req.extent_id).await?;
+
         // Use local extent state for eversion checks (no manager RPC needed on reads).
-        // Seal/eversion updates arrive through the append path and re_avali RPC.
         let ev = extent.eversion.load(Ordering::SeqCst);
         if req.eversion > 0 && req.eversion < ev {
-            return Err(Status::failed_precondition(format!(
-                "extent {} eversion too low: got {}, expect >= {}",
-                req.extent_id, req.eversion, ev
-            )));
+            return Err((
+                StatusCode::FailedPrecondition,
+                format!(
+                    "extent {} eversion too low: got {}, expect >= {}",
+                    req.extent_id, req.eversion, ev
+                ),
+            ));
         }
 
         let total_len = extent.len.load(Ordering::SeqCst);
@@ -1115,272 +1027,139 @@ impl ExtentService for ExtentNode {
             (req.length as u64).min(total_len.saturating_sub(read_offset))
         };
 
-        let resp_header = ReadBytesResponseHeader {
-            code: Code::Ok as i32,
-            code_des: String::new(),
+        // Read the entire data in one shot (no streaming).
+        let data = file_read_at(&extent.file, read_offset, read_size as usize).await
+            .map_err(|e| (StatusCode::Internal, e.to_string()))?;
+
+        Ok(ReadBytesResp {
+            code: CODE_OK,
             end,
-        };
-
-        const CHUNK_SIZE: u64 = 1024 * 1024; // 1 MB per streaming message
-        let (tx, rx) = mpsc::channel(16);
-        let file = Arc::clone(&extent.file);
-        tokio::spawn(async move {
-            let _ = tx
-                .send(Ok(ReadBytesResponse {
-                    data: Some(autumn_proto::autumn::read_bytes_response::Data::Header(
-                        resp_header,
-                    )),
-                }))
-                .await;
-            let mut sent = 0u64;
-            while sent < read_size {
-                let chunk_len = ((read_size - sent) as usize).min(CHUNK_SIZE as usize);
-                match file.read_at(read_offset + sent, chunk_len).await {
-                    Ok(buf) => {
-                        sent += buf.len() as u64;
-                        if tx
-                            .send(Ok(ReadBytesResponse {
-                                data: Some(
-                                    autumn_proto::autumn::read_bytes_response::Data::Payload(
-                                        Bytes::from(buf),
-                                    ),
-                                ),
-                            }))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(Status::internal(e.to_string()))).await;
-                        break;
-                    }
-                }
-            }
-        });
-
-        Ok(Response::new(
-            Box::pin(ReceiverStream::new(rx)) as Self::ReadBytesStream
-        ))
+            payload: Bytes::from(data),
+        }
+        .encode())
     }
 
-    async fn re_avali(
-        &self,
-        request: Request<ReAvaliRequest>,
-    ) -> Result<Response<ReAvaliResponse>, Status> {
-        let req = request.into_inner();
-        let extent = match self.get_extent(req.extent_id).await {
-            Ok(v) => v,
-            Err(_) => {
-                return Ok(Response::new(ReAvaliResponse {
-                    code: Code::NotFound as i32,
-                    code_des: format!("extent {} not found", req.extent_id),
-                }));
+    async fn handle_commit_length(&self, payload: Bytes) -> HandlerResult {
+        let req = CommitLengthReq::decode(payload)
+            .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
+
+        let entry = self
+            .extents
+            .get(&req.extent_id)
+            .ok_or_else(|| {
+                (
+                    StatusCode::NotFound,
+                    format!("extent {} not found", req.extent_id),
+                )
+            })?;
+
+        if req.revision > 0 {
+            let last = entry.last_revision.load(Ordering::SeqCst);
+            if req.revision < last {
+                return Ok(CommitLengthResp {
+                    code: CODE_PRECONDITION,
+                    length: 0,
+                }
+                .encode());
             }
-        };
-
-        let extent_info = match self.extent_info_from_manager(req.extent_id).await? {
-            Some(ex) => ex,
-            None => {
-                return Ok(Response::new(ReAvaliResponse {
-                    code: Code::NotFound as i32,
-                    code_des: format!("extent {} not found in manager", req.extent_id),
-                }));
+            if req.revision > last {
+                entry.last_revision.store(req.revision, Ordering::SeqCst);
+                let _ = self.save_meta(req.extent_id, &entry).await;
             }
-        };
-        let sealed_changed = Self::apply_extent_meta(&extent, &extent_info);
-        if sealed_changed {
-            let _ = self.save_meta(req.extent_id, &extent).await;
         }
-
-        if req.eversion < extent_info.eversion {
-            return Ok(Response::new(ReAvaliResponse {
-                code: Code::PreconditionFailed as i32,
-                code_des: format!(
-                    "eversion too low: got {}, expect >= {}",
-                    req.eversion, extent_info.eversion
-                ),
-            }));
+        let len = entry.len.load(Ordering::SeqCst);
+        Ok(CommitLengthResp {
+            code: CODE_OK,
+            length: len as u32,
         }
+        .encode())
+    }
 
-        let local_len = extent.len.load(Ordering::SeqCst);
-        if local_len >= extent_info.sealed_length {
-            return Ok(Response::new(ReAvaliResponse {
-                code: Code::Ok as i32,
-                code_des: String::new(),
-            }));
+    async fn handle_alloc_extent(&self, payload: Bytes) -> HandlerResult {
+        let req: AllocExtentReq = rkyv_decode(&payload)
+            .map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        let disk = self
+            .choose_disk()
+            .ok_or_else(|| (StatusCode::Unavailable, "no online disk available".to_string()))?;
+        let disk_id = disk.disk_id;
+
+        let path = disk.extent_path(req.extent_id);
+        if let Some(parent) = path.parent() {
+            compio::fs::create_dir_all(parent).await
+                .map_err(|e| (StatusCode::Internal, e.to_string()))?;
         }
-
-        let copied = self.fetch_full_extent_from_sources(&extent_info, &[]).await;
-        let payload = match copied {
-            Ok(v) => v,
-            Err(err) => {
-                return Ok(Response::new(ReAvaliResponse {
-                    code: Code::Error as i32,
-                    code_des: err.to_string(),
-                }));
-            }
-        };
-
-        let want = extent_info.sealed_length as usize;
-        if payload.len() < want {
-            return Ok(Response::new(ReAvaliResponse {
-                code: Code::Error as i32,
-                code_des: format!("copied payload too short: {} < {}", payload.len(), want),
-            }));
-        }
-        let payload = Bytes::from(payload[..want].to_vec());
-
-        let _g = extent.write_lock.lock().await;
-        extent
-            .file
-            .truncate(0)
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let payload_len = payload.len() as u64;
-        extent
-            .file
-            .write_at(0, payload)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        extent
-            .file
-            .sync_all()
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        extent.len.store(payload_len, Ordering::SeqCst);
+            .map_err(|e| (StatusCode::Internal, e.to_string()))?;
+        let len = file.metadata().await
+            .map(|m| m.len())
+            .map_err(|e| (StatusCode::Internal, e.to_string()))?;
 
-        let _ = self.save_meta(req.extent_id, &extent).await;
+        self.extents.insert(
+            req.extent_id,
+            Rc::new(ExtentEntry {
+                        file: RefCell::new(file),
+                len: AtomicU64::new(len),
+                eversion: AtomicU64::new(1),
+                sealed_length: AtomicU64::new(0),
+                avali: AtomicU32::new(0),
+                last_revision: AtomicI64::new(0),
+                disk_id,
+            }),
+        );
 
-        Ok(Response::new(ReAvaliResponse {
-            code: Code::Ok as i32,
-            code_des: String::new(),
+        let entry = self.get_extent(req.extent_id).await?;
+        self.save_meta(req.extent_id, &entry).await
+            .map_err(|e| (StatusCode::Internal, e))?;
+
+        Ok(rkyv_encode(&AllocExtentResp {
+            code: CODE_OK,
+            disk_id,
+            message: String::new(),
         }))
     }
 
-    async fn copy_extent(
-        &self,
-        request: Request<CopyExtentRequest>,
-    ) -> Result<Response<Self::CopyExtentStream>, Status> {
-        let req = request.into_inner();
-        let extent = self.get_extent(req.extent_id).await?;
-        let mut logical_len = extent.len.load(Ordering::SeqCst);
-        if let Some(ex) = self.extent_info_from_manager(req.extent_id).await? {
-            let sealed_changed = Self::apply_extent_meta(&extent, &ex);
-            if sealed_changed {
-                let _ = self.save_meta(req.extent_id, &extent).await;
-            }
-            if req.eversion < ex.eversion {
-                return Err(Status::failed_precondition(format!(
-                    "eversion too low: got {}, expect >= {}",
-                    req.eversion, ex.eversion
-                )));
-            }
-            if ex.sealed_length > 0 {
-                logical_len = logical_len.min(ex.sealed_length);
-            }
-        } else {
-            let ev = extent.eversion.load(Ordering::SeqCst);
-            if req.eversion > 0 && req.eversion < ev {
-                return Err(Status::failed_precondition(format!(
-                    "eversion too low: got {}, expect >= {}",
-                    req.eversion, ev
-                )));
-            }
-        }
+    async fn handle_df(&self, payload: Bytes) -> HandlerResult {
+        let req: DfReq = rkyv_decode(&payload)
+            .map_err(|e| (StatusCode::InvalidArgument, e))?;
 
-        let offset = req.offset.min(logical_len);
-        let size = if req.size == 0 {
-            logical_len.saturating_sub(offset)
-        } else {
-            req.size.min(logical_len.saturating_sub(offset))
-        };
-
-        let header = CopyResponseHeader {
-            code: Code::Ok as i32,
-            code_des: String::new(),
-            payload_len: size,
-        };
-
-        const COPY_CHUNK_SIZE: u64 = 1024 * 1024; // 1 MB per streaming message
-        let file = Arc::clone(&extent.file);
-        let (tx, rx) = mpsc::channel(8);
-        tokio::spawn(async move {
-            let _ = tx
-                .send(Ok(CopyExtentResponse {
-                    data: Some(autumn_proto::autumn::copy_extent_response::Data::Header(
-                        header,
-                    )),
-                }))
-                .await;
-            let mut sent = 0u64;
-            while sent < size {
-                let chunk_len = ((size - sent) as usize).min(COPY_CHUNK_SIZE as usize);
-                match file.read_at(offset + sent, chunk_len).await {
-                    Ok(buf) => {
-                        sent += buf.len() as u64;
-                        if tx
-                            .send(Ok(CopyExtentResponse {
-                                data: Some(
-                                    autumn_proto::autumn::copy_extent_response::Data::Payload(
-                                        Bytes::from(buf),
-                                    ),
-                                ),
-                            }))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(Status::internal(e.to_string()))).await;
-                        break;
-                    }
-                }
-            }
-        });
-
-        Ok(Response::new(
-            Box::pin(ReceiverStream::new(rx)) as Self::CopyExtentStream
-        ))
-    }
-
-    async fn df(&self, request: Request<DfRequest>) -> Result<Response<DfResponse>, Status> {
-        let req = request.into_inner();
-        let mut disk_status = std::collections::HashMap::new();
+        let mut disk_status: Vec<(u64, DiskStatus)> = Vec::new();
         if req.disk_ids.is_empty() {
             // Report all known disks.
             for disk in self.disks.values() {
                 let (total, free) = disk.disk_stats();
-                disk_status.insert(
+                disk_status.push((
                     disk.disk_id,
-                    Df {
+                    DiskStatus {
                         total,
                         free,
                         online: disk.online(),
                     },
-                );
+                ));
             }
         } else {
-            for disk_id in req.disk_ids {
-                if let Some(disk) = self.disks.get(&disk_id) {
+            for disk_id in &req.disk_ids {
+                if let Some(disk) = self.disks.get(disk_id) {
                     let (total, free) = disk.disk_stats();
-                    disk_status.insert(
-                        disk_id,
-                        Df {
+                    disk_status.push((
+                        *disk_id,
+                        DiskStatus {
                             total,
                             free,
                             online: disk.online(),
                         },
-                    );
+                    ));
                 }
             }
         }
 
-        let done_task = {
-            let mut done = self.recovery_done.lock().await;
+        let done_tasks = {
+            let mut done = self.recovery_done.borrow_mut();
             if req.tasks.is_empty() {
                 std::mem::take(&mut *done)
             } else {
@@ -1392,11 +1171,12 @@ impl ExtentService for ExtentNode {
                 let mut matched = Vec::new();
                 let mut remaining = Vec::new();
                 for status in done.drain(..) {
-                    let key = status
-                        .task
-                        .as_ref()
-                        .map(|t| (t.extent_id, t.replace_id, t.node_id));
-                    if key.map(|k| wanted.contains(&k)).unwrap_or(false) {
+                    let key = (
+                        status.task.extent_id,
+                        status.task.replace_id,
+                        status.task.node_id,
+                    );
+                    if wanted.contains(&key) {
                         matched.push(status);
                     } else {
                         remaining.push(status);
@@ -1407,281 +1187,325 @@ impl ExtentService for ExtentNode {
             }
         };
 
-        Ok(Response::new(DfResponse {
-            done_task,
+        Ok(rkyv_encode(&DfResp {
+            done_tasks,
             disk_status,
         }))
     }
 
-    async fn require_recovery(
-        &self,
-        request: Request<RequireRecoveryRequest>,
-    ) -> Result<Response<RequireRecoveryResponse>, Status> {
-        let req = request.into_inner();
-        let Some(task) = req.task else {
-            return Ok(Response::new(RequireRecoveryResponse {
-                code: Code::Error as i32,
-                code_des: "recovery task is required".to_string(),
-            }));
-        };
+    async fn handle_require_recovery(&self, payload: Bytes) -> HandlerResult {
+        let req: RequireRecoveryReq = rkyv_decode(&payload)
+            .map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        let task = req.task;
 
         if self.manager_endpoint.is_none() {
-            return Ok(Response::new(RequireRecoveryResponse {
-                code: Code::PreconditionFailed as i32,
-                code_des: "manager endpoint is not configured".to_string(),
+            return Ok(rkyv_encode(&CodeResp {
+                code: CODE_PRECONDITION,
+                message: "manager endpoint is not configured".to_string(),
             }));
         }
 
         if self.recovery_inflight.contains_key(&task.extent_id) {
-            return Ok(Response::new(RequireRecoveryResponse {
-                code: Code::PreconditionFailed as i32,
-                code_des: format!("extent {} recovery already running", task.extent_id),
+            return Ok(rkyv_encode(&CodeResp {
+                code: CODE_PRECONDITION,
+                message: format!("extent {} recovery already running", task.extent_id),
             }));
         }
 
         if self.extents.contains_key(&task.extent_id) {
-            return Ok(Response::new(RequireRecoveryResponse {
-                code: Code::PreconditionFailed as i32,
-                code_des: format!("extent {} already exists", task.extent_id),
+            return Ok(rkyv_encode(&CodeResp {
+                code: CODE_PRECONDITION,
+                message: format!("extent {} already exists", task.extent_id),
             }));
         }
 
         self.recovery_inflight.insert(task.extent_id, task.clone());
         let node = self.clone();
-        tokio::spawn(async move {
+        compio::runtime::spawn(async move {
             let extent_id = task.extent_id;
             let result = node.run_recovery_task(task).await;
             node.recovery_inflight.remove(&extent_id);
             if let Ok(done) = result {
-                node.recovery_done.lock().await.push(done);
+                node.recovery_done.borrow_mut().push(done);
             }
-        });
+        })
+        .detach();
 
-        Ok(Response::new(RequireRecoveryResponse {
-            code: Code::Ok as i32,
-            code_des: String::new(),
+        Ok(rkyv_encode(&CodeResp {
+            code: CODE_OK,
+            message: String::new(),
         }))
     }
 
-    async fn commit_length(
-        &self,
-        request: Request<CommitLengthRequest>,
-    ) -> Result<Response<CommitLengthResponse>, Status> {
-        let req = request.into_inner();
-        let entry = self
-            .extents
-            .get(&req.extent_id)
-            .ok_or_else(|| Status::not_found(format!("extent {} not found", req.extent_id)))?;
+    async fn handle_re_avali(&self, payload: Bytes) -> HandlerResult {
+        let req: ReAvaliReq = rkyv_decode(&payload)
+            .map_err(|e| (StatusCode::InvalidArgument, e))?;
 
-        if req.revision > 0 {
-            let last = entry.last_revision.load(Ordering::SeqCst);
-            if req.revision < last {
-                return Ok(Response::new(CommitLengthResponse {
-                    code: Code::PreconditionFailed as i32,
-                    code_des: format!(
-                        "locked by newer revision: got {}, latest {}",
-                        req.revision, last
-                    ),
-                    length: 0,
+        let extent = match self.get_extent(req.extent_id).await {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(rkyv_encode(&CodeResp {
+                    code: CODE_NOT_FOUND,
+                    message: format!("extent {} not found", req.extent_id),
                 }));
             }
-            if req.revision > last {
-                entry.last_revision.store(req.revision, Ordering::SeqCst);
-                let _ = self.save_meta(req.extent_id, &entry).await;
+        };
+
+        // TODO(F044): manager RPC for extent_info not yet implemented
+        let extent_info = match self.extent_info_from_manager(req.extent_id).await {
+            Ok(Some(ex)) => ex,
+            Ok(None) => {
+                return Ok(rkyv_encode(&CodeResp {
+                    code: CODE_NOT_FOUND,
+                    message: format!("extent {} not found in manager", req.extent_id),
+                }));
             }
+            Err(e) => {
+                return Ok(rkyv_encode(&CodeResp {
+                    code: CODE_ERROR,
+                    message: e,
+                }));
+            }
+        };
+        let sealed_changed = Self::apply_extent_meta(&extent, &extent_info);
+        if sealed_changed {
+            let _ = self.save_meta(req.extent_id, &extent).await;
         }
-        let len = entry.len.load(Ordering::SeqCst);
-        Ok(Response::new(CommitLengthResponse {
-            code: Code::Ok as i32,
-            code_des: String::new(),
-            length: len as u32,
+
+        if req.eversion < extent_info.eversion {
+            return Ok(rkyv_encode(&CodeResp {
+                code: CODE_PRECONDITION,
+                message: format!(
+                    "eversion too low: got {}, expect >= {}",
+                    req.eversion, extent_info.eversion
+                ),
+            }));
+        }
+
+        let local_len = extent.len.load(Ordering::SeqCst);
+        if local_len >= extent_info.sealed_length {
+            return Ok(rkyv_encode(&CodeResp {
+                code: CODE_OK,
+                message: String::new(),
+            }));
+        }
+
+        let copied = self.fetch_full_extent_from_sources(&extent_info, &[]).await;
+        let raw_payload = match copied {
+            Ok(v) => v,
+            Err(err) => {
+                return Ok(rkyv_encode(&CodeResp {
+                    code: CODE_ERROR,
+                    message: err,
+                }));
+            }
+        };
+
+        let want = extent_info.sealed_length as usize;
+        if raw_payload.len() < want {
+            return Ok(rkyv_encode(&CodeResp {
+                code: CODE_ERROR,
+                message: format!("copied payload too short: {} < {}", raw_payload.len(), want),
+            }));
+        }
+        let write_payload = Bytes::from(raw_payload[..want].to_vec());
+
+
+        extent
+            .file.borrow()
+            .set_len(0)
+            .await
+            .map_err(|e| (StatusCode::Internal, e.to_string()))?;
+        let payload_len = write_payload.len() as u64;
+        file_write_at(&extent.file, 0, write_payload.to_vec()).await
+            .map_err(|e| (StatusCode::Internal, e.to_string()))?;
+        extent.file.borrow().sync_all().await
+            .map_err(|e| (StatusCode::Internal, e.to_string()))?;
+        extent.len.store(payload_len, Ordering::SeqCst);
+
+        let _ = self.save_meta(req.extent_id, &extent).await;
+
+        Ok(rkyv_encode(&CodeResp {
+            code: CODE_OK,
+            message: String::new(),
         }))
     }
 
-    async fn heartbeat(
-        &self,
-        request: Request<Payload>,
-    ) -> Result<Response<Self::HeartbeatStream>, Status> {
-        let _ = request.into_inner();
-        let payload = Payload {
-            data: Bytes::from_static(b"beat"),
-        };
-        let (tx, rx) = mpsc::channel(4);
-        tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_secs(1));
-            loop {
-                ticker.tick().await;
-                if tx.send(Ok(payload.clone())).await.is_err() {
-                    break;
+    async fn handle_copy_extent(&self, payload: Bytes) -> HandlerResult {
+        let req = CopyExtentReq::decode(payload)
+            .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
+
+        let extent = self.get_extent(req.extent_id).await?;
+        let mut logical_len = extent.len.load(Ordering::SeqCst);
+
+        // TODO(F044): manager RPC for extent_info not yet implemented
+        match self.extent_info_from_manager(req.extent_id).await {
+            Ok(Some(ex)) => {
+                let sealed_changed = Self::apply_extent_meta(&extent, &ex);
+                if sealed_changed {
+                    let _ = self.save_meta(req.extent_id, &extent).await;
+                }
+                if req.eversion < ex.eversion {
+                    return Err((
+                        StatusCode::FailedPrecondition,
+                        format!(
+                            "eversion too low: got {}, expect >= {}",
+                            req.eversion, ex.eversion
+                        ),
+                    ));
+                }
+                if ex.sealed_length > 0 {
+                    logical_len = logical_len.min(ex.sealed_length);
                 }
             }
-        });
-        Ok(Response::new(
-            Box::pin(ReceiverStream::new(rx)) as Self::HeartbeatStream
-        ))
+            Ok(None) => {
+                let ev = extent.eversion.load(Ordering::SeqCst);
+                if req.eversion > 0 && req.eversion < ev {
+                    return Err((
+                        StatusCode::FailedPrecondition,
+                        format!(
+                            "eversion too low: got {}, expect >= {}",
+                            req.eversion, ev
+                        ),
+                    ));
+                }
+            }
+            Err(_) => {
+                let ev = extent.eversion.load(Ordering::SeqCst);
+                if req.eversion > 0 && req.eversion < ev {
+                    return Err((
+                        StatusCode::FailedPrecondition,
+                        format!(
+                            "eversion too low: got {}, expect >= {}",
+                            req.eversion, ev
+                        ),
+                    ));
+                }
+            }
+        }
+
+        let offset = req.offset.min(logical_len);
+        let size = if req.size == 0 {
+            logical_len.saturating_sub(offset)
+        } else {
+            req.size.min(logical_len.saturating_sub(offset))
+        };
+
+        // Read the entire data in one shot (no streaming).
+        let data = file_read_at(&extent.file, offset, size as usize).await
+            .map_err(|e| (StatusCode::Internal, e.to_string()))?;
+
+        Ok(CopyExtentResp {
+            code: CODE_OK,
+            payload: Bytes::from(data),
+        }
+        .encode())
     }
 
-    /// Seal-after-write EC conversion: coordinator reads local sealed extent,
-    /// EC-encodes it, then distributes shards to target nodes.
-    /// This node must hold a full replicated copy of the sealed extent.
-    async fn convert_to_ec(
-        &self,
-        request: Request<ConvertToEcRequest>,
-    ) -> Result<Response<ConvertToEcResponse>, Status> {
-        let req = request.into_inner();
+    async fn handle_convert_to_ec(&self, payload: Bytes) -> HandlerResult {
+        let req: ConvertToEcReq = rkyv_decode(&payload)
+            .map_err(|e| (StatusCode::InvalidArgument, e))?;
+
         let extent_id = req.extent_id;
         let data_shards = req.data_shards as usize;
         let parity_shards = req.parity_shards as usize;
 
         if data_shards == 0 || parity_shards == 0 {
-            return Err(Status::invalid_argument("data_shards and parity_shards must be > 0"));
+            return Err((
+                StatusCode::InvalidArgument,
+                "data_shards and parity_shards must be > 0".to_string(),
+            ));
         }
         if req.target_addrs.len() != data_shards + parity_shards {
-            return Err(Status::invalid_argument(format!(
-                "target_addrs len {} != data_shards+parity_shards {}",
-                req.target_addrs.len(),
-                data_shards + parity_shards
-            )));
+            return Err((
+                StatusCode::InvalidArgument,
+                format!(
+                    "target_addrs len {} != data_shards+parity_shards {}",
+                    req.target_addrs.len(),
+                    data_shards + parity_shards
+                ),
+            ));
         }
 
         // Read the full sealed extent from local storage.
         let entry = self.get_extent(extent_id).await?;
         let sealed_length = entry.sealed_length.load(Ordering::SeqCst);
         if sealed_length == 0 {
-            return Err(Status::failed_precondition(format!(
-                "extent {extent_id} is not sealed — cannot EC convert"
-            )));
+            return Err((
+                StatusCode::FailedPrecondition,
+                format!("extent {extent_id} is not sealed — cannot EC convert"),
+            ));
         }
 
-        let data = entry
-            .file
-            .read_at(0, sealed_length as usize)
-            .await
-            .map_err(|e| Status::internal(format!("read extent {extent_id}: {e}")))?;
+        let data = file_read_at(&entry.file, 0, sealed_length as usize).await
+            .map_err(|e| (StatusCode::Internal, format!("read extent {extent_id}: {e}")))?;
 
         // EC-encode the full extent data into k+m shards.
         let shards = crate::erasure::ec_encode(&data, data_shards, parity_shards)
-            .map_err(|e| Status::internal(format!("ec_encode failed: {e}")))?;
+            .map_err(|e| (StatusCode::Internal, format!("ec_encode failed: {e}")))?;
 
-        // Determine this node's own address to identify which shard to write locally.
-        // We use the local data_dir as a proxy — actual self-identification is done by
-        // checking if target_addr matches any local bind address; instead we find which
-        // target slot we should handle by attempting all remote ones and handling the rest.
-        //
-        // Strategy: send shards to remote targets; the shard for "self" is written locally.
-        // We identify self by checking against the manager endpoint pattern.
-        // Simpler approach: write shard[i] locally if target_addrs[i] points to self
-        // (detected by connection failure or by checking our own listen addr).
-        //
-        // For robustness: try remote first; if it resolves to self (connection refused or
-        // we match known self addr), write locally. Since we don't have a clean way to
-        // detect "self" here, use a convention: the coordinator always takes shard index 0
-        // (or whichever matches the local address stored in config — not available here).
-        //
-        // Best approach: caller (manager) puts coordinator's address in target_addrs[i].
-        // We identify self by trying to connect and seeing a loopback. Instead, we use the
-        // fact that the coordinator was chosen as one of the existing replicas: attempt to
-        // connect to each target; if it's our own address the write will fail with connection
-        // refused. We handle that by writing locally.
-        let node = self.clone();
+        // Distribute shards to target nodes via WriteShard RPC.
+        // If connection fails, assume this is our own address and write locally.
         for (i, target_addr) in req.target_addrs.iter().enumerate() {
-            let shard = shards[i].clone();
+            let shard = &shards[i];
+            let ws_req = WriteShardReq {
+                extent_id,
+                shard_index: i as u32,
+                sealed_length,
+                payload: Bytes::copy_from_slice(shard),
+            };
 
-            // Try to send via WriteShard RPC; if connection fails, write locally.
-            let normalized = Self::normalize_endpoint(target_addr);
-            match ExtentServiceClient::connect(normalized).await {
-                Ok(mut client) => {
-                    use autumn_proto::autumn::write_shard_request::Data;
-                    use futures::stream;
-
-                    let msgs = vec![
-                        WriteShardRequest {
-                            extent_id,
-                            shard_index: i as u32,
-                            sealed_length,
-                            original_replicates: 0, // manager fills this in ExtentInfo
-                            data: Some(Data::Header(true)),
-                        },
-                        WriteShardRequest {
-                            extent_id,
-                            shard_index: i as u32,
-                            sealed_length,
-                            original_replicates: 0,
-                            data: Some(Data::Payload(shard.clone())),
-                        },
-                    ];
-
-                    let resp = client
-                        .write_shard(Request::new(stream::iter(msgs)))
+            let sock = parse_addr(target_addr)
+                .map_err(|e| (StatusCode::Internal, format!("parse addr {target_addr}: {e}")))?;
+            match autumn_rpc::RpcClient::connect(sock).await {
+                Ok(client) => {
+                    let resp_bytes = client
+                        .call(MSG_WRITE_SHARD, ws_req.encode())
                         .await
                         .map_err(|e| {
-                            Status::internal(format!(
-                                "WriteShard to {target_addr} for shard {i} failed: {e}"
-                            ))
-                        })?
-                        .into_inner();
-
-                    if resp.code != Code::Ok as i32 {
-                        return Err(Status::internal(format!(
-                            "WriteShard to {target_addr} shard {i}: {}",
-                            resp.code_des
-                        )));
+                            (
+                                StatusCode::Internal,
+                                format!("WriteShard to {target_addr} for shard {i} failed: {e}"),
+                            )
+                        })?;
+                    let resp = WriteShardResp::decode(resp_bytes)
+                        .map_err(|e| (StatusCode::Internal, format!("decode write_shard resp: {e}")))?;
+                    if resp.code != CODE_OK {
+                        return Err((
+                            StatusCode::Internal,
+                            format!(
+                                "WriteShard to {target_addr} shard {i}: code={}",
+                                code_description(resp.code)
+                            ),
+                        ));
                     }
                 }
                 Err(_) => {
                     // Connection failed — assume this is our own address; write locally.
-                    node.write_shard_local(extent_id, i, sealed_length, &shards[i]).await?;
+                    self.write_shard_local(extent_id, i, sealed_length, shard).await?;
                 }
             }
         }
 
-        Ok(Response::new(ConvertToEcResponse {
-            code: Code::Ok as i32,
-            code_des: String::new(),
+        Ok(rkyv_encode(&CodeResp {
+            code: CODE_OK,
+            message: String::new(),
         }))
     }
 
-    /// Receive a single EC shard from the coordinator during seal-after-write EC conversion.
-    async fn write_shard(
-        &self,
-        request: Request<tonic::Streaming<WriteShardRequest>>,
-    ) -> Result<Response<WriteShardResponse>, Status> {
-        let mut stream = request.into_inner();
+    async fn handle_write_shard(&self, payload: Bytes) -> HandlerResult {
+        let req = WriteShardReq::decode(payload)
+            .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
 
-        let mut extent_id = 0u64;
-        let mut shard_index = 0usize;
-        let mut sealed_length = 0u64;
-        let mut payload = bytes::BytesMut::new();
-        let mut got_header = false;
+        self.write_shard_local(
+            req.extent_id,
+            req.shard_index as usize,
+            req.sealed_length,
+            &req.payload,
+        )
+        .await?;
 
-        while let Some(msg) = stream.message().await? {
-            match msg.data {
-                Some(WriteShardData::Header(_)) => {
-                    if got_header {
-                        return Err(Status::invalid_argument("duplicate write_shard header"));
-                    }
-                    extent_id = msg.extent_id;
-                    shard_index = msg.shard_index as usize;
-                    sealed_length = msg.sealed_length;
-                    got_header = true;
-                }
-                Some(WriteShardData::Payload(p)) => {
-                    payload.extend_from_slice(&p);
-                }
-                None => {}
-            }
-        }
-
-        if !got_header {
-            return Err(Status::invalid_argument("write_shard: missing header"));
-        }
-
-        self.write_shard_local(extent_id, shard_index, sealed_length, &payload.freeze())
-            .await?;
-
-        Ok(Response::new(WriteShardResponse {
-            code: Code::Ok as i32,
-            code_des: String::new(),
-        }))
+        Ok(WriteShardResp { code: CODE_OK }.encode())
     }
 }
