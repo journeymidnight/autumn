@@ -40,7 +40,7 @@ async fn connect_ps_client(ps_addr: &str) -> Result<PartitionKvClient<Channel>> 
         .connect()
         .await
         .with_context(|| format!("connect PS {endpoint}"))?;
-    const GRPC_MAX_MSG: usize = 64 * 1024 * 1024;
+    const GRPC_MAX_MSG: usize = 512 * 1024 * 1024;
     Ok(PartitionKvClient::new(channel)
         .max_decoding_message_size(GRPC_MAX_MSG)
         .max_encoding_message_size(GRPC_MAX_MSG))

@@ -511,6 +511,14 @@ impl StreamClient {
                 continue;
             }
             if let Some(err) = append_error {
+                tracing::warn!(
+                    stream_id,
+                    extent_id = tail.extent.extent_id,
+                    retry,
+                    commit,
+                    error = %err,
+                    "append failed, will retry"
+                );
                 state.tail = None;
                 retry += 1;
                 if retry <= 2 {
