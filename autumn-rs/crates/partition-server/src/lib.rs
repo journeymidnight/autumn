@@ -1912,7 +1912,7 @@ impl PartitionServer {
         }
 
         let phase1_started_at = Instant::now();
-        let (valid, record_sizes, payload, batch_must_sync, log_stream_id, part_sc) = {
+        let (valid, record_sizes, segments, batch_must_sync, log_stream_id, part_sc) = {
             let mut part = part_arc.write().await;
 
             let mut valid: Vec<ValidatedEntry> = Vec::with_capacity(batch.len());
@@ -1951,26 +1951,26 @@ impl PartitionServer {
                 return Ok(BatchStats::default());
             }
 
-            // Build a single payload buffer for log_stream batch append.
+            // Build per-entry payload segments for log_stream batch append.
             // ALL entries (small and large) go to logStream — matches Go design.
-            // Encode directly into one BytesMut instead of N individual Vecs + concat.
-            let total_size: usize = valid
-                .iter()
-                .map(|e| 17 + e.internal_key.len() + e.value.len())
-                .sum();
-            let mut payload_buf = BytesMut::with_capacity(total_size);
+            // Each entry is encoded as [header+key] + [value] segments to avoid
+            // copying large values into a single contiguous buffer.
+            let mut segments: Vec<Bytes> = Vec::with_capacity(valid.len() * 2);
             let mut record_sizes: Vec<u32> = Vec::with_capacity(valid.len());
             for e in &valid {
-                let before = payload_buf.len();
-                payload_buf.put_u8(e.op);
-                payload_buf.put_u32_le(e.internal_key.len() as u32);
-                payload_buf.put_u32_le(e.value.len() as u32);
-                payload_buf.put_u64_le(e.expires_at);
-                payload_buf.extend_from_slice(&e.internal_key);
-                payload_buf.extend_from_slice(&e.value);
-                record_sizes.push((payload_buf.len() - before) as u32);
+                let hdr_size = 17 + e.internal_key.len();
+                let mut hdr_buf = BytesMut::with_capacity(hdr_size);
+                hdr_buf.put_u8(e.op);
+                hdr_buf.put_u32_le(e.internal_key.len() as u32);
+                hdr_buf.put_u32_le(e.value.len() as u32);
+                hdr_buf.put_u64_le(e.expires_at);
+                hdr_buf.extend_from_slice(&e.internal_key);
+                segments.push(hdr_buf.freeze());
+                if !e.value.is_empty() {
+                    segments.push(e.value.clone()); // O(1) Bytes clone — no copy!
+                }
+                record_sizes.push((hdr_size + e.value.len()) as u32);
             }
-            let payload = payload_buf.freeze();
 
             // If ANY request in the batch requires sync, the whole batch syncs.
             let batch_must_sync = valid.iter().any(|e| e.must_sync);
@@ -1980,7 +1980,7 @@ impl PartitionServer {
             (
                 valid,
                 record_sizes,
-                payload,
+                segments,
                 batch_must_sync,
                 log_stream_id,
                 part_sc,
@@ -1993,12 +1993,12 @@ impl PartitionServer {
         // Reads, flushes, and compaction can proceed concurrently.
         let phase2_started_at = Instant::now();
         let result = match part_sc
-            .append_bytes(log_stream_id, payload, batch_must_sync)
+            .append_segments(log_stream_id, segments, batch_must_sync)
             .await
         {
             Ok(result) => result,
             Err(e) => {
-                let msg = format!("log_stream append_bytes: {e}");
+                let msg = format!("log_stream append_segments: {e}");
                 for entry in valid {
                     let _ = entry.resp_tx.send(Err(Status::internal(msg.clone())));
                 }

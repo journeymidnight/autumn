@@ -378,6 +378,22 @@ impl StreamClient {
         payload: Bytes,
         must_sync: bool,
     ) -> Result<AppendResult> {
+        self.append_payload_segments(stream_id, vec![payload], must_sync)
+            .await
+    }
+
+    /// Core append implementation that sends multiple payload segments as
+    /// separate gRPC Payload messages. This avoids copying large values into
+    /// a single contiguous buffer — matching Go's `[][]byte` block approach.
+    /// The extent node already accumulates multiple Payload messages via
+    /// `extend_from_slice`, so the on-disk result is identical.
+    async fn append_payload_segments(
+        &self,
+        stream_id: u64,
+        segments: Vec<Bytes>,
+        must_sync: bool,
+    ) -> Result<AppendResult> {
+        let payload_len: usize = segments.iter().map(|s| s.len()).sum();
         let append_started_at = Instant::now();
         let state_arc = self.stream_state(stream_id);
         let lock_started_at = Instant::now();
@@ -424,11 +440,12 @@ impl StreamClient {
             }
             extent_lookup_elapsed += extent_lookup_started_at.elapsed();
 
-            // Fan out identical payload to all replicas in parallel.
+            // Fan out identical payload segments to all replicas in parallel.
             // All active extents are replicated — EC conversion only happens after seal
             // (by the manager background loop). Parity is always empty on active extents.
             let extent_id = tail.extent.extent_id;
-            let per_node_payloads: Vec<Bytes> = vec![payload.clone(); clients.len()];
+            // Clone segments for each replica — O(1) per Bytes element.
+            let per_node_segments: Vec<Vec<Bytes>> = vec![segments.clone(); clients.len()];
 
             let fanout_started_at = Instant::now();
             let futs: Vec<_> = clients
@@ -436,16 +453,17 @@ impl StreamClient {
                 .enumerate()
                 .map(|(i, (addr, mut client))| {
                     let hdr = header.clone();
-                    let p = per_node_payloads[i].clone(); // O(1) Bytes clone
+                    let segs = per_node_segments[i].clone();
                     async move {
-                        let reqs = vec![
-                            AppendRequest {
-                                data: Some(append_request::Data::Header(hdr)),
-                            },
-                            AppendRequest {
-                                data: Some(append_request::Data::Payload(p)),
-                            },
-                        ];
+                        let mut reqs = Vec::with_capacity(1 + segs.len());
+                        reqs.push(AppendRequest {
+                            data: Some(append_request::Data::Header(hdr)),
+                        });
+                        for seg in segs {
+                            reqs.push(AppendRequest {
+                                data: Some(append_request::Data::Payload(seg)),
+                            });
+                        }
                         let resp = client.append(Request::new(iter(reqs))).await;
                         (addr, resp)
                     }
@@ -593,7 +611,7 @@ impl StreamClient {
             let total_elapsed = append_started_at.elapsed();
             tracing::debug!(
                 stream_id,
-                payload_len = payload.len(),
+                payload_len,
                 lock_wait_ms = lock_wait.as_secs_f64() * 1000.0,
                 extent_lookup_ms = extent_lookup_elapsed.as_secs_f64() * 1000.0,
                 fanout_ms = fanout_elapsed.as_secs_f64() * 1000.0,
@@ -698,6 +716,19 @@ impl StreamClient {
         must_sync: bool,
     ) -> Result<AppendResult> {
         self.append_payload(stream_id, payload, must_sync).await
+    }
+
+    /// Append multiple Bytes segments without copying them into a single buffer.
+    /// Each segment is sent as a separate gRPC Payload message. This avoids
+    /// large memory copies for big values — matches Go's `[][]byte` approach.
+    pub async fn append_segments(
+        &self,
+        stream_id: u64,
+        segments: Vec<Bytes>,
+        must_sync: bool,
+    ) -> Result<AppendResult> {
+        self.append_payload_segments(stream_id, segments, must_sync)
+            .await
     }
 
     pub async fn append(
