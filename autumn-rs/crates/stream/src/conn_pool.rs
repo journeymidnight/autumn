@@ -32,6 +32,9 @@ const HEALTH_WINDOW_MS: i64 = 8_000;
 struct PoolEntry {
     /// Data channel — used for append, commit_length, read RPCs.
     channel: Channel,
+    /// Cached configured ExtentServiceClient — avoids per-call construction
+    /// of max message size wrappers.  Tonic clients are cheap to clone.
+    ext_client: ExtentServiceClient<Channel>,
     /// Unix milliseconds of last successful heartbeat echo. Initialised to
     /// now() so a brand-new connection starts healthy.
     last_echo: AtomicI64,
@@ -65,8 +68,12 @@ impl ConnPool {
             return Ok(entry.channel.clone());
         }
         let channel = make_endpoint(addr)?.connect().await?;
+        let ext_client = ExtentServiceClient::new(channel.clone())
+            .max_decoding_message_size(GRPC_MAX_MSG)
+            .max_encoding_message_size(GRPC_MAX_MSG);
         let entry = Arc::new(PoolEntry {
             channel: channel.clone(),
+            ext_client,
             last_echo: AtomicI64::new(now_millis()),
             heartbeat_handle: tokio::sync::Mutex::new(None),
         });
@@ -93,11 +100,13 @@ impl ConnPool {
 
     /// Return a ready-to-use `ExtentServiceClient` for `addr`, creating the
     /// connection and starting the heartbeat monitor on first call.
+    /// Returns a cheap clone of the cached client (no per-call construction).
     pub async fn extent_client(&self, addr: &str) -> Result<ExtentServiceClient<Channel>> {
-        let channel = self.connect_extent(addr).await?;
-        Ok(ExtentServiceClient::new(channel)
-            .max_decoding_message_size(GRPC_MAX_MSG)
-            .max_encoding_message_size(GRPC_MAX_MSG))
+        // Ensure connection + heartbeat are established.
+        let _ = self.connect_extent(addr).await?;
+        let key = normalize_endpoint(addr);
+        let entry = self.entries.get(&key).unwrap();
+        Ok(entry.ext_client.clone())
     }
 
     /// Returns `true` if the connection to `addr` has received a heartbeat

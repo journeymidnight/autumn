@@ -431,13 +431,13 @@ impl StreamClient {
             let per_node_payloads: Vec<Bytes> = vec![payload.clone(); clients.len()];
 
             let fanout_started_at = Instant::now();
-            let handles: Vec<_> = clients
+            let futs: Vec<_> = clients
                 .into_iter()
                 .enumerate()
                 .map(|(i, (addr, mut client))| {
                     let hdr = header.clone();
                     let p = per_node_payloads[i].clone(); // O(1) Bytes clone
-                    tokio::spawn(async move {
+                    async move {
                         let reqs = vec![
                             AppendRequest {
                                 data: Some(append_request::Data::Header(hdr)),
@@ -448,24 +448,17 @@ impl StreamClient {
                         ];
                         let resp = client.append(Request::new(iter(reqs))).await;
                         (addr, resp)
-                    })
+                    }
                 })
                 .collect();
-            let results = join_all(handles).await;
+            let results = join_all(futs).await;
             fanout_elapsed += fanout_started_at.elapsed();
 
             let mut first_resp: Option<autumn_proto::autumn::AppendResponse> = None;
             let mut saw_not_found = false;
             let mut append_error = None;
 
-            for join_result in results {
-                let (addr, resp) = match join_result {
-                    Ok(r) => r,
-                    Err(e) => {
-                        append_error = Some(anyhow!("replica task panicked: {e}"));
-                        break;
-                    }
-                };
+            for (addr, resp) in results {
                 let inner = match resp {
                     Ok(v) => v.into_inner(),
                     Err(e) => {
