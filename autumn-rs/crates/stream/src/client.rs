@@ -511,8 +511,6 @@ impl StreamClient {
                 continue;
             }
             if let Some(err) = append_error {
-                // Keep commit value — it's still valid for the same extent.
-                // Only clear the tail so we re-resolve it.
                 state.tail = None;
                 retry += 1;
                 if retry <= 2 {
@@ -533,6 +531,13 @@ impl StreamClient {
                             replica_addrs,
                         });
                     } else {
+                        // Reset commit if the tail moved to a different extent
+                        // (e.g. sealed externally during split). Sending the old
+                        // extent's commit to a new extent causes commit-mismatch
+                        // rejection on the extent node.
+                        if fresh.extent.extent_id != tail.extent.extent_id {
+                            state.commit = 0;
+                        }
                         state.tail = Some(fresh);
                     }
                     continue;

@@ -2141,11 +2141,6 @@ impl PartitionServer {
         const GRPC_MAX_MSG: usize = 64 * 1024 * 1024;
         Server::builder()
             .tcp_nodelay(true)
-            .http2_adaptive_window(Some(true))
-            .initial_connection_window_size(Some(256 * 1024 * 1024u32))
-            .initial_stream_window_size(Some(32 * 1024 * 1024u32))
-            .http2_keepalive_interval(Some(std::time::Duration::from_secs(15)))
-            .http2_keepalive_timeout(Some(std::time::Duration::from_secs(5)))
             .http2_max_pending_accept_reset_streams(Some(1024))
             .max_concurrent_streams(Some(1000))
             .add_service(
