@@ -2,11 +2,12 @@
 
 ## Purpose
 
-Four components in one crate:
-1. **`ExtentNode`** (`extent_node.rs`) — the server-side storage daemon that holds extents on local disk, implements `ExtentService` gRPC.
-2. **`StreamClient`** (`client.rs`) — the client library used by `PartitionServer` to read/write streams.
-3. **`erasure`** (`erasure.rs`) — Reed-Solomon EC codec (`ec_encode`, `ec_decode`, `ec_reconstruct_shard`), wrapping `reed-solomon-erasure` crate.
-4. **`wal`** (`wal.rs`) — Extent node WAL for small-write durability (F035).
+Five components in one crate:
+1. **`ExtentNode`** (`extent_node.rs`) — the server-side storage daemon that holds extents on local disk, implements ExtentService via autumn-rpc (custom binary protocol on compio).
+2. **`extent_rpc`** (`extent_rpc.rs`) — wire codec for all 10 ExtentService RPCs. Hot-path uses binary encoding; control-plane uses rkyv zero-copy serialization.
+3. **`StreamClient`** (`client.rs`) — the client library used by `PartitionServer` to read/write streams. Manager calls are stubbed (F044 scope).
+4. **`erasure`** (`erasure.rs`) — Reed-Solomon EC codec (`ec_encode`, `ec_decode`, `ec_reconstruct_shard`), wrapping `reed-solomon-erasure` crate.
+5. **`wal`** (`wal.rs`) — Extent node WAL for small-write durability (F035).
 
 All are exported from `src/lib.rs`.
 
@@ -16,7 +17,7 @@ All are exported from `src/lib.rs`.
 
 ### Data Model (F021: Multi-Disk)
 
-An `ExtentNode` can manage **multiple disk directories**. Each directory is represented by a `DiskFS` struct (disk_id, base_dir, io engine, online flag).
+An `ExtentNode` can manage **multiple disk directories**. Each directory is represented by a `DiskFS` struct (disk_id, base_dir, online flag). File I/O uses `compio::fs::File` directly (no IoEngine abstraction).
 
 All extents use the hashed layout: `{data_dir}/{hash:02x}/extent-{id}.dat` + `.meta`. Hash = `crc32c(extent_id_le_bytes) & 0xFF` (low byte). Hash subdirs are created on-demand — no pre-formatting required. Matches the 256 subdirs created by `autumn-client format`.
 
@@ -48,50 +49,65 @@ autumn-extent-node --data /disk1,/disk2 --manager ... [--wal-dir /nvme/wal]
 autumn-extent-node --data /tmp/data --disk-id 1 --manager ...
 ```
 
-In memory, `ExtentNode` holds a `DashMap<u64, Arc<ExtentEntry>>`:
+In memory, `ExtentNode` holds a `Rc<DashMap<u64, Rc<ExtentEntry>>>` (single-threaded compio, no `Arc`/`Mutex` needed):
 
 ```rust
 struct ExtentEntry {
-    file: Arc<dyn IoFile>,      // data file handle
-    len: AtomicU64,              // current byte length
-    write_lock: Mutex<()>,       // serializes concurrent appends
-    eversion: AtomicU64,         // bumped on seal or eversion change
-    sealed_length: AtomicU64,    // 0 = active; >0 = sealed at this length
-    avali: AtomicU32,            // availability flag (non-zero = sealed)
-    last_revision: AtomicI64,    // most recent owner revision seen
+    file: UnsafeCell<CompioFile>, // compio::fs::File, UnsafeCell for async I/O
+    len: AtomicU64,               // current byte length
+    eversion: AtomicU64,          // bumped on seal or eversion change
+    sealed_length: AtomicU64,     // 0 = active; >0 = sealed at this length
+    avali: AtomicU32,             // availability flag (non-zero = sealed)
+    last_revision: AtomicI64,     // most recent owner revision seen
+    disk_id: u64,                 // immutable after creation
 }
 ```
 
-### Append Protocol (eversion check → seal check → write lock → fencing → commit truncation → write)
+No `write_lock` — appends are serialized by the single-threaded compio runtime (sequential processing in `handle_connection`).
+
+### Connection Handling & Batch Optimization
+
+`handle_connection` processes all frames from one TCP read in a batch:
 
 ```
-Append(stream of AppendRequest):
-  1. Read header (extent_id, eversion, commit, revision, must_sync)
+TCP read → FrameDecoder → collect all frames → process batch → write_vectored_all
+```
+
+1. **MSG_APPEND batch** (`handle_append_batch`): consecutive append frames grouped by extent_id, validated once, written with one `write_vectored_at` (pwritev) syscall per extent.
+2. **MSG_READ_BYTES batch** (`handle_read_batch`): consecutive read frames processed sequentially (no spawn), responses collected.
+3. **All other RPCs**: processed one at a time via `dispatch()`.
+4. **Response write**: ALL response frames from one TCP read batch are encoded and written with a single `write_vectored_all` call — one TCP write syscall per batch.
+
+This batch-oriented design eliminates per-request syscall overhead. With client-side pipelining (depth=64), achieves 125k write ops/s and 95k read ops/s on loopback.
+
+### Append Protocol (eversion check → seal check → fencing → commit truncation → write)
+
+```
+Append(AppendReq via autumn-rpc binary frame):
+  1. Decode binary request (extent_id, eversion, commit, revision, must_sync, payload)
   2. Eversion check:
        - If client eversion > local: fetch ExtentInfo from manager, apply if sealed
        - If client eversion < local: reject (PRECONDITION_FAILED)
   3. Sealed check: reject if sealed_length > 0 or avali > 0
-  4. Acquire write_lock (serializes concurrent appends)
-  5. Revision fencing:
+  4. Revision fencing:
        - If header.revision < last_revision: reject (stale owner)
        - If header.revision > last_revision: update last_revision, persist meta
-  6. Commit reconciliation:
+  5. Commit reconciliation:
        - If local file len < header.commit: reject (data loss on our side)
        - If local file len > header.commit: TRUNCATE file to header.commit
-         (rolls back divergent writes from previous failed leader)
-  7. Collect payload chunks from stream
-  8. Write payload:
+  6. Write payload:
        - WAL path (must_sync=true AND payload ≤ 2MB AND WAL enabled):
-           tokio::join!(wal.write(record), file.write_at(start, payload))
-           WAL is synced; extent file write is async (no sync_all needed)
-       - Direct path (large payload or must_sync=false or WAL disabled):
+           futures::join!(wal.write(record), file.write_at(start, payload))
+       - Direct path:
            file.write_at(start, payload)
            if must_sync: file.sync_all()
-  9. Advance extent.len
-  10. Return (offset=start, end=start+payload_len)
+  7. Advance extent.len
+  8. Return (offset=start, end=start+payload_len)
 ```
 
-Step 6 (commit-based truncation) is the key to consistency: it effectively replaces a traditional WAL by using the data files themselves as journals. The per-extent WAL (F035) adds an extra durability layer specifically for small must_sync writes, reducing latency by making sequential WAL sync cheaper than random extent sync.
+No `write_lock` — appends are serialized by sequential processing within `handle_connection`. The `end` watermark guarantee: returning end=N means all data in 0..N is written.
+
+Step 5 (commit-based truncation) is the key to consistency: it effectively replaces a traditional WAL by using the data files themselves as journals.
 
 ### WAL (wal.rs)
 
@@ -136,7 +152,7 @@ Used to bring a **sealed** extent's lagging replica up to date (e.g., after a no
 
 ## StreamClient — Client Side
 
-Used by `PartitionServer` and tests. Holds gRPC connections to the manager and extent nodes.
+Used by `PartitionServer` and tests. Holds autumn-rpc connections to extent nodes via `ConnPool`. Manager calls are currently stubbed (F044 scope).
 
 ### Connection & Ownership
 
@@ -223,3 +239,42 @@ All caches use `DashMap` for lock-free concurrent access.
 9. **Commit tracking is local, not per-append RPC** — `state.commit` is a plain `u32` (not `Option`), matching Go's `sc.end` pattern. It starts at 0 and is updated to `appended.end` after each successful append. After allocating a new extent, it resets to 0. `current_commit()` (which RPCs all replicas) exists for partition load time only, never in the hot append path.
 
 10. **Extent allocation is capped per append** — `append_payload` allows at most 3 new extent allocations per single append call (`MAX_ALLOC_PER_APPEND`). This prevents runaway empty extent creation if appends persistently fail.
+
+---
+
+## RPC Wire Protocol (extent_rpc.rs)
+
+Uses autumn-rpc custom binary protocol (10-byte frame header). No protobuf — hot-path RPCs use hand-coded binary encoding for minimal overhead; control-plane RPCs use rkyv zero-copy serialization.
+
+### Hot-path binary codecs
+
+| RPC | msg_type | Request size | Response size |
+|-----|----------|-------------|--------------|
+| Append | 1 | 29B + payload | 9B |
+| ReadBytes | 2 | 24B | 9B + payload |
+| CommitLength | 3 | 16B | 5B |
+
+### Control-plane (rkyv)
+
+AllocExtent(4), Df(5), RequireRecovery(6), ReAvali(7), CopyExtent(8), ConvertToEc(9), WriteShard(10).
+
+---
+
+## Performance (benches/extent_bench.rs)
+
+Benchmark setup: single compio thread, loopback TCP, 4KB payload.
+
+Key results (single connection, pipelined):
+- **Write depth=32**: 116k ops/s, 455 MB/s
+- **Write depth=64**: 125k ops/s, 489 MB/s
+- **Read depth=64**: 95k ops/s, 373 MB/s
+- **Mixed 1w+1r**: 93k total ops/s
+
+See `benches/bench_results.md` for full results and historical comparison.
+
+### Performance optimizations
+
+1. **pwritev batch** — consecutive MSG_APPEND frames coalesced into one `write_vectored_at` syscall
+2. **pread batch** — consecutive MSG_READ_BYTES processed sequentially, responses collected
+3. **write_vectored_all** — ALL responses from one TCP read written in one syscall
+4. **Client pipelining** — sliding window depth hides RTT, enables server-side batching
