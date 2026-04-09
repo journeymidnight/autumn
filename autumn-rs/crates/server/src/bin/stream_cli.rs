@@ -4,34 +4,17 @@
 ///   autumn-stream-cli [--manager <addr>] <subcommand> [args]
 ///
 /// Subcommands:
-///   register-node  --addr <node-addr>  --disk <uuid> [--disk <uuid>...]
-///   create-stream  [--data-shard N]    [--parity-shard N]
-///   stream-info    [--stream-id N]     (omit to list all streams)
+///   register-node  --addr <node-addr>  --disk <uuid> [--disk <uuid>...]   (TODO: F044)
+///   create-stream  [--data-shard N]    [--parity-shard N]                 (TODO: F044)
+///   stream-info    [--stream-id N]                                        (TODO: F044)
 ///   append         --stream-id N  --data <string>  [--owner-key <key>]
 ///   read           --stream-id N  [--extent-id N]  [--offset N]  [--length N]  [--owner-key <key>]
-///                  Uses StreamClient so EC streams are decoded correctly.
 ///   alloc-extent   --node <addr>  --extent-id N
 ///   commit-length  --node <addr>  --extent-id N  [--revision N]
 use anyhow::{anyhow, Context, Result};
-use autumn_proto::autumn::extent_service_client::ExtentServiceClient;
-use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
-use autumn_proto::autumn::{
-    AllocExtentRequest, Code, CommitLengthRequest, CreateStreamRequest,
-    RegisterNodeRequest, StreamInfoRequest,
-};
+use autumn_stream::extent_rpc::*;
 use autumn_stream::{ConnPool, StreamClient};
-use std::sync::Arc;
-use tonic::Request;
-
-// ── helpers ──────────────────────────────────────────────────────────────────
-
-fn normalize(addr: &str) -> String {
-    if addr.starts_with("http://") || addr.starts_with("https://") {
-        addr.to_string()
-    } else {
-        format!("http://{addr}")
-    }
-}
+use std::rc::Rc;
 
 // ── arg parsing ───────────────────────────────────────────────────────────────
 
@@ -82,7 +65,6 @@ fn parse_args() -> Result<Args> {
 
     let mut manager = "127.0.0.1:9001".to_string();
 
-    // global flags before subcommand
     while let Some(tok) = it.peek() {
         match tok.as_str() {
             "--manager" => {
@@ -173,7 +155,7 @@ fn parse_args() -> Result<Args> {
             let mut stream_id = 0u64;
             let mut extent_id: Option<u64> = None;
             let mut offset = 0u32;
-            let mut length = 0u32; // 0 = all
+            let mut length = 0u32;
             let mut owner_key = "cli-owner".to_string();
             while let Some(tok) = it.next() {
                 match tok.as_str() {
@@ -246,69 +228,28 @@ fn parse_args() -> Result<Args> {
 
 // ── subcommand implementations ────────────────────────────────────────────────
 
-async fn cmd_register_node(manager: &str, addr: String, disks: Vec<String>) -> Result<()> {
-    let mut client = StreamManagerServiceClient::connect(normalize(manager)).await?;
-    let resp = client
-        .register_node(Request::new(RegisterNodeRequest {
-            addr: addr.clone(),
-            disk_uuids: disks,
-        }))
-        .await?
-        .into_inner();
-    println!("node_id  : {}", resp.node_id);
-    println!("disks    : {:?}", resp.disk_uuids);
+// TODO(F044): manager commands will use autumn-rpc once manager is migrated.
+
+async fn cmd_register_node(_manager: &str, addr: String, disks: Vec<String>) -> Result<()> {
+    eprintln!("TODO(F044): register-node not yet implemented via autumn-rpc");
+    eprintln!("  addr={addr}, disks={disks:?}");
     Ok(())
 }
 
-async fn cmd_create_stream(manager: &str, replicates: u32, ec_data_shard: u32, ec_parity_shard: u32) -> Result<()> {
-    let mut client = StreamManagerServiceClient::connect(normalize(manager)).await?;
-    let resp = client
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates,
-            ec_data_shard,
-            ec_parity_shard,
-            ..Default::default()
-        }))
-        .await?
-        .into_inner();
-    if resp.code != Code::Ok as i32 {
-        return Err(anyhow!("create_stream failed: {}", resp.code_des));
-    }
-    let stream = resp.stream.context("missing stream")?;
-    let extent = resp.extent.context("missing extent")?;
-    println!("stream_id : {}", stream.stream_id);
-    println!("extent_id : {}", extent.extent_id);
-    println!("replicates: {:?}", extent.replicates);
+async fn cmd_create_stream(_manager: &str, replicates: u32, ec_data_shard: u32, ec_parity_shard: u32) -> Result<()> {
+    eprintln!("TODO(F044): create-stream not yet implemented via autumn-rpc");
+    eprintln!("  replicates={replicates}, ec_data_shard={ec_data_shard}, ec_parity_shard={ec_parity_shard}");
     Ok(())
 }
 
-async fn cmd_stream_info(manager: &str, stream_id: u64) -> Result<()> {
-    let mut client = StreamManagerServiceClient::connect(normalize(manager)).await?;
-    let resp = client
-        .stream_info(Request::new(StreamInfoRequest {
-            stream_ids: vec![stream_id],
-        }))
-        .await?
-        .into_inner();
-    if resp.code != Code::Ok as i32 {
-        return Err(anyhow!("stream_info failed: {}", resp.code_des));
-    }
-    let stream = resp.streams.get(&stream_id).context("stream not found")?;
-    println!("stream_id  : {}", stream.stream_id);
-    println!("extent_ids : {:?}", stream.extent_ids);
-    for eid in &stream.extent_ids {
-        if let Some(ex) = resp.extents.get(eid) {
-            println!(
-                "  extent {}  replicates={:?}  parity={:?}  eversion={}  sealed_length={}",
-                ex.extent_id, ex.replicates, ex.parity, ex.eversion, ex.sealed_length
-            );
-        }
-    }
+async fn cmd_stream_info(_manager: &str, stream_id: u64) -> Result<()> {
+    eprintln!("TODO(F044): stream-info not yet implemented via autumn-rpc");
+    eprintln!("  stream_id={stream_id}");
     Ok(())
 }
 
 async fn cmd_append(manager: &str, stream_id: u64, data: String, owner_key: String) -> Result<()> {
-    let pool = Arc::new(ConnPool::new());
+    let pool = Rc::new(ConnPool::new());
     let client = StreamClient::connect(manager, owner_key, 3 * 1024 * 1024 * 1024, pool).await?;
     let result = client.append(stream_id, data.as_bytes(), true).await?;
     println!("extent_id : {}", result.extent_id);
@@ -318,10 +259,6 @@ async fn cmd_append(manager: &str, stream_id: u64, data: String, owner_key: Stri
     Ok(())
 }
 
-/// Read via StreamClient so EC streams are decoded correctly.
-///
-/// If --extent-id is given, reads that specific extent at (offset, length).
-/// Otherwise reads the last non-empty extent of the stream.
 async fn cmd_read(
     manager: &str,
     stream_id: u64,
@@ -330,7 +267,7 @@ async fn cmd_read(
     length: u32,
     owner_key: String,
 ) -> Result<()> {
-    let pool = Arc::new(ConnPool::new());
+    let pool = Rc::new(ConnPool::new());
     let client =
         StreamClient::connect(manager, owner_key, 3 * 1024 * 1024 * 1024, pool).await?;
 
@@ -345,7 +282,6 @@ async fn cmd_read(
             println!("data      : {text}");
         }
         None => {
-            // Read last non-empty extent.
             let info = client.get_stream_info(stream_id).await?;
             if info.extent_ids.is_empty() {
                 println!("stream {stream_id} has no extents");
@@ -369,32 +305,65 @@ async fn cmd_read(
     Ok(())
 }
 
+/// Send one autumn-rpc frame and read one response frame via blocking TCP.
+fn rpc_sync(addr: &str, msg_type: u8, payload: bytes::Bytes) -> Result<bytes::Bytes> {
+    use autumn_rpc::{Frame, FrameDecoder};
+    use std::io::{Read, Write};
+
+    let stripped = addr
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    let sock: std::net::SocketAddr = stripped
+        .parse()
+        .map_err(|e| anyhow!("invalid address {:?}: {e}", addr))?;
+
+    let mut tcp = std::net::TcpStream::connect(sock)?;
+    tcp.set_nodelay(true)?;
+
+    let frame = Frame::request(1, msg_type, payload);
+    let data = frame.encode();
+    tcp.write_all(&data)?;
+
+    let mut decoder = FrameDecoder::new();
+    let mut buf = vec![0u8; 8192];
+    loop {
+        if let Some(resp) = decoder.try_decode().map_err(|e| anyhow!("{e}"))? {
+            if resp.is_error() {
+                let (code, message) = autumn_rpc::RpcError::decode_status(&resp.payload);
+                return Err(anyhow!("rpc error ({:?}): {}", code, message));
+            }
+            return Ok(resp.payload);
+        }
+        let n = tcp.read(&mut buf)?;
+        if n == 0 {
+            return Err(anyhow!("connection closed"));
+        }
+        decoder.feed(&buf[..n]);
+    }
+}
+
 async fn cmd_alloc_extent(node: &str, extent_id: u64) -> Result<()> {
-    let mut client = ExtentServiceClient::connect(normalize(node)).await?;
-    let resp = client
-        .alloc_extent(Request::new(AllocExtentRequest { extent_id }))
-        .await?
-        .into_inner();
-    println!("disk_id: {}", resp.disk_id);
+    let payload = rkyv_encode(&AllocExtentReq { extent_id });
+    let resp = rpc_sync(node, MSG_ALLOC_EXTENT, payload)?;
+    let alloc: AllocExtentResp = rkyv_decode(&resp).map_err(|e| anyhow!("decode: {e}"))?;
+    println!("disk_id: {}", alloc.disk_id);
     Ok(())
 }
 
 async fn cmd_commit_length(node: &str, extent_id: u64, revision: u64) -> Result<()> {
-    let mut client = ExtentServiceClient::connect(normalize(node)).await?;
-    let resp = client
-        .commit_length(Request::new(CommitLengthRequest {
-            extent_id,
-            revision: revision as i64,
-        }))
-        .await?
-        .into_inner();
-    println!("length: {}", resp.length);
+    let req = CommitLengthReq {
+        extent_id,
+        revision: revision as i64,
+    };
+    let resp = rpc_sync(node, MSG_COMMIT_LENGTH, req.encode())?;
+    let cl = CommitLengthResp::decode(resp).map_err(|e| anyhow!("decode: {e}"))?;
+    println!("length: {}", cl.length);
     Ok(())
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
 
-#[tokio::main]
+#[compio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(

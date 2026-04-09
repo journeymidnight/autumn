@@ -1,3 +1,4 @@
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -138,7 +139,7 @@ pub struct StreamClient {
     max_extent_size: u32,
     /// Shared connection pool — one RpcClient per remote address, with
     /// heartbeat health checks for extent nodes.
-    pool: Arc<ConnPool>,
+    pool: Rc<ConnPool>,
     /// Node-id → address map (refreshed on miss).
     nodes_cache: DashMap<u64, String>,
     /// Cached ExtentInfo for read path.
@@ -154,7 +155,7 @@ impl StreamClient {
         manager_endpoint: &str,
         owner_key: String,
         max_extent_size: u32,
-        pool: Arc<ConnPool>,
+        pool: Rc<ConnPool>,
     ) -> Result<Self> {
         // TODO(F044): call manager.acquire_owner_lock via autumn-rpc
         tracing::warn!("StreamClient::connect: manager calls are stubbed (F044)");
@@ -178,7 +179,7 @@ impl StreamClient {
         owner_key: String,
         revision: i64,
         max_extent_size: u32,
-        pool: Arc<ConnPool>,
+        pool: Rc<ConnPool>,
     ) -> Result<Self> {
         Ok(Self {
             manager_addr: manager_endpoint.to_string(),

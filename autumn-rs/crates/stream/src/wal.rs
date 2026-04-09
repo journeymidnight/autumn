@@ -1,14 +1,14 @@
 /// Extent node WAL for small-write durability.
 ///
 /// For small MustSync writes (≤ 2MB), writes are done as:
-///   WAL (sync) + extent file (no sync) in parallel
+///   WAL (sync) + extent file (no sync)
 ///
 /// This gives better latency than syncing the extent file directly because:
 /// - WAL writes are sequential (single rotating file)
 /// - The WAL file is smaller and syncs faster
 /// - Extent files don't need to be synced on every append
 ///
-/// On startup, `replay()` recovers any unsynced extent writes from the WAL.
+/// On startup, `replay_wal_files()` recovers any unsynced extent writes from the WAL.
 ///
 /// ## Record format (inside each framed chunk)
 /// ```text
@@ -29,11 +29,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use crc32c::crc32c;
-use tokio::sync::{mpsc, oneshot, Mutex};
 
 // ── constants ────────────────────────────────────────────────────────────────
 
@@ -278,11 +276,6 @@ impl RecordReader {
             record_buf.extend_from_slice(chunk_payload);
             self.pos += HEADER_SIZE + chunk_len;
 
-            // Align to block boundary tracking.
-            if self.pos % BLOCK_SIZE == 0 {
-                // Already at block boundary.
-            }
-
             match chunk_type {
                 CHUNK_TYPE_FULL | CHUNK_TYPE_LAST => return Ok(Some(record_buf)),
                 CHUNK_TYPE_FIRST | CHUNK_TYPE_MIDDLE => continue,
@@ -315,44 +308,59 @@ fn list_wal_files(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
 
 // ── WAL public API ────────────────────────────────────────────────────────────
 
-struct WalInner {
+/// Single-threaded WAL. Directly owns the writer — no channels or background
+/// tasks. Called synchronously from the compio event loop (blocking I/O for
+/// sequential writes is cheap and simpler than async for WAL).
+pub struct Wal {
     dir: PathBuf,
     writer: RecordWriter,
     current_id: u64,
-    old_wals: Vec<PathBuf>, // WAL files from before last rotation, pending cleanup
+    old_wals: Vec<PathBuf>,
 }
 
-impl WalInner {
-    fn open(dir: &Path) -> Result<(Self, Vec<PathBuf>)> {
-        fs::create_dir_all(dir)?;
+impl Wal {
+    /// Open the WAL at `dir`. Returns (Wal, replay_files) where replay_files
+    /// are the pre-existing WAL files to replay before accepting new writes.
+    pub fn open(dir: PathBuf) -> Result<(Self, Vec<PathBuf>)> {
+        fs::create_dir_all(&dir)?;
 
-        let existing = list_wal_files(dir)?;
-
-        // All existing WAL files become "old" (to be replayed then cleaned up).
+        let existing = list_wal_files(&dir)?;
         let old_wals: Vec<PathBuf> = existing.iter().map(|(_, p)| p.clone()).collect();
+        let replay_files = old_wals.clone();
 
-        // Start a fresh WAL file.
         let next_id = existing.last().map(|(id, _)| id + 1).unwrap_or(1);
         let path = dir.join(wal_file_name(next_id));
-        let file = OpenOptions::new().create(true).write(true).append(true).open(&path)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(true)
+            .open(&path)?;
 
         Ok((
-            WalInner {
-                dir: dir.to_path_buf(),
+            Wal {
+                dir,
                 writer: RecordWriter::new(file),
                 current_id: next_id,
-                old_wals: old_wals.clone(), // populated so cleanup_old_wals() actually deletes them
+                old_wals,
             },
-            old_wals,
+            replay_files,
         ))
     }
 
-    fn write(&mut self, record: &WalRecord) -> io::Result<()> {
-        let encoded = record.encode();
-        self.writer.write_record(&encoded)?;
+    /// Write a single record and sync to disk.
+    pub fn write(&mut self, record: &WalRecord) -> io::Result<()> {
+        self.write_batch(std::slice::from_ref(record))
+    }
+
+    /// Write multiple records in one batch — encode all, then sync once.
+    /// This amortizes the fsync cost across the batch.
+    pub fn write_batch(&mut self, records: &[WalRecord]) -> io::Result<()> {
+        for record in records {
+            let encoded = record.encode();
+            self.writer.write_record(&encoded)?;
+        }
         self.writer.sync()?;
 
-        // Rotate if file exceeds 250MB.
         if self.writer.file_size() > MAX_WAL_SIZE {
             self.rotate()?;
         }
@@ -365,69 +373,20 @@ impl WalInner {
 
         self.current_id += 1;
         let new_path = self.dir.join(wal_file_name(self.current_id));
-        let file = OpenOptions::new().create(true).write(true).append(true).open(&new_path)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(true)
+            .open(&new_path)?;
         self.writer = RecordWriter::new(file);
         Ok(())
     }
 
-    fn cleanup_old_wals(&mut self) {
+    /// Delete old WAL files after replay is complete.
+    pub fn cleanup_old_wals(&mut self) {
         for path in self.old_wals.drain(..) {
             let _ = fs::remove_file(&path);
         }
-    }
-}
-
-/// Async WAL: accepts write requests via a channel, processes them
-/// serially in a background task.
-#[derive(Clone)]
-pub struct Wal {
-    tx: mpsc::Sender<WalMsg>,
-}
-
-enum WalMsg {
-    Write(WalRecord, oneshot::Sender<io::Result<()>>),
-    CleanupOld,
-}
-
-impl Wal {
-    /// Open the WAL at `dir`. Returns (Wal, replay_files) where replay_files
-    /// are the pre-existing WAL files to replay before accepting new writes.
-    pub fn open(dir: PathBuf) -> Result<(Self, Vec<PathBuf>)> {
-        let (inner, old_wals) = WalInner::open(&dir)?;
-        let replay_files = old_wals.clone();
-
-        let (tx, mut rx) = mpsc::channel::<WalMsg>(64);
-        let wal_inner = Arc::new(Mutex::new(inner));
-
-        tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                match msg {
-                    WalMsg::Write(record, reply) => {
-                        let mut inner = wal_inner.lock().await;
-                        let result = inner.write(&record);
-                        let _ = reply.send(result);
-                    }
-                    WalMsg::CleanupOld => {
-                        let mut inner = wal_inner.lock().await;
-                        inner.cleanup_old_wals();
-                    }
-                }
-            }
-        });
-
-        Ok((Wal { tx }, replay_files))
-    }
-
-    /// Write a record to the WAL synchronously (waits for sync to disk).
-    pub async fn write(&self, record: WalRecord) -> io::Result<()> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.tx.send(WalMsg::Write(record, reply_tx)).await;
-        reply_rx.await.unwrap_or(Err(io::Error::other("WAL task gone")))
-    }
-
-    /// Trigger cleanup of old (pre-open) WAL files after replay is complete.
-    pub async fn cleanup_old_wals(&self) {
-        let _ = self.tx.send(WalMsg::CleanupOld).await;
     }
 }
 
@@ -582,31 +541,52 @@ mod tests {
         assert_eq!(replayed[2].revision, 7);
     }
 
-    #[tokio::test]
-    async fn test_wal_open_write_replay() {
+    #[test]
+    fn test_wal_open_write_replay() {
         let dir = tempdir().unwrap();
         let wal_dir = dir.path().join("wal");
 
         {
-            let (wal, replay) = Wal::open(wal_dir.clone()).unwrap();
-            assert!(replay.is_empty()); // No pre-existing files.
-            wal.write(WalRecord {
+            let (mut wal, replay) = Wal::open(wal_dir.clone()).unwrap();
+            assert!(replay.is_empty());
+            wal.write(&WalRecord {
                 extent_id: 10,
                 start: 0,
                 revision: 1,
                 payload: b"payload1".to_vec(),
             })
-            .await
             .unwrap();
         }
-        // Drop the wal to close the background task.
 
-        // Reopening should find one existing WAL file to replay.
         let (_wal2, replay) = Wal::open(wal_dir.clone()).unwrap();
         let mut records = Vec::new();
         replay_wal_files(&replay, |r| records.push(r));
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].extent_id, 10);
         assert_eq!(records[0].payload, b"payload1");
+    }
+
+    #[test]
+    fn test_wal_batch_write() {
+        let dir = tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+
+        {
+            let (mut wal, _) = Wal::open(wal_dir.clone()).unwrap();
+            let records = vec![
+                WalRecord { extent_id: 1, start: 0, revision: 1, payload: b"aaa".to_vec() },
+                WalRecord { extent_id: 1, start: 3, revision: 1, payload: b"bbb".to_vec() },
+                WalRecord { extent_id: 2, start: 0, revision: 2, payload: b"ccc".to_vec() },
+            ];
+            wal.write_batch(&records).unwrap();
+        }
+
+        let (_, replay) = Wal::open(wal_dir).unwrap();
+        let mut replayed = Vec::new();
+        replay_wal_files(&replay, |r| replayed.push(r));
+        assert_eq!(replayed.len(), 3);
+        assert_eq!(replayed[0].payload, b"aaa");
+        assert_eq!(replayed[1].payload, b"bbb");
+        assert_eq!(replayed[2].extent_id, 2);
     }
 }

@@ -180,8 +180,8 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 ### F043 · Migrate ExtentService to autumn-rpc (data plane hot path)
 - **Target:** ExtentNode 服务端和 StreamClient/ConnPool 客户端从 tonic gRPC 迁移到 autumn-rpc。`append_payload_segments` fanout 使用 RpcClient::call() 替代 gRPC client-streaming。binary `autumn-extent-node` 切换到 `#[compio::main]`。
 - **Evidence:** `crates/stream/src/extent_node.rs` (ExtentService impl line 878, serve() line 452) · `crates/stream/src/client.rs` (append_payload_segments line 390, fanout line 450) · `crates/stream/src/conn_pool.rs` (gRPC Channel/ExtentServiceClient) · `crates/server/src/bin/extent_node.rs`
-- **Notes:** ExtentService 11 个 RPC 方法全部迁移：append, read_bytes, commit_length, alloc_extent, df, require_recovery, re_avali, copy_extent, heartbeat, convert_to_ec, write_shard。数据面消息（Append, ReadBytes, CommitLength）用固定二进制编码。其余用 protobuf payload。IoEngine 保持不变（BlockingIoEngine 使用 tokio::sync channel, runtime-agnostic）。Heartbeat 从 gRPC server-streaming 改为 periodic ping frame。`tokio::spawn` → `compio::runtime::spawn`，`tokio::join!` → `futures::join!`，`tokio::select!` → `futures::select!`，`tokio::time::sleep` → `compio::time::sleep`。
-- **passes:** false
+- **Notes:** ExtentService 11 个 RPC 方法全部迁移：append, read_bytes, commit_length, alloc_extent, df, require_recovery, re_avali, copy_extent, heartbeat, convert_to_ec, write_shard。数据面消息（Append, ReadBytes, CommitLength）用固定二进制编码。控制面用 rkyv zero-copy 序列化。WAL 完全重写：同步阻塞 I/O，支持 write_batch 批量写入，无 tokio 依赖。ConnPool 单线程 compio (Rc/RefCell)。stream_cli alloc-extent/commit-length 用 autumn-rpc。tonic/prost/tokio/autumn-proto/autumn-io-engine 全部从 stream Cargo.toml 移除。18 单元测试 + 11 集成测试全部通过。partition-server 编译中断为预期（F045 scope）。
+- **passes:** true
 
 ### F044 · Migrate Manager services to autumn-rpc (control plane)
 - **Target:** AutumnManager 的 StreamManagerService (12 RPC) + PartitionManagerService (4 RPC) 从 tonic 迁移到 autumn-rpc handler。Manager 内部的 ExtentServiceClient 调用改为 autumn-rpc RpcClient。etcd 通过 EtcdBridge 桥接（内嵌小型 tokio Runtime）。binary `autumn-manager-server` 切换到 `#[compio::main]`。

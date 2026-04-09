@@ -238,13 +238,17 @@ where
 }
 
 /// Deserialize a value from bytes using rkyv (unchecked — we control both sides).
+/// Copies into an AlignedVec if the input is not properly aligned.
 pub fn rkyv_decode<T>(data: &[u8]) -> Result<T, String>
 where
     T: Archive,
     T::Archived: Deserialize<T, HighDeserializer<RkyvError>>,
 {
+    // Wire bytes may not be aligned; copy into AlignedVec to satisfy rkyv requirements.
+    let mut v = rkyv::util::AlignedVec::<16>::with_capacity(data.len());
+    v.extend_from_slice(data);
     // SAFETY: data was serialized by rkyv_encode on the same side of the wire.
-    unsafe { rkyv::from_bytes_unchecked::<T, RkyvError>(data) }
+    unsafe { rkyv::from_bytes_unchecked::<T, RkyvError>(&v) }
         .map_err(|e| format!("rkyv decode: {e}"))
 }
 

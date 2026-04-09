@@ -208,7 +208,6 @@ struct ExtentEntry {
 
 // ─── ExtentNode ───────────────────────────────────────────────────────────────
 
-#[derive(Clone)]
 pub struct ExtentNode {
     extents: Rc<DashMap<u64, Rc<ExtentEntry>>>,
     /// All disks attached to this node, keyed by disk_id.
@@ -217,7 +216,21 @@ pub struct ExtentNode {
     recovery_done: Rc<RefCell<Vec<RecoveryTaskDone>>>,
     recovery_inflight: Rc<DashMap<u64, crate::extent_rpc::RecoveryTask>>,
     /// WAL for small must_sync writes. None if WAL is disabled.
-    wal: Option<Wal>,
+    /// Wrapped in Rc<RefCell<>> for interior mutability on single-threaded compio.
+    wal: Option<Rc<RefCell<Wal>>>,
+}
+
+impl Clone for ExtentNode {
+    fn clone(&self) -> Self {
+        Self {
+            extents: self.extents.clone(),
+            disks: self.disks.clone(),
+            manager_endpoint: self.manager_endpoint.clone(),
+            recovery_done: self.recovery_done.clone(),
+            recovery_inflight: self.recovery_inflight.clone(),
+            wal: self.wal.clone(),
+        }
+    }
 }
 
 /// Helper: one-shot RPC call (connect → send → recv → close).
@@ -298,22 +311,23 @@ impl ExtentNode {
             None
         };
 
-        let node = Self {
+        let mut node = Self {
             extents: Rc::new(DashMap::new()),
             disks: Rc::new(disk_map),
             manager_endpoint: config.manager_endpoint,
             recovery_done: Rc::new(std::cell::RefCell::new(Vec::new())),
             recovery_inflight: Rc::new(DashMap::new()),
-            wal: wal_result.as_ref().map(|(w, _)| w.clone()),
+            wal: None, // set after replay
         };
 
         // Load existing extents from all disks.
         node.load_extents().await?;
 
         // Replay WAL records into extent files.
-        if let Some((wal, replay_files)) = wal_result {
+        if let Some((mut wal, replay_files)) = wal_result {
             node.replay_wal(&replay_files).await;
-            wal.cleanup_old_wals().await;
+            wal.cleanup_old_wals();
+            node.wal = Some(Rc::new(RefCell::new(wal)));
         }
 
         Ok(node)
@@ -1013,27 +1027,19 @@ impl ExtentNode {
 
         let data_payload = req.payload;
 
-        if let Some(wal) = &self.wal {
-            if should_use_wal(req.must_sync, data_payload.len()) {
-                let wal_record = WalRecord {
-                    extent_id: req.extent_id,
-                    start: start as u32,
-                    revision: req.revision,
-                    payload: data_payload.to_vec(),
-                };
-                let wal_fut = wal.write(wal_record);
-                let file_fut = file_pwrite(&extent.file, start, data_payload.clone());
-                let (wal_res, file_res) = futures::join!(wal_fut, file_fut);
-                wal_res.map_err(|e| (StatusCode::Internal, e.to_string()))?;
-                file_res.map_err(|e| (StatusCode::Internal, e.to_string()))?;
-            } else {
-                file_pwrite(&extent.file, start, data_payload.clone()).await
-                    .map_err(|e| (StatusCode::Internal, e.to_string()))?;
-                if req.must_sync {
-                    file_ref(&extent.file).sync_all().await
-                        .map_err(|e| (StatusCode::Internal, e.to_string()))?;
-                }
-            }
+        let use_wal = self.wal.is_some() && should_use_wal(req.must_sync, data_payload.len());
+        if use_wal {
+            let record = WalRecord {
+                extent_id: req.extent_id,
+                start: start as u32,
+                revision: req.revision,
+                payload: data_payload.to_vec(),
+            };
+            self.wal.as_ref().unwrap().borrow_mut().write(&record)
+                .map_err(|e| (StatusCode::Internal, e.to_string()))?;
+            // Extent write — no sync needed, WAL provides durability.
+            file_pwrite(&extent.file, start, data_payload.clone()).await
+                .map_err(|e| (StatusCode::Internal, e.to_string()))?;
         } else {
             file_pwrite(&extent.file, start, data_payload.clone()).await
                 .map_err(|e| (StatusCode::Internal, e.to_string()))?;
@@ -1208,6 +1214,31 @@ impl ExtentNode {
             }
             let total_end = cursor;
 
+            // WAL batch: write all records in one batch + one fsync, skip extent sync.
+            let total_payload: usize = reqs[..valid_count].iter().map(|r| r.payload.len()).sum();
+            let use_wal = must_sync && self.wal.is_some()
+                && should_use_wal(true, total_payload);
+            if use_wal {
+                let wal_records: Vec<WalRecord> = reqs[..valid_count].iter().enumerate().map(|(k, req)| {
+                    WalRecord {
+                        extent_id,
+                        start: offsets[k],
+                        revision: req.revision,
+                        payload: req.payload.to_vec(),
+                    }
+                }).collect();
+                if let Err(e) = self.wal.as_ref().unwrap().borrow_mut().write_batch(&wal_records) {
+                    let payload = autumn_rpc::RpcError::encode_status(
+                        StatusCode::Internal, &e.to_string(),
+                    );
+                    for k in sub_start..sub_end {
+                        out.push(Frame::error(frames[k].req_id, MSG_APPEND, payload.clone()));
+                    }
+                    i = sub_end;
+                    continue;
+                }
+            }
+
             // Single vectored write — one pwritev syscall, zero extra copies.
             let f = unsafe { &mut *extent.file.get() };
             let BufResult(wr, _) = f.write_vectored_at(bufs, file_start).await;
@@ -1222,7 +1253,8 @@ impl ExtentNode {
                 continue;
             }
 
-            if must_sync {
+            // If WAL was used, skip extent sync (WAL provides durability).
+            if must_sync && !use_wal {
                 if let Err(e) = file_ref(&extent.file).sync_all().await {
                     let payload = autumn_rpc::RpcError::encode_status(
                         StatusCode::Internal, &e.to_string(),

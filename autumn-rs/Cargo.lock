@@ -208,9 +208,7 @@ name = "autumn-stream"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "autumn-io-engine",
  "autumn-manager",
- "autumn-proto",
  "autumn-rpc",
  "bytes",
  "compio",
@@ -218,13 +216,9 @@ dependencies = [
  "dashmap",
  "futures",
  "libc",
- "prost",
  "reed-solomon-erasure",
  "rkyv",
  "tempfile",
- "tokio",
- "tokio-stream",
- "tonic 0.11.0",
  "tracing",
  "tracing-subscriber",
 ]

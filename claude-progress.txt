@@ -3,29 +3,26 @@ TaskStatus: not_completed
 Task scope: F043 — Migrate ExtentService to autumn-rpc (data plane hot path)
 
 Current summary:
-  Major progress on F043. Core migration complete:
+  F043 nearly complete. All core migration done + integration tests passing:
   - extent_rpc.rs: rkyv message types + binary codecs for all 10 RPCs (done)
-  - conn_pool.rs: replaced gRPC ConnPool with autumn_rpc::ConnPool wrapper (done)
-  - extent_node.rs: migrated to single-threaded compio server, all handlers converted (done)
-    - Removed tonic/gRPC, tokio, autumn-io-engine, protobuf
-    - Using compio::fs::File for disk I/O
-    - Single-threaded TCP accept loop (no Dispatcher)
-    - Rc/RefCell instead of Arc/Mutex
-  - client.rs: migrated to autumn-rpc binary protocol (done)
-    - Manager calls stubbed as TODO(F044)
-    - futures::lock::Mutex for stream state
+  - conn_pool.rs: single-threaded compio ConnPool (Rc/RefCell, no Arc) (done)
+  - extent_node.rs: compio server, all handlers converted (done)
+  - client.rs: autumn-rpc binary protocol, Rc<ConnPool> (done)
+  - wal.rs: fully rewritten — sync blocking I/O, batch write support, no tokio (done)
   - extent_node binary: #[compio::main] (done)
-  - All 17 stream lib tests pass
-  - autumn-stream crate compiles clean
+  - stream_cli.rs: alloc-extent/commit-length via autumn-rpc, manager cmds stubbed (F044) (done)
+  - Integration tests: all 11 pass (compio::test, TestConn helper) (done)
+  - Unit tests: 18 pass (done)
+  - Removed tonic/prost/tokio/autumn-proto/autumn-io-engine from stream Cargo.toml
+  - rkyv_decode: aligned buffer handling for wire data
 
 Main gaps:
-  1. Integration tests (crates/stream/tests/*.rs) need updating for new API
-  2. stream_cli.rs needs migration to compio
-  3. autumn-client.rs needs adaptation (F046 scope)
-  4. partition-server won't compile (expected, F045 scope)
-  5. WAL module still uses tokio internally — needs separate migration
-  6. Remove tonic/tokio/autumn-proto/prost from Cargo.toml deps
-  7. Update CLAUDE.md documentation
+  1. partition-server won't compile (expected, F045 scope) — uses Arc<ConnPool>
+  2. autumn-server crate can't build all binaries until F045
+  3. stream CLAUDE.md updated, but root CLAUDE.md may need updates
+  4. Feature list not yet marked passes=true (pending final review)
 
 Next steps:
-  Fix integration tests, update stream_cli, clean up Cargo.toml deps
+  - Update CLAUDE.md and feature_list.md
+  - Commit all changes
+  - Move to F044 (manager migration) or F045 (partition-server migration)

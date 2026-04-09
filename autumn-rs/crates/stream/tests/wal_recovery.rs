@@ -4,17 +4,10 @@
 /// 1. Small must_sync writes go through the WAL path.
 /// 2. After a simulated data loss (extent file truncated), WAL replay restores the data.
 /// 3. Large writes (>2MB) fall back to direct extent sync (no WAL).
-use std::net::SocketAddr;
-use std::time::Duration;
+mod test_helpers;
 
-use autumn_io_engine::IoMode;
-use autumn_proto::autumn::append_request;
-use autumn_proto::autumn::extent_service_client::ExtentServiceClient;
-use autumn_proto::autumn::{
-    AllocExtentRequest, AppendRequest, AppendRequestHeader, Code, CommitLengthRequest,
-    ReadBytesRequest,
-};
-use autumn_stream::{ExtentNode, ExtentNodeConfig};
+use autumn_stream::extent_rpc::CODE_OK;
+use test_helpers::{pick_addr, start_node_with_wal, TestConn};
 
 /// Mirror DiskFS::hash_byte: low byte of crc32c(extent_id_le).
 fn extent_hash_byte(extent_id: u64) -> u8 {
@@ -26,65 +19,6 @@ fn extent_path(data_dir: &std::path::Path, extent_id: u64) -> std::path::PathBuf
         .join(format!("{:02x}", extent_hash_byte(extent_id)))
         .join(format!("extent-{extent_id}.dat"))
 }
-use tokio::time::sleep;
-use tokio_stream::iter;
-use tonic::Request;
-
-fn pick_addr() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    drop(listener);
-    addr
-}
-
-fn append_reqs(
-    extent_id: u64,
-    commit: u32,
-    must_sync: bool,
-    payload: Vec<u8>,
-) -> Vec<AppendRequest> {
-    vec![
-        AppendRequest {
-            data: Some(append_request::Data::Header(AppendRequestHeader {
-                extent_id,
-                eversion: 1,
-                commit,
-                revision: 1,
-                must_sync,
-            })),
-        },
-        AppendRequest {
-            data: Some(append_request::Data::Payload(payload.into())),
-        },
-    ]
-}
-
-/// Start a node with WAL enabled.
-async fn start_node_with_wal(
-    data_dir: &std::path::Path,
-    addr: SocketAddr,
-) -> (
-    tokio::task::JoinHandle<()>,
-    ExtentServiceClient<tonic::transport::Channel>,
-) {
-    let wal_dir = data_dir.join("wal");
-    let node = ExtentNode::new(
-        ExtentNodeConfig::new(data_dir.to_path_buf(), IoMode::Standard, 1)
-            .with_wal_dir(wal_dir),
-    )
-    .await
-    .expect("create ExtentNode");
-
-    let task = tokio::spawn(async move {
-        let _ = node.serve(addr).await;
-    });
-    sleep(Duration::from_millis(120)).await;
-
-    let client = ExtentServiceClient::connect(format!("http://{addr}"))
-        .await
-        .expect("connect");
-    (task, client)
-}
 
 /// Verify WAL replay recovers data lost from extent file.
 ///
@@ -93,7 +27,7 @@ async fn start_node_with_wal(
 ///   2. Abort node and truncate extent file to simulate data loss.
 ///   3. Restart node — WAL replay should restore the data.
 ///   4. Verify commit_length == original payload length.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[compio::test]
 async fn wal_replay_recovers_truncated_extent() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path();
@@ -104,24 +38,19 @@ async fn wal_replay_recovers_truncated_extent() {
 
     // Phase 1: write with WAL enabled
     {
-        let (task, mut client) = start_node_with_wal(data_dir, addr).await;
+        start_node_with_wal(data_dir, addr).await;
+        let conn = TestConn::new(addr);
 
-        client
-            .alloc_extent(Request::new(AllocExtentRequest { extent_id }))
-            .await
-            .expect("alloc");
+        conn.alloc_extent(extent_id).await;
 
-        let resp = client
-            .append(Request::new(iter(append_reqs(extent_id, 0, true, payload))))
-            .await
-            .expect("append")
-            .into_inner();
-        assert_eq!(resp.code, Code::Ok as i32);
+        let resp = conn
+            .append(extent_id, 1, 0, 1, true, payload)
+            .await;
+        assert_eq!(resp.code, CODE_OK);
         assert_eq!(resp.end, payload_len);
-
-        task.abort();
-        sleep(Duration::from_millis(50)).await;
     }
+    // Allow time for the old server to wind down
+    compio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Phase 2: truncate the extent .dat file to simulate data loss (crash before sync)
     let extent_file = extent_path(data_dir, extent_id);
@@ -136,26 +65,18 @@ async fn wal_replay_recovers_truncated_extent() {
 
     // Phase 3: restart with WAL — replay should restore data
     let addr2 = pick_addr();
-    let (task2, mut client2) = start_node_with_wal(data_dir, addr2).await;
+    start_node_with_wal(data_dir, addr2).await;
+    let conn2 = TestConn::new(addr2);
 
     // After WAL replay, commit_length should equal the payload length
-    let cl = client2
-        .commit_length(Request::new(CommitLengthRequest {
-            extent_id,
-            revision: 0,
-        }))
-        .await
-        .expect("commit_length")
-        .into_inner();
-    assert_eq!(cl.code, Code::Ok as i32, "extent should be accessible after replay");
+    let cl = conn2.commit_length(extent_id, 0).await;
+    assert_eq!(cl.code, CODE_OK, "extent should be accessible after replay");
     assert_eq!(cl.length, payload_len, "WAL replay should restore {payload_len} bytes");
-
-    task2.abort();
 }
 
 /// Verify WAL is NOT used for large writes (>2MB threshold).
 /// Large must_sync writes still sync the extent file directly.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[compio::test]
 async fn large_write_bypasses_wal() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path();
@@ -166,47 +87,32 @@ async fn large_write_bypasses_wal() {
     let payload_len = payload.len() as u32;
 
     {
-        let (task, mut client) = start_node_with_wal(data_dir, addr).await;
+        start_node_with_wal(data_dir, addr).await;
+        let conn = TestConn::new(addr);
 
-        client
-            .alloc_extent(Request::new(AllocExtentRequest { extent_id }))
-            .await
-            .expect("alloc");
+        conn.alloc_extent(extent_id).await;
 
-        let resp = client
-            .append(Request::new(iter(append_reqs(extent_id, 0, true, payload))))
-            .await
-            .expect("append")
-            .into_inner();
-        assert_eq!(resp.code, Code::Ok as i32);
+        let resp = conn
+            .append(extent_id, 1, 0, 1, true, payload)
+            .await;
+        assert_eq!(resp.code, CODE_OK);
         assert_eq!(resp.end, payload_len);
-
-        task.abort();
-        sleep(Duration::from_millis(50)).await;
     }
+    compio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // WAL dir should either be empty or not contain a record for this extent
-    // (large writes skip the WAL path). The write should have been direct sync.
-    // Verify by checking no WAL record is replayed after restart when extent is intact.
+    // WAL dir should either be empty or not contain a record for this extent.
+    // Verify by checking data survives restart (direct sync preserved it).
     let addr2 = pick_addr();
-    let (task2, mut client2) = start_node_with_wal(data_dir, addr2).await;
+    start_node_with_wal(data_dir, addr2).await;
+    let conn2 = TestConn::new(addr2);
 
-    let cl = client2
-        .commit_length(Request::new(CommitLengthRequest {
-            extent_id,
-            revision: 0,
-        }))
-        .await
-        .expect("commit_length")
-        .into_inner();
-    assert_eq!(cl.code, Code::Ok as i32);
+    let cl = conn2.commit_length(extent_id, 0).await;
+    assert_eq!(cl.code, CODE_OK);
     assert_eq!(cl.length, payload_len, "large write data should persist");
-
-    task2.abort();
 }
 
 /// Verify WAL handles multiple appends, all replayed in order after restart.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[compio::test]
 async fn wal_replay_multiple_appends() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path();
@@ -219,33 +125,22 @@ async fn wal_replay_multiple_appends() {
 
     // Phase 1: write multiple small appends
     {
-        let (task, mut client) = start_node_with_wal(data_dir, addr).await;
+        start_node_with_wal(data_dir, addr).await;
+        let conn = TestConn::new(addr);
 
-        client
-            .alloc_extent(Request::new(AllocExtentRequest { extent_id }))
-            .await
-            .expect("alloc");
+        conn.alloc_extent(extent_id).await;
 
         let mut commit = 0u32;
         for chunk in &chunks {
-            let resp = client
-                .append(Request::new(iter(append_reqs(
-                    extent_id,
-                    commit,
-                    true,
-                    chunk.clone(),
-                ))))
-                .await
-                .expect("append")
-                .into_inner();
-            assert_eq!(resp.code, Code::Ok as i32);
+            let resp = conn
+                .append(extent_id, 1, commit, 1, true, chunk.clone())
+                .await;
+            assert_eq!(resp.code, CODE_OK);
             commit = resp.end;
         }
         assert_eq!(commit, total_len);
-
-        task.abort();
-        sleep(Duration::from_millis(50)).await;
     }
+    compio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Phase 2: truncate extent file to simulate data loss
     let extent_file = extent_path(data_dir, extent_id);
@@ -258,40 +153,16 @@ async fn wal_replay_multiple_appends() {
 
     // Phase 3: restart + WAL replay
     let addr2 = pick_addr();
-    let (task2, mut client2) = start_node_with_wal(data_dir, addr2).await;
+    start_node_with_wal(data_dir, addr2).await;
+    let conn2 = TestConn::new(addr2);
 
-    let cl = client2
-        .commit_length(Request::new(CommitLengthRequest {
-            extent_id,
-            revision: 0,
-        }))
-        .await
-        .expect("commit_length")
-        .into_inner();
-    assert_eq!(cl.code, Code::Ok as i32);
+    let cl = conn2.commit_length(extent_id, 0).await;
+    assert_eq!(cl.code, CODE_OK);
     assert_eq!(cl.length, total_len, "all chunks should be replayed");
 
     // Read back and verify content
-    let read_resp = client2
-        .read_bytes(Request::new(ReadBytesRequest {
-            extent_id,
-            eversion: 0,
-            offset: 0,
-            length: total_len,
-        }))
-        .await
-        .expect("read_bytes");
-
-    use tonic::Streaming;
-    let mut stream: Streaming<_> = read_resp.into_inner();
-    let mut data = Vec::new();
-    while let Some(msg) = stream.message().await.expect("stream message") {
-        if let Some(autumn_proto::autumn::read_bytes_response::Data::Payload(p)) = msg.data {
-            data.extend_from_slice(&p);
-        }
-    }
+    let read = conn2.read_bytes(extent_id, 0, 0, total_len).await;
+    assert_eq!(read.code, CODE_OK);
     let expected: Vec<u8> = chunks.into_iter().flatten().collect();
-    assert_eq!(data, expected, "read back should match original data");
-
-    task2.abort();
+    assert_eq!(read.payload.as_ref(), expected.as_slice(), "read back should match original data");
 }

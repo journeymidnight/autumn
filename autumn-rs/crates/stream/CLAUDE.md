@@ -115,10 +115,12 @@ Small must_sync writes (≤ 2MB) use the WAL for lower-latency durability:
 
 - **Format**: Pebble/LevelDB-style 128KB block framing. Each chunk has a 9-byte header: `[CRC32C: 4B][len: 4B][type: 1B]`. Chunk types: FULL=1, FIRST=2, MIDDLE=3, LAST=4.
 - **Record**: `[uvarint extent_id][uvarint start][i64 revision][uvarint payload_len][payload]`
-- **Async writes**: `Wal` holds a tokio mpsc channel; a background task serializes all disk writes and `sync_all()`.
+- **Synchronous writes**: `Wal` directly owns the `RecordWriter` (std::fs::File). No background task, no channels. `write()` and `write_batch()` are blocking sync calls — acceptable because WAL writes are sequential and fast (single rotating file, single fsync). Called from the compio event loop thread.
+- **Batch support**: `write_batch(&mut self, records: &[WalRecord])` writes all records then syncs once, amortizing fsync cost. Used by `handle_append_batch` for pipelined writes.
 - **Rotation**: at 250MB; old WAL files are kept for replay then deleted.
 - **Startup replay**: `replay_wal_files()` called in `ExtentNode::new()` after `load_extents()`. Each record is written back to the extent file at `record.start`; idempotent if extent already has the data.
 - **Config**: `ExtentNodeConfig::with_wal_dir(PathBuf)`. Binary defaults to `data_dir/wal/`.
+- **Ownership**: Stored as `Option<Rc<RefCell<Wal>>>` in `ExtentNode`. Single-threaded compio, no Arc/Mutex needed.
 
 ### Commit Protocol Explained
 

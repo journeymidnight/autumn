@@ -4,22 +4,10 @@
 ///   f021_multi_disk_alloc        — two disks, extents distributed across them
 ///   f021_multi_disk_load_extents — pre-populate hash subdirs, verify all loaded on restart
 ///   f021_disk_offline_skip       — first disk offline → alloc goes to second
-use std::net::SocketAddr;
-use std::time::Duration;
+mod test_helpers;
 
-use autumn_io_engine::IoMode;
-use autumn_proto::autumn::extent_service_client::ExtentServiceClient;
-use autumn_proto::autumn::{AllocExtentRequest, DfRequest};
-use autumn_stream::{ExtentNode, ExtentNodeConfig};
-use tokio::time::sleep;
-use tonic::Request;
-
-fn pick_addr() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    drop(listener);
-    addr
-}
+use autumn_stream::extent_rpc::CODE_OK;
+use test_helpers::{pick_addr, start_node_multi, TestConn};
 
 /// Prepare a disk directory: write disk_id file.
 /// Hash subdirs are created on-demand by the extent node.
@@ -27,27 +15,8 @@ fn format_disk(dir: &std::path::Path, disk_id: u64) {
     std::fs::write(dir.join("disk_id"), disk_id.to_string()).expect("write disk_id");
 }
 
-async fn start_node_multi(
-    dirs: Vec<std::path::PathBuf>,
-    addr: SocketAddr,
-) -> (
-    tokio::task::JoinHandle<()>,
-    ExtentServiceClient<tonic::transport::Channel>,
-) {
-    let config = ExtentNodeConfig::new_multi(dirs, IoMode::Standard);
-    let node = ExtentNode::new(config).await.expect("create ExtentNode");
-    let task = tokio::spawn(async move {
-        let _ = node.serve(addr).await;
-    });
-    sleep(Duration::from_millis(120)).await;
-    let client = ExtentServiceClient::connect(format!("http://{addr}"))
-        .await
-        .expect("connect");
-    (task, client)
-}
-
 /// Alloc several extents on a two-disk node, then verify both disks received files.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[compio::test]
 async fn f021_multi_disk_alloc() {
     let d1 = tempfile::tempdir().expect("d1");
     let d2 = tempfile::tempdir().expect("d2");
@@ -55,19 +24,16 @@ async fn f021_multi_disk_alloc() {
     format_disk(d2.path(), 20);
 
     let addr = pick_addr();
-    let (task, mut client) = start_node_multi(
+    start_node_multi(
         vec![d1.path().to_path_buf(), d2.path().to_path_buf()],
         addr,
     )
     .await;
+    let conn = TestConn::new(addr);
 
     // Alloc 4 extents.
     for eid in 1u64..=4 {
-        let resp = client
-            .alloc_extent(Request::new(AllocExtentRequest { extent_id: eid }))
-            .await
-            .expect("alloc")
-            .into_inner();
+        let resp = conn.alloc_extent(eid).await;
         assert!(
             resp.disk_id == 10 || resp.disk_id == 20,
             "disk_id {} must be 10 or 20",
@@ -86,13 +52,11 @@ async fn f021_multi_disk_alloc() {
         4,
         "total extent files should be 4, got d1={count_d1} d2={count_d2}"
     );
-
-    task.abort();
 }
 
 /// Pre-populate two disk dirs with extent files in hash subdirs, then start a node
 /// and verify all extents are discovered by load_extents.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[compio::test]
 async fn f021_multi_disk_load_extents() {
     let d1 = tempfile::tempdir().expect("d1");
     let d2 = tempfile::tempdir().expect("d2");
@@ -113,41 +77,23 @@ async fn f021_multi_disk_load_extents() {
     std::fs::write(subdir_200.join("extent-200.dat"), b"world").expect("write extent-200.dat");
 
     let addr = pick_addr();
-    let (task, mut client) = start_node_multi(
+    start_node_multi(
         vec![d1.path().to_path_buf(), d2.path().to_path_buf()],
         addr,
     )
     .await;
+    let conn = TestConn::new(addr);
 
     // commit_length should succeed for both extents, confirming they were loaded.
-    use autumn_proto::autumn::CommitLengthRequest;
-    let r100 = client
-        .commit_length(Request::new(CommitLengthRequest {
-            extent_id: 100,
-            revision: 0,
-        }))
-        .await
-        .expect("commit_length 100")
-        .into_inner();
+    let r100 = conn.commit_length(100, 0).await;
     assert_eq!(r100.length, 5, "extent 100 should have 5 bytes");
 
-    let r200 = client
-        .commit_length(Request::new(CommitLengthRequest {
-            extent_id: 200,
-            revision: 0,
-        }))
-        .await
-        .expect("commit_length 200")
-        .into_inner();
+    let r200 = conn.commit_length(200, 0).await;
     assert_eq!(r200.length, 5, "extent 200 should have 5 bytes");
-
-    task.abort();
 }
 
-/// When the node has two disks and one is marked offline via the df() response,
-/// verify the df() response reports the correct online status.
-/// (set_offline is internal; we indirectly verify df reports per-disk stats.)
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// When the node has two disks, verify the df() response reports per-disk stats.
+#[compio::test]
 async fn f021_df_reports_per_disk_stats() {
     let d1 = tempfile::tempdir().expect("d1");
     let d2 = tempfile::tempdir().expect("d2");
@@ -155,20 +101,14 @@ async fn f021_df_reports_per_disk_stats() {
     format_disk(d2.path(), 20);
 
     let addr = pick_addr();
-    let (task, mut client) = start_node_multi(
+    start_node_multi(
         vec![d1.path().to_path_buf(), d2.path().to_path_buf()],
         addr,
     )
     .await;
+    let conn = TestConn::new(addr);
 
-    let resp = client
-        .df(Request::new(DfRequest {
-            tasks: vec![],
-            disk_ids: vec![],
-        }))
-        .await
-        .expect("df")
-        .into_inner();
+    let resp = conn.df(vec![], vec![]).await;
 
     // Both disks should be reported.
     assert_eq!(resp.disk_status.len(), 2, "should report 2 disks");
@@ -176,8 +116,6 @@ async fn f021_df_reports_per_disk_stats() {
         assert!(info.online, "disk {did} should be online");
         assert!(info.total > 0, "disk {did} total should be > 0");
     }
-
-    task.abort();
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────

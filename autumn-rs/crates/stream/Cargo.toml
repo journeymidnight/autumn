@@ -11,15 +11,9 @@ crc32c.workspace = true
 reed-solomon-erasure = "6"
 dashmap.workspace = true
 futures = "0.3"
-tokio.workspace = true
-tokio-stream = "0.1"
-tonic.workspace = true
 tracing.workspace = true
-autumn-proto = { path = "../proto" }
-autumn-io-engine = { path = "../io-engine" }
 autumn-rpc = { path = "../rpc" }
 compio = { version = "0.18", features = ["net", "time", "macros", "dispatcher", "fs"] }
-prost.workspace = true
 libc = "0.2"
 rkyv = { version = "0.8.15", features = ["alloc"] }
 
@@ -27,10 +21,11 @@ rkyv = { version = "0.8.15", features = ["alloc"] }
 tempfile = "3"
 autumn-manager = { path = "../manager" }
 autumn-rpc = { path = "../rpc" }
-autumn-io-engine = { path = "../io-engine" }
+bytes.workspace = true
 crc32c = "0.6"
-tokio-stream = "0.1"
+rkyv = { version = "0.8.15", features = ["alloc"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+compio = { version = "0.18", features = ["net", "time", "macros"] }
 
 [[bench]]
 name = "append_bench"
