@@ -4,6 +4,7 @@ members = [
   "crates/common",
   "crates/io-engine",
   "crates/rpc",
+  "crates/etcd",
   "crates/stream",
   "crates/manager",
   "crates/partition-server",

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
+use autumn_rpc::manager_rpc::{self, *};
 use crate::ConnPool;
 use crate::extent_rpc::{
     AppendReq, AppendResp, CommitLengthReq, CommitLengthResp, ExtentInfo, ReadBytesReq,
@@ -150,19 +151,31 @@ pub struct StreamClient {
 }
 
 impl StreamClient {
-    // TODO(F044): restore connect() with manager acquire_owner_lock via autumn-rpc
     pub async fn connect(
         manager_endpoint: &str,
         owner_key: String,
         max_extent_size: u32,
         pool: Rc<ConnPool>,
     ) -> Result<Self> {
-        // TODO(F044): call manager.acquire_owner_lock via autumn-rpc
-        tracing::warn!("StreamClient::connect: manager calls are stubbed (F044)");
+        let mgr_addr = crate::conn_pool::normalize_endpoint(manager_endpoint);
+        let req = manager_rpc::rkyv_encode(&AcquireOwnerLockReq {
+            owner_key: owner_key.clone(),
+        });
+        let resp_data = pool
+            .call(&mgr_addr, MSG_ACQUIRE_OWNER_LOCK, req)
+            .await?;
+        let resp: AcquireOwnerLockResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        if resp.code != CODE_OK {
+            return Err(anyhow!(
+                "acquire_owner_lock failed: {}",
+                resp.message
+            ));
+        }
         Ok(Self {
-            manager_addr: manager_endpoint.to_string(),
+            manager_addr: mgr_addr,
             owner_key,
-            revision: 1, // placeholder
+            revision: resp.revision,
             max_extent_size,
             pool,
             nodes_cache: DashMap::new(),
@@ -209,9 +222,20 @@ impl StreamClient {
         self.pool.is_healthy(addr)
     }
 
-    // TODO(F044): migrate to autumn-rpc
     async fn refresh_nodes_map(&self) -> Result<()> {
-        Err(anyhow!("refresh_nodes_map: manager calls stubbed (F044)"))
+        let resp_data = self
+            .pool
+            .call(&self.manager_addr, MSG_NODES_INFO, Bytes::new())
+            .await?;
+        let resp: NodesInfoResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        if resp.code != CODE_OK {
+            return Err(anyhow!("nodes_info failed: {}", resp.message));
+        }
+        for (id, node) in resp.nodes {
+            self.nodes_cache.insert(id, node.address);
+        }
+        Ok(())
     }
 
     fn replica_addrs_from_cache(&self, ex: &ExtentInfo) -> Result<Vec<String>> {
@@ -254,19 +278,102 @@ impl StreamClient {
         state
     }
 
-    // TODO(F044): migrate to autumn-rpc
-    async fn load_stream_tail(&self, _stream_id: u64) -> Result<StreamTail> {
-        Err(anyhow!("load_stream_tail: manager calls stubbed (F044)"))
+    async fn load_stream_tail(&self, stream_id: u64) -> Result<StreamTail> {
+        let req = manager_rpc::rkyv_encode(&StreamInfoReq {
+            stream_ids: vec![stream_id],
+        });
+        let resp_data = self
+            .pool
+            .call(&self.manager_addr, MSG_STREAM_INFO, req)
+            .await?;
+        let resp: StreamInfoResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        if resp.code != CODE_OK {
+            return Err(anyhow!("stream_info failed: {}", resp.message));
+        }
+        let (_, mgr_stream) = resp
+            .streams
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("stream {} not found", stream_id))?;
+        let tail_eid = *mgr_stream
+            .extent_ids
+            .last()
+            .ok_or_else(|| anyhow!("stream {} has no extents", stream_id))?;
+
+        // Find the tail extent in the response extents
+        let mgr_extent = resp
+            .extents
+            .into_iter()
+            .find(|(id, _)| *id == tail_eid)
+            .map(|(_, e)| e)
+            .ok_or_else(|| anyhow!("tail extent {} not in response", tail_eid))?;
+
+        let extent = Self::mgr_to_extent_info(&mgr_extent);
+        self.extent_info_cache.insert(extent.extent_id, extent.clone());
+
+        // Cache all nodes, then resolve addresses
+        self.refresh_nodes_map().await?;
+        let addrs = self.replica_addrs_from_cache(&extent)?;
+
+        Ok(StreamTail {
+            extent,
+            replica_addrs: addrs,
+        })
     }
 
-    // TODO(F044): migrate to autumn-rpc
-    async fn check_commit(&self, _stream_id: u64) -> Result<(StreamInfo, ExtentInfo, u32)> {
-        Err(anyhow!("check_commit: manager calls stubbed (F044)"))
+    async fn check_commit(&self, stream_id: u64) -> Result<(StreamInfo, ExtentInfo, u32)> {
+        let req = manager_rpc::rkyv_encode(&CheckCommitLengthReq {
+            stream_id,
+            owner_key: self.owner_key.clone(),
+            revision: self.revision,
+        });
+        let resp_data = self
+            .pool
+            .call(&self.manager_addr, MSG_CHECK_COMMIT_LENGTH, req)
+            .await?;
+        let resp: CheckCommitLengthResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        if resp.code != CODE_OK {
+            return Err(anyhow!("check_commit_length failed: {}", resp.message));
+        }
+        let stream = resp
+            .stream_info
+            .map(|s| Self::mgr_to_stream_info(&s))
+            .ok_or_else(|| anyhow!("check_commit: missing stream_info"))?;
+        let extent = resp
+            .last_ex_info
+            .map(|e| Self::mgr_to_extent_info(&e))
+            .ok_or_else(|| anyhow!("check_commit: missing last_ex_info"))?;
+        Ok((stream, extent, resp.end))
     }
 
-    // TODO(F044): migrate to autumn-rpc
-    async fn alloc_new_extent(&self, _stream_id: u64, _end: u32) -> Result<(StreamInfo, ExtentInfo)> {
-        Err(anyhow!("alloc_new_extent: manager calls stubbed (F044)"))
+    async fn alloc_new_extent(&self, stream_id: u64, end: u32) -> Result<(StreamInfo, ExtentInfo)> {
+        let req = manager_rpc::rkyv_encode(&StreamAllocExtentReq {
+            stream_id,
+            owner_key: self.owner_key.clone(),
+            revision: self.revision,
+            end,
+        });
+        let resp_data = self
+            .pool
+            .call(&self.manager_addr, MSG_STREAM_ALLOC_EXTENT, req)
+            .await?;
+        let resp: StreamAllocExtentResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        if resp.code != CODE_OK {
+            return Err(anyhow!("stream_alloc_extent failed: {}", resp.message));
+        }
+        let stream = resp
+            .stream_info
+            .map(|s| Self::mgr_to_stream_info(&s))
+            .ok_or_else(|| anyhow!("alloc_new_extent: missing stream_info"))?;
+        let extent = resp
+            .last_ex_info
+            .map(|e| Self::mgr_to_extent_info(&e))
+            .ok_or_else(|| anyhow!("alloc_new_extent: missing last_ex_info"))?;
+        self.extent_info_cache.insert(extent.extent_id, extent.clone());
+        Ok((stream, extent))
     }
 
     /// Core append implementation.  Acquires the per-stream state lock so that
@@ -625,24 +732,71 @@ impl StreamClient {
             .await
     }
 
-    // TODO(F044): migrate to autumn-rpc
-    pub async fn commit_length(&self, _stream_id: u64) -> Result<u32> {
-        Err(anyhow!("commit_length: manager calls stubbed (F044)"))
+    pub async fn commit_length(&self, stream_id: u64) -> Result<u32> {
+        let (_stream, _extent, end) = self.check_commit(stream_id).await?;
+        Ok(end)
     }
 
-    // TODO(F044): migrate to autumn-rpc
-    pub async fn punch_holes(&self, _stream_id: u64, _extent_ids: Vec<u64>) -> Result<StreamInfo> {
-        Err(anyhow!("punch_holes: manager calls stubbed (F044)"))
+    pub async fn punch_holes(&self, stream_id: u64, extent_ids: Vec<u64>) -> Result<StreamInfo> {
+        let req = manager_rpc::rkyv_encode(&PunchHolesReq {
+            stream_id,
+            owner_key: self.owner_key.clone(),
+            revision: self.revision,
+            extent_ids,
+        });
+        let resp_data = self
+            .pool
+            .call(&self.manager_addr, MSG_STREAM_PUNCH_HOLES, req)
+            .await?;
+        let resp: PunchHolesResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        if resp.code != CODE_OK {
+            return Err(anyhow!("punch_holes failed: {}", resp.message));
+        }
+        resp.stream
+            .map(|s| Self::mgr_to_stream_info(&s))
+            .ok_or_else(|| anyhow!("punch_holes: missing stream"))
     }
 
-    // TODO(F044): migrate to autumn-rpc
-    pub async fn truncate(&self, _stream_id: u64, _extent_id: u64) -> Result<StreamInfo> {
-        Err(anyhow!("truncate: manager calls stubbed (F044)"))
+    pub async fn truncate(&self, stream_id: u64, extent_id: u64) -> Result<StreamInfo> {
+        let req = manager_rpc::rkyv_encode(&TruncateReq {
+            stream_id,
+            owner_key: self.owner_key.clone(),
+            revision: self.revision,
+            extent_id,
+        });
+        let resp_data = self
+            .pool
+            .call(&self.manager_addr, MSG_TRUNCATE, req)
+            .await?;
+        let resp: TruncateResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        if resp.code != CODE_OK {
+            return Err(anyhow!("truncate failed: {}", resp.message));
+        }
+        resp.updated_stream_info
+            .map(|s| Self::mgr_to_stream_info(&s))
+            .ok_or_else(|| anyhow!("truncate: missing stream"))
     }
 
-    // TODO(F044): migrate to autumn-rpc
-    pub async fn get_stream_info(&self, _stream_id: u64) -> Result<StreamInfo> {
-        Err(anyhow!("get_stream_info: manager calls stubbed (F044)"))
+    pub async fn get_stream_info(&self, stream_id: u64) -> Result<StreamInfo> {
+        let req = manager_rpc::rkyv_encode(&StreamInfoReq {
+            stream_ids: vec![stream_id],
+        });
+        let resp_data = self
+            .pool
+            .call(&self.manager_addr, MSG_STREAM_INFO, req)
+            .await?;
+        let resp: StreamInfoResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        if resp.code != CODE_OK {
+            return Err(anyhow!("stream_info failed: {}", resp.message));
+        }
+        resp.streams
+            .into_iter()
+            .next()
+            .map(|(_, s)| Self::mgr_to_stream_info(&s))
+            .ok_or_else(|| anyhow!("stream {} not found", stream_id))
     }
 
     /// Return the ExtentInfo for a given extent (includes sealed_length). Cached.
@@ -650,12 +804,26 @@ impl StreamClient {
         self.fetch_extent_info(extent_id).await
     }
 
-    // TODO(F044): migrate to autumn-rpc
     async fn fetch_extent_info(&self, extent_id: u64) -> Result<ExtentInfo> {
         if let Some(ex) = self.extent_info_cache.get(&extent_id) {
             return Ok(ex.clone());
         }
-        Err(anyhow!("fetch_extent_info: manager calls stubbed (F044), extent {extent_id} not cached"))
+        let req = manager_rpc::rkyv_encode(&ExtentInfoReq { extent_id });
+        let resp_data = self
+            .pool
+            .call(&self.manager_addr, MSG_EXTENT_INFO, req)
+            .await?;
+        let resp: ExtentInfoResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        if resp.code != CODE_OK {
+            return Err(anyhow!("extent_info failed: {}", resp.message));
+        }
+        let ex = resp
+            .extent
+            .map(|e| Self::mgr_to_extent_info(&e))
+            .ok_or_else(|| anyhow!("extent {} not found", extent_id))?;
+        self.extent_info_cache.insert(extent_id, ex.clone());
+        Ok(ex)
     }
 
     /// Read bytes from a specific extent.
@@ -875,13 +1043,56 @@ impl StreamClient {
         Ok(None)
     }
 
-    // TODO(F044): migrate to autumn-rpc
     pub async fn multi_modify_split(
         &self,
-        _mid_key: Vec<u8>,
-        _part_id: u64,
-        _sealed_lengths: [u64; 3],
+        mid_key: Vec<u8>,
+        part_id: u64,
+        sealed_lengths: [u64; 3],
     ) -> Result<()> {
-        Err(anyhow!("multi_modify_split: manager calls stubbed (F044)"))
+        let req = manager_rpc::rkyv_encode(&MultiModifySplitReq {
+            part_id,
+            owner_key: self.owner_key.clone(),
+            revision: self.revision,
+            mid_key,
+            log_stream_sealed_length: sealed_lengths[0] as u32,
+            row_stream_sealed_length: sealed_lengths[1] as u32,
+            meta_stream_sealed_length: sealed_lengths[2] as u32,
+        });
+        let resp_data = self
+            .pool
+            .call(&self.manager_addr, MSG_MULTI_MODIFY_SPLIT, req)
+            .await?;
+        let resp: CodeResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        if resp.code != CODE_OK {
+            return Err(anyhow!("multi_modify_split failed: {}", resp.message));
+        }
+        Ok(())
+    }
+
+    // ── Mgr→local type conversion helpers ───────────────────────────────
+
+    fn mgr_to_stream_info(s: &MgrStreamInfo) -> StreamInfo {
+        StreamInfo {
+            stream_id: s.stream_id,
+            extent_ids: s.extent_ids.clone(),
+            ec_data_shard: s.ec_data_shard,
+            ec_parity_shard: s.ec_parity_shard,
+        }
+    }
+
+    fn mgr_to_extent_info(e: &MgrExtentInfo) -> ExtentInfo {
+        ExtentInfo {
+            extent_id: e.extent_id,
+            replicates: e.replicates.clone(),
+            parity: e.parity.clone(),
+            eversion: e.eversion,
+            refs: e.refs,
+            sealed_length: e.sealed_length,
+            avali: e.avali,
+            replicate_disks: e.replicate_disks.clone(),
+            parity_disks: e.parity_disks.clone(),
+            original_replicates: e.original_replicates,
+        }
     }
 }

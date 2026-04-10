@@ -2,9 +2,6 @@ use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
 use autumn_manager::AutumnManager;
-use autumn_proto::autumn::partition_manager_service_server::PartitionManagerServiceServer;
-use autumn_proto::autumn::stream_manager_service_server::StreamManagerServiceServer;
-use tonic_reflection::server::Builder as ReflectionBuilder;
 
 struct Args {
     port: u16,
@@ -25,7 +22,6 @@ fn parse_args() -> Args {
             }
             "--etcd" => {
                 i += 1;
-                // support comma-separated or repeated flags:  --etcd a,b  or  --etcd a --etcd b
                 for ep in raw[i].split(',') {
                     etcd.push(ep.trim().to_string());
                 }
@@ -38,7 +34,7 @@ fn parse_args() -> Args {
     Args { port, etcd }
 }
 
-#[tokio::main]
+#[compio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -64,21 +60,8 @@ async fn main() -> Result<()> {
             .context("connect to etcd")?
     };
 
-    let reflection = ReflectionBuilder::configure()
-        .register_encoded_file_descriptor_set(autumn_proto::FILE_DESCRIPTOR_SET)
-        .build()
-        .context("build reflection service")?;
-
     tracing::info!("autumn-manager-server listening on {addr}");
-
-    tonic::transport::Server::builder()
-        .http2_max_pending_accept_reset_streams(Some(1024))
-        .max_concurrent_streams(Some(1000))
-        .add_service(reflection)
-        .add_service(StreamManagerServiceServer::new(manager.clone()))
-        .add_service(PartitionManagerServiceServer::new(manager))
-        .serve(addr)
-        .await?;
+    manager.serve(addr).await?;
 
     Ok(())
 }

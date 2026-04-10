@@ -10,6 +10,7 @@
 
 pub mod error;
 pub mod frame;
+pub mod manager_rpc;
 
 pub use error::{RpcError, Result, StatusCode};
 pub use frame::{Frame, FrameDecoder, HEADER_LEN};

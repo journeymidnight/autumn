@@ -2,24 +2,30 @@
 
 ## Purpose
 
-The central control-plane service. Serves two gRPC services in one process:
-- `StreamManagerService` — manages stream/extent metadata, node registration, allocation, GC, recovery
-- `PartitionManagerService` — manages partition → partition-server assignments
+The central control-plane service. Serves 16 RPCs via autumn-rpc (custom binary protocol on compio):
+- StreamManager (12 RPCs): status, acquire_owner_lock, register_node, create_stream, stream_info, extent_info, nodes_info, check_commit_length, stream_alloc_extent, stream_punch_holes, truncate, multi_modify_split
+- PartitionManager (4 RPCs): register_ps, upsert_partition, get_regions, heartbeat_ps
 
-Uses etcd (optional) for persistent metadata and leader election.
+Uses etcd (optional, via autumn-etcd compio-native client) for persistent metadata and leader election. Single-threaded compio runtime (Rc/RefCell, !Send).
 
 ## Core Struct: `AutumnManager`
 
 ```rust
 pub struct AutumnManager {
-    store: MetadataStore,           // Arc<RwLock<MetadataState>> — all in-memory cluster state
-    leader: Arc<AtomicBool>,        // are we the current leader?
-    etcd: Option<EtcdMirror>,       // optional etcd persistence
-    recovery_tasks: ...,            // in-flight recovery task tracking
+    store: MetadataStore,           // Rc<RefCell<MetadataState>> — all in-memory cluster state
+    leader: Rc<Cell<bool>>,         // are we the current leader?
+    etcd: Option<EtcdMirror>,       // optional etcd persistence (autumn-etcd)
+    conn_pool: Rc<ConnPool>,        // for extent node RPC calls
+    recovery_tasks: Rc<RefCell<HashMap<u64, RecoveryTask>>>,
+    // ...
 }
 ```
 
 The `store` (from `autumn-common`) holds everything: streams, extents, nodes, disks, partitions, regions, owner revisions. All mutations must also be mirrored to etcd when `self.etcd.is_some()`.
+
+## RPC Wire Format
+
+All 16 RPCs use rkyv zero-copy serialization over autumn-rpc 10-byte frame headers. Message types 0x20–0x2F defined in `autumn-rpc/src/manager_rpc.rs`. Manager calls to extent nodes use extent_rpc message types (0x01–0x0A) via ConnPool.
 
 ## Leader Election
 

@@ -1,28 +1,33 @@
-Date: 2026-04-08
+Date: 2026-04-09
 TaskStatus: not_completed
-Task scope: F043 — Migrate ExtentService to autumn-rpc (data plane hot path)
+Task scope: F044 — Migrate Manager services to autumn-rpc
 
 Current summary:
-  F043 nearly complete. All core migration done + integration tests passing:
-  - extent_rpc.rs: rkyv message types + binary codecs for all 10 RPCs (done)
-  - conn_pool.rs: single-threaded compio ConnPool (Rc/RefCell, no Arc) (done)
-  - extent_node.rs: compio server, all handlers converted (done)
-  - client.rs: autumn-rpc binary protocol, Rc<ConnPool> (done)
-  - wal.rs: fully rewritten — sync blocking I/O, batch write support, no tokio (done)
-  - extent_node binary: #[compio::main] (done)
-  - stream_cli.rs: alloc-extent/commit-length via autumn-rpc, manager cmds stubbed (F044) (done)
-  - Integration tests: all 11 pass (compio::test, TestConn helper) (done)
-  - Unit tests: 18 pass (done)
-  - Removed tonic/prost/tokio/autumn-proto/autumn-io-engine from stream Cargo.toml
-  - rkyv_decode: aligned buffer handling for wire data
+  F044 core migration complete. AutumnManager rewritten from tonic/tokio/etcd-client
+  to compio + autumn-rpc + autumn-etcd. All 16 RPC handlers implemented via dispatch().
+  EtcdMirror migrated to autumn-etcd. Background loops migrated to compio::runtime::spawn.
+  MetadataStore migrated from Arc<RwLock> to Rc<RefCell>.
+
+  StreamClient 12 TODO stubs implemented — all manager calls via ConnPool + rkyv.
+  ExtentNode 3 stub methods implemented (extent_info_from_manager, nodes_map_from_manager,
+  resolve_recovery_extent).
+
+  Manager binary (autumn-manager-server) switched to #[compio::main].
+
+  New crate/module: crates/rpc/src/manager_rpc.rs — 16 MSG_TYPE constants, rkyv message
+  types for all manager RPCs, plus extent node RPC types needed by manager.
+
+  5 manager unit tests pass. 18 stream unit tests pass.
+
+  Blocked: other binaries in autumn-server crate (autumn-client, autumn-ps, stream-cli)
+  still use tonic gRPC clients for manager services — they won't compile until F045/F046.
 
 Main gaps:
-  1. partition-server won't compile (expected, F045 scope) — uses Arc<ConnPool>
-  2. autumn-server crate can't build all binaries until F045
-  3. stream CLAUDE.md updated, but root CLAUDE.md may need updates
-  4. Feature list not yet marked passes=true (pending final review)
+  - F045: PartitionKv service migration (partition-server crate uses tonic)
+  - F046: CLI tools + proto codegen + integration tests migration
+  - autumn-server crate doesn't fully compile because autumn-client/ps still use tonic
+  - Integration tests not yet migrated to compio runtime
 
 Next steps:
-  - Update CLAUDE.md and feature_list.md
-  - Commit all changes
-  - Move to F044 (manager migration) or F045 (partition-server migration)
+  - Commit F044 changes
+  - Start F045 (Migrate PartitionKv service to autumn-rpc)

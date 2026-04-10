@@ -1,0 +1,10 @@
+[package]
+name = "autumn-rpc"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+rkyv = { version = "0.8.15", features = ["alloc"] }
+thiserror.workspace = true

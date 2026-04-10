@@ -6,22 +6,20 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-async-trait.workspace = true
 autumn-common = { path = "../common" }
+autumn-etcd = { path = "../etcd" }
 autumn-proto = { path = "../proto" }
-dashmap.workspace = true
-etcd-client = "0.12"
-parking_lot.workspace = true
+autumn-rpc = { path = "../rpc" }
+bytes.workspace = true
+compio = { version = "0.18", features = ["net", "time", "macros"] }
 prost.workspace = true
-tokio.workspace = true
-tonic.workspace = true
+rkyv = { version = "0.8.15", features = ["alloc"] }
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-autumn-io-engine = { path = "../io-engine" }
 autumn-stream = { path = "../stream" }
+autumn-rpc = { path = "../rpc" }
+compio = { version = "0.18", features = ["net", "time", "macros"] }
 tempfile = "3"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-tonic = { workspace = true }
 tracing-subscriber = "0.3"

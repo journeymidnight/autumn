@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::cell::RefCell;
 
 use anyhow::{anyhow, Result};
-use autumn_rpc::{Frame, FrameDecoder, RpcError, StatusCode};
+use autumn_rpc::{Frame, FrameDecoder, RpcError};
 use bytes::Bytes;
 use compio::BufResult;
 use compio::io::{AsyncRead, AsyncWriteExt};

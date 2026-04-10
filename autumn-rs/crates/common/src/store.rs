@@ -1,8 +1,8 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::rc::Rc;
 
 use autumn_proto::autumn::{DiskInfo, ExtentInfo, NodeInfo, PartitionMeta, RegionInfo, StreamInfo};
-use parking_lot::RwLock;
 
 use crate::{AppError, AppResult};
 
@@ -53,13 +53,13 @@ impl MetadataState {
 
 #[derive(Debug, Clone, Default)]
 pub struct MetadataStore {
-    pub inner: Arc<RwLock<MetadataState>>,
+    pub inner: Rc<RefCell<MetadataState>>,
 }
 
 impl MetadataStore {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(MetadataState {
+            inner: Rc::new(RefCell::new(MetadataState {
                 next_id: 1,
                 next_revision: 0,
                 ..MetadataState::default()

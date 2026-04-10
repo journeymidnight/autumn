@@ -2,8 +2,25 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use autumn_rpc::manager_rpc::{self, MgrExtentInfo};
 use crate::conn_pool::parse_addr;
 use crate::extent_rpc::*;
+
+/// Convert manager RPC ExtentInfo to local extent_rpc ExtentInfo.
+fn mgr_to_local_extent(e: &MgrExtentInfo) -> ExtentInfo {
+    ExtentInfo {
+        extent_id: e.extent_id,
+        replicates: e.replicates.clone(),
+        parity: e.parity.clone(),
+        eversion: e.eversion,
+        refs: e.refs,
+        sealed_length: e.sealed_length,
+        avali: e.avali,
+        replicate_disks: e.replicate_disks.clone(),
+        parity_disks: e.parity_disks.clone(),
+        original_replicates: e.original_replicates,
+    }
+}
 use crate::wal::{replay_wal_files, should_use_wal, Wal, WalRecord};
 
 use anyhow::Result;
@@ -213,6 +230,8 @@ pub struct ExtentNode {
     /// All disks attached to this node, keyed by disk_id.
     disks: Rc<HashMap<u64, Rc<DiskFS>>>,
     manager_endpoint: Option<String>,
+    /// ConnPool for manager RPC calls (nodes_info, extent_info, etc.)
+    manager_pool: Rc<crate::ConnPool>,
     recovery_done: Rc<RefCell<Vec<RecoveryTaskDone>>>,
     recovery_inflight: Rc<DashMap<u64, crate::extent_rpc::RecoveryTask>>,
     /// WAL for small must_sync writes. None if WAL is disabled.
@@ -226,6 +245,7 @@ impl Clone for ExtentNode {
             extents: self.extents.clone(),
             disks: self.disks.clone(),
             manager_endpoint: self.manager_endpoint.clone(),
+            manager_pool: self.manager_pool.clone(),
             recovery_done: self.recovery_done.clone(),
             recovery_inflight: self.recovery_inflight.clone(),
             wal: self.wal.clone(),
@@ -315,6 +335,7 @@ impl ExtentNode {
             extents: Rc::new(DashMap::new()),
             disks: Rc::new(disk_map),
             manager_endpoint: config.manager_endpoint,
+            manager_pool: Rc::new(crate::ConnPool::new()),
             recovery_done: Rc::new(std::cell::RefCell::new(Vec::new())),
             recovery_inflight: Rc::new(DashMap::new()),
             wal: None, // set after replay
@@ -746,23 +767,50 @@ impl ExtentNode {
         Err("no source replica available for copy".to_string())
     }
 
-    /// Stub: manager client is not available yet (TODO(F044)).
-    async fn extent_info_from_manager(&self, _extent_id: u64) -> Result<Option<ExtentInfo>, String> {
-        tracing::debug!("extent_info_from_manager: TODO(F044) — manager RPC not yet implemented");
-        Ok(None)
+    async fn extent_info_from_manager(&self, extent_id: u64) -> Result<Option<ExtentInfo>, String> {
+        let mgr = match &self.manager_endpoint {
+            Some(ep) => crate::conn_pool::normalize_endpoint(ep),
+            None => return Ok(None),
+        };
+        let req = manager_rpc::rkyv_encode(&manager_rpc::ExtentInfoReq { extent_id });
+        let resp_data = self
+            .manager_pool
+            .call(&mgr, autumn_rpc::manager_rpc::MSG_EXTENT_INFO, req)
+            .await
+            .map_err(|e| format!("extent_info rpc: {e}"))?;
+        let resp: manager_rpc::ExtentInfoResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| format!("decode: {e}"))?;
+        if resp.code != manager_rpc::CODE_OK {
+            return Ok(None);
+        }
+        Ok(resp.extent.map(|e| mgr_to_local_extent(&e)))
     }
 
-    /// Stub: manager client is not available yet (TODO(F044)).
     async fn nodes_map_from_manager(&self) -> Result<HashMap<u64, String>, String> {
-        Err("TODO(F044): manager RPC not yet implemented".to_string())
+        let mgr = match &self.manager_endpoint {
+            Some(ep) => crate::conn_pool::normalize_endpoint(ep),
+            None => return Err("no manager endpoint configured".to_string()),
+        };
+        let resp_data = self
+            .manager_pool
+            .call(&mgr, autumn_rpc::manager_rpc::MSG_NODES_INFO, Bytes::new())
+            .await
+            .map_err(|e| format!("nodes_info rpc: {e}"))?;
+        let resp: manager_rpc::NodesInfoResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| format!("decode: {e}"))?;
+        if resp.code != manager_rpc::CODE_OK {
+            return Err(format!("nodes_info failed: {}", resp.message));
+        }
+        Ok(resp.nodes.into_iter().map(|(id, n)| (id, n.address)).collect())
     }
 
-    /// Stub: resolve_recovery_extent via manager (TODO(F044)).
     async fn resolve_recovery_extent(
         &self,
-        _task: &crate::extent_rpc::RecoveryTask,
+        task: &crate::extent_rpc::RecoveryTask,
     ) -> Result<ExtentInfo, String> {
-        Err("TODO(F044): resolve_recovery_extent via manager not yet implemented".to_string())
+        self.extent_info_from_manager(task.extent_id)
+            .await?
+            .ok_or_else(|| format!("extent {} not found on manager", task.extent_id))
     }
 
     async fn run_recovery_task(

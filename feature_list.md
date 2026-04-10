@@ -183,11 +183,17 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 - **Notes:** ExtentService 11 个 RPC 方法全部迁移：append, read_bytes, commit_length, alloc_extent, df, require_recovery, re_avali, copy_extent, heartbeat, convert_to_ec, write_shard。数据面消息（Append, ReadBytes, CommitLength）用固定二进制编码。控制面用 rkyv zero-copy 序列化。WAL 完全重写：同步阻塞 I/O，支持 write_batch 批量写入，无 tokio 依赖。ConnPool 单线程 compio (Rc/RefCell)。stream_cli alloc-extent/commit-length 用 autumn-rpc。tonic/prost/tokio/autumn-proto/autumn-io-engine 全部从 stream Cargo.toml 移除。18 单元测试 + 11 集成测试全部通过。partition-server 编译中断为预期（F045 scope）。
 - **passes:** true
 
+### F047 · autumn-etcd: compio-native etcd v3 client
+- **Target:** 新 crate `autumn-etcd`，基于 compio 的原生 etcd v3 客户端。使用 HTTP/2 cleartext (h2c) 通过 hyper 低级 API + cyper-core 的 HyperStream 适配器。实现 manager 所需的最小 API：get (with prefix)、put、txn (CAS + batch put/delete)、lease_grant、lease_keep_alive (streaming)。gRPC framing 手动实现（5 字节头 + protobuf body）。
+- **Evidence:** `cyper/cyper-core/src/stream.rs` (HyperStream adapter) · `cyper/cyper-core/src/executor.rs` (CompioExecutor) · `crates/manager/src/lib.rs` (EtcdMirror usage, 9 etcd API calls)
+- **Notes:** 实现完成。架构：compio TcpStream → HyperStream → hyper::client::conn::http2::handshake() (h2c)。Protobuf 类型手工定义（15 个 message，使用 prost::Message derive）。LeaseKeeper 使用 unary HTTP/2 POST 实现（每次 keep_alive() 发送一个请求读取一个响应）。EtcdClient 单线程 compio（Rc<RefCell<GrpcChannel>>）。Txn builder helpers: Cmp::create_revision/version, Op::put/put_with_lease/delete。3 单元测试 + 7 集成测试全部通过（需 etcd 运行在 localhost:2379）。
+- **passes:** true
+
 ### F044 · Migrate Manager services to autumn-rpc (control plane)
-- **Target:** AutumnManager 的 StreamManagerService (12 RPC) + PartitionManagerService (4 RPC) 从 tonic 迁移到 autumn-rpc handler。Manager 内部的 ExtentServiceClient 调用改为 autumn-rpc RpcClient。etcd 通过 EtcdBridge 桥接（内嵌小型 tokio Runtime）。binary `autumn-manager-server` 切换到 `#[compio::main]`。
-- **Evidence:** `crates/manager/src/lib.rs` (StreamManagerService impl line 1394, PartitionManagerService impl line 2397, EtcdMirror line 39) · `crates/server/src/bin/manager.rs`
-- **Notes:** 16 个 RPC 全部 unary，payload 用 protobuf。EtcdBridge: 内嵌 `tokio::runtime::Runtime` (2 worker threads)，所有 etcd 调用通过 `compio::runtime::spawn_blocking` → `tokio_handle.block_on()` 桥接。leader_keepalive_loop 在内嵌 tokio Runtime 上 spawn。`crates/manager/Cargo.toml` 保留 tokio + etcd-client，移除 tonic。
-- **passes:** false
+- **Target:** AutumnManager 的 StreamManagerService (12 RPC) + PartitionManagerService (4 RPC) 从 tonic 迁移到 autumn-rpc handler。Manager 内部的 ExtentServiceClient 调用改为 autumn-rpc RpcClient。etcd 使用 autumn-etcd 原生 compio 客户端（F047）。binary `autumn-manager-server` 切换到 `#[compio::main]`。同时实现 StreamClient 和 ExtentNode 中所有 F044 TODO stubs。
+- **Evidence:** `crates/manager/src/lib.rs` (StreamManagerService impl line 1394, PartitionManagerService impl line 2397, EtcdMirror line 39) · `crates/server/src/bin/manager.rs` · `crates/stream/src/client.rs` (15 TODO stubs) · `crates/stream/src/extent_node.rs` (5 TODO stubs)
+- **Notes:** 16 个 RPC 全部 unary，wire format 用 rkyv（manager_rpc.rs 放在 autumn-rpc crate 中避免循环依赖）。Manager 内部状态和 etcd 持久化继续使用 protobuf（prost），需要 rkyv↔protobuf 转换层。background loops 全部迁移到 compio（spawn/sleep/select）。tokio 和 etcd-client 从 manager Cargo.toml 完全移除。MetadataStore 从 Arc<RwLock> 改为 Rc<RefCell>。EtcdMirror 使用 autumn-etcd。StreamClient 12 个 TODO(F044) 全部实现。ExtentNode 3 个 stub 方法实现。5 单元测试 + 18 stream 单元测试通过。
+- **passes:** true
 
 ### F045 · Migrate PartitionKv service to autumn-rpc
 - **Target:** PartitionServer 的 PartitionKv (8 RPC) 从 tonic 迁移到 autumn-rpc handler。PartitionManagerServiceClient 调用改为 autumn-rpc RpcClient。binary `autumn-ps` 切换到 `#[compio::main]`。
