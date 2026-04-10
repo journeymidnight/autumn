@@ -6,21 +6,18 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-async-trait.workspace = true
 bytes.workspace = true
 crossbeam-skiplist.workspace = true
-dashmap.workspace = true
-parking_lot.workspace = true
 prost.workspace = true
-tokio.workspace = true
-tonic.workspace = true
+tokio = { version = "1", features = ["sync"] }
 tracing.workspace = true
-autumn-common = { path = "../common" }
 autumn-proto = { path = "../proto" }
-autumn-io-engine = { path = "../io-engine" }
+autumn-rpc = { path = "../rpc" }
 autumn-stream = { path = "../stream" }
+compio = { version = "0.18", features = ["net", "time", "macros"] }
 crc32c.workspace = true
 xxhash-rust.workspace = true
+rkyv = { version = "0.8.15", features = ["alloc"] }
 
 [dev-dependencies]
 tempfile = "3"

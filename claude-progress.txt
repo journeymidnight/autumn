@@ -1,33 +1,33 @@
-Date: 2026-04-09
-TaskStatus: not_completed
-Task scope: F044 — Migrate Manager services to autumn-rpc
+Date: 2026-04-10
+TaskStatus: completed
+Task scope: F045 — Migrate PartitionKv service to autumn-rpc (Thread-per-Partition)
 
 Current summary:
-  F044 core migration complete. AutumnManager rewritten from tonic/tokio/etcd-client
-  to compio + autumn-rpc + autumn-etcd. All 16 RPC handlers implemented via dispatch().
-  EtcdMirror migrated to autumn-etcd. Background loops migrated to compio::runtime::spawn.
-  MetadataStore migrated from Arc<RwLock> to Rc<RefCell>.
+  F045 complete. PartitionServer rewritten with thread-per-partition architecture:
+  - Main thread (compio): accept connections, route by part_id, heartbeat/region sync
+  - Per-partition threads: each with own compio Runtime, Rc/RefCell (no locks)
+  - Inter-thread communication: tokio::sync::mpsc (runtime-agnostic) for request routing
 
-  StreamClient 12 TODO stubs implemented — all manager calls via ConnPool + rkyv.
-  ExtentNode 3 stub methods implemented (extent_info_from_manager, nodes_map_from_manager,
-  resolve_recovery_extent).
+  8 PartitionKv RPCs (Put, Get, Delete, Head, Range, SplitPart, StreamPut, Maintenance)
+  migrated from tonic gRPC to autumn-rpc with rkyv serialization (msg types 0x40-0x47).
 
-  Manager binary (autumn-manager-server) switched to #[compio::main].
+  Manager client calls (register_ps, heartbeat_ps, get_regions) use autumn-rpc ConnPool.
 
-  New crate/module: crates/rpc/src/manager_rpc.rs — 16 MSG_TYPE constants, rkyv message
-  types for all manager RPCs, plus extent node RPC types needed by manager.
+  Background loops (write, flush, compact, gc) all on partition thread via compio::spawn.
+  tokio::select! replaced with manual poll_fn for compact/gc loops.
 
-  5 manager unit tests pass. 18 stream unit tests pass.
+  Arc<RwLock<PartitionData>> → Rc<RefCell<PartitionData>> (single-threaded per partition).
+  tonic, async-trait, parking_lot, dashmap removed from partition-server deps.
 
-  Blocked: other binaries in autumn-server crate (autumn-client, autumn-ps, stream-cli)
-  still use tonic gRPC clients for manager services — they won't compile until F045/F046.
+  New: crates/rpc/src/partition_rpc.rs — 8 MSG_TYPE constants, rkyv request/response types.
+
+  34 unit tests pass (5 manager + 18 stream + 11 partition-server).
+  Partition server binary switched to #[compio::main].
 
 Main gaps:
-  - F045: PartitionKv service migration (partition-server crate uses tonic)
-  - F046: CLI tools + proto codegen + integration tests migration
-  - autumn-server crate doesn't fully compile because autumn-client/ps still use tonic
-  - Integration tests not yet migrated to compio runtime
+  - F046: CLI tools (autumn-client, stream-cli) + proto codegen + integration tests
+  - autumn-server crate still won't fully compile (CLI binaries use tonic)
 
 Next steps:
-  - Commit F044 changes
-  - Start F045 (Migrate PartitionKv service to autumn-rpc)
+  - Commit F045
+  - Start F046 (Migrate CLI tools, proto codegen, and tests to compio)

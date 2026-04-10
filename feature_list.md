@@ -198,8 +198,8 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 ### F045 · Migrate PartitionKv service to autumn-rpc
 - **Target:** PartitionServer 的 PartitionKv (8 RPC) 从 tonic 迁移到 autumn-rpc handler。PartitionManagerServiceClient 调用改为 autumn-rpc RpcClient。binary `autumn-ps` 切换到 `#[compio::main]`。
 - **Evidence:** `crates/partition-server/src/lib.rs` (PartitionKv impl line 2290, serve() line 2142, connect_with_advertise line 412) · `crates/server/src/bin/partition_server.rs`
-- **Notes:** 7 unary + 1 client-streaming (stream_put)。stream_put 改为 RpcClient::call() 单次发送完整 payload。后台循环（write_loop, flush_loop, compact_loop, gc_loop）的 tokio::spawn/select!/sleep 全部替换为 compio 等价物。tokio::sync::Mutex/RwLock/mpsc 保持不变（runtime-agnostic）。`tokio::task::block_in_place` → `compio::runtime::spawn_blocking`。
-- **passes:** false
+- **Notes:** Thread-per-partition 架构：每个 partition 独立 OS 线程 + compio Runtime，Rc/RefCell 无锁。Main thread 接受连接，按 part_id 路由到 partition 线程。8 个 RPC 用 rkyv（msg types 0x40-0x47）。Background loops 全部 compio::spawn。tokio::select! 用 poll_fn 手动实现。stream_put 改为单次 RPC（不再 streaming）。Manager client 用 autumn-rpc ConnPool。tonic/async-trait/parking_lot/dashmap 从 deps 移除。11 单元测试通过。
+- **passes:** true
 
 ### F046 · Migrate CLI tools, proto codegen, and tests to compio
 - **Target:** `autumn-client`、`autumn-stream-cli` 的 gRPC client 全部替换为 autumn-rpc RpcClient。`autumn-proto` 的 build.rs 移除 tonic-build server/client codegen，只保留 prost 消息类型生成。所有集成测试从 `#[tokio::test]` 迁移到 compio runtime。
