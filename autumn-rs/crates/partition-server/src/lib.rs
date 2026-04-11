@@ -195,7 +195,7 @@ impl TableMeta {
 pub(crate) struct PartitionData {
     rg: Range,
     active: Memtable,
-    imm: VecDeque<Rc<Memtable>>,
+    imm: VecDeque<Arc<Memtable>>,
     flush_tx: mpsc::UnboundedSender<()>,
     compact_tx: mpsc::Sender<bool>,
     gc_tx: mpsc::Sender<GcTask>,
@@ -651,7 +651,7 @@ impl PartitionServer {
                                         req_id,
                                         msg_type,
                                         autumn_rpc::RpcError::encode_status(code, &message),
-                                    ),
+                                        ),
                                     Err(_) => Frame::error(
                                         req_id,
                                         msg_type,
@@ -773,10 +773,22 @@ async fn partition_thread_main(
         .detach();
     }
 
-    // Main request processing loop.
+    // Main request processing loop — spawn each request as a separate task so
+    // multiple handle_put can enqueue to write_tx concurrently, enabling group
+    // commit batching in background_write_loop.
     while let Some(req) = req_rx.next().await {
-        let result = dispatch_partition_rpc(req.msg_type, req.payload, &part, &part_sc, &pool, &manager_addr, &owner_key, revision).await;
-        let _ = req.resp_tx.send(result);
+        let part = part.clone();
+        let part_sc = part_sc.clone();
+        let pool = pool.clone();
+        let manager_addr = manager_addr.clone();
+        let owner_key = owner_key.clone();
+        compio::runtime::spawn(async move {
+            let result = dispatch_partition_rpc(
+                req.msg_type, req.payload, &part, &part_sc, &pool,
+                &manager_addr, &owner_key, revision,
+            ).await;
+            let _ = req.resp_tx.send(result);
+        }).detach();
     }
 
     tracing::info!(part_id, "partition thread exiting");
@@ -1133,7 +1145,7 @@ pub(crate) fn rotate_active(part: &mut PartitionData) {
         let size = entry.key().len() as u64 + entry.value().value.len() as u64 + 32;
         frozen.insert(entry.key().clone(), entry.value().clone(), size);
     }
-    part.imm.push_back(Rc::new(frozen));
+    part.imm.push_back(Arc::new(frozen));
     part.active = Memtable::new();
     let _ = part.flush_tx.unbounded_send(());
 }
