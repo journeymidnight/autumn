@@ -40,8 +40,10 @@ impl RpcConn {
         self.next_id = self.next_id.wrapping_add(1).max(1);
 
         let frame = Frame::request(req_id, msg_type, payload);
-        let data = frame.encode();
-        let BufResult(result, _) = self.writer.write_all(data).await;
+        // Vectored write: header + payload without copying the payload.
+        let hdr = Bytes::copy_from_slice(&frame.encode_header());
+        let bufs = vec![hdr, frame.payload];
+        let BufResult(result, _) = self.writer.write_vectored_all(bufs).await;
         result?;
 
         loop {
