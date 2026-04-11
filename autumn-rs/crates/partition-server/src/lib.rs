@@ -651,7 +651,7 @@ impl PartitionServer {
                                         req_id,
                                         msg_type,
                                         autumn_rpc::RpcError::encode_status(code, &message),
-                                        ),
+                                    ),
                                     Err(_) => Frame::error(
                                         req_id,
                                         msg_type,
