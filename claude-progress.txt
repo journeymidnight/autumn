@@ -1,29 +1,35 @@
-Date: 2026-04-10
+Date: 2026-04-11
 TaskStatus: completed
-Task scope: Code cleanup — delete io-engine, remove tokio, split long lib.rs files
+Task scope: PS write performance optimization (F048, F049)
 
 Current summary:
-  Cleanup complete:
-  1. Deleted autumn-io-engine crate (unused since compio migration)
-     - Removed from workspace members, server Cargo.toml, bench references
-     - Removed async-trait and parking_lot workspace deps (unused)
-  2. Removed ALL tokio dependencies from autumn-rs crates
-     - RpcClient: tokio::sync::{oneshot, Mutex} → futures::channel::oneshot + futures::lock::Mutex
-       (Mutex needed because write_all().await crosses await point)
-     - RpcServer: tokio::sync::mpsc → futures::channel::mpsc; writer Mutex same pattern
-     - ConnPool: Arc → Rc, DashMap → HashMap (single-threaded compio)
-     - partition-server: tokio::sync::{mpsc, oneshot} → futures::channel equivalents
-     - Removed tokio from all Cargo.toml files including workspace
-  3. Split long lib.rs files
-     - manager/src/lib.rs: 2776 → 1189 lines (extracted rpc_handlers.rs 1154, recovery.rs 468)
-     - partition-server/src/lib.rs: 2522 → 1324 lines (extracted background.rs 917, rpc_handlers.rs 319)
-  All 49 unit tests pass. All 4 binaries build.
+  Write throughput: 6.3K → 32.9K ops/s (5.2x improvement)
 
-Key design insight (compio concurrency):
-  - Rc<RefCell<T>>: use when borrow does NOT cross await points (fastest)
-  - Rc<futures::lock::Mutex<T>>: use when lock MUST be held across await (e.g. write_all)
-  - Never use std::sync::Mutex in async (blocks entire runtime)
+  Optimizations applied:
+  1. partition_thread_main: spawn concurrent tasks (batch_size 1→60-80)
+     - Root cause: sequential request processing defeated group commit
+     - Effect: 6.3K → 25K ops/s (4x)
+  2. TCP/read buffer 512KB (SO_SNDBUF/SO_RCVBUF + read buf)
+     - Root cause: 128KB TCP buf + 64KB read buf for 280KB batch payloads
+     - Effect: best-case fanout 1.1→0.86ms, extent_bench +20%
+  3. F048: Zero-copy frame write (vectored write in ConnPool)
+     - Root cause: 280KB memcpy per append in Frame::encode()
+     - Effect: p99 93→34ms
+  4. F049: spawn_blocking for SSTable build in flush
+     - Root cause: CPU-intensive build_sst_bytes blocked compio event loop
+     - Effect: 25.8K → 32.9K ops/s, bad seconds 4-15K → 21-35K
+
+  Stream layer baseline (confirmed, no degradation):
+  - extent_bench depth=64: 482 MB/s (4KB append)
+  - append_benchmark 1-replica batch=16: 197K ops/s
+
+Main gaps:
+  - Still ~2x from 80K target. Remaining bottleneck: 3-replica fanout
+    avg ~1.5ms (good seconds 0.9ms, bad seconds 2.3ms).
+  - Compaction CPU work still on partition thread (lower priority than flush)
+  - PS main thread handles 256 connections on single compio thread
 
 Next steps:
-  - Investigate write perf regression (5938 vs 17388 ops/s)
-  - Update remaining CLAUDE.md files
+  - Profile remaining fanout variance (bad seconds still 2-3ms)
+  - Consider multi-threaded PS connection handling (Dispatcher model)
+  - Consider pipelining in benchmark client (depth>1 per thread)

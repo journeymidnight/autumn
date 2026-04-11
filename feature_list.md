@@ -141,14 +141,14 @@
 ### F048 · Zero-copy frame write in ConnPool (avoid 280KB memcpy per append)
 - **Target:** `Frame::encode()` 当前把 10B header + payload 拷贝到新 BytesMut，对 280KB batch 产生不必要的 memcpy。改为 vectored write：先写 10B header，再写 payload（零拷贝）。需要改 `RpcConn::call()` 使用 `write_vectored_all` 代替 `write_all(frame.encode())`。
 - **Evidence:** `crates/rpc/src/frame.rs` (Frame::encode line 78-86) · `crates/stream/src/conn_pool.rs` (RpcConn::call line 42-43)
-- **Notes:** 当前每次 append batch 产生 ~280KB memcpy (10B header + 29B AppendReq header + ~280KB payload)。对比：extent_node 侧已使用 write_vectored_all 批量回复。
-- **passes:** false
+- **Notes:** RpcConn::call 使用 write_vectored_all([header, payload]) 避免 280KB 拷贝。p99 从 93ms→34ms。extent_bench depth=16 从 424→451 MB/s。
+- **passes:** true
 
 ### F049 · Move SSTable build to spawn_blocking (unblock partition event loop)
 - **Target:** `build_sst_bytes` 是同步 CPU 密集函数，在 partition 线程的 compio 事件循环中执行时阻塞 write loop 的 fanout I/O。改为 `compio::runtime::spawn_blocking` 在独立线程构建 SSTable，让 write loop Phase2 不受干扰。
 - **Evidence:** `crates/partition-server/src/lib.rs` (build_sst_bytes line 1116, flush_one_imm line 1159) · perf_check 差秒 Phase2 从 1ms 飙到 4-7ms（与 flush 周期吻合）
 - **Notes:** imm 已改为 `Arc<Memtable>` (Memtable 是 Send+Sync)，可直接 clone Arc 传入 spawn_blocking。之前尝试过但当时差秒根因被误判，现在 TCP buffer 优化后好秒已达 0.86ms fanout，差秒是唯一剩余瓶颈。
-- **passes:** false
+- **passes:** true
 
 ---
 
