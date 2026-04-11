@@ -36,4 +36,4 @@ serde_json = "1"
 rand = "0.8"
 uuid.workspace = true
 libc = "0.2"
-compio = { version = "0.18.0", features = ["macros"] }
+compio = { version = "0.18.0", features = ["macros", "time", "net"] }

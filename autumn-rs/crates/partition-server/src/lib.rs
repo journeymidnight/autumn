@@ -406,12 +406,6 @@ impl PartitionServer {
         server.register_ps().await?;
         server.sync_regions_once().await?;
 
-        let s = server.clone();
-        compio::runtime::spawn(async move { s.heartbeat_loop().await }).detach();
-
-        let s = server.clone();
-        compio::runtime::spawn(async move { s.region_sync_loop().await }).detach();
-
         Ok(server)
     }
 
@@ -438,10 +432,10 @@ impl PartitionServer {
     }
 
     async fn heartbeat_loop(&self) {
-        const INTERVAL: Duration = Duration::from_secs(5);
-        tracing::info!("PS {} heartbeat_loop started", self.ps_id);
+        let mut ticker = compio::time::interval(Duration::from_secs(5));
+        ticker.tick().await; // first tick is immediate
         loop {
-            compio::time::sleep(INTERVAL).await;
+            ticker.tick().await;
             let req = manager_rpc::rkyv_encode(&manager_rpc::HeartbeatPsReq { ps_id: self.ps_id });
             if let Err(e) = self.pool.call(&self.manager_addr, manager_rpc::MSG_HEARTBEAT_PS, req).await {
                 tracing::warn!("PS {} heartbeat failed: {e}", self.ps_id);
@@ -450,9 +444,11 @@ impl PartitionServer {
     }
 
     async fn region_sync_loop(&self) {
-        const INTERVAL: Duration = Duration::from_secs(5);
+        let mut ticker = compio::time::interval(Duration::from_secs(5));
+        ticker.tick().await; // first tick is immediate
         loop {
-            compio::time::sleep(INTERVAL).await;
+            ticker.tick().await;
+            tracing::debug!("PS {} region_sync_loop: syncing", self.ps_id);
             if let Err(e) = self.sync_regions_once().await {
                 tracing::warn!("PS {} region sync failed: {e}", self.ps_id);
             }
@@ -472,7 +468,9 @@ impl PartitionServer {
         }
 
         let mut wanted: BTreeMap<u64, (Range, u64, u64, u64)> = BTreeMap::new();
+        tracing::debug!("PS {} sync: got {} regions, my ps_id={}", self.ps_id, resp.regions.len(), self.ps_id);
         for (part_id, region) in resp.regions {
+            tracing::debug!("PS {} sync: region part_id={} ps_id={}", self.ps_id, part_id, region.ps_id);
             if region.ps_id == self.ps_id {
                 if let Some(rg) = region.rg {
                     wanted.insert(
@@ -504,9 +502,11 @@ impl PartitionServer {
             if self.partitions.borrow().contains_key(&part_id) {
                 continue;
             }
+            tracing::info!("PS {} opening partition {part_id}", self.ps_id);
             let handle = self
                 .open_partition(part_id, rg, log_stream_id, row_stream_id, meta_stream_id)
                 .await?;
+            tracing::info!("PS {} partition {part_id} opened", self.ps_id);
             self.partitions.borrow_mut().insert(part_id, handle);
         }
         Ok(())
@@ -561,24 +561,27 @@ impl PartitionServer {
     pub async fn serve(&self, addr: SocketAddr) -> Result<()> {
         let listener = compio::net::TcpListener::bind(addr).await?;
         tracing::info!(addr = %addr, "partition server listening");
+
+        // Spawn heartbeat and region_sync as background tasks.
+        let s = self.clone();
+        compio::runtime::spawn(async move { s.heartbeat_loop().await }).detach();
+        let s = self.clone();
+        compio::runtime::spawn(async move { s.region_sync_loop().await }).detach();
+
+        // Main task: just a timer loop that keeps the runtime polling.
+        // Accept loop is also spawned so it doesn't block the timer.
+        let s = self.clone();
+        compio::runtime::spawn(async move { s.accept_loop(listener).await }).detach();
+
+        // Keep the main task alive with a timer so the runtime keeps polling timers.
         loop {
-            // timeout so that spawned background tasks (heartbeat, region_sync)
-            // get polled even when no client connections arrive.
-            tracing::debug!("accept loop: waiting for connection (with 1s timeout)");
-            let accept_result = compio::time::timeout(
-                Duration::from_secs(1),
-                listener.accept(),
-            ).await;
-            tracing::debug!("accept loop: result is_timeout={}", accept_result.is_err());
-            let (stream, peer) = match accept_result {
-                Ok(Ok(v)) => v,
-                Ok(Err(e)) => return Err(e.into()),
-                Err(_) => {
-                    // Yield to let spawned tasks (heartbeat, region_sync) run.
-                    compio::time::sleep(Duration::from_millis(1)).await;
-                    continue;
-                }
-            };
+            compio::time::sleep(Duration::from_secs(3600)).await;
+        }
+    }
+
+    async fn accept_loop(&self, listener: compio::net::TcpListener) -> Result<()> {
+        loop {
+            let (stream, peer) = listener.accept().await?;
             if let Err(e) = stream.set_nodelay(true) {
                 tracing::warn!(peer = %peer, error = %e, "set_nodelay failed");
             }
@@ -615,7 +618,7 @@ impl PartitionServer {
                         let payload = frame.payload;
 
                         // Route partition RPCs to the correct partition thread.
-                        let part_id = partition_rpc::extract_part_id(&payload);
+                        let part_id = partition_rpc::extract_part_id(msg_type, &payload);
                         let resp_frame = if let Some(handle) =
                             server.partitions.borrow().get(&part_id)
                         {
@@ -2454,99 +2457,6 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn compio_timer_with_accept_timeout_loop() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        use std::sync::Arc;
-
-        let count = Arc::new(AtomicU32::new(0));
-        let count2 = count.clone();
-
-        compio::runtime::Runtime::new().unwrap().block_on(async {
-            compio::runtime::spawn(async move {
-                loop {
-                    compio::time::sleep(Duration::from_millis(500)).await;
-                    count2.fetch_add(1, Ordering::SeqCst);
-                }
-            }).detach();
-
-            let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            // 5 iterations of 1s timeout = ~5s total
-            for _ in 0..5 {
-                let _ = compio::time::timeout(Duration::from_secs(1), listener.accept()).await;
-            }
-        });
-
-        let c = count.load(Ordering::SeqCst);
-        assert!(c >= 3, "expected at least 3 ticks in 5s, got {c}");
-    }
-
-    #[test]
-    fn compio_timer_after_tcp_io_then_accept_loop() {
-        // Simulates the PS binary: TCP I/O first, then spawn+accept loop.
-        use std::sync::atomic::{AtomicU32, Ordering};
-        use std::sync::Arc;
-
-        let count = Arc::new(AtomicU32::new(0));
-        let count2 = count.clone();
-
-        compio::runtime::Runtime::new().unwrap().block_on(async {
-            // Phase 1: do some TCP I/O (simulates connect_with_advertise)
-            let echo_listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let echo_addr = echo_listener.local_addr().unwrap();
-            // Connect to ourselves
-            let _client = compio::net::TcpStream::connect(echo_addr).await.unwrap();
-            let (_server, _) = echo_listener.accept().await.unwrap();
-            drop(_client);
-            drop(_server);
-            drop(echo_listener);
-
-            // Phase 2: spawn background timer
-            compio::runtime::spawn(async move {
-                loop {
-                    compio::time::sleep(Duration::from_millis(500)).await;
-                    count2.fetch_add(1, Ordering::SeqCst);
-                }
-            }).detach();
-
-            // Phase 3: accept loop with timeout
-            let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            for _ in 0..5 {
-                let _ = compio::time::timeout(Duration::from_secs(1), listener.accept()).await;
-            }
-        });
-
-        let c = count.load(Ordering::SeqCst);
-        assert!(c >= 3, "expected at least 3 ticks in 5s after prior TCP I/O, got {c}");
-    }
-
-    #[test]
-    fn compio_timer_with_accept_loop() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        use std::sync::Arc;
-
-        let count = Arc::new(AtomicU32::new(0));
-        let count2 = count.clone();
-
-        compio::runtime::Runtime::new().unwrap().block_on(async {
-            // Spawned task with timer
-            compio::runtime::spawn(async move {
-                for _ in 0..3 {
-                    compio::time::sleep(Duration::from_millis(100)).await;
-                    count2.fetch_add(1, Ordering::SeqCst);
-                }
-            })
-            .detach();
-
-            // Main task: accept loop (nobody connects)
-            let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let _ = compio::time::timeout(Duration::from_millis(500), listener.accept()).await;
-        });
-
-        let c = count.load(Ordering::SeqCst);
-        assert!(c >= 2, "expected at least 2 timer ticks, got {c}");
-    }
 
     #[test]
     fn compio_timer_in_spawn() {

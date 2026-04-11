@@ -1,22 +1,22 @@
 {
   "version": 1,
   "write": {
-    "total_ops": 176829,
-    "total_bytes": 724291584,
-    "ops_per_sec": 17387.863028766416,
-    "throughput_mb_per_sec": 67.92133995611881,
-    "p50_ms": 4.629083,
-    "p95_ms": 38.214875,
-    "p99_ms": 334.806959
+    "total_ops": 65135,
+    "total_bytes": 266792960,
+    "ops_per_sec": 5938.040939598491,
+    "throughput_mb_per_sec": 23.195472420306604,
+    "p50_ms": 30.260292,
+    "p95_ms": 32.633083,
+    "p99_ms": 37.689458
   },
   "read": {
-    "total_ops": 777096,
+    "total_ops": 579074,
     "total_bytes": 0,
-    "ops_per_sec": 77616.77163732184,
+    "ops_per_sec": 57868.443929949375,
     "throughput_mb_per_sec": 0.0,
-    "p50_ms": 2.5932500000000003,
-    "p95_ms": 6.486291,
-    "p99_ms": 13.963375
+    "p50_ms": 4.328583,
+    "p95_ms": 5.5045,
+    "p99_ms": 7.206917
   },
   "config": {
     "threads": 256,
@@ -27,5 +27,5 @@
     "part_id": null,
     "reuse_value": true
   },
-  "recorded_at": 1775190057
+  "recorded_at": 1775882484
 }

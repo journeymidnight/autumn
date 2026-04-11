@@ -169,21 +169,18 @@ pub struct TableLocations {
 
 // ── Helper: extract part_id from any partition RPC payload ─────────────────
 
-/// Extract part_id from an rkyv-encoded partition RPC request.
-/// All request types have `part_id: u64` as their first field.
-///
-/// For efficiency, we decode only a minimal wrapper struct instead of
-/// the full request type.
-#[derive(Archive, Serialize, Deserialize)]
-struct PartIdHeader {
-    pub part_id: u64,
-}
-
-/// Extract the part_id from a partition RPC request payload without fully
-/// decoding the request. Returns 0 if decoding fails.
-pub fn extract_part_id(payload: &[u8]) -> u64 {
-    match rkyv_decode::<PartIdHeader>(payload) {
-        Ok(h) => h.part_id,
-        Err(_) => 0,
+/// Extract the part_id from a partition RPC request payload.
+/// Decodes the full request type based on msg_type. Returns 0 if decoding fails.
+pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
+    match msg_type {
+        MSG_PUT => rkyv_decode::<PutReq>(payload).map(|r| r.part_id).unwrap_or(0),
+        MSG_GET => rkyv_decode::<GetReq>(payload).map(|r| r.part_id).unwrap_or(0),
+        MSG_DELETE => rkyv_decode::<DeleteReq>(payload).map(|r| r.part_id).unwrap_or(0),
+        MSG_HEAD => rkyv_decode::<HeadReq>(payload).map(|r| r.part_id).unwrap_or(0),
+        MSG_RANGE => rkyv_decode::<RangeReq>(payload).map(|r| r.part_id).unwrap_or(0),
+        MSG_SPLIT_PART => rkyv_decode::<SplitPartReq>(payload).map(|r| r.part_id).unwrap_or(0),
+        MSG_STREAM_PUT => rkyv_decode::<StreamPutReq>(payload).map(|r| r.part_id).unwrap_or(0),
+        MSG_MAINTENANCE => rkyv_decode::<MaintenanceReq>(payload).map(|r| r.part_id).unwrap_or(0),
+        _ => 0,
     }
 }
