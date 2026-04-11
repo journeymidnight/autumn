@@ -23,13 +23,14 @@ impl RpcConn {
     async fn connect(addr: SocketAddr) -> Result<Self> {
         let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
+        set_tcp_buffer_sizes(&stream, 512 * 1024);
         let (reader, writer) = stream.into_split();
         Ok(Self {
             reader,
             writer,
             decoder: FrameDecoder::new(),
             next_id: 1,
-            read_buf: vec![0u8; 64 * 1024],
+            read_buf: vec![0u8; 512 * 1024],
         })
     }
 
@@ -126,6 +127,23 @@ impl ConnPool {
 impl Default for ConnPool {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Set TCP send/recv buffer sizes via setsockopt.
+fn set_tcp_buffer_sizes(stream: &compio::net::TcpStream, size: usize) {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let size = size as libc::c_int;
+    unsafe {
+        libc::setsockopt(
+            fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
+            &size as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        libc::setsockopt(
+            fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
+            &size as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
     }
 }
 

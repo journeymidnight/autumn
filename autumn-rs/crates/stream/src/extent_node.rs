@@ -284,6 +284,23 @@ async fn rpc_oneshot(addr: std::net::SocketAddr, msg_type: u8, payload: Bytes) -
     }
 }
 
+/// Set TCP send/recv buffer sizes via setsockopt.
+fn set_tcp_buffer_sizes(stream: &compio::net::TcpStream, size: usize) {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let size = size as libc::c_int;
+    unsafe {
+        libc::setsockopt(
+            fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
+            &size as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        libc::setsockopt(
+            fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
+            &size as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
 /// Shared ref to file inside UnsafeCell (single-threaded compio).
 fn file_ref(file: &std::cell::UnsafeCell<CompioFile>) -> &CompioFile {
     unsafe { &*file.get() }
@@ -530,6 +547,7 @@ impl ExtentNode {
             if let Err(e) = stream.set_nodelay(true) {
                 tracing::warn!(peer = %peer, error = %e, "set_nodelay failed");
             }
+            set_tcp_buffer_sizes(&stream, 512 * 1024);
             let node = self.clone();
             compio::runtime::spawn(async move {
                 tracing::debug!(peer = %peer, "new rpc connection");
@@ -552,7 +570,7 @@ impl ExtentNode {
     ) -> Result<()> {
         let (mut reader, mut writer) = stream.into_split();
         let mut decoder = FrameDecoder::new();
-        let mut buf = vec![0u8; 64 * 1024];
+        let mut buf = vec![0u8; 512 * 1024];
 
         loop {
             let BufResult(result, buf_back) = reader.read(buf).await;
