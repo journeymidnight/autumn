@@ -8,18 +8,19 @@ license.workspace = true
 anyhow.workspace = true
 autumn-common = { path = "../common" }
 autumn-etcd = { path = "../etcd" }
-autumn-proto = { path = "../proto" }
 autumn-rpc = { path = "../rpc" }
 bytes.workspace = true
 compio = { version = "0.18", features = ["net", "time", "macros"] }
-prost.workspace = true
 rkyv = { version = "0.8.15", features = ["alloc"] }
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 autumn-stream = { path = "../stream" }
+autumn-partition-server = { path = "../partition-server" }
 autumn-rpc = { path = "../rpc" }
+autumn-etcd = { path = "../etcd" }
 compio = { version = "0.18", features = ["net", "time", "macros"] }
 tempfile = "3"
 tracing-subscriber = "0.3"
+anyhow = "1"

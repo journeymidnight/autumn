@@ -13,14 +13,6 @@ use bytes::Bytes;
 use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::net::TcpStream;
 use compio::BufResult;
-use prost::Message;
-
-// Re-use proto types for etcd persistence only.
-use autumn_proto::autumn::{
-    DiskInfo as ProtoDiskInfo, ExtentInfo as ProtoExtentInfo, NodeInfo as ProtoNodeInfo,
-    PartitionMeta as ProtoPartitionMeta, RecoveryTask as ProtoRecoveryTask,
-    RegionInfo as ProtoRegionInfo, StreamInfo as ProtoStreamInfo,
-};
 
 // ── EtcdMirror ─────────────────────────────────────────────────────────────
 
@@ -35,12 +27,6 @@ impl EtcdMirror {
         Ok(Self {
             client: Rc::new(RefCell::new(client)),
         })
-    }
-
-    fn encode_msg<M: Message>(msg: &M) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        msg.encode(&mut buf)?;
-        Ok(buf)
     }
 
     async fn put_msgs_txn(&self, kvs: Vec<(String, Vec<u8>)>) -> Result<()> {
@@ -199,7 +185,7 @@ pub struct AutumnManager {
     leader: Rc<Cell<bool>>,
     etcd: Option<EtcdMirror>,
     instance_id: String,
-    recovery_tasks: Rc<RefCell<HashMap<u64, ProtoRecoveryTask>>>,
+    recovery_tasks: Rc<RefCell<HashMap<u64, MgrRecoveryTask>>>,
     ec_conversion_inflight: Rc<RefCell<HashSet<u64>>>,
     runtime_started: Rc<Cell<bool>>,
     ps_last_heartbeat: Rc<RefCell<HashMap<u64, Instant>>>,
@@ -404,7 +390,7 @@ impl AutumnManager {
         let mut decoded_nodes = HashMap::new();
         for kv in &nodes.kvs {
             let id = Self::parse_id_from_key("nodes/", &kv.key)?;
-            let node = ProtoNodeInfo::decode(kv.value.as_slice())?;
+            let node: MgrNodeInfo = rkyv_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
             max_id = max_id.max(id);
             decoded_nodes.insert(id, node);
         }
@@ -412,7 +398,7 @@ impl AutumnManager {
         let mut decoded_disks = HashMap::new();
         for kv in &disks.kvs {
             let id = Self::parse_id_from_key("disks/", &kv.key)?;
-            let disk = ProtoDiskInfo::decode(kv.value.as_slice())?;
+            let disk: MgrDiskInfo = rkyv_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
             max_id = max_id.max(id);
             decoded_disks.insert(id, disk);
         }
@@ -420,7 +406,7 @@ impl AutumnManager {
         let mut decoded_streams = HashMap::new();
         for kv in &streams.kvs {
             let id = Self::parse_id_from_key("streams/", &kv.key)?;
-            let st = ProtoStreamInfo::decode(kv.value.as_slice())?;
+            let st: MgrStreamInfo = rkyv_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
             max_id = max_id.max(id);
             decoded_streams.insert(id, st);
         }
@@ -428,7 +414,7 @@ impl AutumnManager {
         let mut decoded_extents = HashMap::new();
         for kv in &extents.kvs {
             let id = Self::parse_id_from_key("extents/", &kv.key)?;
-            let ex = ProtoExtentInfo::decode(kv.value.as_slice())?;
+            let ex: MgrExtentInfo = rkyv_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
             max_id = max_id.max(id);
             decoded_extents.insert(id, ex);
         }
@@ -436,7 +422,7 @@ impl AutumnManager {
         let mut decoded_tasks = HashMap::new();
         for kv in &tasks.kvs {
             let id = Self::parse_id_from_key("recoveryTasks/", &kv.key)?;
-            let task = ProtoRecoveryTask::decode(kv.value.as_slice())?;
+            let task: MgrRecoveryTask = rkyv_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
             decoded_tasks.insert(id, task);
         }
 
@@ -456,7 +442,7 @@ impl AutumnManager {
         let mut decoded_partitions = HashMap::new();
         for kv in &partitions.kvs {
             let id = Self::parse_id_from_key("partitions/", &kv.key)?;
-            let part = ProtoPartitionMeta::decode(kv.value.as_slice())?;
+            let part: MgrPartitionMeta = rkyv_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
             max_id = max_id.max(id);
             decoded_partitions.insert(id, part);
         }
@@ -471,7 +457,7 @@ impl AutumnManager {
         let mut decoded_regions = BTreeMap::new();
         for kv in &regions.kvs {
             let id = Self::parse_id_from_key("regions/", &kv.key)?;
-            let region = ProtoRegionInfo::decode(kv.value.as_slice())?;
+            let region: MgrRegionInfo = rkyv_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
             decoded_regions.insert(id, region);
         }
 
@@ -524,9 +510,9 @@ impl AutumnManager {
     }
 
     fn select_nodes(
-        nodes: &HashMap<u64, ProtoNodeInfo>,
+        nodes: &HashMap<u64, MgrNodeInfo>,
         count: usize,
-    ) -> Result<Vec<ProtoNodeInfo>, AppError> {
+    ) -> Result<Vec<MgrNodeInfo>, AppError> {
         let mut all: Vec<_> = nodes.values().cloned().collect();
         all.sort_by_key(|n| n.node_id);
         if all.len() < count {
@@ -712,7 +698,7 @@ impl AutumnManager {
 
             state.regions.insert(
                 part_id,
-                ProtoRegionInfo {
+                MgrRegionInfo {
                     rg: meta.rg.clone(),
                     part_id,
                     ps_id,
@@ -736,7 +722,7 @@ impl AutumnManager {
             .cloned()
             .ok_or_else(|| AppError::NotFound(format!("stream {src_stream_id}")))?;
 
-        let mut dst = ProtoStreamInfo {
+        let mut dst = MgrStreamInfo {
             stream_id: dst_stream_id,
             extent_ids: vec![],
             ec_data_shard: src.ec_data_shard,
@@ -761,7 +747,7 @@ impl AutumnManager {
         Ok(())
     }
 
-    fn extent_nodes(extent: &ProtoExtentInfo) -> Vec<u64> {
+    fn extent_nodes(extent: &MgrExtentInfo) -> Vec<u64> {
         extent
             .replicates
             .iter()
@@ -770,7 +756,7 @@ impl AutumnManager {
             .collect()
     }
 
-    fn extent_slot(extent: &ProtoExtentInfo, node_id: u64) -> Option<usize> {
+    fn extent_slot(extent: &MgrExtentInfo, node_id: u64) -> Option<usize> {
         Self::extent_nodes(extent)
             .iter()
             .position(|id| *id == node_id)
@@ -835,10 +821,9 @@ impl AutumnManager {
 
     // ── Etcd mirroring ─────────────────────────────────────────────────
 
-    async fn persist_extent(&self, extent: &ProtoExtentInfo) -> Result<(), AppError> {
+    async fn persist_extent(&self, extent: &MgrExtentInfo) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
-            let value =
-                EtcdMirror::encode_msg(extent).map_err(|e| AppError::Internal(e.to_string()))?;
+            let value = rkyv_encode(extent).to_vec();
             etcd.put_msgs_txn(vec![(format!("extents/{}", extent.extent_id), value)])
                 .await
                 .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -908,20 +893,14 @@ impl AutumnManager {
         for candidate in &candidates {
             let addr = Self::normalize_endpoint(&candidate.address);
 
-            let task = ProtoRecoveryTask {
+            let task = MgrRecoveryTask {
                 extent_id,
                 replace_id,
                 node_id: candidate.node_id,
                 start_time: Self::epoch_seconds(),
             };
 
-            let rpc_task = MgrRecoveryTask {
-                extent_id,
-                replace_id,
-                node_id: candidate.node_id,
-                start_time: task.start_time,
-            };
-            let payload = rkyv_encode(&ExtRequireRecoveryReq { task: rpc_task });
+            let payload = rkyv_encode(&ExtRequireRecoveryReq { task: task.clone() });
             let resp = match self
                 .conn_pool
                 .call(&addr, EXT_MSG_REQUIRE_RECOVERY, payload)
@@ -940,8 +919,7 @@ impl AutumnManager {
 
             if let Some(etcd) = &self.etcd {
                 let key = format!("recoveryTasks/{extent_id}");
-                let payload = EtcdMirror::encode_msg(&task)
-                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                let payload = rkyv_encode(&task).to_vec();
                 let cmp =
                     autumn_etcd::Cmp::create_revision(key.as_bytes(), 0);
                 let txn = autumn_etcd::proto::TxnRequest {
@@ -1019,8 +997,7 @@ impl AutumnManager {
         };
 
         if let Some(etcd) = &self.etcd {
-            let ex_payload = EtcdMirror::encode_msg(&updated_extent)
-                .map_err(|e| AppError::Internal(e.to_string()))?;
+            let ex_payload = rkyv_encode(&updated_extent).to_vec();
             etcd.put_and_delete_txn(
                 vec![(format!("extents/{}", updated_extent.extent_id), ex_payload)],
                 vec![format!("recoveryTasks/{}", updated_extent.extent_id)],
@@ -1115,7 +1092,7 @@ impl AutumnManager {
                 s.nodes.clone()
             };
 
-            let mut by_node: HashMap<u64, Vec<ProtoRecoveryTask>> = HashMap::new();
+            let mut by_node: HashMap<u64, Vec<MgrRecoveryTask>> = HashMap::new();
             for task in tasks.values() {
                 by_node.entry(task.node_id).or_default().push(task.clone());
             }
@@ -1125,17 +1102,8 @@ impl AutumnManager {
                     continue;
                 };
                 let addr = Self::normalize_endpoint(&node.address);
-                let rpc_tasks: Vec<MgrRecoveryTask> = node_tasks
-                    .iter()
-                    .map(|t| MgrRecoveryTask {
-                        extent_id: t.extent_id,
-                        replace_id: t.replace_id,
-                        node_id: t.node_id,
-                        start_time: t.start_time,
-                    })
-                    .collect();
                 let payload = rkyv_encode(&ExtDfReq {
-                    tasks: rpc_tasks,
+                    tasks: node_tasks,
                     disk_ids: Vec::new(),
                 });
                 let resp = match self.conn_pool.call(&addr, EXT_MSG_DF, payload).await {
@@ -1160,7 +1128,7 @@ impl AutumnManager {
                 continue;
             }
 
-            let candidates: Vec<(ProtoExtentInfo, ProtoStreamInfo)> = {
+            let candidates: Vec<(MgrExtentInfo, MgrStreamInfo)> = {
                 let s = self.store.inner.borrow();
                 let mut out = Vec::new();
                 for stream in s.streams.values() {
@@ -1334,8 +1302,7 @@ impl AutumnManager {
 
         if let Some(etcd) = &self.etcd {
             let key = format!("extents/{}", extent_id);
-            let val =
-                EtcdMirror::encode_msg(&updated).map_err(|e| AppError::Internal(e.to_string()))?;
+            let val = rkyv_encode(&updated).to_vec();
             etcd.put_msgs_txn(vec![(key, val)])
                 .await
                 .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -1348,19 +1315,19 @@ impl AutumnManager {
 
     async fn mirror_register_node(
         &self,
-        node: &ProtoNodeInfo,
-        disks: &[ProtoDiskInfo],
+        node: &MgrNodeInfo,
+        disks: &[MgrDiskInfo],
     ) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
             let mut kvs = Vec::with_capacity(1 + disks.len());
             kvs.push((
                 format!("nodes/{}", node.node_id),
-                EtcdMirror::encode_msg(node).map_err(|e| AppError::Internal(e.to_string()))?,
+                rkyv_encode(node).to_vec(),
             ));
             for disk in disks {
                 kvs.push((
                     format!("disks/{}", disk.disk_id),
-                    EtcdMirror::encode_msg(disk).map_err(|e| AppError::Internal(e.to_string()))?,
+                    rkyv_encode(disk).to_vec(),
                 ));
             }
             etcd.put_msgs_txn(kvs)
@@ -1372,20 +1339,18 @@ impl AutumnManager {
 
     async fn mirror_create_stream(
         &self,
-        stream: &ProtoStreamInfo,
-        extent: &ProtoExtentInfo,
+        stream: &MgrStreamInfo,
+        extent: &MgrExtentInfo,
     ) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
             let kvs = vec![
                 (
                     format!("streams/{}", stream.stream_id),
-                    EtcdMirror::encode_msg(stream)
-                        .map_err(|e| AppError::Internal(e.to_string()))?,
+                    rkyv_encode(stream).to_vec(),
                 ),
                 (
                     format!("extents/{}", extent.extent_id),
-                    EtcdMirror::encode_msg(extent)
-                        .map_err(|e| AppError::Internal(e.to_string()))?,
+                    rkyv_encode(extent).to_vec(),
                 ),
             ];
             etcd.put_msgs_txn(kvs)
@@ -1397,26 +1362,23 @@ impl AutumnManager {
 
     async fn mirror_stream_alloc_extent(
         &self,
-        stream: &ProtoStreamInfo,
-        sealed_old: &ProtoExtentInfo,
-        new_extent: &ProtoExtentInfo,
+        stream: &MgrStreamInfo,
+        sealed_old: &MgrExtentInfo,
+        new_extent: &MgrExtentInfo,
     ) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
             let kvs = vec![
                 (
                     format!("streams/{}", stream.stream_id),
-                    EtcdMirror::encode_msg(stream)
-                        .map_err(|e| AppError::Internal(e.to_string()))?,
+                    rkyv_encode(stream).to_vec(),
                 ),
                 (
                     format!("extents/{}", sealed_old.extent_id),
-                    EtcdMirror::encode_msg(sealed_old)
-                        .map_err(|e| AppError::Internal(e.to_string()))?,
+                    rkyv_encode(sealed_old).to_vec(),
                 ),
                 (
                     format!("extents/{}", new_extent.extent_id),
-                    EtcdMirror::encode_msg(new_extent)
-                        .map_err(|e| AppError::Internal(e.to_string()))?,
+                    rkyv_encode(new_extent).to_vec(),
                 ),
             ];
             etcd.put_msgs_txn(kvs)
@@ -1428,20 +1390,20 @@ impl AutumnManager {
 
     async fn mirror_stream_extent_mutation(
         &self,
-        stream: &ProtoStreamInfo,
-        extent_puts: &[ProtoExtentInfo],
+        stream: &MgrStreamInfo,
+        extent_puts: &[MgrExtentInfo],
         extent_deletes: &[u64],
     ) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
             let mut puts = Vec::with_capacity(1 + extent_puts.len());
             puts.push((
                 format!("streams/{}", stream.stream_id),
-                EtcdMirror::encode_msg(stream).map_err(|e| AppError::Internal(e.to_string()))?,
+                rkyv_encode(stream).to_vec(),
             ));
             for ex in extent_puts {
                 puts.push((
                     format!("extents/{}", ex.extent_id),
-                    EtcdMirror::encode_msg(ex).map_err(|e| AppError::Internal(e.to_string()))?,
+                    rkyv_encode(ex).to_vec(),
                 ));
             }
             let deletes = extent_deletes
@@ -1468,14 +1430,13 @@ impl AutumnManager {
             for (part_id, part) in partitions {
                 kvs.push((
                     format!("partitions/{part_id}"),
-                    EtcdMirror::encode_msg(&part).map_err(|e| AppError::Internal(e.to_string()))?,
+                    rkyv_encode(&part).to_vec(),
                 ));
             }
             for (part_id, region) in regions {
                 kvs.push((
                     format!("regions/{part_id}"),
-                    EtcdMirror::encode_msg(&region)
-                        .map_err(|e| AppError::Internal(e.to_string()))?,
+                    rkyv_encode(&region).to_vec(),
                 ));
             }
             etcd.put_msgs_txn(kvs)
@@ -1483,54 +1444,6 @@ impl AutumnManager {
                 .map_err(|e| AppError::Internal(e.to_string()))?;
         }
         Ok(())
-    }
-
-    // ── Proto ↔ rkyv conversion helpers ────────────────────────────────
-
-    fn proto_to_mgr_stream(s: &ProtoStreamInfo) -> MgrStreamInfo {
-        MgrStreamInfo {
-            stream_id: s.stream_id,
-            extent_ids: s.extent_ids.clone(),
-            ec_data_shard: s.ec_data_shard,
-            ec_parity_shard: s.ec_parity_shard,
-        }
-    }
-
-    fn proto_to_mgr_extent(e: &ProtoExtentInfo) -> MgrExtentInfo {
-        MgrExtentInfo {
-            extent_id: e.extent_id,
-            replicates: e.replicates.clone(),
-            parity: e.parity.clone(),
-            eversion: e.eversion,
-            refs: e.refs,
-            sealed_length: e.sealed_length,
-            avali: e.avali,
-            replicate_disks: e.replicate_disks.clone(),
-            parity_disks: e.parity_disks.clone(),
-            original_replicates: e.original_replicates,
-        }
-    }
-
-    fn proto_to_mgr_node(n: &ProtoNodeInfo) -> MgrNodeInfo {
-        MgrNodeInfo {
-            node_id: n.node_id,
-            address: n.address.clone(),
-            disks: n.disks.clone(),
-        }
-    }
-
-    fn proto_to_mgr_region(r: &ProtoRegionInfo) -> MgrRegionInfo {
-        MgrRegionInfo {
-            rg: r.rg.as_ref().map(|rg| MgrRange {
-                start_key: rg.start_key.clone(),
-                end_key: rg.end_key.clone(),
-            }),
-            part_id: r.part_id,
-            ps_id: r.ps_id,
-            log_stream: r.log_stream,
-            row_stream: r.row_stream,
-            meta_stream: r.meta_stream,
-        }
     }
 
     // ── Serve ──────────────────────────────────────────────────────────
@@ -1678,7 +1591,7 @@ impl AutumnManager {
             for (idx, uuid) in req.disk_uuids.iter().enumerate() {
                 let disk_id = node_id + idx as u64 + 1;
                 disk_ids.push(disk_id);
-                let disk = ProtoDiskInfo {
+                let disk = MgrDiskInfo {
                     disk_id,
                     online: true,
                     uuid: uuid.clone(),
@@ -1688,7 +1601,7 @@ impl AutumnManager {
                 uuid_map.push((uuid.clone(), disk_id));
             }
 
-            let node = ProtoNodeInfo {
+            let node = MgrNodeInfo {
                 node_id,
                 address: req.addr,
                 disks: disk_ids,
@@ -1790,13 +1703,13 @@ impl AutumnManager {
             disk_ids.push(disk);
         }
 
-        let stream = ProtoStreamInfo {
+        let stream = MgrStreamInfo {
             stream_id,
             extent_ids: vec![extent_id],
             ec_data_shard: ec_data,
             ec_parity_shard: ec_parity,
         };
-        let extent = ProtoExtentInfo {
+        let extent = MgrExtentInfo {
             extent_id,
             replicates: node_ids,
             parity: vec![],
@@ -1827,8 +1740,8 @@ impl AutumnManager {
         Ok(rkyv_encode(&CreateStreamResp {
             code: CODE_OK,
             message: String::new(),
-            stream: Some(Self::proto_to_mgr_stream(&stream)),
-            extent: Some(Self::proto_to_mgr_extent(&extent)),
+            stream: Some(stream.clone()),
+            extent: Some(extent.clone()),
         }))
     }
 
@@ -1848,10 +1761,10 @@ impl AutumnManager {
 
         for id in ids {
             if let Some(st) = s.streams.get(&id) {
-                streams.push((id, Self::proto_to_mgr_stream(st)));
+                streams.push((id, st.clone()));
                 for extent_id in &st.extent_ids {
                     if let Some(e) = s.extents.get(extent_id) {
-                        extents.push((*extent_id, Self::proto_to_mgr_extent(e)));
+                        extents.push((*extent_id, e.clone()));
                     }
                 }
             }
@@ -1873,7 +1786,7 @@ impl AutumnManager {
             Some(e) => Ok(rkyv_encode(&ExtentInfoResp {
                 code: CODE_OK,
                 message: String::new(),
-                extent: Some(Self::proto_to_mgr_extent(e)),
+                extent: Some(e.clone()),
             })),
             None => Ok(rkyv_encode(&ExtentInfoResp {
                 code: CODE_NOT_FOUND,
@@ -1888,7 +1801,7 @@ impl AutumnManager {
         let nodes = s
             .nodes
             .iter()
-            .map(|(&id, n)| (id, Self::proto_to_mgr_node(n)))
+            .map(|(&id, n)| (id, n.clone()))
             .collect();
         Ok(rkyv_encode(&NodesInfoResp {
             code: CODE_OK,
@@ -1956,9 +1869,9 @@ impl AutumnManager {
             return Ok(rkyv_encode(&CheckCommitLengthResp {
                 code: CODE_OK,
                 message: String::new(),
-                stream_info: Some(Self::proto_to_mgr_stream(&stream)),
+                stream_info: Some(stream.clone()),
                 end: ex.sealed_length as u32,
-                last_ex_info: Some(Self::proto_to_mgr_extent(&ex)),
+                last_ex_info: Some(ex.clone()),
             }));
         }
 
@@ -2015,9 +1928,9 @@ impl AutumnManager {
         Ok(rkyv_encode(&CheckCommitLengthResp {
             code: CODE_OK,
             message: String::new(),
-            stream_info: Some(Self::proto_to_mgr_stream(&stream)),
+            stream_info: Some(stream.clone()),
             end,
-            last_ex_info: Some(Self::proto_to_mgr_extent(&ex)),
+            last_ex_info: Some(ex.clone()),
         }))
     }
 
@@ -2161,7 +2074,7 @@ impl AutumnManager {
         let mut node_ids = Vec::with_capacity(selected.len());
         let mut disk_ids = Vec::with_capacity(selected.len());
         let selected_ids: HashSet<u64> = selected.iter().map(|n| n.node_id).collect();
-        let mut fallback_nodes: Vec<ProtoNodeInfo> = nodes_map
+        let mut fallback_nodes: Vec<MgrNodeInfo> = nodes_map
             .values()
             .filter(|n| !selected_ids.contains(&n.node_id))
             .cloned()
@@ -2194,7 +2107,7 @@ impl AutumnManager {
             disk_ids.push(disk);
         }
 
-        let new_extent = ProtoExtentInfo {
+        let new_extent = MgrExtentInfo {
             extent_id,
             replicates: node_ids[..data].to_vec(),
             parity: node_ids[data..].to_vec(),
@@ -2242,8 +2155,8 @@ impl AutumnManager {
         Ok(rkyv_encode(&StreamAllocExtentResp {
             code: CODE_OK,
             message: String::new(),
-            stream_info: Some(Self::proto_to_mgr_stream(&stream_after)),
-            last_ex_info: Some(Self::proto_to_mgr_extent(&new_extent)),
+            stream_info: Some(stream_after.clone()),
+            last_ex_info: Some(new_extent.clone()),
         }))
     }
 
@@ -2261,7 +2174,7 @@ impl AutumnManager {
 
         let out = {
             let mut s = self.store.inner.borrow_mut();
-            (|| -> Result<(ProtoStreamInfo, Vec<ProtoExtentInfo>, Vec<u64>), AppError> {
+            (|| -> Result<(MgrStreamInfo, Vec<MgrExtentInfo>, Vec<u64>), AppError> {
                 Self::ensure_owner_revision(&req.owner_key, req.revision, &s)?;
                 let removed: HashSet<u64> = req.extent_ids.into_iter().collect();
                 let stream = s
@@ -2310,7 +2223,7 @@ impl AutumnManager {
                 Ok(rkyv_encode(&PunchHolesResp {
                     code: CODE_OK,
                     message: String::new(),
-                    stream: Some(Self::proto_to_mgr_stream(&stream)),
+                    stream: Some(stream.clone()),
                 }))
             }
             Err(err) => Ok(rkyv_encode(&PunchHolesResp {
@@ -2335,7 +2248,7 @@ impl AutumnManager {
 
         let out = {
             let mut s = self.store.inner.borrow_mut();
-            (|| -> Result<(ProtoStreamInfo, Vec<ProtoExtentInfo>, Vec<u64>), AppError> {
+            (|| -> Result<(MgrStreamInfo, Vec<MgrExtentInfo>, Vec<u64>), AppError> {
                 Self::ensure_owner_revision(&req.owner_key, req.revision, &s)?;
                 let stream = s
                     .streams
@@ -2398,7 +2311,7 @@ impl AutumnManager {
                 Ok(rkyv_encode(&TruncateResp {
                     code: CODE_OK,
                     message: String::new(),
-                    updated_stream_info: Some(Self::proto_to_mgr_stream(&stream)),
+                    updated_stream_info: Some(stream.clone()),
                 }))
             }
             Err(err) => Ok(rkyv_encode(&TruncateResp {
@@ -2422,7 +2335,7 @@ impl AutumnManager {
 
         let out = {
             let mut s = self.store.inner.borrow_mut();
-            (|| -> Result<(Vec<ProtoStreamInfo>, Vec<ProtoExtentInfo>), AppError> {
+            (|| -> Result<(Vec<MgrStreamInfo>, Vec<MgrExtentInfo>), AppError> {
                 Self::ensure_owner_revision(&req.owner_key, req.revision, &s)?;
 
                 let src_meta = s
@@ -2497,7 +2410,7 @@ impl AutumnManager {
                 let mut left = src_meta.clone();
                 let mut right = src_meta;
 
-                left.rg = Some(autumn_proto::autumn::Range {
+                left.rg = Some(MgrRange {
                     start_key: rg.start_key.clone(),
                     end_key: req.mid_key.clone(),
                 });
@@ -2505,7 +2418,7 @@ impl AutumnManager {
                 right.log_stream = new_log_stream;
                 right.row_stream = new_row_stream;
                 right.meta_stream = new_meta_stream;
-                right.rg = Some(autumn_proto::autumn::Range {
+                right.rg = Some(MgrRange {
                     start_key: req.mid_key,
                     end_key: rg.end_key,
                 });
@@ -2533,14 +2446,10 @@ impl AutumnManager {
                     let mut kvs =
                         Vec::with_capacity(changed_streams.len() + changed_extents.len());
                     for st in &changed_streams {
-                        let encoded = EtcdMirror::encode_msg(st)
-                            .map_err(|e| (StatusCode::Internal, e.to_string()))?;
-                        kvs.push((format!("streams/{}", st.stream_id), encoded));
+                        kvs.push((format!("streams/{}", st.stream_id), rkyv_encode(st).to_vec()));
                     }
                     for ex in &changed_extents {
-                        let encoded = EtcdMirror::encode_msg(ex)
-                            .map_err(|e| (StatusCode::Internal, e.to_string()))?;
-                        kvs.push((format!("extents/{}", ex.extent_id), encoded));
+                        kvs.push((format!("extents/{}", ex.extent_id), rkyv_encode(ex).to_vec()));
                     }
                     etcd.put_msgs_txn(kvs)
                         .await
@@ -2608,21 +2517,9 @@ impl AutumnManager {
         let req: UpsertPartitionReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
-        // Convert MgrPartitionMeta → proto PartitionMeta
-        let meta = ProtoPartitionMeta {
-            part_id: req.meta.part_id,
-            log_stream: req.meta.log_stream,
-            row_stream: req.meta.row_stream,
-            meta_stream: req.meta.meta_stream,
-            rg: req.meta.rg.map(|r| autumn_proto::autumn::Range {
-                start_key: r.start_key,
-                end_key: r.end_key,
-            }),
-        };
-
         {
             let mut s = self.store.inner.borrow_mut();
-            s.partitions.insert(meta.part_id, meta);
+            s.partitions.insert(req.meta.part_id, req.meta);
             Self::rebalance_regions(&mut s);
         }
         if let Err(err) = self.mirror_partition_snapshot().await {
@@ -2643,7 +2540,7 @@ impl AutumnManager {
         let regions = s
             .regions
             .iter()
-            .map(|(&id, r)| (id, Self::proto_to_mgr_region(r)))
+            .map(|(&id, r)| (id, r.clone()))
             .collect();
         let ps_details = s
             .ps_nodes

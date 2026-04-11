@@ -1,19 +1,16 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::cell::RefCell;
 
 use anyhow::{anyhow, Result};
 use autumn_rpc::{Frame, FrameDecoder, RpcError};
 use bytes::Bytes;
-use compio::BufResult;
 use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::net::TcpStream;
+use compio::BufResult;
 
-/// A single multiplexed RPC connection for the single-threaded compio runtime.
-///
-/// Since everything is single-threaded, no Mutex needed. Uses simple
-/// sequential request-response: send frame, read response frame.
+/// A single sequential RPC connection for single-threaded compio runtime.
 struct RpcConn {
     reader: compio::net::OwnedReadHalf<TcpStream>,
     writer: compio::net::OwnedWriteHalf<TcpStream>,
@@ -36,7 +33,7 @@ impl RpcConn {
         })
     }
 
-    /// Send a request and read back the response (single-threaded, no multiplexing).
+    /// Send a request and read back the response (sequential, single owner).
     async fn call(&mut self, msg_type: u8, payload: Bytes) -> Result<Bytes> {
         let req_id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
@@ -46,7 +43,6 @@ impl RpcConn {
         let BufResult(result, _) = self.writer.write_all(data).await;
         result?;
 
-        // Read until we get the response for our req_id.
         loop {
             match self.decoder.try_decode().map_err(|e| anyhow!("{e}"))? {
                 Some(resp) if resp.req_id == req_id => {
@@ -56,11 +52,12 @@ impl RpcConn {
                     }
                     return Ok(resp.payload);
                 }
-                Some(_) => continue, // stale response, skip
+                Some(_) => continue,
                 None => {}
             }
 
-            let BufResult(result, buf_back) = self.reader.read(std::mem::take(&mut self.read_buf)).await;
+            let BufResult(result, buf_back) =
+                self.reader.read(std::mem::take(&mut self.read_buf)).await;
             self.read_buf = buf_back;
             let n = result?;
             if n == 0 {
@@ -72,8 +69,12 @@ impl RpcConn {
 }
 
 /// Per-process connection pool for extent nodes (single-threaded compio).
+///
+/// Uses take/put pattern on `RefCell<Option<RpcConn>>` to avoid holding
+/// borrow_mut across await points. If a conn is already taken (another task
+/// is using it), we create a second connection for that address.
 pub struct ConnPool {
-    conns: RefCell<HashMap<SocketAddr, Rc<RefCell<RpcConn>>>>,
+    conns: RefCell<HashMap<SocketAddr, Rc<RefCell<Option<RpcConn>>>>>,
 }
 
 impl ConnPool {
@@ -86,18 +87,32 @@ impl ConnPool {
     /// Send an RPC to an extent node and return the response payload.
     pub async fn call(&self, addr: &str, msg_type: u8, payload: Bytes) -> Result<Bytes> {
         let sock = parse_addr(addr)?;
-        let conn = self.get_or_connect(sock).await?;
-        let result = conn.borrow_mut().call(msg_type, payload).await;
+        let mut conn = self.take_conn(sock).await?;
+        let result = conn.call(msg_type, payload).await;
+        self.put_conn(sock, conn);
         result
     }
 
-    async fn get_or_connect(&self, addr: SocketAddr) -> Result<Rc<RefCell<RpcConn>>> {
-        if let Some(conn) = self.conns.borrow().get(&addr) {
-            return Ok(conn.clone());
+    /// Take an RpcConn for the given address. If the pooled one is in use
+    /// (taken by another task), create a fresh connection.
+    async fn take_conn(&self, addr: SocketAddr) -> Result<RpcConn> {
+        // Try to take the existing conn.
+        if let Some(cell) = self.conns.borrow().get(&addr).cloned() {
+            if let Some(conn) = cell.borrow_mut().take() {
+                return Ok(conn);
+            }
         }
-        let conn = Rc::new(RefCell::new(RpcConn::connect(addr).await?));
-        self.conns.borrow_mut().insert(addr, conn.clone());
-        Ok(conn)
+        // No pooled conn or it's in use — connect fresh.
+        RpcConn::connect(addr).await
+    }
+
+    /// Return an RpcConn to the pool.
+    fn put_conn(&self, addr: SocketAddr, conn: RpcConn) {
+        let mut conns = self.conns.borrow_mut();
+        let cell = conns
+            .entry(addr)
+            .or_insert_with(|| Rc::new(RefCell::new(None)));
+        *cell.borrow_mut() = Some(conn);
     }
 
     pub fn is_healthy(&self, addr: &str) -> bool {

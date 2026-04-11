@@ -8,16 +8,15 @@ license.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 crossbeam-skiplist.workspace = true
-prost.workspace = true
 tokio = { version = "1", features = ["sync"] }
 tracing.workspace = true
-autumn-proto = { path = "../proto" }
 autumn-rpc = { path = "../rpc" }
 autumn-stream = { path = "../stream" }
 compio = { version = "0.18", features = ["net", "time", "macros"] }
 crc32c.workspace = true
 xxhash-rust.workspace = true
 rkyv = { version = "0.8.15", features = ["alloc"] }
+futures = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

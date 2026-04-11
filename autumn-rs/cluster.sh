@@ -21,7 +21,6 @@ ETCD_DIR="$DATA_ROOT/etcd"
 MANAGER="$BIN/autumn-manager-server"
 NODE="$BIN/autumn-extent-node"
 PS="$BIN/autumn-ps"
-SC="$BIN/autumn-stream-cli"
 AC="$BIN/autumn-client"
 
 # ---------------------------------------------------------------------------
@@ -100,7 +99,6 @@ do_start() {
     need_bin "$MANAGER"
     need_bin "$NODE"
     need_bin "$PS"
-    need_bin "$SC"
     need_bin "$AC"
 
     # Create data dirs for all nodes (d1..dN)
@@ -132,7 +130,7 @@ do_start() {
     # register extent node(s)
     for (( i=1; i<=replicas; i++ )); do
         local port=$(( 9100 + i ))
-        "$SC" --manager "$MANAGER_ADDR" register-node --addr "127.0.0.1:$port" --disk "disk-$i"
+        "$AC" --manager "$MANAGER_ADDR" register-node --addr "127.0.0.1:$port" --disk "disk-$i"
     done
     echo "[cluster] extent node(s) registered"
 

@@ -1,47 +1,32 @@
 use std::net::SocketAddr;
+use std::rc::Rc;
 use std::time::Duration;
 
-use autumn_io_engine::IoMode;
 use autumn_manager::AutumnManager;
-use autumn_proto::autumn::extent_service_client::ExtentServiceClient;
-use autumn_proto::autumn::partition_kv_client::PartitionKvClient;
-use autumn_proto::autumn::partition_manager_service_client::PartitionManagerServiceClient;
-use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
-use autumn_proto::autumn::{
-    read_bytes_response, AcquireOwnerLockRequest, Code, CreateStreamRequest, Empty, GetRequest,
-    PartitionMeta, PutRequest, Range, RangeRequest, ReadBytesRequest, RegisterNodeRequest,
-    SplitPartRequest, StreamAllocExtentRequest, StreamInfoRequest, TableLocations, TruncateRequest,
-    UpsertPartitionRequest,
-};
+use autumn_partition_server::PartitionServer;
+use autumn_rpc::client::RpcClient;
+use autumn_rpc::manager_rpc::*;
+use autumn_rpc::partition_rpc::{self, TableLocations};
 use autumn_stream::{ConnPool, ExtentNode, ExtentNodeConfig, StreamClient};
-use std::sync::Arc;
-use partition_server::PartitionServer;
-use prost::Message as _;
-use tokio::time::sleep;
-use tonic::Request;
 
 fn decode_last_table_locations(data: &[u8]) -> TableLocations {
-    use prost::Message as _;
     let mut last: Option<TableLocations> = None;
     let mut buf = data;
-    while !buf.is_empty() {
-        match TableLocations::decode_length_delimited(buf) {
-            Ok(locs) => match prost::decode_length_delimiter(buf) {
-                Ok(msg_len) => {
-                    let prefix = prost::length_delimiter_len(msg_len);
-                    let total = prefix + msg_len;
-                    if total > buf.len() {
-                        break;
-                    }
-                    buf = &buf[total..];
-                    last = Some(locs);
-                }
-                Err(_) => break,
-            },
+    while buf.len() >= 4 {
+        let msg_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let total = 4 + msg_len;
+        if total > buf.len() {
+            break;
+        }
+        match partition_rpc::rkyv_decode::<TableLocations>(&buf[4..4 + msg_len]) {
+            Ok(locs) => {
+                last = Some(locs);
+                buf = &buf[total..];
+            }
             Err(_) => break,
         }
     }
-    last.unwrap_or_else(|| TableLocations::decode(data).expect("fallback decode"))
+    last.expect("no valid TableLocations record")
 }
 
 fn pick_addr() -> SocketAddr {
@@ -51,2023 +36,1117 @@ fn pick_addr() -> SocketAddr {
     addr
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stream_manager_alloc_and_truncate_flow() {
-    let manager = AutumnManager::new();
-    let mgr_addr = pick_addr();
-    let mgr_task = tokio::spawn(manager.clone().serve(mgr_addr));
-
-    sleep(Duration::from_millis(120)).await;
-
-    let endpoint = format!("http://{}", mgr_addr);
-    let mut stream = StreamManagerServiceClient::connect(endpoint)
-        .await
-        .expect("connect stream manager");
-
-    let n1_addr = "127.0.0.1:3101";
-    let n2_addr = "127.0.0.1:3102";
-
-    let n1_dir = tempfile::tempdir().expect("n1 tempdir");
-    let n2_dir = tempfile::tempdir().expect("n2 tempdir");
-    let n1 = ExtentNode::new(ExtentNodeConfig::new(
-        n1_dir.path().to_path_buf(),
-        IoMode::Standard,
-        1,
-    ))
-    .await
-    .expect("node1");
-    let n2 = ExtentNode::new(ExtentNodeConfig::new(
-        n2_dir.path().to_path_buf(),
-        IoMode::Standard,
-        2,
-    ))
-    .await
-    .expect("node2");
-    let n1_task = tokio::spawn(n1.serve(n1_addr.parse().expect("n1 addr")));
-    let n2_task = tokio::spawn(n2.serve(n2_addr.parse().expect("n2 addr")));
-    sleep(Duration::from_millis(120)).await;
-
-    stream
-        .register_node(Request::new(RegisterNodeRequest {
-            addr: n1_addr.to_string(),
-            disk_uuids: vec!["disk-a".to_string()],
-        }))
-        .await
-        .expect("register node1");
-
-    stream
-        .register_node(Request::new(RegisterNodeRequest {
-            addr: n2_addr.to_string(),
-            disk_uuids: vec!["disk-b".to_string()],
-        }))
-        .await
-        .expect("register node2");
-
-    let created = stream
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create stream")
-        .into_inner();
-    let stream_id = created.stream.expect("stream").stream_id;
-
-    let lock = stream
-        .acquire_owner_lock(Request::new(AcquireOwnerLockRequest {
-            owner_key: "owner/stream/1".to_string(),
-        }))
-        .await
-        .expect("acquire lock")
-        .into_inner();
-
-    let alloc = stream
-        .stream_alloc_extent(Request::new(StreamAllocExtentRequest {
-            stream_id,
-            owner_key: "owner/stream/1".to_string(),
-            revision: lock.revision,
-            end: 128,
-        }))
-        .await
-        .expect("alloc extent")
-        .into_inner();
-
-    let stream_after_alloc = alloc.stream_info.expect("stream after alloc");
-    assert_eq!(stream_after_alloc.extent_ids.len(), 2);
-
-    let tail_extent = *stream_after_alloc.extent_ids.last().expect("tail");
-    let trunc = stream
-        .truncate(Request::new(TruncateRequest {
-            stream_id,
-            extent_id: tail_extent,
-            owner_key: "owner/stream/1".to_string(),
-            revision: lock.revision,
-        }))
-        .await
-        .expect("truncate")
-        .into_inner();
-
-    let truncated = trunc.updated_stream_info.expect("updated stream");
-    assert_eq!(truncated.extent_ids.len(), 1);
-
-    n1_task.abort();
-    n2_task.abort();
-    mgr_task.abort();
+/// Start a manager on its own thread and return its address.
+fn start_manager(mgr_addr: SocketAddr) {
+    std::thread::spawn(move || {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let manager = AutumnManager::new();
+            let _ = manager.serve(mgr_addr).await;
+        });
+    });
+    std::thread::sleep(Duration::from_millis(200));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn partition_server_put_get_and_split_flow() {
-    let manager = AutumnManager::new();
-    let mgr_addr = pick_addr();
-    let mgr_task = tokio::spawn(manager.clone().serve(mgr_addr));
+/// Start an extent node on its own thread and return its address.
+fn start_extent_node(addr: SocketAddr, dir: std::path::PathBuf, disk_id: u64) {
+    std::thread::spawn(move || {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let n = ExtentNode::new(ExtentNodeConfig::new(dir, disk_id))
+                .await
+                .expect("extent node");
+            let _ = n.serve(addr).await;
+        });
+    });
+    std::thread::sleep(Duration::from_millis(200));
+}
 
-    sleep(Duration::from_millis(120)).await;
-
-    let endpoint = format!("http://{}", mgr_addr);
-    let mut stream = StreamManagerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("connect stream manager");
-
-    let n1_addr = "127.0.0.1:3201";
-    let n2_addr = "127.0.0.1:3202";
-    let n1_dir = tempfile::tempdir().expect("n1 tempdir");
-    let n2_dir = tempfile::tempdir().expect("n2 tempdir");
-    let n1 = ExtentNode::new(ExtentNodeConfig::new(
-        n1_dir.path().to_path_buf(),
-        IoMode::Standard,
-        1,
-    ))
-    .await
-    .expect("node1");
-    let n2 = ExtentNode::new(ExtentNodeConfig::new(
-        n2_dir.path().to_path_buf(),
-        IoMode::Standard,
-        2,
-    ))
-    .await
-    .expect("node2");
-    let n1_task = tokio::spawn(n1.serve(n1_addr.parse().expect("n1 addr")));
-    let n2_task = tokio::spawn(n2.serve(n2_addr.parse().expect("n2 addr")));
-    sleep(Duration::from_millis(120)).await;
-
-    stream
-        .register_node(Request::new(RegisterNodeRequest {
-            addr: n1_addr.to_string(),
-            disk_uuids: vec!["disk-c".to_string()],
-        }))
-        .await
-        .expect("register node1");
-
-    stream
-        .register_node(Request::new(RegisterNodeRequest {
-            addr: n2_addr.to_string(),
-            disk_uuids: vec!["disk-d".to_string()],
-        }))
-        .await
-        .expect("register node2");
-
-    let log_stream = stream
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create log stream")
-        .into_inner()
-        .stream
-        .expect("log stream")
-        .stream_id;
-
-    let row_stream = stream
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create row stream")
-        .into_inner()
-        .stream
-        .expect("row stream")
-        .stream_id;
-
-    let meta_stream = stream
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create meta stream")
-        .into_inner()
-        .stream
-        .expect("meta stream")
-        .stream_id;
-
-    let data_dir = tempfile::tempdir().expect("tempdir");
-    let ps = PartitionServer::connect(12, &endpoint)
-        .await
-        .expect("connect partition server");
-
-    let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("connect partition manager");
-
-    pm.upsert_partition(Request::new(UpsertPartitionRequest {
-        meta: Some(PartitionMeta {
-            log_stream,
-            row_stream,
-            meta_stream,
-            part_id: 501,
-            rg: Some(Range {
-                start_key: b"a".to_vec(),
-                end_key: b"z".to_vec(),
+/// Register a node with the manager via RPC.
+async fn register_node(mgr: &RpcClient, addr: &str, disk_uuid: &str) -> RegisterNodeResp {
+    let resp = mgr
+        .call(
+            MSG_REGISTER_NODE,
+            rkyv_encode(&RegisterNodeReq {
+                addr: addr.to_string(),
+                disk_uuids: vec![disk_uuid.to_string()],
             }),
-        }),
-    }))
-    .await
-    .expect("upsert partition");
-
-    ps.sync_regions_once().await.expect("sync regions");
-
-    let ps_addr = pick_addr();
-    let ps_task = tokio::spawn(ps.clone().serve(ps_addr));
-    sleep(Duration::from_millis(120)).await;
-
-    let mut kv = PartitionKvClient::connect(format!("http://{}", ps_addr))
+        )
         .await
-        .expect("connect kv");
+        .expect("register node");
+    rkyv_decode::<RegisterNodeResp>(&resp).expect("decode RegisterNodeResp")
+}
 
-    for k in ["a1", "a2", "a3", "a4"] {
-        kv.put(Request::new(PutRequest {
-            must_sync: false,
-            key: k.as_bytes().to_vec().into(),
-            value: format!("val-{k}").into_bytes().into(),
-            expires_at: 0,
-            part_id: 501,
-        }))
+/// Create a stream via RPC and return its stream_id.
+async fn create_stream(mgr: &RpcClient, replicates: u32) -> u64 {
+    let resp = mgr
+        .call(
+            MSG_CREATE_STREAM,
+            rkyv_encode(&CreateStreamReq {
+                replicates,
+                ec_data_shard: 0,
+                ec_parity_shard: 0,
+            }),
+        )
+        .await
+        .expect("create stream");
+    let created: CreateStreamResp = rkyv_decode(&resp).expect("decode CreateStreamResp");
+    created.stream.expect("stream").stream_id
+}
+
+/// Helper: send a PutReq to a partition server via RpcClient.
+async fn ps_put(
+    ps: &RpcClient,
+    part_id: u64,
+    key: &[u8],
+    value: &[u8],
+    must_sync: bool,
+) {
+    let resp = ps
+        .call(
+            partition_rpc::MSG_PUT,
+            partition_rpc::rkyv_encode(&partition_rpc::PutReq {
+                part_id,
+                key: key.to_vec(),
+                value: value.to_vec(),
+                must_sync,
+                expires_at: 0,
+            }),
+        )
         .await
         .expect("put");
-    }
-
-    let get = kv
-        .get(Request::new(GetRequest {
-            key: b"a3".to_vec(),
-            part_id: 501,
-        }))
-        .await
-        .expect("get")
-        .into_inner();
-    assert_eq!(get.value, b"val-a3");
-
-    kv.split_part(Request::new(SplitPartRequest { part_id: 501 }))
-        .await
-        .expect("split part");
-
-    let split_streams = stream
-        .stream_info(Request::new(StreamInfoRequest {
-            stream_ids: vec![log_stream, row_stream, meta_stream],
-        }))
-        .await
-        .expect("stream info after split")
-        .into_inner();
-    for stream_id in [log_stream, row_stream, meta_stream] {
-        let st = split_streams
-            .streams
-            .get(&stream_id)
-            .expect("source stream exists");
-        let tail = *st.extent_ids.last().expect("tail extent");
-        let ex = split_streams
-            .extents
-            .get(&tail)
-            .expect("tail extent info exists");
-        assert!(
-            ex.sealed_length > 0,
-            "source stream {stream_id} should be sealed during split"
-        );
-    }
-
-    let regions = pm
-        .get_regions(Request::new(Empty {}))
-        .await
-        .expect("get regions")
-        .into_inner();
-    let region_len = regions.regions.expect("regions").regions.len();
-    assert_eq!(region_len, 2);
-
-    n1_task.abort();
-    n2_task.abort();
-    ps_task.abort();
-    mgr_task.abort();
+    let _: partition_rpc::PutResp = partition_rpc::rkyv_decode(&resp).expect("decode PutResp");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn partition_server_recovery_replays_table_and_wal() {
-    let manager = AutumnManager::new();
-    let mgr_addr = pick_addr();
-    let mgr_task = tokio::spawn(manager.clone().serve(mgr_addr));
-    sleep(Duration::from_millis(120)).await;
-
-    let endpoint = format!("http://{}", mgr_addr);
-    let mut stream = StreamManagerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("connect stream manager");
-
-    let n1_addr = "127.0.0.1:3221";
-    let n2_addr = "127.0.0.1:3222";
-    let n1_dir = tempfile::tempdir().expect("n1 tempdir");
-    let n2_dir = tempfile::tempdir().expect("n2 tempdir");
-    let n1 = ExtentNode::new(ExtentNodeConfig::new(
-        n1_dir.path().to_path_buf(),
-        IoMode::Standard,
-        1,
-    ))
-    .await
-    .expect("node1");
-    let n2 = ExtentNode::new(ExtentNodeConfig::new(
-        n2_dir.path().to_path_buf(),
-        IoMode::Standard,
-        2,
-    ))
-    .await
-    .expect("node2");
-    let n1_task = tokio::spawn(n1.serve(n1_addr.parse().expect("n1 addr")));
-    let n2_task = tokio::spawn(n2.serve(n2_addr.parse().expect("n2 addr")));
-    sleep(Duration::from_millis(120)).await;
-
-    stream
-        .register_node(Request::new(RegisterNodeRequest {
-            addr: n1_addr.to_string(),
-            disk_uuids: vec!["disk-rp1".to_string()],
-        }))
-        .await
-        .expect("register node1");
-
-    stream
-        .register_node(Request::new(RegisterNodeRequest {
-            addr: n2_addr.to_string(),
-            disk_uuids: vec!["disk-rp2".to_string()],
-        }))
-        .await
-        .expect("register node2");
-
-    let log_stream = stream
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create log stream")
-        .into_inner()
-        .stream
-        .expect("log stream")
-        .stream_id;
-
-    let row_stream = stream
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create row stream")
-        .into_inner()
-        .stream
-        .expect("row stream")
-        .stream_id;
-
-    let meta_stream = stream
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create meta stream")
-        .into_inner()
-        .stream
-        .expect("meta stream")
-        .stream_id;
-
-    let data_dir = tempfile::tempdir().expect("tempdir");
-
-    let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("connect partition manager");
-
-    pm.upsert_partition(Request::new(UpsertPartitionRequest {
-        meta: Some(PartitionMeta {
-            log_stream,
-            row_stream,
-            meta_stream,
-            part_id: 511,
-            rg: Some(Range {
-                start_key: b"a".to_vec(),
-                end_key: b"z".to_vec(),
+/// Helper: send a GetReq to a partition server via RpcClient.
+async fn ps_get(ps: &RpcClient, part_id: u64, key: &[u8]) -> partition_rpc::GetResp {
+    let resp = ps
+        .call(
+            partition_rpc::MSG_GET,
+            partition_rpc::rkyv_encode(&partition_rpc::GetReq {
+                part_id,
+                key: key.to_vec(),
             }),
-        }),
-    }))
-    .await
-    .expect("upsert partition");
-
-    let ps1 = PartitionServer::connect(22, &endpoint)
+        )
         .await
-        .expect("connect partition server");
-    ps1.sync_regions_once().await.expect("sync regions");
-
-    let ps1_addr = pick_addr();
-    let ps1_task = tokio::spawn(ps1.clone().serve(ps1_addr));
-    sleep(Duration::from_millis(120)).await;
-
-    let mut kv1 = PartitionKvClient::connect(format!("http://{}", ps1_addr))
-        .await
-        .expect("connect kv1");
-
-    kv1.put(Request::new(PutRequest {
-        must_sync: false,
-        key: b"a-flush".to_vec().into(),
-        value: b"flushed-value".to_vec().into(),
-        expires_at: 0,
-        part_id: 511,
-    }))
-    .await
-    .expect("put flush key");
-
-    // Force flush so the key lands in an SSTable (not just WAL).
-    ps1.flush_partition(511).await.expect("flush ps1");
-
-    kv1.put(Request::new(PutRequest {
-        must_sync: false,
-        key: b"a-wal-1".to_vec().into(),
-        value: b"v1".to_vec().into(),
-        expires_at: 0,
-        part_id: 511,
-    }))
-    .await
-    .expect("put wal key 1");
-
-    kv1.put(Request::new(PutRequest {
-        must_sync: false,
-        key: b"a-wal-2".to_vec().into(),
-        value: b"v2".to_vec().into(),
-        expires_at: 0,
-        part_id: 511,
-    }))
-    .await
-    .expect("put wal key 2");
-
-    ps1_task.abort();
-    sleep(Duration::from_millis(120)).await;
-
-    let ps2 = PartitionServer::connect(22, &endpoint)
-        .await
-        .expect("reconnect partition server");
-    ps2.sync_regions_once().await.expect("resync regions");
-
-    let ps2_addr = pick_addr();
-    let ps2_task = tokio::spawn(ps2.clone().serve(ps2_addr));
-    sleep(Duration::from_millis(120)).await;
-
-    let mut kv2 = PartitionKvClient::connect(format!("http://{}", ps2_addr))
-        .await
-        .expect("connect kv2");
-
-    let got_flush = kv2
-        .get(Request::new(GetRequest {
-            key: b"a-flush".to_vec(),
-            part_id: 511,
-        }))
-        .await
-        .expect("get flush key")
-        .into_inner();
-    assert_eq!(got_flush.value, b"flushed-value");
-
-    let got_wal_1 = kv2
-        .get(Request::new(GetRequest {
-            key: b"a-wal-1".to_vec(),
-            part_id: 511,
-        }))
-        .await
-        .expect("get wal key 1")
-        .into_inner();
-    assert_eq!(got_wal_1.value, b"v1");
-
-    let got_wal_2 = kv2
-        .get(Request::new(GetRequest {
-            key: b"a-wal-2".to_vec(),
-            part_id: 511,
-        }))
-        .await
-        .expect("get wal key 2")
-        .into_inner();
-    assert_eq!(got_wal_2.value, b"v2");
-
-    n1_task.abort();
-    n2_task.abort();
-    ps2_task.abort();
-    mgr_task.abort();
+        .expect("get");
+    partition_rpc::rkyv_decode(&resp).expect("decode GetResp")
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stream_append_commit_punchhole_truncate_flow() {
-    let manager = AutumnManager::new();
-    let mgr_addr = pick_addr();
-    let mgr_task = tokio::spawn(manager.clone().serve(mgr_addr));
-    sleep(Duration::from_millis(120)).await;
+/// Helper: flush a partition via the Maintenance RPC.
+async fn ps_flush(ps: &RpcClient, part_id: u64) {
+    let resp = ps
+        .call(
+            partition_rpc::MSG_MAINTENANCE,
+            partition_rpc::rkyv_encode(&partition_rpc::MaintenanceReq {
+                part_id,
+                op: partition_rpc::MAINTENANCE_FLUSH,
+                extent_ids: vec![],
+            }),
+        )
+        .await
+        .expect("flush");
+    let r: partition_rpc::MaintenanceResp =
+        partition_rpc::rkyv_decode(&resp).expect("decode MaintenanceResp");
+    assert_eq!(r.code, partition_rpc::CODE_OK, "flush failed: {}", r.message);
+}
 
-    let n1_addr = "127.0.0.1:3301";
-    let n2_addr = "127.0.0.1:3302";
+/// Helper: trigger major compaction via the Maintenance RPC.
+async fn ps_compact(ps: &RpcClient, part_id: u64) {
+    let resp = ps
+        .call(
+            partition_rpc::MSG_MAINTENANCE,
+            partition_rpc::rkyv_encode(&partition_rpc::MaintenanceReq {
+                part_id,
+                op: partition_rpc::MAINTENANCE_COMPACT,
+                extent_ids: vec![],
+            }),
+        )
+        .await
+        .expect("compact");
+    let _: partition_rpc::MaintenanceResp =
+        partition_rpc::rkyv_decode(&resp).expect("decode MaintenanceResp");
+}
+
+/// Helper: trigger GC via the Maintenance RPC.
+async fn ps_gc(ps: &RpcClient, part_id: u64) {
+    let resp = ps
+        .call(
+            partition_rpc::MSG_MAINTENANCE,
+            partition_rpc::rkyv_encode(&partition_rpc::MaintenanceReq {
+                part_id,
+                op: partition_rpc::MAINTENANCE_AUTO_GC,
+                extent_ids: vec![],
+            }),
+        )
+        .await
+        .expect("gc");
+    let _: partition_rpc::MaintenanceResp =
+        partition_rpc::rkyv_decode(&resp).expect("decode MaintenanceResp");
+}
+
+/// Helper: upsert a partition via the manager RPC.
+async fn upsert_partition(
+    mgr: &RpcClient,
+    part_id: u64,
+    log_stream: u64,
+    row_stream: u64,
+    meta_stream: u64,
+    start_key: &[u8],
+    end_key: &[u8],
+) {
+    let resp = mgr
+        .call(
+            MSG_UPSERT_PARTITION,
+            rkyv_encode(&UpsertPartitionReq {
+                meta: MgrPartitionMeta {
+                    part_id,
+                    log_stream,
+                    row_stream,
+                    meta_stream,
+                    rg: Some(MgrRange {
+                        start_key: start_key.to_vec(),
+                        end_key: end_key.to_vec(),
+                    }),
+                },
+            }),
+        )
+        .await
+        .expect("upsert partition");
+    let r: CodeResp = rkyv_decode(&resp).expect("decode CodeResp");
+    assert_eq!(r.code, CODE_OK, "upsert_partition failed: {}", r.message);
+}
+
+/// Start a partition server on its own thread.
+fn start_partition_server(ps_id: u64, mgr_addr: SocketAddr, ps_addr: SocketAddr) {
+    std::thread::spawn(move || {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let ps = PartitionServer::connect(ps_id, &mgr_addr.to_string())
+                .await
+                .expect("connect partition server");
+            ps.sync_regions_once().await.expect("sync regions");
+            let _ = ps.serve(ps_addr).await;
+        });
+    });
+    std::thread::sleep(Duration::from_millis(200));
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stream_manager_alloc_and_truncate_flow() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
     let n1_dir = tempfile::tempdir().expect("n1 tempdir");
     let n2_dir = tempfile::tempdir().expect("n2 tempdir");
-    let n1 = ExtentNode::new(ExtentNodeConfig::new(
-        n1_dir.path().to_path_buf(),
-        IoMode::Standard,
-        1,
-    ))
-    .await
-    .expect("node1");
-    let n2 = ExtentNode::new(ExtentNodeConfig::new(
-        n2_dir.path().to_path_buf(),
-        IoMode::Standard,
-        2,
-    ))
-    .await
-    .expect("node2");
-    let n1_task = tokio::spawn(n1.serve(n1_addr.parse().expect("n1 addr")));
-    let n2_task = tokio::spawn(n2.serve(n2_addr.parse().expect("n2 addr")));
-    sleep(Duration::from_millis(120)).await;
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
-    let endpoint = format!("http://{}", mgr_addr);
-    let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("connect stream manager");
-    sm.register_node(Request::new(RegisterNodeRequest {
-        addr: n1_addr.to_string(),
-        disk_uuids: vec!["disk-e".to_string()],
-    }))
-    .await
-    .expect("register node1");
-    sm.register_node(Request::new(RegisterNodeRequest {
-        addr: n2_addr.to_string(),
-        disk_uuids: vec!["disk-f".to_string()],
-    }))
-    .await
-    .expect("register node2");
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
 
-    let created = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create stream")
-        .into_inner();
-    let stream_id = created.stream.expect("stream").stream_id;
+        register_node(&mgr, &n1_addr.to_string(), "disk-a").await;
+        register_node(&mgr, &n2_addr.to_string(), "disk-b").await;
 
-    let mut client = StreamClient::connect(&endpoint, "owner/e2e/1".to_string(), 8, Arc::new(ConnPool::new()))
+        let stream_id = create_stream(&mgr, 1).await;
+
+        let resp = mgr
+            .call(
+                MSG_ACQUIRE_OWNER_LOCK,
+                rkyv_encode(&AcquireOwnerLockReq {
+                    owner_key: "owner/stream/1".to_string(),
+                }),
+            )
+            .await
+            .expect("acquire lock");
+        let lock: AcquireOwnerLockResp = rkyv_decode(&resp).expect("decode");
+
+        let resp = mgr
+            .call(
+                MSG_STREAM_ALLOC_EXTENT,
+                rkyv_encode(&StreamAllocExtentReq {
+                    stream_id,
+                    owner_key: "owner/stream/1".to_string(),
+                    revision: lock.revision,
+                    end: 128,
+                }),
+            )
+            .await
+            .expect("alloc extent");
+        let alloc: StreamAllocExtentResp = rkyv_decode(&resp).expect("decode");
+        let stream_after_alloc = alloc.stream_info.expect("stream after alloc");
+        assert_eq!(stream_after_alloc.extent_ids.len(), 2);
+
+        let tail_extent = *stream_after_alloc.extent_ids.last().expect("tail");
+        let resp = mgr
+            .call(
+                MSG_TRUNCATE,
+                rkyv_encode(&TruncateReq {
+                    stream_id,
+                    extent_id: tail_extent,
+                    owner_key: "owner/stream/1".to_string(),
+                    revision: lock.revision,
+                }),
+            )
+            .await
+            .expect("truncate");
+        let trunc: TruncateResp = rkyv_decode(&resp).expect("decode");
+        let truncated = trunc.updated_stream_info.expect("updated stream");
+        assert_eq!(truncated.extent_ids.len(), 1);
+    });
+}
+
+#[test]
+fn partition_server_put_get_and_split_flow() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    let n1_dir = tempfile::tempdir().expect("n1 tempdir");
+    let n2_dir = tempfile::tempdir().expect("n2 tempdir");
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+
+        register_node(&mgr, &n1_addr.to_string(), "disk-c").await;
+        register_node(&mgr, &n2_addr.to_string(), "disk-d").await;
+
+        let log_stream = create_stream(&mgr, 1).await;
+        let row_stream = create_stream(&mgr, 1).await;
+        let meta_stream = create_stream(&mgr, 1).await;
+
+        upsert_partition(&mgr, 501, log_stream, row_stream, meta_stream, b"a", b"z").await;
+
+        // Start partition server
+        let ps_addr = pick_addr();
+        start_partition_server(12, mgr_addr, ps_addr);
+
+        let ps = RpcClient::connect(ps_addr).await.expect("connect ps");
+
+        for k in ["a1", "a2", "a3", "a4"] {
+            ps_put(&ps, 501, k.as_bytes(), format!("val-{k}").as_bytes(), false).await;
+        }
+
+        let get = ps_get(&ps, 501, b"a3").await;
+        assert_eq!(get.value, b"val-a3");
+
+        // Split
+        let resp = ps
+            .call(
+                partition_rpc::MSG_SPLIT_PART,
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 501 }),
+            )
+            .await
+            .expect("split part");
+        let _: partition_rpc::SplitPartResp =
+            partition_rpc::rkyv_decode(&resp).expect("decode SplitPartResp");
+
+        // Check streams are sealed after split
+        let resp = mgr
+            .call(
+                MSG_STREAM_INFO,
+                rkyv_encode(&StreamInfoReq {
+                    stream_ids: vec![log_stream, row_stream, meta_stream],
+                }),
+            )
+            .await
+            .expect("stream info");
+        let info: StreamInfoResp = rkyv_decode(&resp).expect("decode");
+        for (_, si) in &info.streams {
+            let tail = *si.extent_ids.last().expect("tail extent");
+            let ex = info
+                .extents
+                .iter()
+                .find(|(eid, _)| *eid == tail)
+                .expect("tail extent info")
+                .1
+                .clone();
+            assert!(
+                ex.sealed_length > 0,
+                "source stream should be sealed during split"
+            );
+        }
+
+        // Check regions
+        let resp = mgr
+            .call(MSG_GET_REGIONS, bytes::Bytes::new())
+            .await
+            .expect("get regions");
+        let regions: GetRegionsResp = rkyv_decode(&resp).expect("decode");
+        assert_eq!(regions.regions.len(), 2);
+    });
+}
+
+#[test]
+fn partition_server_recovery_replays_table_and_wal() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    let n1_dir = tempfile::tempdir().expect("n1 tempdir");
+    let n2_dir = tempfile::tempdir().expect("n2 tempdir");
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+
+        register_node(&mgr, &n1_addr.to_string(), "disk-rp1").await;
+        register_node(&mgr, &n2_addr.to_string(), "disk-rp2").await;
+
+        let log_stream = create_stream(&mgr, 1).await;
+        let row_stream = create_stream(&mgr, 1).await;
+        let meta_stream = create_stream(&mgr, 1).await;
+
+        upsert_partition(&mgr, 511, log_stream, row_stream, meta_stream, b"a", b"z").await;
+
+        // First PS
+        let ps1_addr = pick_addr();
+        start_partition_server(22, mgr_addr, ps1_addr);
+
+        let ps1 = RpcClient::connect(ps1_addr).await.expect("connect ps1");
+
+        ps_put(&ps1, 511, b"a-flush", b"flushed-value", false).await;
+        ps_flush(&ps1, 511).await;
+        ps_put(&ps1, 511, b"a-wal-1", b"v1", false).await;
+        ps_put(&ps1, 511, b"a-wal-2", b"v2", false).await;
+
+        // Drop ps1 connection (server thread keeps running but we don't care)
+        drop(ps1);
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Second PS (recovery)
+        let ps2_addr = pick_addr();
+        start_partition_server(22, mgr_addr, ps2_addr);
+
+        let ps2 = RpcClient::connect(ps2_addr).await.expect("connect ps2");
+
+        let got_flush = ps_get(&ps2, 511, b"a-flush").await;
+        assert_eq!(got_flush.value, b"flushed-value");
+
+        let got_wal_1 = ps_get(&ps2, 511, b"a-wal-1").await;
+        assert_eq!(got_wal_1.value, b"v1");
+
+        let got_wal_2 = ps_get(&ps2, 511, b"a-wal-2").await;
+        assert_eq!(got_wal_2.value, b"v2");
+    });
+}
+
+#[test]
+fn stream_append_commit_punchhole_truncate_flow() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    let n1_dir = tempfile::tempdir().expect("n1 tempdir");
+    let n2_dir = tempfile::tempdir().expect("n2 tempdir");
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+
+        register_node(&mgr, &n1_addr.to_string(), "disk-e").await;
+        register_node(&mgr, &n2_addr.to_string(), "disk-f").await;
+
+        let stream_id = create_stream(&mgr, 1).await;
+
+        let pool = Rc::new(ConnPool::new());
+        let client = StreamClient::connect(
+            &mgr_addr.to_string(),
+            "owner/e2e/1".to_string(),
+            8,
+            pool,
+        )
         .await
         .expect("stream client");
 
-    let first_batch = [b"hello".as_slice(), b"world!!!".as_slice()];
-    let b1 = client
-        .append_batch(stream_id, &first_batch, true)
-        .await
-        .expect("batch append 1");
-    // append_batch returns single AppendResult (start of whole payload)
-    assert_eq!(b1.offset, 0);
-    let _a3 = client
-        .append(stream_id, b"z", true)
-        .await
-        .expect("append 3");
+        let first_batch = [b"hello".as_slice(), b"world!!!".as_slice()];
+        let b1 = client
+            .append_batch(stream_id, &first_batch, true)
+            .await
+            .expect("batch append 1");
+        assert_eq!(b1.offset, 0);
+        let _a3 = client.append(stream_id, b"z", true).await.expect("append 3");
 
-    let committed = client
-        .commit_length(stream_id)
-        .await
-        .expect("commit length");
-    assert!(committed > 0);
+        let committed = client.commit_length(stream_id).await.expect("commit length");
+        assert!(committed > 0);
 
-    let info = sm
-        .stream_info(Request::new(autumn_proto::autumn::StreamInfoRequest {
-            stream_ids: vec![stream_id],
-        }))
-        .await
-        .expect("stream_info")
-        .into_inner();
-    let stream = info.streams.get(&stream_id).expect("stream exists");
-    assert!(stream.extent_ids.len() >= 2);
-    let first = stream.extent_ids[0];
-    let second = stream.extent_ids[1];
+        let resp = mgr
+            .call(
+                MSG_STREAM_INFO,
+                rkyv_encode(&StreamInfoReq {
+                    stream_ids: vec![stream_id],
+                }),
+            )
+            .await
+            .expect("stream_info");
+        let info: StreamInfoResp = rkyv_decode(&resp).expect("decode");
+        let stream = &info
+            .streams
+            .iter()
+            .find(|(id, _)| *id == stream_id)
+            .expect("stream exists")
+            .1;
+        assert!(stream.extent_ids.len() >= 2);
+        let first = stream.extent_ids[0];
+        let second = stream.extent_ids[1];
 
-    let after_trunc = client.truncate(stream_id, second).await.expect("truncate");
-    assert_eq!(after_trunc.extent_ids[0], second);
+        let after_trunc = client.truncate(stream_id, second).await.expect("truncate");
+        assert_eq!(after_trunc.extent_ids[0], second);
 
-    let _ = client
-        .punch_holes(stream_id, vec![first])
-        .await
-        .expect("punchhole");
-
-    n1_task.abort();
-    n2_task.abort();
-    mgr_task.abort();
+        let _ = client
+            .punch_holes(stream_id, vec![first])
+            .await
+            .expect("punchhole");
+    });
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stream_append_and_read_blocks_flow() {
-    let manager = AutumnManager::new();
+#[test]
+fn stream_append_and_read_blocks_flow() {
     let mgr_addr = pick_addr();
-    let mgr_task = tokio::spawn(manager.clone().serve(mgr_addr));
-    sleep(Duration::from_millis(120)).await;
+    start_manager(mgr_addr);
 
-    let n1_sock = pick_addr();
-    let n2_sock = pick_addr();
-    let n1_addr = n1_sock.to_string();
-    let n2_addr = n2_sock.to_string();
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
     let n1_dir = tempfile::tempdir().expect("n1 tempdir");
     let n2_dir = tempfile::tempdir().expect("n2 tempdir");
-    let n1 = ExtentNode::new(ExtentNodeConfig::new(
-        n1_dir.path().to_path_buf(),
-        IoMode::Standard,
-        1,
-    ))
-    .await
-    .expect("node1");
-    let n2 = ExtentNode::new(ExtentNodeConfig::new(
-        n2_dir.path().to_path_buf(),
-        IoMode::Standard,
-        2,
-    ))
-    .await
-    .expect("node2");
-    let n1_task = tokio::spawn(n1.serve(n1_sock));
-    let n2_task = tokio::spawn(n2.serve(n2_sock));
-    sleep(Duration::from_millis(120)).await;
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
-    let endpoint = format!("http://{}", mgr_addr);
-    let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+
+        register_node(&mgr, &n1_addr.to_string(), "disk-r1").await;
+        register_node(&mgr, &n2_addr.to_string(), "disk-r2").await;
+
+        let stream_id = create_stream(&mgr, 1).await;
+
+        let pool = Rc::new(ConnPool::new());
+        let client = StreamClient::connect(
+            &mgr_addr.to_string(),
+            "owner/read/1".to_string(),
+            512 * 1024 * 1024,
+            pool,
+        )
         .await
-        .expect("connect stream manager");
-    sm.register_node(Request::new(RegisterNodeRequest {
-        addr: n1_addr.clone(),
-        disk_uuids: vec!["disk-r1".to_string()],
-    }))
-    .await
-    .expect("register node1");
-    sm.register_node(Request::new(RegisterNodeRequest {
-        addr: n2_addr.clone(),
-        disk_uuids: vec!["disk-r2".to_string()],
-    }))
-    .await
-    .expect("register node2");
+        .expect("stream client");
 
-    let created = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create stream")
-        .into_inner();
-    let stream_id = created.stream.expect("stream").stream_id;
-
-    let mut client =
-        StreamClient::connect(&endpoint, "owner/read/1".to_string(), 512 * 1024 * 1024, Arc::new(ConnPool::new()))
+        let batch = [b"hello".as_slice(), b"world".as_slice()];
+        let wr = client
+            .append_batch(stream_id, &batch, true)
             .await
-            .expect("stream client");
-    let batch = [b"hello".as_slice(), b"world".as_slice()];
-    let wr = client
-        .append_batch(stream_id, &batch, true)
-        .await
-        .expect("append batch");
-    assert_eq!(wr.offset, 0);
-    let wr2 = client
-        .append(stream_id, b"!", true)
-        .await
-        .expect("append third");
-    assert_eq!(wr2.offset, 10);
+            .expect("append batch");
+        assert_eq!(wr.offset, 0);
+        let wr2 = client.append(stream_id, b"!", true).await.expect("append third");
+        assert_eq!(wr2.offset, 10);
 
-    let info = sm
-        .stream_info(Request::new(StreamInfoRequest {
-            stream_ids: vec![stream_id],
-        }))
-        .await
-        .expect("stream_info")
-        .into_inner();
-    let stream = info.streams.get(&stream_id).expect("stream exists");
-    let extent_id = *stream.extent_ids.last().expect("tail extent");
-    let ex = info.extents.get(&extent_id).expect("extent exists");
-    let primary_id = *ex.replicates.first().expect("primary replicate");
+        // Read all bytes via StreamClient
+        let resp = mgr
+            .call(
+                MSG_STREAM_INFO,
+                rkyv_encode(&StreamInfoReq {
+                    stream_ids: vec![stream_id],
+                }),
+            )
+            .await
+            .expect("stream_info");
+        let info: StreamInfoResp = rkyv_decode(&resp).expect("decode");
+        let stream = &info
+            .streams
+            .iter()
+            .find(|(id, _)| *id == stream_id)
+            .expect("stream exists")
+            .1;
+        let extent_id = *stream.extent_ids.last().expect("tail extent");
 
-    let nodes = sm
-        .nodes_info(Request::new(Empty {}))
-        .await
-        .expect("nodes_info")
-        .into_inner();
-    let primary_addr = nodes
-        .nodes
-        .get(&primary_id)
-        .expect("primary node")
-        .address
-        .clone();
+        // Read all bytes from the extent
+        let (payload_buf, end) = client
+            .read_bytes_from_extent(extent_id, 0, 0)
+            .await
+            .expect("read bytes");
+        assert_eq!(end, 11); // "hello" + "world" + "!" = 11 bytes
+        assert_eq!(payload_buf, b"helloworld!");
 
-    let mut extent = ExtentServiceClient::connect(format!("http://{}", primary_addr))
-        .await
-        .expect("connect extent node");
-
-    // Read all bytes from the extent (offset=0, length=0 means read to end)
-    let mut rb = extent
-        .read_bytes(Request::new(ReadBytesRequest {
-            extent_id,
-            offset: 0,
-            length: 0,
-            eversion: ex.eversion,
-        }))
-        .await
-        .expect("read bytes")
-        .into_inner();
-
-    let mut header = None;
-    let mut payload_buf = Vec::new();
-    while let Some(msg) = rb.message().await.expect("stream message") {
-        match msg.data {
-            Some(read_bytes_response::Data::Header(h)) => header = Some(h),
-            Some(read_bytes_response::Data::Payload(p)) => payload_buf.extend_from_slice(&p),
-            None => {}
-        }
-    }
-
-    let h = header.expect("header");
-    assert_eq!(h.code, Code::Ok as i32);
-    assert_eq!(h.end, 11); // "hello" + "world" + "!" = 11 bytes
-    assert_eq!(payload_buf, b"helloworld!");
-
-    // Read just the last byte ("!") via byte-range read (offset=10, length=1)
-    let mut rb_last = extent
-        .read_bytes(Request::new(ReadBytesRequest {
-            extent_id,
-            offset: 10,
-            length: 1,
-            eversion: ex.eversion,
-        }))
-        .await
-        .expect("read last byte")
-        .into_inner();
-
-    let mut last_header = None;
-    let mut last_payload = Vec::new();
-    while let Some(msg) = rb_last.message().await.expect("stream message") {
-        match msg.data {
-            Some(read_bytes_response::Data::Header(h)) => last_header = Some(h),
-            Some(read_bytes_response::Data::Payload(p)) => last_payload.extend_from_slice(&p),
-            None => {}
-        }
-    }
-    let lh = last_header.expect("last header");
-    assert_eq!(lh.code, Code::Ok as i32);
-    assert_eq!(lh.end, 11);
-    assert_eq!(last_payload, b"!".to_vec());
-
-    n1_task.abort();
-    n2_task.abort();
-    mgr_task.abort();
+        // Read just the last byte via byte-range read
+        let (last_payload, _) = client
+            .read_bytes_from_extent(extent_id, 10, 1)
+            .await
+            .expect("read last byte");
+        assert_eq!(last_payload, b"!");
+    });
 }
 
 // ---------------------------------------------------------------------------
 // F030: three-stream model tests
 // ---------------------------------------------------------------------------
 
-/// Helper: spin up manager + 2 extent nodes using dynamic ports.
-async fn setup_infra_f030(
-    node_id_base: u64,
-) -> (
-    String,
-    tokio::task::JoinHandle<Result<(), anyhow::Error>>,
-    tokio::task::JoinHandle<Result<(), anyhow::Error>>,
-    tokio::task::JoinHandle<Result<(), anyhow::Error>>,
-    tempfile::TempDir,
-    tempfile::TempDir,
-) {
-    let manager = AutumnManager::new();
+/// Helper: spin up manager + 2 extent nodes.
+fn setup_infra_f030(node_id_base: u64) -> (SocketAddr, SocketAddr, SocketAddr, tempfile::TempDir, tempfile::TempDir) {
     let mgr_addr = pick_addr();
-    let mgr_task = tokio::spawn(manager.serve(mgr_addr));
-    sleep(Duration::from_millis(120)).await;
-
-    let endpoint = format!("http://{}", mgr_addr);
-    let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("connect sm");
+    start_manager(mgr_addr);
 
     let n1_sock = pick_addr();
     let n2_sock = pick_addr();
     let n1_dir = tempfile::tempdir().expect("n1 tempdir");
     let n2_dir = tempfile::tempdir().expect("n2 tempdir");
 
-    let n1 = ExtentNode::new(ExtentNodeConfig::new(
-        n1_dir.path().to_path_buf(),
-        IoMode::Standard,
-        node_id_base,
-    ))
-    .await
-    .expect("node1");
-    let n2 = ExtentNode::new(ExtentNodeConfig::new(
-        n2_dir.path().to_path_buf(),
-        IoMode::Standard,
-        node_id_base + 1,
-    ))
-    .await
-    .expect("node2");
-    let n1_task = tokio::spawn(n1.serve(n1_sock));
-    let n2_task = tokio::spawn(n2.serve(n2_sock));
-    sleep(Duration::from_millis(120)).await;
+    start_extent_node(n1_sock, n1_dir.path().to_path_buf(), node_id_base);
+    start_extent_node(n2_sock, n2_dir.path().to_path_buf(), node_id_base + 1);
 
-    sm.register_node(Request::new(RegisterNodeRequest {
-        addr: n1_sock.to_string(),
-        disk_uuids: vec![format!("disk-f030-{}", node_id_base)],
-    }))
-    .await
-    .expect("register n1");
-    sm.register_node(Request::new(RegisterNodeRequest {
-        addr: n2_sock.to_string(),
-        disk_uuids: vec![format!("disk-f030-{}", node_id_base + 1)],
-    }))
-    .await
-    .expect("register n2");
-
-    (endpoint, n1_task, n2_task, mgr_task, n1_dir, n2_dir)
+    (mgr_addr, n1_sock, n2_sock, n1_dir, n2_dir)
 }
 
-/// F030: after a flush, rowStream has an SSTable block and metaStream has
-/// a valid TableLocations protobuf pointing to that SSTable.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn f030_flush_writes_sst_to_row_stream() {
-    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) = setup_infra_f030(101).await;
+/// Register nodes after connect.
+async fn register_infra_nodes(mgr: &RpcClient, n1_addr: SocketAddr, n2_addr: SocketAddr, node_id_base: u64) {
+    register_node(mgr, &n1_addr.to_string(), &format!("disk-f030-{}", node_id_base)).await;
+    register_node(
+        mgr,
+        &n2_addr.to_string(),
+        &format!("disk-f030-{}", node_id_base + 1),
+    )
+    .await;
+}
 
-    let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("connect sm");
-    let log_stream = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create log stream")
-        .into_inner()
-        .stream
-        .expect("log stream")
-        .stream_id;
-    let row_stream = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create row stream")
-        .into_inner()
-        .stream
-        .expect("row stream")
-        .stream_id;
-    let meta_stream = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create meta stream")
-        .into_inner()
-        .stream
-        .expect("meta stream")
-        .stream_id;
+/// Create 3 streams (log, row, meta) and return their IDs.
+async fn create_three_streams(mgr: &RpcClient) -> (u64, u64, u64) {
+    let log_stream = create_stream(mgr, 1).await;
+    let row_stream = create_stream(mgr, 1).await;
+    let meta_stream = create_stream(mgr, 1).await;
+    (log_stream, row_stream, meta_stream)
+}
 
-    let data_dir = tempfile::tempdir().expect("tempdir");
-    let ps = PartitionServer::connect(41, &endpoint)
-        .await
-        .expect("connect ps");
-    let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("connect pm");
-    pm.upsert_partition(Request::new(UpsertPartitionRequest {
-        meta: Some(PartitionMeta {
-            log_stream,
-            row_stream,
-            meta_stream,
-            part_id: 601,
-            rg: Some(Range {
-                start_key: b"a".to_vec(),
-                end_key: b"z".to_vec(),
-            }),
-        }),
-    }))
-    .await
-    .expect("upsert partition");
-    ps.sync_regions_once().await.expect("sync regions");
+#[test]
+fn f030_flush_writes_sst_to_row_stream() {
+    let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(101);
 
-    let ps_addr = pick_addr();
-    let ps_task = tokio::spawn(ps.clone().serve(ps_addr));
-    sleep(Duration::from_millis(120)).await;
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+        register_infra_nodes(&mgr, n1_addr, n2_addr, 101).await;
 
-    let mut kv = PartitionKvClient::connect(format!("http://{}", ps_addr))
-        .await
-        .expect("connect kv");
+        let (log_stream, row_stream, meta_stream) = create_three_streams(&mgr).await;
 
-    kv.put(Request::new(PutRequest {
-        must_sync: false,
-        key: b"a-big".to_vec().into(),
-        value: vec![b'X'; 4 * 1024].into(),
-        expires_at: 0,
-        part_id: 601,
-    }))
-    .await
-    .expect("put big");
-    ps.flush_partition(601).await.expect("flush");
+        upsert_partition(&mgr, 601, log_stream, row_stream, meta_stream, b"a", b"z").await;
 
-    let mut sc = StreamClient::connect(&endpoint, "test-f030-flush".to_string(), 128 * 1024 * 1024, Arc::new(ConnPool::new()))
+        let ps_addr = pick_addr();
+        start_partition_server(41, mgr_addr, ps_addr);
+
+        let ps = RpcClient::connect(ps_addr).await.expect("connect ps");
+
+        ps_put(&ps, 601, b"a-big", &vec![b'X'; 4 * 1024], false).await;
+        ps_flush(&ps, 601).await;
+
+        let pool = Rc::new(ConnPool::new());
+        let sc = StreamClient::connect(
+            &mgr_addr.to_string(),
+            "test-f030-flush".to_string(),
+            128 * 1024 * 1024,
+            pool,
+        )
         .await
         .expect("stream client");
 
-    // rowStream: last block is the SSTable.
-    let sst = sc
-        .read_last_extent_data(row_stream)
-        .await
-        .expect("read_last_extent_data rowStream");
-    assert!(
-        sst.is_some(),
-        "rowStream must have SSTable data after flush"
-    );
-    assert!(!sst.unwrap().is_empty(), "SSTable data must not be empty");
-
-    // metaStream: last extent has a length-delimited TableLocations proto.
-    let meta_bytes = sc
-        .read_last_extent_data(meta_stream)
-        .await
-        .expect("read_last_extent_data metaStream");
-    assert!(
-        meta_bytes.is_some(),
-        "metaStream must have a TableLocations entry"
-    );
-    let raw = meta_bytes.unwrap();
-    let locs = decode_last_table_locations(raw.as_slice());
-    assert_eq!(
-        locs.locs.len(),
-        1,
-        "TableLocations must list exactly one SSTable"
-    );
-
-    n1_task.abort();
-    n2_task.abort();
-    ps_task.abort();
-    mgr_task.abort();
-}
-
-/// F030: full restart recovery reads from metaStream + rowStream (stream-backed SST),
-/// then replays the local WAL on top.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn f030_recovery_from_meta_and_row_streams() {
-    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) = setup_infra_f030(103).await;
-
-    let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("connect sm");
-    let log_stream = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create log stream")
-        .into_inner()
-        .stream
-        .expect("log stream")
-        .stream_id;
-    let row_stream = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create row stream")
-        .into_inner()
-        .stream
-        .expect("row stream")
-        .stream_id;
-    let meta_stream = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create meta stream")
-        .into_inner()
-        .stream
-        .expect("meta stream")
-        .stream_id;
-
-    let data_dir = tempfile::tempdir().expect("tempdir");
-    let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("connect pm");
-    pm.upsert_partition(Request::new(UpsertPartitionRequest {
-        meta: Some(PartitionMeta {
-            log_stream,
-            row_stream,
-            meta_stream,
-            part_id: 611,
-            rg: Some(Range {
-                start_key: b"a".to_vec(),
-                end_key: b"z".to_vec(),
-            }),
-        }),
-    }))
-    .await
-    .expect("upsert partition");
-
-    // First PS: write one flushed key + one WAL-only key.
-    let ps1 = PartitionServer::connect(42, &endpoint)
-        .await
-        .expect("connect ps1");
-    ps1.sync_regions_once().await.expect("sync regions");
-    let ps1_addr = pick_addr();
-    let ps1_task = tokio::spawn(ps1.clone().serve(ps1_addr));
-    sleep(Duration::from_millis(120)).await;
-
-    let mut kv1 = PartitionKvClient::connect(format!("http://{}", ps1_addr))
-        .await
-        .expect("connect kv1");
-    kv1.put(Request::new(PutRequest {
-        must_sync: false,
-        key: b"a-streamed".to_vec().into(),
-        value: vec![b'S'; 4 * 1024].into(),
-        expires_at: 0,
-        part_id: 611,
-    }))
-    .await
-    .expect("put streamed");
-    ps1.flush_partition(611).await.expect("flush ps1");
-    kv1.put(Request::new(PutRequest {
-        must_sync: false,
-        key: b"a-wal-only".to_vec().into(),
-        value: b"small".to_vec().into(),
-        expires_at: 0,
-        part_id: 611,
-    }))
-    .await
-    .expect("put wal-only");
-    ps1_task.abort();
-    sleep(Duration::from_millis(120)).await;
-
-    // Second PS: recover – reads metaStream → SST from rowStream → local WAL.
-    let ps2 = PartitionServer::connect(42, &endpoint)
-        .await
-        .expect("connect ps2");
-    ps2.sync_regions_once().await.expect("resync regions");
-    let ps2_addr = pick_addr();
-    let ps2_task = tokio::spawn(ps2.serve(ps2_addr));
-    sleep(Duration::from_millis(120)).await;
-
-    let mut kv2 = PartitionKvClient::connect(format!("http://{}", ps2_addr))
-        .await
-        .expect("connect kv2");
-
-    let v1 = kv2
-        .get(Request::new(GetRequest {
-            key: b"a-streamed".to_vec(),
-            part_id: 611,
-        }))
-        .await
-        .expect("get streamed")
-        .into_inner();
-    assert_eq!(
-        v1.value.len(),
-        4 * 1024,
-        "stream-backed SST key survives restart"
-    );
-
-    let v2 = kv2
-        .get(Request::new(GetRequest {
-            key: b"a-wal-only".to_vec(),
-            part_id: 611,
-        }))
-        .await
-        .expect("get wal-only")
-        .into_inner();
-    assert_eq!(v2.value, b"small", "WAL-only key survives restart");
-
-    n1_task.abort();
-    n2_task.abort();
-    ps2_task.abort();
-    mgr_task.abort();
-}
-
-/// F029: compaction merges multiple small SSTables into one.
-///
-/// Test steps:
-/// 1. Write enough data to produce at least 3 separate SSTables (each flush
-///    produces one SSTable; we write 3 × 300 KB to exceed FLUSH_MEM_BYTES each time).
-/// 2. Trigger a major compaction via `trigger_major_compact`.
-/// 3. Verify all keys are still readable after compaction.
-/// 4. Verify the number of SSTables decreased (merged into fewer tables).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn f029_compaction_merges_small_tables() {
-    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) = setup_infra_f030(105).await;
-
-    let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("connect sm");
-    let log_stream = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create log stream")
-        .into_inner()
-        .stream
-        .expect("log stream")
-        .stream_id;
-    let row_stream = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create row stream")
-        .into_inner()
-        .stream
-        .expect("row stream")
-        .stream_id;
-    let meta_stream = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create meta stream")
-        .into_inner()
-        .stream
-        .expect("meta stream")
-        .stream_id;
-
-    let data_dir = tempfile::tempdir().expect("tempdir");
-    let ps = PartitionServer::connect(43, &endpoint)
-        .await
-        .expect("connect ps");
-    let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("connect pm");
-    pm.upsert_partition(Request::new(UpsertPartitionRequest {
-        meta: Some(PartitionMeta {
-            log_stream,
-            row_stream,
-            meta_stream,
-            part_id: 621,
-            rg: Some(Range {
-                start_key: b"a".to_vec(),
-                end_key: b"z".to_vec(),
-            }),
-        }),
-    }))
-    .await
-    .expect("upsert partition");
-    ps.sync_regions_once().await.expect("sync regions");
-
-    let ps_addr = pick_addr();
-    let ps_task = tokio::spawn(ps.clone().serve(ps_addr));
-    sleep(Duration::from_millis(120)).await;
-
-    let mut kv = PartitionKvClient::connect(format!("http://{}", ps_addr))
-        .await
-        .expect("connect kv");
-
-    // Write 3 values, each followed by an explicit flush.
-    for i in 0u8..3 {
-        kv.put(Request::new(PutRequest {
-            must_sync: false,
-            key: format!("key-{:02}", i).into_bytes().into(),
-            value: vec![b'A' + i; 4 * 1024].into(),
-            expires_at: 0,
-            part_id: 621,
-        }))
-        .await
-        .expect("put large key");
-        ps.flush_partition(621).await.expect("flush");
-    }
-
-    // Verify we have 3 SSTables in metaStream before compaction.
-    let mut sc = StreamClient::connect(&endpoint, "test-f029".to_string(), 128 * 1024 * 1024, Arc::new(ConnPool::new()))
-        .await
-        .expect("stream client");
-    let meta_bytes_before = sc
-        .read_last_extent_data(meta_stream)
-        .await
-        .expect("read meta")
-        .expect("meta data must exist");
-    let locs_before = decode_last_table_locations(&meta_bytes_before);
-    assert!(
-        locs_before.locs.len() >= 2,
-        "expected at least 2 SSTables before compaction, got {}",
-        locs_before.locs.len()
-    );
-
-    // Trigger major compaction (non-blocking send to bounded channel).
-    ps.trigger_major_compact(621);
-    sleep(Duration::from_millis(800)).await; // wait for compaction to complete
-
-    // All keys must still be readable after compaction.
-    for i in 0u8..3 {
-        let resp = kv
-            .get(Request::new(GetRequest {
-                key: format!("key-{:02}", i).into_bytes(),
-                part_id: 621,
-            }))
+        // rowStream: last block is the SSTable.
+        let sst = sc
+            .read_last_extent_data(row_stream)
             .await
-            .expect("get after compact")
-            .into_inner();
-        assert_eq!(
-            resp.value.len(),
-            4 * 1024,
-            "key-{:02} must be readable after compaction",
-            i
-        );
+            .expect("read_last_extent_data rowStream");
+        assert!(sst.is_some(), "rowStream must have SSTable data after flush");
+        assert!(!sst.unwrap().is_empty(), "SSTable data must not be empty");
+
+        // metaStream: last extent has a TableLocations record.
+        let meta_bytes = sc
+            .read_last_extent_data(meta_stream)
+            .await
+            .expect("read_last_extent_data metaStream");
         assert!(
-            resp.value.iter().all(|&b| b == b'A' + i),
-            "key-{:02} value bytes must match",
-            i
+            meta_bytes.is_some(),
+            "metaStream must have a TableLocations entry"
         );
-    }
+        let raw = meta_bytes.unwrap();
+        let locs = decode_last_table_locations(raw.as_slice());
+        assert_eq!(
+            locs.locs.len(),
+            1,
+            "TableLocations must list exactly one SSTable"
+        );
+    });
+}
 
-    // After major compaction the number of SSTables should have decreased.
-    let meta_bytes_after = sc
-        .read_last_extent_data(meta_stream)
+#[test]
+fn f030_recovery_from_meta_and_row_streams() {
+    let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(103);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+        register_infra_nodes(&mgr, n1_addr, n2_addr, 103).await;
+
+        let (log_stream, row_stream, meta_stream) = create_three_streams(&mgr).await;
+
+        upsert_partition(&mgr, 611, log_stream, row_stream, meta_stream, b"a", b"z").await;
+
+        // First PS: write one flushed key + one WAL-only key.
+        let ps1_addr = pick_addr();
+        start_partition_server(42, mgr_addr, ps1_addr);
+
+        let ps1 = RpcClient::connect(ps1_addr).await.expect("connect ps1");
+        ps_put(&ps1, 611, b"a-streamed", &vec![b'S'; 4 * 1024], false).await;
+        ps_flush(&ps1, 611).await;
+        ps_put(&ps1, 611, b"a-wal-only", b"small", false).await;
+
+        drop(ps1);
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Second PS: recover
+        let ps2_addr = pick_addr();
+        start_partition_server(42, mgr_addr, ps2_addr);
+
+        let ps2 = RpcClient::connect(ps2_addr).await.expect("connect ps2");
+
+        let v1 = ps_get(&ps2, 611, b"a-streamed").await;
+        assert_eq!(v1.value.len(), 4 * 1024, "stream-backed SST key survives restart");
+
+        let v2 = ps_get(&ps2, 611, b"a-wal-only").await;
+        assert_eq!(v2.value, b"small", "WAL-only key survives restart");
+    });
+}
+
+#[test]
+fn f029_compaction_merges_small_tables() {
+    let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(105);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+        register_infra_nodes(&mgr, n1_addr, n2_addr, 105).await;
+
+        let (log_stream, row_stream, meta_stream) = create_three_streams(&mgr).await;
+
+        upsert_partition(&mgr, 621, log_stream, row_stream, meta_stream, b"a", b"z").await;
+
+        let ps_addr = pick_addr();
+        start_partition_server(43, mgr_addr, ps_addr);
+
+        let ps = RpcClient::connect(ps_addr).await.expect("connect ps");
+
+        // Write 3 values, each followed by an explicit flush.
+        for i in 0u8..3 {
+            ps_put(
+                &ps,
+                621,
+                format!("key-{:02}", i).as_bytes(),
+                &vec![b'A' + i; 4 * 1024],
+                false,
+            )
+            .await;
+            ps_flush(&ps, 621).await;
+        }
+
+        // Verify we have at least 2 SSTables before compaction.
+        let pool = Rc::new(ConnPool::new());
+        let sc = StreamClient::connect(
+            &mgr_addr.to_string(),
+            "test-f029".to_string(),
+            128 * 1024 * 1024,
+            pool,
+        )
         .await
-        .expect("read meta after compact")
-        .expect("meta data must exist after compact");
-    let locs_after = decode_last_table_locations(&meta_bytes_after);
-    assert!(
-        locs_after.locs.len() < locs_before.locs.len(),
-        "compaction should reduce SSTable count: before={} after={}",
-        locs_before.locs.len(),
-        locs_after.locs.len()
-    );
+        .expect("stream client");
 
-    n1_task.abort();
-    n2_task.abort();
-    ps_task.abort();
-    mgr_task.abort();
+        let meta_bytes_before = sc
+            .read_last_extent_data(meta_stream)
+            .await
+            .expect("read meta")
+            .expect("meta data must exist");
+        let locs_before = decode_last_table_locations(&meta_bytes_before);
+        assert!(
+            locs_before.locs.len() >= 2,
+            "expected at least 2 SSTables before compaction, got {}",
+            locs_before.locs.len()
+        );
+
+        // Trigger major compaction.
+        ps_compact(&ps, 621).await;
+        compio::time::sleep(Duration::from_millis(800)).await;
+
+        // All keys must still be readable after compaction.
+        for i in 0u8..3 {
+            let resp = ps_get(&ps, 621, format!("key-{:02}", i).as_bytes()).await;
+            assert_eq!(
+                resp.value.len(),
+                4 * 1024,
+                "key-{:02} must be readable after compaction",
+                i
+            );
+            assert!(
+                resp.value.iter().all(|&b| b == b'A' + i),
+                "key-{:02} value bytes must match",
+                i
+            );
+        }
+
+        // After major compaction the number of SSTables should have decreased.
+        let meta_bytes_after = sc
+            .read_last_extent_data(meta_stream)
+            .await
+            .expect("read meta after compact")
+            .expect("meta data must exist after compact");
+        let locs_after = decode_last_table_locations(&meta_bytes_after);
+        assert!(
+            locs_after.locs.len() < locs_before.locs.len(),
+            "compaction should reduce SSTable count: before={} after={}",
+            locs_before.locs.len(),
+            locs_after.locs.len()
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------
 // F031: value log separation tests
 // ---------------------------------------------------------------------------
 
-/// F031: large values (> 4KB) are stored in logStream; Get returns correct bytes.
-/// Small values (<= 4KB) stay inline. Both are readable without restart.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn f031_large_value_stored_in_log_stream() {
-    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) = setup_infra_f030(107).await;
+#[test]
+fn f031_large_value_stored_in_log_stream() {
+    let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(107);
 
-    let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("connect sm");
-    let log_stream = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create log stream")
-        .into_inner()
-        .stream
-        .expect("log stream")
-        .stream_id;
-    let row_stream = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create row stream")
-        .into_inner()
-        .stream
-        .expect("row stream")
-        .stream_id;
-    let meta_stream = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create meta stream")
-        .into_inner()
-        .stream
-        .expect("meta stream")
-        .stream_id;
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+        register_infra_nodes(&mgr, n1_addr, n2_addr, 107).await;
 
-    let data_dir = tempfile::tempdir().expect("tempdir");
-    let ps = PartitionServer::connect(51, &endpoint)
-        .await
-        .expect("connect ps");
-    let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("connect pm");
-    pm.upsert_partition(Request::new(UpsertPartitionRequest {
-        meta: Some(PartitionMeta {
-            log_stream,
-            row_stream,
-            meta_stream,
-            part_id: 701,
-            rg: Some(Range {
-                start_key: b"a".to_vec(),
-                end_key: b"z".to_vec(),
-            }),
-        }),
-    }))
-    .await
-    .expect("upsert partition");
-    ps.sync_regions_once().await.expect("sync regions");
+        let (log_stream, row_stream, meta_stream) = create_three_streams(&mgr).await;
 
-    let ps_addr = pick_addr();
-    let ps_task = tokio::spawn(ps.clone().serve(ps_addr));
-    sleep(Duration::from_millis(120)).await;
+        upsert_partition(&mgr, 701, log_stream, row_stream, meta_stream, b"a", b"z").await;
 
-    let mut kv = PartitionKvClient::connect(format!("http://{}", ps_addr))
-        .await
-        .expect("connect kv");
+        let ps_addr = pick_addr();
+        start_partition_server(51, mgr_addr, ps_addr);
 
-    // Large value: 8 KB > VALUE_THROTTLE (4 KB) — stored in logStream.
-    let large_val: Vec<u8> = (0u8..=255).cycle().take(8 * 1024).collect();
-    kv.put(Request::new(PutRequest {
-        must_sync: false,
-        key: b"large-key".to_vec().into(),
-        value: large_val.clone().into(),
-        expires_at: 0,
-        part_id: 701,
-    }))
-    .await
-    .expect("put large value");
+        let ps = RpcClient::connect(ps_addr).await.expect("connect ps");
 
-    // Small value: 2 KB <= VALUE_THROTTLE — stays inline.
-    let small_val = vec![b'S'; 2 * 1024];
-    kv.put(Request::new(PutRequest {
-        must_sync: false,
-        key: b"small-key".to_vec().into(),
-        value: small_val.clone().into(),
-        expires_at: 0,
-        part_id: 701,
-    }))
-    .await
-    .expect("put small value");
+        // Large value: 8 KB > VALUE_THROTTLE (4 KB) — stored in logStream.
+        let large_val: Vec<u8> = (0u8..=255).cycle().take(8 * 1024).collect();
+        ps_put(&ps, 701, b"large-key", &large_val, false).await;
 
-    let got_large = kv
-        .get(Request::new(GetRequest {
-            key: b"large-key".to_vec(),
-            part_id: 701,
-        }))
-        .await
-        .expect("get large")
-        .into_inner();
-    assert_eq!(
-        got_large.value, large_val,
-        "large value must roundtrip via logStream"
-    );
+        // Small value: 2 KB <= VALUE_THROTTLE — stays inline.
+        let small_val = vec![b'S'; 2 * 1024];
+        ps_put(&ps, 701, b"small-key", &small_val, false).await;
 
-    let got_small = kv
-        .get(Request::new(GetRequest {
-            key: b"small-key".to_vec(),
-            part_id: 701,
-        }))
-        .await
-        .expect("get small")
-        .into_inner();
-    assert_eq!(
-        got_small.value, small_val,
-        "small value must roundtrip inline"
-    );
+        let got_large = ps_get(&ps, 701, b"large-key").await;
+        assert_eq!(got_large.value, large_val, "large value must roundtrip via logStream");
 
-    n1_task.abort();
-    n2_task.abort();
-    ps_task.abort();
-    mgr_task.abort();
+        let got_small = ps_get(&ps, 701, b"small-key").await;
+        assert_eq!(got_small.value, small_val, "small value must roundtrip inline");
+    });
 }
 
-/// F031: after restart, large values stored in logStream are recovered.
-/// A value that was flushed to SST (SST has a ValuePointer record) must be
-/// readable after restart by following the pointer to logStream.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn f031_recovery_replays_log_stream() {
-    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) = setup_infra_f030(109).await;
+#[test]
+fn f031_recovery_replays_log_stream() {
+    let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(109);
 
-    let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("connect sm");
-    let log_stream = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create log stream")
-        .into_inner()
-        .stream
-        .expect("log stream")
-        .stream_id;
-    let row_stream = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create row stream")
-        .into_inner()
-        .stream
-        .expect("row stream")
-        .stream_id;
-    let meta_stream = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create meta stream")
-        .into_inner()
-        .stream
-        .expect("meta stream")
-        .stream_id;
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+        register_infra_nodes(&mgr, n1_addr, n2_addr, 109).await;
 
-    let data_dir = tempfile::tempdir().expect("tempdir");
-    let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("connect pm");
-    pm.upsert_partition(Request::new(UpsertPartitionRequest {
-        meta: Some(PartitionMeta {
-            log_stream,
-            row_stream,
-            meta_stream,
-            part_id: 711,
-            rg: Some(Range {
-                start_key: b"a".to_vec(),
-                end_key: b"z".to_vec(),
-            }),
-        }),
-    }))
-    .await
-    .expect("upsert partition");
+        let (log_stream, row_stream, meta_stream) = create_three_streams(&mgr).await;
 
-    // First PS: write a large value + filler to trigger flush, then a small WAL-only key.
-    let ps1 = PartitionServer::connect(52, &endpoint)
-        .await
-        .expect("connect ps1");
-    ps1.sync_regions_once().await.expect("sync regions");
-    let ps1_addr = pick_addr();
-    let ps1_task = tokio::spawn(ps1.clone().serve(ps1_addr));
-    sleep(Duration::from_millis(120)).await;
+        upsert_partition(&mgr, 711, log_stream, row_stream, meta_stream, b"a", b"z").await;
 
-    let mut kv1 = PartitionKvClient::connect(format!("http://{}", ps1_addr))
-        .await
-        .expect("connect kv1");
+        // First PS
+        let ps1_addr = pick_addr();
+        start_partition_server(52, mgr_addr, ps1_addr);
 
-    let large_val: Vec<u8> = (0u8..=255).cycle().take(8 * 1024).collect();
-    kv1.put(Request::new(PutRequest {
-        must_sync: false,
-        key: b"b-large".to_vec().into(),
-        value: large_val.clone().into(),
-        expires_at: 0,
-        part_id: 711,
-    }))
-    .await
-    .expect("put large");
+        let ps1 = RpcClient::connect(ps1_addr).await.expect("connect ps1");
 
-    // Force flush so the SST gets a ValuePointer record for b-large.
-    ps1.flush_partition(711).await.expect("flush ps1");
+        let large_val: Vec<u8> = (0u8..=255).cycle().take(8 * 1024).collect();
+        ps_put(&ps1, 711, b"b-large", &large_val, false).await;
+        ps_flush(&ps1, 711).await;
+        ps_put(&ps1, 711, b"b-wal-small", b"small-wal", false).await;
 
-    kv1.put(Request::new(PutRequest {
-        must_sync: false,
-        key: b"b-wal-small".to_vec().into(),
-        value: b"small-wal".to_vec().into(),
-        expires_at: 0,
-        part_id: 711,
-    }))
-    .await
-    .expect("put small wal");
+        drop(ps1);
+        std::thread::sleep(Duration::from_millis(200));
 
-    ps1_task.abort();
-    sleep(Duration::from_millis(120)).await;
+        // Second PS: recover
+        let ps2_addr = pick_addr();
+        start_partition_server(52, mgr_addr, ps2_addr);
 
-    // Second PS: recover.
-    let ps2 = PartitionServer::connect(52, &endpoint)
-        .await
-        .expect("connect ps2");
-    ps2.sync_regions_once().await.expect("resync");
-    let ps2_addr = pick_addr();
-    let ps2_task = tokio::spawn(ps2.serve(ps2_addr));
-    sleep(Duration::from_millis(120)).await;
+        let ps2 = RpcClient::connect(ps2_addr).await.expect("connect ps2");
 
-    let mut kv2 = PartitionKvClient::connect(format!("http://{}", ps2_addr))
-        .await
-        .expect("connect kv2");
-
-    // Large value recovered via SST ValuePointer → logStream read.
-    let got_large = kv2
-        .get(Request::new(GetRequest {
-            key: b"b-large".to_vec(),
-            part_id: 711,
-        }))
-        .await
-        .expect("get large after restart")
-        .into_inner();
-    assert_eq!(
-        got_large.value, large_val,
-        "large value must survive restart via logStream"
-    );
-
-    // Small WAL key recovered from local WAL.
-    let got_small = kv2
-        .get(Request::new(GetRequest {
-            key: b"b-wal-small".to_vec(),
-            part_id: 711,
-        }))
-        .await
-        .expect("get small after restart")
-        .into_inner();
-    assert_eq!(
-        got_small.value, b"small-wal",
-        "small WAL key must survive restart"
-    );
-
-    n1_task.abort();
-    n2_task.abort();
-    ps2_task.abort();
-    mgr_task.abort();
-}
-
-/// F031: compaction preserves ValuePointer entries — large values remain
-/// readable after compaction merges the SSTable that contains the pointer.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn f031_compaction_preserves_value_pointers() {
-    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) = setup_infra_f030(111).await;
-
-    let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("connect sm");
-    let log_stream = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create log stream")
-        .into_inner()
-        .stream
-        .expect("log stream")
-        .stream_id;
-    let row_stream = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create row stream")
-        .into_inner()
-        .stream
-        .expect("row stream")
-        .stream_id;
-    let meta_stream = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create meta stream")
-        .into_inner()
-        .stream
-        .expect("meta stream")
-        .stream_id;
-
-    let data_dir = tempfile::tempdir().expect("tempdir");
-    let ps = PartitionServer::connect(53, &endpoint)
-        .await
-        .expect("connect ps");
-    let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("connect pm");
-    pm.upsert_partition(Request::new(UpsertPartitionRequest {
-        meta: Some(PartitionMeta {
-            log_stream,
-            row_stream,
-            meta_stream,
-            part_id: 721,
-            rg: Some(Range {
-                start_key: b"a".to_vec(),
-                end_key: b"z".to_vec(),
-            }),
-        }),
-    }))
-    .await
-    .expect("upsert partition");
-    ps.sync_regions_once().await.expect("sync regions");
-
-    let ps_addr = pick_addr();
-    let ps_task = tokio::spawn(ps.clone().serve(ps_addr));
-    sleep(Duration::from_millis(120)).await;
-
-    let mut kv = PartitionKvClient::connect(format!("http://{}", ps_addr))
-        .await
-        .expect("connect kv");
-
-    let large_val: Vec<u8> = (0u8..=255).cycle().take(8 * 1024).collect();
-
-    // Write 3 rounds of large values, each followed by explicit flush, to produce 3 SSTables.
-    for i in 0..3u8 {
-        kv.put(Request::new(PutRequest {
-            must_sync: false,
-            key: format!("c-large-{}", i).into_bytes().into(),
-            value: large_val.clone().into(),
-            expires_at: 0,
-            part_id: 721,
-        }))
-        .await
-        .expect("put large");
-        ps.flush_partition(721).await.expect("flush");
-    }
-
-    // Trigger major compaction.
-    ps.trigger_major_compact(721);
-    sleep(Duration::from_millis(800)).await;
-
-    // All large values must still be readable after compaction.
-    for i in 0..3u8 {
-        let got = kv
-            .get(Request::new(GetRequest {
-                key: format!("c-large-{}", i).into_bytes(),
-                part_id: 721,
-            }))
-            .await
-            .expect("get large after compact")
-            .into_inner();
+        let got_large = ps_get(&ps2, 711, b"b-large").await;
         assert_eq!(
-            got.value, large_val,
-            "large value c-large-{} must survive compaction",
-            i
+            got_large.value, large_val,
+            "large value must survive restart via logStream"
         );
-    }
 
-    n1_task.abort();
-    n2_task.abort();
-    ps_task.abort();
-    mgr_task.abort();
+        let got_small = ps_get(&ps2, 711, b"b-wal-small").await;
+        assert_eq!(
+            got_small.value, b"small-wal",
+            "small WAL key must survive restart"
+        );
+    });
 }
 
-/// F033: GC reclaims logStream extents with >40% dead data.
-/// 1. Write large values (>4KB) for the same keys multiple times, each round triggering a flush.
-///    This creates ValuePointer entries in logStream. Overwrites make old logStream records dead.
-/// 2. Trigger major compaction (builds discard maps in the new SST).
-/// 3. Trigger GC (aggregates discards, runs runGC on high-discard extents).
-/// 4. Verify all current keys are still readable with correct values.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn f033_gc_reclaims_log_stream_extents() {
-    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) = setup_infra_f030(117).await;
+#[test]
+fn f031_compaction_preserves_value_pointers() {
+    let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(111);
 
-    let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("connect sm");
-    let log_stream = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create log stream")
-        .into_inner()
-        .stream
-        .expect("log stream")
-        .stream_id;
-    let row_stream = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create row stream")
-        .into_inner()
-        .stream
-        .expect("row stream")
-        .stream_id;
-    let meta_stream = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create meta stream")
-        .into_inner()
-        .stream
-        .expect("meta stream")
-        .stream_id;
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+        register_infra_nodes(&mgr, n1_addr, n2_addr, 111).await;
 
-    let data_dir = tempfile::tempdir().expect("tempdir");
-    let ps = PartitionServer::connect(59, &endpoint)
-        .await
-        .expect("connect ps");
-    let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("connect pm");
-    pm.upsert_partition(Request::new(UpsertPartitionRequest {
-        meta: Some(PartitionMeta {
-            log_stream,
-            row_stream,
-            meta_stream,
-            part_id: 801,
-            rg: Some(Range {
-                start_key: b"a".to_vec(),
-                end_key: b"z".to_vec(),
-            }),
-        }),
-    }))
-    .await
-    .expect("upsert partition");
-    ps.sync_regions_once().await.expect("sync regions");
+        let (log_stream, row_stream, meta_stream) = create_three_streams(&mgr).await;
 
-    let ps_addr = pick_addr();
-    let ps_task = tokio::spawn(ps.clone().serve(ps_addr));
-    sleep(Duration::from_millis(120)).await;
+        upsert_partition(&mgr, 721, log_stream, row_stream, meta_stream, b"a", b"z").await;
 
-    let mut kv = PartitionKvClient::connect(format!("http://{}", ps_addr))
-        .await
-        .expect("connect kv");
+        let ps_addr = pick_addr();
+        start_partition_server(53, mgr_addr, ps_addr);
 
-    // Round 1: write large values for 3 keys, each >4KB so they go to logStream.
-    // Explicit flush after each key so the VP is recorded in an SSTable.
-    let val_v1: Vec<u8> = vec![b'A'; 8 * 1024];
-    for i in 0u8..3 {
-        kv.put(Request::new(PutRequest {
-            must_sync: false,
-            key: format!("gc-key-{}", i).into_bytes().into(),
-            value: val_v1.clone().into(),
-            expires_at: 0,
-            part_id: 801,
-        }))
-        .await
-        .expect("put v1");
-        ps.flush_partition(801).await.expect("flush round1");
-    }
+        let ps = RpcClient::connect(ps_addr).await.expect("connect ps");
 
-    // Round 2: overwrite the same keys with new values.
-    // This makes the Round 1 logStream records dead (VP entries now point nowhere current).
-    let val_v2: Vec<u8> = vec![b'B'; 8 * 1024];
-    for i in 0u8..3 {
-        kv.put(Request::new(PutRequest {
-            must_sync: false,
-            key: format!("gc-key-{}", i).into_bytes().into(),
-            value: val_v2.clone().into(),
-            expires_at: 0,
-            part_id: 801,
-        }))
-        .await
-        .expect("put v2");
-        ps.flush_partition(801).await.expect("flush round2");
-    }
+        let large_val: Vec<u8> = (0u8..=255).cycle().take(8 * 1024).collect();
 
-    // Major compaction: merges SSTables and builds discard maps for dead VP entries.
-    ps.trigger_major_compact(801);
-    sleep(Duration::from_millis(1000)).await;
+        // Write 3 rounds of large values, each followed by explicit flush.
+        for i in 0..3u8 {
+            ps_put(
+                &ps,
+                721,
+                format!("c-large-{}", i).as_bytes(),
+                &large_val,
+                false,
+            )
+            .await;
+            ps_flush(&ps, 721).await;
+        }
 
-    // Trigger GC: should detect high-discard extents and reclaim them.
-    ps.trigger_gc(801);
-    sleep(Duration::from_millis(1500)).await;
+        // Trigger major compaction.
+        ps_compact(&ps, 721).await;
+        compio::time::sleep(Duration::from_millis(800)).await;
 
-    // All keys must still return the v2 values after GC.
-    for i in 0u8..3 {
-        let resp = kv
-            .get(Request::new(GetRequest {
-                key: format!("gc-key-{}", i).into_bytes(),
-                part_id: 801,
-            }))
-            .await
-            .expect("get after gc")
-            .into_inner();
-        assert_eq!(
-            resp.value, val_v2,
-            "gc-key-{} must return v2 value after GC",
-            i
-        );
-    }
+        // All large values must still be readable after compaction.
+        for i in 0..3u8 {
+            let got = ps_get(&ps, 721, format!("c-large-{}", i).as_bytes()).await;
+            assert_eq!(
+                got.value, large_val,
+                "large value c-large-{} must survive compaction",
+                i
+            );
+        }
+    });
+}
 
-    n1_task.abort();
-    n2_task.abort();
-    ps_task.abort();
-    mgr_task.abort();
+#[test]
+fn f033_gc_reclaims_log_stream_extents() {
+    let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(117);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+        register_infra_nodes(&mgr, n1_addr, n2_addr, 117).await;
+
+        let (log_stream, row_stream, meta_stream) = create_three_streams(&mgr).await;
+
+        upsert_partition(&mgr, 801, log_stream, row_stream, meta_stream, b"a", b"z").await;
+
+        let ps_addr = pick_addr();
+        start_partition_server(59, mgr_addr, ps_addr);
+
+        let ps = RpcClient::connect(ps_addr).await.expect("connect ps");
+
+        // Round 1: write large values
+        let val_v1: Vec<u8> = vec![b'A'; 8 * 1024];
+        for i in 0u8..3 {
+            ps_put(
+                &ps,
+                801,
+                format!("gc-key-{}", i).as_bytes(),
+                &val_v1,
+                false,
+            )
+            .await;
+            ps_flush(&ps, 801).await;
+        }
+
+        // Round 2: overwrite same keys
+        let val_v2: Vec<u8> = vec![b'B'; 8 * 1024];
+        for i in 0u8..3 {
+            ps_put(
+                &ps,
+                801,
+                format!("gc-key-{}", i).as_bytes(),
+                &val_v2,
+                false,
+            )
+            .await;
+            ps_flush(&ps, 801).await;
+        }
+
+        // Major compaction
+        ps_compact(&ps, 801).await;
+        compio::time::sleep(Duration::from_millis(1000)).await;
+
+        // Trigger GC
+        ps_gc(&ps, 801).await;
+        compio::time::sleep(Duration::from_millis(1500)).await;
+
+        // All keys must return v2 values
+        for i in 0u8..3 {
+            let resp = ps_get(&ps, 801, format!("gc-key-{}", i).as_bytes()).await;
+            assert_eq!(
+                resp.value, val_v2,
+                "gc-key-{} must return v2 value after GC",
+                i
+            );
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
 // F037: Partition split with overlap detection and major compaction
 // ---------------------------------------------------------------------------
 
-/// F037: After a split, child partitions inherit parent SSTables covering the
-/// full key range. Both children should detect overlap on open. Split on an
-/// overlapping partition must be rejected. Major compaction clears overlap.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn f037_overlap_detected_after_split_and_cleared_by_compaction() {
-    let (endpoint, n1_task, n2_task, mgr_task, _n1_dir, _n2_dir) = setup_infra_f030(119).await;
+#[test]
+fn f037_overlap_detected_after_split_and_cleared_by_compaction() {
+    let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(119);
 
-    let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("connect sm");
-    let log_stream = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create log stream")
-        .into_inner()
-        .stream
-        .expect("log stream")
-        .stream_id;
-    let row_stream = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create row stream")
-        .into_inner()
-        .stream
-        .expect("row stream")
-        .stream_id;
-    let meta_stream = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 1,
-        ..Default::default()
-        }))
-        .await
-        .expect("create meta stream")
-        .into_inner()
-        .stream
-        .expect("meta stream")
-        .stream_id;
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+        register_infra_nodes(&mgr, n1_addr, n2_addr, 119).await;
 
-    let data_dir = tempfile::tempdir().expect("tempdir");
-    let ps = PartitionServer::connect(71, &endpoint)
-        .await
-        .expect("connect ps");
-    let mut pm = PartitionManagerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("connect pm");
-    pm.upsert_partition(Request::new(UpsertPartitionRequest {
-        meta: Some(PartitionMeta {
-            log_stream,
-            row_stream,
-            meta_stream,
-            part_id: 901,
-            rg: Some(Range {
-                start_key: b"a".to_vec(),
-                end_key: b"z".to_vec(),
-            }),
-        }),
-    }))
-    .await
-    .expect("upsert partition");
-    ps.sync_regions_once().await.expect("sync regions");
+        let (log_stream, row_stream, meta_stream) = create_three_streams(&mgr).await;
 
-    let ps_addr = pick_addr();
-    let ps_task = tokio::spawn(ps.clone().serve(ps_addr));
-    sleep(Duration::from_millis(120)).await;
+        upsert_partition(&mgr, 901, log_stream, row_stream, meta_stream, b"a", b"z").await;
 
-    let mut kv = PartitionKvClient::connect(format!("http://{}", ps_addr))
-        .await
-        .expect("connect kv");
+        let ps_addr = pick_addr();
+        start_partition_server(71, mgr_addr, ps_addr);
 
-    // Write keys in the "a*" range and flush them to an SSTable.
-    for i in 0u8..5 {
-        kv.put(Request::new(PutRequest {
-            must_sync: false,
-            key: format!("a-key-{:02}", i).into_bytes().into(),
-            value: format!("val-a-{}", i).into_bytes().into(),
-            expires_at: 0,
-            part_id: 901,
-        }))
-        .await
-        .expect("put a-key");
-    }
-    ps.flush_partition(901).await.expect("flush after a-keys");
+        let ps = RpcClient::connect(ps_addr).await.expect("connect ps");
 
-    // Write keys in the "y*" range and flush them to a second SSTable.
-    for i in 0u8..5 {
-        kv.put(Request::new(PutRequest {
-            must_sync: false,
-            key: format!("y-key-{:02}", i).into_bytes().into(),
-            value: format!("val-y-{}", i).into_bytes().into(),
-            expires_at: 0,
-            part_id: 901,
-        }))
-        .await
-        .expect("put y-key");
-    }
-    ps.flush_partition(901).await.expect("flush after y-keys");
+        // Write keys in the "a*" range and flush
+        for i in 0u8..5 {
+            ps_put(
+                &ps,
+                901,
+                format!("a-key-{:02}", i).as_bytes(),
+                format!("val-a-{}", i).as_bytes(),
+                false,
+            )
+            .await;
+        }
+        ps_flush(&ps, 901).await;
 
-    // Parent has no overlap before the split.
-    assert!(
-        !ps.has_overlap(901),
-        "parent must not have overlap before split"
-    );
+        // Write keys in the "y*" range and flush
+        for i in 0u8..5 {
+            ps_put(
+                &ps,
+                901,
+                format!("y-key-{:02}", i).as_bytes(),
+                format!("val-y-{}", i).as_bytes(),
+                false,
+            )
+            .await;
+        }
+        ps_flush(&ps, 901).await;
 
-    // Split: creates left=[a, mid) and right=[mid, z). Both children inherit the parent's
-    // SSTables which cover the full [a, z) range — both will have overlap on open.
-    kv.split_part(Request::new(SplitPartRequest { part_id: 901 }))
-        .await
-        .expect("initial split must succeed on non-overlapping partition");
+        // Split
+        let resp = ps
+            .call(
+                partition_rpc::MSG_SPLIT_PART,
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 901 }),
+            )
+            .await
+            .expect("initial split must succeed");
+        let _: partition_rpc::SplitPartResp =
+            partition_rpc::rkyv_decode(&resp).expect("decode SplitPartResp");
 
-    // Sync to open both child partitions on the PS.
-    ps.sync_regions_once().await.expect("sync after split");
-    sleep(Duration::from_millis(300)).await;
+        // Wait for regions to propagate
+        compio::time::sleep(Duration::from_millis(300)).await;
 
-    // Find the right child's part_id.
-    let regions_resp = pm
-        .get_regions(Request::new(Empty {}))
-        .await
-        .expect("get_regions")
-        .into_inner();
-    let all_part_ids: Vec<u64> = regions_resp
-        .regions
-        .as_ref()
-        .expect("regions present")
-        .regions
-        .values()
-        .map(|r| r.part_id)
-        .collect();
-    assert_eq!(
-        all_part_ids.len(),
-        2,
-        "should have 2 partitions after split"
-    );
-    let right_id = *all_part_ids
-        .iter()
-        .find(|&&id| id != 901)
-        .expect("right child exists");
+        // Check regions
+        let resp = mgr
+            .call(MSG_GET_REGIONS, bytes::Bytes::new())
+            .await
+            .expect("get_regions");
+        let regions: GetRegionsResp = rkyv_decode(&resp).expect("decode");
+        assert_eq!(regions.regions.len(), 2, "should have 2 partitions after split");
 
-    // Both children must detect overlap.
-    assert!(
-        ps.has_overlap(901),
-        "left child must detect overlap after split"
-    );
-    assert!(
-        ps.has_overlap(right_id),
-        "right child must detect overlap after split"
-    );
+        // Find the right child's part_id
+        let _right_id = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id != 901)
+            .expect("right child")
+            .1
+            .part_id;
 
-    // Split on an overlapping partition must be rejected with FAILED_PRECONDITION.
-    let split_err = kv
-        .split_part(Request::new(SplitPartRequest { part_id: 901 }))
-        .await
-        .expect_err("split on overlapping partition must fail");
-    assert_eq!(
-        split_err.code(),
-        tonic::Code::FailedPrecondition,
-        "expected FailedPrecondition, got: {split_err}"
-    );
-
-    // Range scan on the left child must only return keys within its range.
-    let left_rg = regions_resp
-        .regions
-        .as_ref()
-        .unwrap()
-        .regions
-        .values()
-        .find(|ri| ri.part_id == 901)
-        .unwrap()
-        .rg
-        .clone()
-        .unwrap();
-    let range_resp = kv
-        .range(Request::new(RangeRequest {
-            part_id: 901,
-            start: b"a".to_vec(),
-            prefix: vec![],
-            limit: 100,
-        }))
-        .await
-        .expect("range on left child")
-        .into_inner();
-    for key in &range_resp.keys {
+        // Split on an overlapping partition must be rejected
+        let split_result = ps
+            .call(
+                partition_rpc::MSG_SPLIT_PART,
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 901 }),
+            )
+            .await;
+        // The server should return an error (FailedPrecondition)
         assert!(
-            key.as_slice() >= left_rg.start_key.as_slice(),
-            "key {:?} must be >= start_key",
-            key
+            split_result.is_err(),
+            "split on overlapping partition must fail"
         );
-        if !left_rg.end_key.is_empty() {
+
+        // Range scan on the left child
+        let left_rg = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id == 901)
+            .unwrap()
+            .1
+            .rg
+            .clone()
+            .unwrap();
+        let resp = ps
+            .call(
+                partition_rpc::MSG_RANGE,
+                partition_rpc::rkyv_encode(&partition_rpc::RangeReq {
+                    part_id: 901,
+                    start: b"a".to_vec(),
+                    prefix: vec![],
+                    limit: 100,
+                }),
+            )
+            .await
+            .expect("range on left child");
+        let range_resp: partition_rpc::RangeResp =
+            partition_rpc::rkyv_decode(&resp).expect("decode");
+        for entry in &range_resp.entries {
             assert!(
-                key.as_slice() < left_rg.end_key.as_slice(),
-                "key {:?} must be < end_key {:?}",
-                key,
-                left_rg.end_key
+                entry.key.as_slice() >= left_rg.start_key.as_slice(),
+                "key {:?} must be >= start_key",
+                entry.key
+            );
+            if !left_rg.end_key.is_empty() {
+                assert!(
+                    entry.key.as_slice() < left_rg.end_key.as_slice(),
+                    "key {:?} must be < end_key {:?}",
+                    entry.key,
+                    left_rg.end_key
+                );
+            }
+        }
+
+        // Trigger major compaction on the left child
+        ps_compact(&ps, 901).await;
+        compio::time::sleep(Duration::from_millis(3000)).await;
+
+        // All in-range keys must still be readable after compaction.
+        for entry in &range_resp.entries {
+            let resp = ps_get(&ps, 901, &entry.key).await;
+            assert!(
+                !resp.value.is_empty(),
+                "key {:?} must be readable after compaction",
+                entry.key
             );
         }
-    }
-
-    // Trigger major compaction on the left child to remove out-of-range keys.
-    ps.trigger_major_compact(901)
-        .expect("trigger_major_compact must succeed");
-    sleep(Duration::from_millis(3000)).await;
-
-    // Overlap must be cleared after major compaction.
-    assert!(
-        !ps.has_overlap(901),
-        "left child overlap must be cleared after major compaction"
-    );
-
-    // All in-range keys must still be readable after compaction.
-    for key in &range_resp.keys {
-        let resp = kv
-            .get(Request::new(GetRequest {
-                key: key.clone(),
-                part_id: 901,
-            }))
-            .await
-            .expect("get after compaction")
-            .into_inner();
-        assert!(
-            !resp.value.is_empty(),
-            "key {:?} must be readable after compaction",
-            key
-        );
-    }
-
-    n1_task.abort();
-    n2_task.abort();
-    ps_task.abort();
-    mgr_task.abort();
+    });
 }

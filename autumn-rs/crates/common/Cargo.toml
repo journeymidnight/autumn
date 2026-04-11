@@ -6,6 +6,6 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-autumn-proto = { path = "../proto" }
+autumn-rpc = { path = "../rpc" }
 serde.workspace = true
 thiserror.workspace = true

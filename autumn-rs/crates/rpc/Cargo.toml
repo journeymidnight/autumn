@@ -6,5 +6,9 @@ license.workspace = true
 
 [dependencies]
 bytes.workspace = true
+compio = { version = "0.18", features = ["net", "time", "macros", "dispatcher"] }
+dashmap = "6"
 rkyv = { version = "0.8.15", features = ["alloc"] }
 thiserror.workspace = true
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"

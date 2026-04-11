@@ -211,20 +211,9 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 
 ## P3 — Developer Experience & Operations
 
-### F023 · gRPC Gateway REST API for partition server
-- **Target:** REST HTTP endpoints for Get/Head/Range via gRPC-gateway. Equivalent to Go `autumn-ps --gateway-listen`.
-- **Evidence:** `cmd/autumn-ps/main.go` · `proto/pspb.proto` (google.api.http annotations)
-- **Notes:** Go pspb.proto has HTTP annotations. Rust proto has no REST gateway support.
-- **passes:** false
-
 ### F024 · Observability: distributed tracing and structured logging
 - **Target:** Jaeger/OpenTelemetry tracing with configurable sampling. Equivalent to Go xlog + trace-sampler flags.
 - **Evidence:** `xlog/xlog.go` · `cmd/autumn-ps/main.go` (trace-sampler) · `cmd/extent-node/main.go`
 - **Notes:** Rust uses basic tracing_subscriber with no distributed tracing export.
 - **passes:** false
 
-### F025 · Stream benchmark CLI tool
-- **Target:** CLI binary with alloc/wbench/plot subcommands for stream layer performance testing. Equivalent to Go `cmd/stream-client`.
-- **Evidence:** `cmd/stream-client/main.go` · `autumn-rs/crates/manager/tests/append_benchmark.rs`
-- **Notes:** Rust has an in-test benchmark but no standalone CLI with latency histograms and gnuplot output.
-- **passes:** false

@@ -141,11 +141,30 @@ pub struct MaintenanceReq {
 pub const MAINTENANCE_COMPACT: u8 = 0;
 pub const MAINTENANCE_AUTO_GC: u8 = 1;
 pub const MAINTENANCE_FORCE_GC: u8 = 2;
+pub const MAINTENANCE_FLUSH: u8 = 3;
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct MaintenanceResp {
     pub code: u8,
     pub message: String,
+}
+
+// ── MetaStream persistence types ────────────────────────────────────────────
+
+/// SSTable location in rowStream.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct SstLocation {
+    pub extent_id: u64,
+    pub offset: u32,
+    pub len: u32,
+}
+
+/// Checkpoint written to metaStream after each flush/compaction.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct TableLocations {
+    pub locs: Vec<SstLocation>,
+    pub vp_extent_id: u64,
+    pub vp_offset: u32,
 }
 
 // ── Helper: extract part_id from any partition RPC payload ─────────────────

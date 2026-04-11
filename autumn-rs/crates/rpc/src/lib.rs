@@ -8,10 +8,13 @@
 //! [req_id: u32 LE][msg_type: u8][flags: u8][payload_len: u32 LE][payload]
 //! ```
 
+pub mod client;
 pub mod error;
 pub mod frame;
 pub mod manager_rpc;
 pub mod partition_rpc;
+pub mod pool;
+pub mod server;
 
 pub use error::{RpcError, Result, StatusCode};
 pub use frame::{Frame, FrameDecoder, HEADER_LEN};

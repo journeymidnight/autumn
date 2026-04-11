@@ -1,33 +1,32 @@
-Date: 2026-04-10
-TaskStatus: completed
-Task scope: F045 — Migrate PartitionKv service to autumn-rpc (Thread-per-Partition)
+Date: 2026-04-11
+TaskStatus: not_completed
+Task scope: F046 — Migrate CLI tools, proto codegen, and tests to compio
 
 Current summary:
-  F045 complete. PartitionServer rewritten with thread-per-partition architecture:
-  - Main thread (compio): accept connections, route by part_id, heartbeat/region sync
-  - Per-partition threads: each with own compio Runtime, Rc/RefCell (no locks)
-  - Inter-thread communication: tokio::sync::mpsc (runtime-agnostic) for request routing
-
-  8 PartitionKv RPCs (Put, Get, Delete, Head, Range, SplitPart, StreamPut, Maintenance)
-  migrated from tonic gRPC to autumn-rpc with rkyv serialization (msg types 0x40-0x47).
-
-  Manager client calls (register_ps, heartbeat_ps, get_regions) use autumn-rpc ConnPool.
-
-  Background loops (write, flush, compact, gc) all on partition thread via compio::spawn.
-  tokio::select! replaced with manual poll_fn for compact/gc loops.
-
-  Arc<RwLock<PartitionData>> → Rc<RefCell<PartitionData>> (single-threaded per partition).
-  tonic, async-trait, parking_lot, dashmap removed from partition-server deps.
-
-  New: crates/rpc/src/partition_rpc.rs — 8 MSG_TYPE constants, rkyv request/response types.
-
-  34 unit tests pass (5 manager + 18 stream + 11 partition-server).
-  Partition server binary switched to #[compio::main].
+  F046 proto/tonic elimination complete:
+  - autumn-proto crate deleted entirely (prost only in crates/etcd now)
+  - MetadataStore (common/store.rs) uses rkyv Mgr* types from manager_rpc.rs
+  - Manager etcd persistence uses rkyv_encode/rkyv_decode instead of protobuf
+  - Partition server TableLocations uses rkyv (new SstLocation type in partition_rpc.rs)
+  - autumn-client rewritten: autumn-rpc + compio, no tonic/protobuf
+  - stream-cli deleted (autumn-client now has register-node subcommand)
+  - Manager integration tests rewritten: compio + autumn-rpc
+  - tonic/prost/tonic-build removed from workspace deps
+  - ConnPool fixed: take/put pattern avoids RefCell borrow across await
+  - 48 unit tests pass (2 common + 7 rpc + 18 stream + 5 manager + 11 partition + 5 client)
+  - All 4 binaries build (manager, extent-node, ps, client)
 
 Main gaps:
-  - F046: CLI tools (autumn-client, stream-cli) + proto codegen + integration tests
-  - autumn-server crate still won't fully compile (CLI binaries use tonic)
+  - compio timer issue: spawned task timers don't fire when main task is in
+    timeout(accept) loop. PS heartbeat_loop and region_sync_loop don't execute.
+    Affects both PS and manager background loops. Unit tests pass (timers work in
+    test context) but real binary has the issue. Needs deeper investigation of
+    compio's block_on/run/poll_with interaction.
+  - tokio::sync not yet replaced (RpcClient, RpcServer, partition-server channels).
+    Plan exists but blocked on understanding compio timer behavior first.
 
 Next steps:
-  - Commit F045
-  - Start F046 (Migrate CLI tools, proto codegen, and tests to compio)
+  - Debug compio timer issue — key question: why do spawned task timers fire in
+    unit tests but not in the real binary's accept loop?
+  - Once timer issue resolved: replace tokio::sync with futures::channel everywhere
+  - Run perf_check.sh to verify end-to-end functionality

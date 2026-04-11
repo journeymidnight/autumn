@@ -5,16 +5,13 @@
 /// EC conversion tests will be added in a separate test file once the
 /// ec_conversion_dispatch_loop is implemented.
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::Duration;
 
-use autumn_io_engine::IoMode;
 use autumn_manager::AutumnManager;
-use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
-use autumn_proto::autumn::{CreateStreamRequest, RegisterNodeRequest};
+use autumn_rpc::client::RpcClient;
+use autumn_rpc::manager_rpc::*;
 use autumn_stream::{ConnPool, ExtentNode, ExtentNodeConfig, StreamClient};
-use tokio::time::sleep;
-use tonic::Request;
 
 fn pick_addr() -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -23,217 +20,228 @@ fn pick_addr() -> SocketAddr {
     addr
 }
 
-/// Start a manager and 3 extent nodes.
-/// Returns (manager_endpoint, stream_id, client, abort handles).
-async fn setup_cluster_3nodes(
+/// Start a manager and 3 extent nodes, register them, create a stream.
+/// Returns (mgr_addr, stream_id).
+fn setup_cluster_3nodes(
     n1_dir: &std::path::Path,
     n2_dir: &std::path::Path,
     n3_dir: &std::path::Path,
+    _ec_data_shard: u32,
+    _ec_parity_shard: u32,
+) -> (SocketAddr, SocketAddr, SocketAddr, SocketAddr) {
+    let mgr_addr = pick_addr();
+    std::thread::spawn(move || {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let manager = AutumnManager::new();
+            let _ = manager.serve(mgr_addr).await;
+        });
+    });
+    std::thread::sleep(Duration::from_millis(200));
+
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    let n3_addr = pick_addr();
+
+    let n1_path = n1_dir.to_path_buf();
+    let n2_path = n2_dir.to_path_buf();
+    let n3_path = n3_dir.to_path_buf();
+
+    for (addr, path, disk_id) in [
+        (n1_addr, n1_path, 1u64),
+        (n2_addr, n2_path, 2),
+        (n3_addr, n3_path, 3),
+    ] {
+        std::thread::spawn(move || {
+            compio::runtime::Runtime::new().unwrap().block_on(async {
+                let n = ExtentNode::new(ExtentNodeConfig::new(path, disk_id))
+                    .await
+                    .expect("extent node");
+                let _ = n.serve(addr).await;
+            });
+        });
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    (mgr_addr, n1_addr, n2_addr, n3_addr)
+}
+
+async fn setup_ec_stream(
+    mgr_addr: SocketAddr,
+    n1_addr: SocketAddr,
+    n2_addr: SocketAddr,
+    n3_addr: SocketAddr,
     ec_data_shard: u32,
     ec_parity_shard: u32,
-) -> (
-    String,
-    u64,
-    Arc<StreamClient>,
-    Vec<tokio::task::JoinHandle<()>>,
-) {
-    let manager = AutumnManager::new();
-    let mgr_addr = pick_addr();
-    let mgr_task = tokio::spawn(async move { let _ = manager.serve(mgr_addr).await; });
-    sleep(Duration::from_millis(120)).await;
+) -> (u64, StreamClient) {
+    let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
 
-    let n1_addr_str = format!("127.0.0.1:{}", pick_addr().port());
-    let n2_addr_str = format!("127.0.0.1:{}", pick_addr().port());
-    let n3_addr_str = format!("127.0.0.1:{}", pick_addr().port());
+    for (addr, disk) in [
+        (n1_addr, "disk-ec-1"),
+        (n2_addr, "disk-ec-2"),
+        (n3_addr, "disk-ec-3"),
+    ] {
+        let resp = mgr
+            .call(
+                MSG_REGISTER_NODE,
+                rkyv_encode(&RegisterNodeReq {
+                    addr: addr.to_string(),
+                    disk_uuids: vec![disk.to_string()],
+                }),
+            )
+            .await
+            .expect("register node");
+        let _: RegisterNodeResp = rkyv_decode(&resp).expect("decode");
+    }
 
-    let n1 = ExtentNode::new(ExtentNodeConfig::new(n1_dir.to_path_buf(), IoMode::Standard, 1))
-        .await
-        .expect("node1");
-    let n2 = ExtentNode::new(ExtentNodeConfig::new(n2_dir.to_path_buf(), IoMode::Standard, 2))
-        .await
-        .expect("node2");
-    let n3 = ExtentNode::new(ExtentNodeConfig::new(n3_dir.to_path_buf(), IoMode::Standard, 3))
-        .await
-        .expect("node3");
-
-    let n1_addr: SocketAddr = n1_addr_str.parse().unwrap();
-    let n2_addr: SocketAddr = n2_addr_str.parse().unwrap();
-    let n3_addr: SocketAddr = n3_addr_str.parse().unwrap();
-
-    let t1 = tokio::spawn(async move { let _ = n1.serve(n1_addr).await; });
-    let t2 = tokio::spawn(async move { let _ = n2.serve(n2_addr).await; });
-    let t3 = tokio::spawn(async move { let _ = n3.serve(n3_addr).await; });
-    sleep(Duration::from_millis(120)).await;
-
-    let endpoint = format!("http://{mgr_addr}");
-    let mut sm = StreamManagerServiceClient::connect(endpoint.clone())
-        .await
-        .expect("connect stream manager");
-
-    sm.register_node(Request::new(RegisterNodeRequest {
-        addr: n1_addr_str.clone(),
-        disk_uuids: vec!["disk-ec-1".to_string()],
-    }))
-    .await
-    .expect("register node1");
-
-    sm.register_node(Request::new(RegisterNodeRequest {
-        addr: n2_addr_str.clone(),
-        disk_uuids: vec!["disk-ec-2".to_string()],
-    }))
-    .await
-    .expect("register node2");
-
-    sm.register_node(Request::new(RegisterNodeRequest {
-        addr: n3_addr_str.clone(),
-        disk_uuids: vec!["disk-ec-3".to_string()],
-    }))
-    .await
-    .expect("register node3");
-
-    // Create a 3-replica stream with optional seal-after-write EC policy.
-    let created = sm
-        .create_stream(Request::new(CreateStreamRequest {
-            replicates: 3,
-            ec_data_shard,
-            ec_parity_shard,
-            ..Default::default()
-        }))
-        .await
-        .expect("create_stream")
-        .into_inner();
-    let stream_id = created.stream.expect("stream").stream_id;
-
-    let client = Arc::new(
-        StreamClient::connect(
-            &endpoint,
-            "owner/ec-test/0".to_string(),
-            256 * 1024 * 1024,
-            Arc::new(ConnPool::new()),
+    let resp = mgr
+        .call(
+            MSG_CREATE_STREAM,
+            rkyv_encode(&CreateStreamReq {
+                replicates: 3,
+                ec_data_shard,
+                ec_parity_shard,
+            }),
         )
         .await
-        .expect("stream client"),
-    );
+        .expect("create_stream");
+    let created: CreateStreamResp = rkyv_decode(&resp).expect("decode");
+    let stream_id = created.stream.expect("stream").stream_id;
 
-    (endpoint, stream_id, client, vec![mgr_task, t1, t2, t3])
+    let pool = Rc::new(ConnPool::new());
+    let client = StreamClient::connect(
+        &mgr_addr.to_string(),
+        "owner/ec-test/0".to_string(),
+        256 * 1024 * 1024,
+        pool,
+    )
+    .await
+    .expect("stream client");
+
+    (stream_id, client)
 }
 
 /// Basic replicated write + read roundtrip on a stream with EC policy.
-/// (Write is always replicated; EC conversion happens after seal.)
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ec_policy_stream_write_read_roundtrip() {
+#[test]
+fn ec_policy_stream_write_read_roundtrip() {
     let d1 = tempfile::tempdir().unwrap();
     let d2 = tempfile::tempdir().unwrap();
     let d3 = tempfile::tempdir().unwrap();
 
-    let (_endpoint, stream_id, client, tasks) =
-        setup_cluster_3nodes(d1.path(), d2.path(), d3.path(), 2, 1).await;
+    let (mgr_addr, n1_addr, n2_addr, n3_addr) =
+        setup_cluster_3nodes(d1.path(), d2.path(), d3.path(), 2, 1);
 
-    let payload = b"hello seal-after-write EC! this is a test payload.";
-    let result = client
-        .append(stream_id, payload.as_slice(), false)
-        .await
-        .expect("append to EC-policy stream");
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let (stream_id, client) =
+            setup_ec_stream(mgr_addr, n1_addr, n2_addr, n3_addr, 2, 1).await;
 
-    let (read_back, _end) = client
-        .read_bytes_from_extent(result.extent_id, result.offset, result.end - result.offset)
-        .await
-        .expect("read from EC-policy stream");
+        let payload = b"hello seal-after-write EC! this is a test payload.";
+        let result = client
+            .append(stream_id, payload.as_slice(), false)
+            .await
+            .expect("append to EC-policy stream");
 
-    assert_eq!(read_back, payload, "payload mismatch");
+        let (read_back, _end) = client
+            .read_bytes_from_extent(result.extent_id, result.offset, result.end - result.offset)
+            .await
+            .expect("read from EC-policy stream");
 
-    for t in tasks {
-        t.abort();
-    }
+        assert_eq!(read_back, payload, "payload mismatch");
+    });
 }
 
 /// Multiple appends to a stream with EC policy: each read back correctly.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ec_policy_stream_multiple_appends() {
+#[test]
+fn ec_policy_stream_multiple_appends() {
     let d1 = tempfile::tempdir().unwrap();
     let d2 = tempfile::tempdir().unwrap();
     let d3 = tempfile::tempdir().unwrap();
 
-    let (_endpoint, stream_id, client, tasks) =
-        setup_cluster_3nodes(d1.path(), d2.path(), d3.path(), 2, 1).await;
+    let (mgr_addr, n1_addr, n2_addr, n3_addr) =
+        setup_cluster_3nodes(d1.path(), d2.path(), d3.path(), 2, 1);
 
-    let payloads: Vec<Vec<u8>> = vec![
-        b"first payload".to_vec(),
-        vec![0xABu8; 1024],
-        vec![0u8; 1],
-        (0..4096u16).map(|i| (i % 251) as u8).collect(),
-    ];
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let (stream_id, client) =
+            setup_ec_stream(mgr_addr, n1_addr, n2_addr, n3_addr, 2, 1).await;
 
-    let mut results = Vec::new();
-    for p in &payloads {
-        let r = client
-            .append(stream_id, p.as_slice(), false)
-            .await
-            .expect("append");
-        results.push(r);
-    }
+        let payloads: Vec<Vec<u8>> = vec![
+            b"first payload".to_vec(),
+            vec![0xABu8; 1024],
+            vec![0u8; 1],
+            (0..4096u16).map(|i| (i % 251) as u8).collect(),
+        ];
 
-    for (i, (r, expected)) in results.iter().zip(payloads.iter()).enumerate() {
-        let (read_back, _end) = client
-            .read_bytes_from_extent(r.extent_id, r.offset, r.end - r.offset)
-            .await
-            .unwrap_or_else(|e| panic!("read #{i} failed: {e}"));
-        assert_eq!(read_back, *expected, "payload #{i} mismatch");
-    }
+        let mut results = Vec::new();
+        for p in &payloads {
+            let r = client
+                .append(stream_id, p.as_slice(), false)
+                .await
+                .expect("append");
+            results.push(r);
+        }
 
-    for t in tasks {
-        t.abort();
-    }
+        for (i, (r, expected)) in results.iter().zip(payloads.iter()).enumerate() {
+            let (read_back, _end) = client
+                .read_bytes_from_extent(r.extent_id, r.offset, r.end - r.offset)
+                .await
+                .unwrap_or_else(|e| panic!("read #{i} failed: {e}"));
+            assert_eq!(read_back, *expected, "payload #{i} mismatch");
+        }
+    });
 }
 
 /// Larger payload (64KB) roundtrip on EC-policy stream.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ec_policy_stream_large_payload() {
+#[test]
+fn ec_policy_stream_large_payload() {
     let d1 = tempfile::tempdir().unwrap();
     let d2 = tempfile::tempdir().unwrap();
     let d3 = tempfile::tempdir().unwrap();
 
-    let (_endpoint, stream_id, client, tasks) =
-        setup_cluster_3nodes(d1.path(), d2.path(), d3.path(), 2, 1).await;
+    let (mgr_addr, n1_addr, n2_addr, n3_addr) =
+        setup_cluster_3nodes(d1.path(), d2.path(), d3.path(), 2, 1);
 
-    let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let (stream_id, client) =
+            setup_ec_stream(mgr_addr, n1_addr, n2_addr, n3_addr, 2, 1).await;
 
-    let result = client
-        .append(stream_id, &payload, false)
-        .await
-        .expect("append large");
+        let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
 
-    let (read_back, _end) = client
-        .read_bytes_from_extent(result.extent_id, result.offset, result.end - result.offset)
-        .await
-        .expect("read large");
+        let result = client
+            .append(stream_id, &payload, false)
+            .await
+            .expect("append large");
 
-    assert_eq!(read_back, payload, "large payload mismatch");
+        let (read_back, _end) = client
+            .read_bytes_from_extent(result.extent_id, result.offset, result.end - result.offset)
+            .await
+            .expect("read large");
 
-    for t in tasks {
-        t.abort();
-    }
+        assert_eq!(read_back, payload, "large payload mismatch");
+    });
 }
 
 /// Pure replication stream (no EC policy) still works.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn replication_stream_works() {
+#[test]
+fn replication_stream_works() {
     let d1 = tempfile::tempdir().unwrap();
     let d2 = tempfile::tempdir().unwrap();
     let d3 = tempfile::tempdir().unwrap();
 
-    let (_endpoint, stream_id, client, tasks) =
-        setup_cluster_3nodes(d1.path(), d2.path(), d3.path(), 0, 0).await;
+    let (mgr_addr, n1_addr, n2_addr, n3_addr) =
+        setup_cluster_3nodes(d1.path(), d2.path(), d3.path(), 0, 0);
 
-    let payload = b"replicated data payload";
-    let r = client.append(stream_id, payload.as_slice(), false).await.unwrap();
-    let (read_back, _) = client
-        .read_bytes_from_extent(r.extent_id, r.offset, r.end - r.offset)
-        .await
-        .unwrap();
-    assert_eq!(read_back.as_slice(), payload);
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let (stream_id, client) =
+            setup_ec_stream(mgr_addr, n1_addr, n2_addr, n3_addr, 0, 0).await;
 
-    for t in tasks {
-        t.abort();
-    }
+        let payload = b"replicated data payload";
+        let r = client
+            .append(stream_id, payload.as_slice(), false)
+            .await
+            .unwrap();
+        let (read_back, _) = client
+            .read_bytes_from_extent(r.extent_id, r.offset, r.end - r.offset)
+            .await
+            .unwrap();
+        assert_eq!(read_back.as_slice(), payload);
+    });
 }

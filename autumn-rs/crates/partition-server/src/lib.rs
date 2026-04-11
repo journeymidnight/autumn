@@ -9,9 +9,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use autumn_proto::autumn::{Range, TableLocations, Location};
-use autumn_rpc::manager_rpc::{self};
-use autumn_rpc::partition_rpc::{self, *};
+use autumn_rpc::manager_rpc::{self, MgrRange as Range, rkyv_encode, rkyv_decode};
+use autumn_rpc::partition_rpc::{self, *, TableLocations, SstLocation};
 use autumn_rpc::{Frame, FrameDecoder, HandlerResult, StatusCode};
 use autumn_stream::{ConnPool, StreamClient};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -19,10 +18,13 @@ use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::net::TcpStream;
 use compio::BufResult;
 use crossbeam_skiplist::SkipMap;
-use prost::Message as _;
 use tokio::sync::{mpsc, oneshot};
 
 use sstable::{IterItem, MemtableIterator, MergeIterator, SstBuilder, SstReader, TableIterator};
+
+// ---------------------------------------------------------------------------
+// Compat helpers
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -437,6 +439,7 @@ impl PartitionServer {
 
     async fn heartbeat_loop(&self) {
         const INTERVAL: Duration = Duration::from_secs(5);
+        tracing::info!("PS {} heartbeat_loop started", self.ps_id);
         loop {
             compio::time::sleep(INTERVAL).await;
             let req = manager_rpc::rkyv_encode(&manager_rpc::HeartbeatPsReq { ps_id: self.ps_id });
@@ -559,7 +562,23 @@ impl PartitionServer {
         let listener = compio::net::TcpListener::bind(addr).await?;
         tracing::info!(addr = %addr, "partition server listening");
         loop {
-            let (stream, peer) = listener.accept().await?;
+            // timeout so that spawned background tasks (heartbeat, region_sync)
+            // get polled even when no client connections arrive.
+            tracing::debug!("accept loop: waiting for connection (with 1s timeout)");
+            let accept_result = compio::time::timeout(
+                Duration::from_secs(1),
+                listener.accept(),
+            ).await;
+            tracing::debug!("accept loop: result is_timeout={}", accept_result.is_err());
+            let (stream, peer) = match accept_result {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => {
+                    // Yield to let spawned tasks (heartbeat, region_sync) run.
+                    compio::time::sleep(Duration::from_millis(1)).await;
+                    continue;
+                }
+            };
             if let Err(e) = stream.set_nodelay(true) {
                 tracing::warn!(peer = %peer, error = %e, "set_nodelay failed");
             }
@@ -1001,29 +1020,25 @@ fn decode_records_with_offsets(bytes: &[u8]) -> Vec<(usize, u8, Vec<u8>, Vec<u8>
 }
 
 fn decode_last_table_locations(data: &[u8]) -> Result<TableLocations> {
+    // Format: sequence of [len: u32 LE][rkyv payload] records.
+    // We want the last successfully decoded record.
     let mut last: Option<TableLocations> = None;
     let mut buf = data;
-    while !buf.is_empty() {
-        match TableLocations::decode_length_delimited(buf) {
-            Ok(locs) => match prost::decode_length_delimiter(buf) {
-                Ok(msg_len) => {
-                    let prefix_len = prost::length_delimiter_len(msg_len);
-                    let total = prefix_len + msg_len;
-                    if total > buf.len() {
-                        break;
-                    }
-                    buf = &buf[total..];
-                    last = Some(locs);
-                }
-                Err(_) => break,
-            },
+    while buf.len() >= 4 {
+        let msg_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let total = 4 + msg_len;
+        if total > buf.len() {
+            break;
+        }
+        match rkyv_decode::<TableLocations>(&buf[4..4 + msg_len]) {
+            Ok(locs) => {
+                last = Some(locs);
+                buf = &buf[total..];
+            }
             Err(_) => break,
         }
     }
-    if let Some(locs) = last {
-        return Ok(locs);
-    }
-    TableLocations::decode(data).map_err(|e| anyhow!("decode TableLocations: {e}"))
+    last.ok_or_else(|| anyhow!("decode TableLocations: no valid record"))
 }
 
 fn in_range(rg: &Range, key: &[u8]) -> bool {
@@ -1047,10 +1062,10 @@ async fn save_table_locs_raw(
     vp_extent_id: u64,
     vp_offset: u32,
 ) -> Result<()> {
-    let locs_proto = TableLocations {
+    let locs = TableLocations {
         locs: tables
             .iter()
-            .map(|t| Location {
+            .map(|t| SstLocation {
                 extent_id: t.extent_id,
                 offset: t.offset,
                 len: t.len,
@@ -1059,7 +1074,10 @@ async fn save_table_locs_raw(
         vp_extent_id,
         vp_offset,
     };
-    let data = locs_proto.encode_length_delimited_to_vec();
+    let payload = rkyv_encode(&locs);
+    let mut data = Vec::with_capacity(4 + payload.len());
+    data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    data.extend_from_slice(&payload);
     stream_client.append(meta_stream_id, &data, true).await?;
     let info = stream_client.get_stream_info(meta_stream_id).await?;
     if info.extent_ids.len() > 1 {
@@ -2389,6 +2407,11 @@ async fn handle_stream_put(payload: Bytes, part: &Rc<RefCell<PartitionData>>) ->
 
 async fn handle_maintenance(payload: Bytes, part: &Rc<RefCell<PartitionData>>) -> HandlerResult {
     let req: MaintenanceReq = partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+    if req.op == MAINTENANCE_FLUSH {
+        // Synchronous flush: rotate active memtable and flush all immutables.
+        flush_memtable_locked(part).await.map_err(|e| (StatusCode::Internal, e.to_string()))?;
+        return Ok(partition_rpc::rkyv_encode(&MaintenanceResp { code: CODE_OK, message: String::new() }));
+    }
     let p = part.borrow();
     let result = match req.op {
         MAINTENANCE_COMPACT => p.compact_tx.try_send(true).map_err(|_| "compaction busy"),
@@ -2431,6 +2454,121 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compio_timer_with_accept_timeout_loop() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let count = Arc::new(AtomicU32::new(0));
+        let count2 = count.clone();
+
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            compio::runtime::spawn(async move {
+                loop {
+                    compio::time::sleep(Duration::from_millis(500)).await;
+                    count2.fetch_add(1, Ordering::SeqCst);
+                }
+            }).detach();
+
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            // 5 iterations of 1s timeout = ~5s total
+            for _ in 0..5 {
+                let _ = compio::time::timeout(Duration::from_secs(1), listener.accept()).await;
+            }
+        });
+
+        let c = count.load(Ordering::SeqCst);
+        assert!(c >= 3, "expected at least 3 ticks in 5s, got {c}");
+    }
+
+    #[test]
+    fn compio_timer_after_tcp_io_then_accept_loop() {
+        // Simulates the PS binary: TCP I/O first, then spawn+accept loop.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let count = Arc::new(AtomicU32::new(0));
+        let count2 = count.clone();
+
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            // Phase 1: do some TCP I/O (simulates connect_with_advertise)
+            let echo_listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let echo_addr = echo_listener.local_addr().unwrap();
+            // Connect to ourselves
+            let _client = compio::net::TcpStream::connect(echo_addr).await.unwrap();
+            let (_server, _) = echo_listener.accept().await.unwrap();
+            drop(_client);
+            drop(_server);
+            drop(echo_listener);
+
+            // Phase 2: spawn background timer
+            compio::runtime::spawn(async move {
+                loop {
+                    compio::time::sleep(Duration::from_millis(500)).await;
+                    count2.fetch_add(1, Ordering::SeqCst);
+                }
+            }).detach();
+
+            // Phase 3: accept loop with timeout
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            for _ in 0..5 {
+                let _ = compio::time::timeout(Duration::from_secs(1), listener.accept()).await;
+            }
+        });
+
+        let c = count.load(Ordering::SeqCst);
+        assert!(c >= 3, "expected at least 3 ticks in 5s after prior TCP I/O, got {c}");
+    }
+
+    #[test]
+    fn compio_timer_with_accept_loop() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let count = Arc::new(AtomicU32::new(0));
+        let count2 = count.clone();
+
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            // Spawned task with timer
+            compio::runtime::spawn(async move {
+                for _ in 0..3 {
+                    compio::time::sleep(Duration::from_millis(100)).await;
+                    count2.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .detach();
+
+            // Main task: accept loop (nobody connects)
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let _ = compio::time::timeout(Duration::from_millis(500), listener.accept()).await;
+        });
+
+        let c = count.load(Ordering::SeqCst);
+        assert!(c >= 2, "expected at least 2 timer ticks, got {c}");
+    }
+
+    #[test]
+    fn compio_timer_in_spawn() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired2 = fired.clone();
+
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            compio::runtime::spawn(async move {
+                compio::time::sleep(Duration::from_millis(100)).await;
+                fired2.store(true, Ordering::SeqCst);
+            })
+            .detach();
+
+            // Main task sleeps longer to give spawned task time
+            compio::time::sleep(Duration::from_millis(500)).await;
+        });
+
+        assert!(fired.load(Ordering::SeqCst), "spawned timer should have fired");
+    }
 
     #[test]
     fn mvcc_key_encoding() {

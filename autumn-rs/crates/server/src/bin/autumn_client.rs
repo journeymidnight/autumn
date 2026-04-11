@@ -2,74 +2,57 @@
 extern crate libc;
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use autumn_proto::autumn::partition_kv_client::PartitionKvClient;
-use autumn_proto::autumn::partition_manager_service_client::PartitionManagerServiceClient;
-use autumn_proto::autumn::stream_manager_service_client::StreamManagerServiceClient;
-use autumn_proto::autumn::{
-    AutoGcOp, CompactOp, CreateStreamRequest, DeleteRequest, Empty, ForceGcOp, GetRequest,
-    HeadRequest, MaintenanceRequest, NodesInfoResponse, PsDetail, PutRequest, RangeRequest,
-    RegionInfo, RegisterNodeRequest, SplitPartRequest, StreamInfoRequest, StreamPutRequest,
-    StreamPutRequestHeader, UpsertPartitionRequest,
-};
-use autumn_proto::autumn::{PartitionMeta, Range};
+use autumn_rpc::client::RpcClient;
+use autumn_rpc::manager_rpc::*;
+use autumn_rpc::partition_rpc::{self, PutReq, PutResp, GetReq, GetResp, DeleteReq, DeleteResp,
+    HeadReq, HeadResp, RangeReq, RangeResp, SplitPartReq, StreamPutReq,
+    MaintenanceReq, MaintenanceResp, MSG_PUT, MSG_GET, MSG_DELETE, MSG_HEAD,
+    MSG_RANGE, MSG_SPLIT_PART, MSG_STREAM_PUT, MSG_MAINTENANCE,
+    MAINTENANCE_COMPACT, MAINTENANCE_AUTO_GC, MAINTENANCE_FORCE_GC};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use tonic::transport::{Channel, Endpoint};
-use tonic::Request;
 
-fn is_not_found(status: &tonic::Status) -> bool {
-    status.code() == tonic::Code::NotFound
+// ---------------------------------------------------------------------------
+// RPC helpers
+// ---------------------------------------------------------------------------
+
+fn parse_addr(addr: &str) -> Result<SocketAddr> {
+    addr.parse()
+        .with_context(|| format!("invalid address: {addr}"))
 }
 
-fn normalize(addr: &str) -> String {
-    if addr.starts_with("http://") || addr.starts_with("https://") {
-        addr.to_string()
-    } else {
-        format!("http://{addr}")
-    }
+fn decode_err(e: String) -> anyhow::Error {
+    anyhow!("rkyv decode: {e}")
 }
 
-async fn connect_ps_client(ps_addr: &str) -> Result<PartitionKvClient<Channel>> {
-    let endpoint = normalize(ps_addr);
-    let channel = autumn_stream::conn_pool::make_endpoint(ps_addr)?
-        .connect()
-        .await
-        .with_context(|| format!("connect PS {endpoint}"))?;
-    const GRPC_MAX_MSG: usize = 512 * 1024 * 1024;
-    Ok(PartitionKvClient::new(channel)
-        .max_decoding_message_size(GRPC_MAX_MSG)
-        .max_encoding_message_size(GRPC_MAX_MSG))
-}
+// ---------------------------------------------------------------------------
+// ClusterClient
+// ---------------------------------------------------------------------------
 
 struct ClusterClient {
     #[allow(dead_code)]
     manager: String,
-    sm: StreamManagerServiceClient<Channel>,
-    pm: PartitionManagerServiceClient<Channel>,
-    ps_conns: HashMap<String, PartitionKvClient<Channel>>,
-    /// Cached regions sorted by start_key for O(log n) key routing.
-    /// Populated once at connect time; refreshed on routing failure.
-    regions: Vec<(u64, RegionInfo)>,
-    ps_details: HashMap<u64, PsDetail>,
+    mgr: Arc<RpcClient>,
+    ps_conns: HashMap<String, Arc<RpcClient>>,
+    regions: Vec<(u64, MgrRegionInfo)>,
+    ps_details: HashMap<u64, MgrPsDetail>,
 }
 
 impl ClusterClient {
     async fn connect(manager: &str) -> Result<Self> {
-        let endpoint = normalize(manager);
-        let channel = Endpoint::from_shared(endpoint.clone())?
-            .connect()
+        let addr = parse_addr(manager)?;
+        let mgr = RpcClient::connect(addr)
             .await
-            .with_context(|| format!("connect manager {endpoint}"))?;
-
+            .with_context(|| format!("connect manager {manager}"))?;
         let mut client = Self {
             manager: manager.to_string(),
-            sm: StreamManagerServiceClient::new(channel.clone()),
-            pm: PartitionManagerServiceClient::new(channel),
+            mgr,
             ps_conns: HashMap::new(),
             regions: Vec::new(),
             ps_details: HashMap::new(),
@@ -79,14 +62,13 @@ impl ClusterClient {
     }
 
     async fn refresh_regions(&mut self) -> Result<()> {
-        let resp = self
-            .pm
-            .get_regions(Request::new(Empty {}))
+        let resp_bytes = self
+            .mgr
+            .call(MSG_GET_REGIONS, Bytes::new())
             .await
-            .context("get regions")?
-            .into_inner();
-        let regions_map = resp.regions.unwrap_or_default().regions;
-        let mut sorted: Vec<(u64, RegionInfo)> = regions_map.into_iter().collect();
+            .context("get regions")?;
+        let resp: GetRegionsResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+        let mut sorted: Vec<(u64, MgrRegionInfo)> = resp.regions.into_iter().collect();
         sorted.sort_by(|a, b| {
             a.1.rg
                 .as_ref()
@@ -99,46 +81,51 @@ impl ClusterClient {
                         .unwrap_or(&[]),
                 )
         });
-        // Validate contiguity: each region's end_key must equal the next region's
-        // start_key. Matches Go saveRegion lines 61-65. Warn rather than panic since
-        // this is a CLI tool, not a long-running service.
         for i in 0..sorted.len().saturating_sub(1) {
-            let end_key = sorted[i].1.rg.as_ref().map(|r| r.end_key.as_slice()).unwrap_or(&[]);
-            let next_start = sorted[i + 1].1.rg.as_ref().map(|r| r.start_key.as_slice()).unwrap_or(&[]);
+            let end_key = sorted[i]
+                .1
+                .rg
+                .as_ref()
+                .map(|r| r.end_key.as_slice())
+                .unwrap_or(&[]);
+            let next_start = sorted[i + 1]
+                .1
+                .rg
+                .as_ref()
+                .map(|r| r.start_key.as_slice())
+                .unwrap_or(&[]);
             if end_key != next_start {
                 eprintln!(
                     "WARNING: region gap: partition {} end_key != partition {} start_key",
-                    sorted[i].1.part_id, sorted[i + 1].1.part_id
+                    sorted[i].1.part_id,
+                    sorted[i + 1].1.part_id
                 );
             }
         }
         self.regions = sorted;
-        self.ps_details = resp.ps_details;
+        self.ps_details = resp.ps_details.into_iter().collect();
         Ok(())
     }
 
-    async fn get_ps_client(&mut self, ps_addr: &str) -> Result<&mut PartitionKvClient<Channel>> {
-        let addr = ps_addr.to_string();
-        if !self.ps_conns.contains_key(&addr) {
-            self.ps_conns
-                .insert(addr.clone(), connect_ps_client(&addr).await?);
+    async fn get_ps_client(&mut self, ps_addr: &str) -> Result<Arc<RpcClient>> {
+        if let Some(c) = self.ps_conns.get(ps_addr) {
+            return Ok(c.clone());
         }
-        Ok(self.ps_conns.get_mut(&addr).unwrap())
+        let addr = parse_addr(ps_addr)?;
+        let client = RpcClient::connect(addr)
+            .await
+            .with_context(|| format!("connect PS {ps_addr}"))?;
+        self.ps_conns.insert(ps_addr.to_string(), client.clone());
+        Ok(client)
     }
 
     fn lookup_key(&self, key: &[u8]) -> Option<(u64, String)> {
         if self.regions.is_empty() {
             return None;
         }
-        // Binary search matching Go's sort.Search in autumn_clientv1/lib.go:217.
-        // Find the first region whose end_key > key (empty end_key = +infinity).
-        // Because regions are sorted by start_key and contiguous, this is the
-        // unique region containing key.
-        let idx = self.regions.partition_point(|(_, region)| {
-            match region.rg.as_ref() {
-                Some(rg) if !rg.end_key.is_empty() => rg.end_key.as_slice() <= key,
-                _ => false, // empty end_key (unbounded last region) — stop here
-            }
+        let idx = self.regions.partition_point(|(_, region)| match region.rg.as_ref() {
+            Some(rg) if !rg.end_key.is_empty() => rg.end_key.as_slice() <= key,
+            _ => false,
         });
         if idx >= self.regions.len() {
             return None;
@@ -152,18 +139,20 @@ impl ClusterClient {
         if let Some(result) = self.lookup_key(key) {
             return Ok(result);
         }
-        // Cache miss or key out of range — refresh and retry once.
         self.refresh_regions().await?;
         self.lookup_key(key)
             .ok_or_else(|| anyhow!("key is out of range"))
     }
 
     async fn resolve_part_id(&mut self, part_id: u64) -> Result<String> {
-        let lookup = |regions: &Vec<(u64, RegionInfo)>, ps_details: &HashMap<u64, PsDetail>| {
+        let lookup = |regions: &Vec<(u64, MgrRegionInfo)>,
+                      ps_details: &HashMap<u64, MgrPsDetail>| {
             regions
                 .iter()
                 .find(|(_, r)| r.part_id == part_id)
-                .and_then(|(_, region)| ps_details.get(&region.ps_id).map(|d| d.address.clone()))
+                .and_then(|(_, region)| {
+                    ps_details.get(&region.ps_id).map(|d| d.address.clone())
+                })
         };
         if let Some(addr) = lookup(&self.regions, &self.ps_details) {
             return Ok(addr);
@@ -173,7 +162,6 @@ impl ClusterClient {
             .ok_or_else(|| anyhow!("partition {} not found", part_id))
     }
 
-    /// Return sorted (part_id, ps_addr) for all partitions, to distribute bench load.
     async fn all_partitions(&mut self) -> Result<Vec<(u64, String)>> {
         if self.regions.is_empty() {
             self.refresh_regions().await?;
@@ -199,9 +187,6 @@ impl ClusterClient {
 // Hex presplit algorithm
 // ---------------------------------------------------------------------------
 
-/// Split the u32 hex key space [0x00000000, 0xFFFFFFFF] into `n` equal parts.
-/// Returns a list of (start_key_bytes, end_key_bytes) pairs suitable for partition ranges.
-/// The first range has empty start (unbounded) and the last has empty end (unbounded).
 fn hex_split_ranges(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
     if n <= 1 {
         return vec![(vec![], vec![])];
@@ -281,6 +266,10 @@ enum Command {
         part_id: u64,
         extent_ids: Vec<u64>,
     },
+    RegisterNode {
+        addr: String,
+        disks: Vec<String>,
+    },
     Format {
         listen: String,
         advertise: String,
@@ -306,7 +295,6 @@ enum Command {
         value_size: usize,
         nosync: bool,
         baseline_file: String,
-        /// Warn if current ops/sec < baseline * threshold (default 0.8 = 20% regression).
         threshold: f64,
         update_baseline: bool,
     },
@@ -351,7 +339,6 @@ fn parse_args() -> Args {
     let mut manager = String::from("127.0.0.1:9001");
     let mut i = 1;
 
-    // Parse global flags
     while i < raw.len() {
         match raw[i].as_str() {
             "--manager" => {
@@ -541,6 +528,26 @@ fn parse_args() -> Args {
                 extent_ids,
             }
         }
+        "register-node" => {
+            let mut addr = String::new();
+            let mut disks: Vec<String> = Vec::new();
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--addr" => { i += 1; addr = raw[i].clone(); }
+                    "--disk" => { i += 1; disks.push(raw[i].clone()); }
+                    _ => {}
+                }
+                i += 1;
+            }
+            if addr.is_empty() {
+                eprintln!("register-node requires --addr");
+                std::process::exit(1);
+            }
+            if disks.is_empty() {
+                disks.push("disk-default".to_string());
+            }
+            Command::RegisterNode { addr, disks }
+        }
         "format" => {
             let mut listen = String::new();
             let mut advertise = String::new();
@@ -695,7 +702,15 @@ fn parse_args() -> Args {
                 }
                 i += 1;
             }
-            Command::PerfCheck { threads, duration_secs, value_size, nosync, baseline_file, threshold, update_baseline }
+            Command::PerfCheck {
+                threads,
+                duration_secs,
+                value_size,
+                nosync,
+                baseline_file,
+                threshold,
+                update_baseline,
+            }
         }
         "info" => Command::Info,
         other => {
@@ -707,8 +722,6 @@ fn parse_args() -> Args {
     Args { manager, command }
 }
 
-/// Parse replication string "N" or "N+M" (M is ignored — write-time EC removed).
-/// Returns the replica count N.
 fn parse_replication(s: &str) -> Result<u32> {
     let n_str = s.split('+').next().unwrap_or(s);
     let n: u32 = n_str.parse().context("parse replica count")?;
@@ -791,7 +804,6 @@ struct PerfBaseline {
     write: BenchSummaryRecord,
     read: BenchSummaryRecord,
     config: BenchConfig,
-    /// Unix seconds when this baseline was recorded.
     recorded_at: u64,
 }
 
@@ -860,7 +872,6 @@ fn print_bench_summary(
     }
 }
 
-/// Returns (results, value_size). Legacy format returns value_size=0.
 fn parse_write_results(json: &str) -> Result<(Vec<BenchResult>, usize)> {
     let trimmed = json.trim_start();
     if trimmed.starts_with('[') {
@@ -881,12 +892,11 @@ fn parse_write_results(json: &str) -> Result<(Vec<BenchResult>, usize)> {
 // ---------------------------------------------------------------------------
 
 fn format_disk(dir: &str) -> Result<String> {
-    // Create 256 hash subdirectories 00..ff
     for byte in 0u8..=255 {
         let subdir = format!("{}/{:02x}", dir, byte);
-        std::fs::create_dir_all(&subdir).with_context(|| format!("create hash subdir {subdir}"))?;
+        std::fs::create_dir_all(&subdir)
+            .with_context(|| format!("create hash subdir {subdir}"))?;
     }
-    // Generate UUID marker file
     let disk_uuid = uuid::Uuid::new_v4().to_string();
     let marker_path = format!("{}/{}", dir, disk_uuid);
     std::fs::File::create(&marker_path)
@@ -927,7 +937,7 @@ mod tests {
         let (parsed, vs) = parse_write_results(&json).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].key, "k1");
-        assert_eq!(vs, 0); // legacy format has no value_size
+        assert_eq!(vs, 0);
     }
 
     #[test]
@@ -1010,7 +1020,7 @@ mod tests {
 // Main
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
+#[compio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -1029,7 +1039,6 @@ async fn main() -> Result<()> {
         } => {
             let replicates = parse_replication(&replication)?;
 
-            // Parse presplit: "1:normal" or "N:hexstring"
             let ranges: Vec<(Vec<u8>, Vec<u8>)> = {
                 let parts: Vec<&str> = presplit.splitn(2, ':').collect();
                 let n: usize = parts[0].parse().unwrap_or(1);
@@ -1041,41 +1050,41 @@ async fn main() -> Result<()> {
             };
 
             for (idx, (start_key, end_key)) in ranges.iter().enumerate() {
-                // Create 3 streams per partition: log, row, meta.
-                // All use replication at write time. Seal-after-write EC can be
-                // configured per stream via ec_data_shard/ec_parity_shard.
-                let log_resp = client
-                    .sm
-                    .create_stream(Request::new(CreateStreamRequest {
-                        replicates,
-                        ..Default::default()
-                    }))
-                    .await
-                    .context("create log stream")?
-                    .into_inner();
-                let log_stream_id = log_resp.stream.as_ref().map(|s| s.stream_id).unwrap_or(0);
+                let create_stream = async {
+                    let resp_bytes = client.mgr
+                        .call(
+                            MSG_CREATE_STREAM,
+                            rkyv_encode(&CreateStreamReq {
+                                replicates,
+                                ec_data_shard: 0,
+                                ec_parity_shard: 0,
+                            }),
+                        )
+                        .await
+                        .context("create stream")?;
+                    let resp: CreateStreamResp =
+                        rkyv_decode(&resp_bytes).map_err(decode_err)?;
+                    Ok::<u64, anyhow::Error>(resp.stream.map(|s| s.stream_id).unwrap_or(0))
+                };
+                let log_stream_id = create_stream.await.context("create log stream")?;
 
-                let row_resp = client
-                    .sm
-                    .create_stream(Request::new(CreateStreamRequest {
-                        replicates,
-                        ..Default::default()
-                    }))
-                    .await
-                    .context("create row stream")?
-                    .into_inner();
-                let row_stream_id = row_resp.stream.as_ref().map(|s| s.stream_id).unwrap_or(0);
+                let create_stream = async {
+                    let resp_bytes = client.mgr
+                        .call(MSG_CREATE_STREAM, rkyv_encode(&CreateStreamReq { replicates, ec_data_shard: 0, ec_parity_shard: 0 }))
+                        .await.context("create stream")?;
+                    let resp: CreateStreamResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+                    Ok::<u64, anyhow::Error>(resp.stream.map(|s| s.stream_id).unwrap_or(0))
+                };
+                let row_stream_id = create_stream.await.context("create row stream")?;
 
-                let meta_resp = client
-                    .sm
-                    .create_stream(Request::new(CreateStreamRequest {
-                        replicates,
-                        ..Default::default()
-                    }))
-                    .await
-                    .context("create meta stream")?
-                    .into_inner();
-                let meta_stream_id = meta_resp.stream.as_ref().map(|s| s.stream_id).unwrap_or(0);
+                let create_stream = async {
+                    let resp_bytes = client.mgr
+                        .call(MSG_CREATE_STREAM, rkyv_encode(&CreateStreamReq { replicates, ec_data_shard: 0, ec_parity_shard: 0 }))
+                        .await.context("create stream")?;
+                    let resp: CreateStreamResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+                    Ok::<u64, anyhow::Error>(resp.stream.map(|s| s.stream_id).unwrap_or(0))
+                };
+                let meta_stream_id = create_stream.await.context("create meta stream")?;
 
                 let part_id = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1083,26 +1092,29 @@ async fn main() -> Result<()> {
                     .as_millis() as u64
                     + idx as u64;
 
-                let meta = PartitionMeta {
+                let meta = MgrPartitionMeta {
                     log_stream: log_stream_id,
                     row_stream: row_stream_id,
                     meta_stream: meta_stream_id,
                     part_id,
-                    rg: Some(Range {
+                    rg: Some(MgrRange {
                         start_key: start_key.clone(),
                         end_key: end_key.clone(),
                     }),
                 };
 
-                let resp = client
-                    .pm
-                    .upsert_partition(Request::new(UpsertPartitionRequest { meta: Some(meta) }))
+                let resp_bytes = client
+                    .mgr
+                    .call(
+                        MSG_UPSERT_PARTITION,
+                        rkyv_encode(&UpsertPartitionReq { meta }),
+                    )
                     .await
-                    .context("upsert partition")?
-                    .into_inner();
+                    .context("upsert partition")?;
+                let resp: CodeResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
 
-                if resp.code != 0 {
-                    bail!("bootstrap partition {} failed: {}", idx, resp.code_des);
+                if resp.code != partition_rpc::CODE_OK {
+                    bail!("bootstrap partition {} failed: {}", idx, resp.message);
                 }
 
                 let start_s = if start_key.is_empty() {
@@ -1124,66 +1136,50 @@ async fn main() -> Result<()> {
         }
 
         Command::Put { key, file, nosync } => {
-            let value = tokio::fs::read(&file)
-                .await
-                .with_context(|| format!("read file {file}"))?;
+            let value = std::fs::read(&file).with_context(|| format!("read file {file}"))?;
             let (part_id, ps_addr) = client.resolve_key(key.as_bytes()).await?;
             let ps = client.get_ps_client(&ps_addr).await?;
-            ps.put(Request::new(PutRequest {
-                key: Bytes::from(key.into_bytes()),
-                value: Bytes::from(value),
-                expires_at: 0,
-                part_id,
-                must_sync: !nosync,
-            }))
-            .await
-            .context("put")?;
+            let resp_bytes = ps
+                .call(
+                    MSG_PUT,
+                    rkyv_encode(&PutReq {
+                        part_id,
+                        key: key.into_bytes(),
+                        value,
+                        must_sync: !nosync,
+                        expires_at: 0,
+                    }),
+                )
+                .await
+                .context("put")?;
+            let resp: PutResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+            if resp.code != partition_rpc::CODE_OK {
+                bail!("put: {}", resp.message);
+            }
             println!("ok");
         }
 
         Command::StreamPut { key, file, nosync } => {
-            let metadata = tokio::fs::metadata(&file)
-                .await
-                .with_context(|| format!("stat file {file}"))?;
-            let file_size = metadata.len() as u32;
+            let value = std::fs::read(&file).with_context(|| format!("read file {file}"))?;
+            let file_size = value.len();
             let (part_id, ps_addr) = client.resolve_key(key.as_bytes()).await?;
             let ps = client.get_ps_client(&ps_addr).await?;
-
-            let key_bytes = key.into_bytes();
-            let file_bytes = tokio::fs::read(&file)
-                .await
-                .with_context(|| format!("read file {}", &file))?;
-
-            const CHUNK_SIZE: usize = 512 * 1024;
-            let header_msg = StreamPutRequest {
-                data: Some(autumn_proto::autumn::stream_put_request::Data::Header(
-                    StreamPutRequestHeader {
-                        key: key_bytes.clone(),
-                        len_of_value: file_size,
-                        expires_at: 0,
+            let resp_bytes = ps
+                .call(
+                    MSG_STREAM_PUT,
+                    rkyv_encode(&StreamPutReq {
                         part_id,
+                        key: key.into_bytes(),
+                        value,
                         must_sync: !nosync,
-                    },
-                )),
-            };
-
-            let mut messages = vec![header_msg];
-            for chunk in file_bytes.chunks(CHUNK_SIZE) {
-                messages.push(StreamPutRequest {
-                    data: Some(autumn_proto::autumn::stream_put_request::Data::Payload(
-                        bytes::Bytes::copy_from_slice(chunk),
-                    )),
-                });
-            }
-
-            let resp = ps
-                .stream_put(Request::new(tokio_stream::iter(messages)))
+                        expires_at: 0,
+                    }),
+                )
                 .await
-                .context("stream put")?
-                .into_inner();
-
-            if resp.key != key_bytes {
-                bail!("stream put error: {}", String::from_utf8_lossy(&resp.key));
+                .context("stream put")?;
+            let resp: PutResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+            if resp.code != partition_rpc::CODE_OK {
+                bail!("stream put: {}", resp.message);
             }
             println!("ok ({file_size} bytes)");
         }
@@ -1191,58 +1187,68 @@ async fn main() -> Result<()> {
         Command::Get { key } => {
             let (part_id, ps_addr) = client.resolve_key(key.as_bytes()).await?;
             let ps = client.get_ps_client(&ps_addr).await?;
-            match ps
-                .get(Request::new(GetRequest {
-                    key: key.into_bytes(),
-                    part_id,
-                }))
+            let resp_bytes = ps
+                .call(
+                    MSG_GET,
+                    rkyv_encode(&GetReq {
+                        part_id,
+                        key: key.into_bytes(),
+                    }),
+                )
                 .await
-            {
-                Ok(resp) => {
-                    use std::io::Write;
-                    std::io::stdout().write_all(&resp.into_inner().value)?;
-                }
-                Err(s) if is_not_found(&s) => {
-                    eprintln!("key not found");
-                    std::process::exit(2);
-                }
-                Err(s) => return Err(s).context("get"),
+                .context("get")?;
+            let resp: GetResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+            if resp.code == partition_rpc::CODE_NOT_FOUND {
+                eprintln!("key not found");
+                std::process::exit(2);
             }
+            if resp.code != partition_rpc::CODE_OK {
+                bail!("get: {}", resp.message);
+            }
+            use std::io::Write;
+            std::io::stdout().write_all(&resp.value)?;
         }
 
         Command::Del { key, nosync } => {
             let (part_id, ps_addr) = client.resolve_key(key.as_bytes()).await?;
             let ps = client.get_ps_client(&ps_addr).await?;
-            match ps
-                .delete(Request::new(DeleteRequest {
-                    key: key.into_bytes(),
-                    part_id,
-                    must_sync: !nosync,
-                }))
+            let resp_bytes = ps
+                .call(
+                    MSG_DELETE,
+                    rkyv_encode(&DeleteReq {
+                        part_id,
+                        key: key.into_bytes(),
+                    }),
+                )
                 .await
-            {
-                Ok(_) => println!("ok"),
-                Err(s) if is_not_found(&s) => {
-                    eprintln!("key not found");
-                    std::process::exit(2);
-                }
-                Err(s) => return Err(s).context("delete"),
+                .context("delete")?;
+            let resp: DeleteResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+            if resp.code == partition_rpc::CODE_NOT_FOUND {
+                eprintln!("key not found");
+                std::process::exit(2);
             }
+            if resp.code != partition_rpc::CODE_OK {
+                bail!("delete: {}", resp.message);
+            }
+            println!("ok");
         }
 
         Command::Head { key } => {
             let (part_id, ps_addr) = client.resolve_key(key.as_bytes()).await?;
             let ps = client.get_ps_client(&ps_addr).await?;
-            let resp = ps
-                .head(Request::new(HeadRequest {
-                    key: key.clone().into_bytes(),
-                    part_id,
-                }))
+            let resp_bytes = ps
+                .call(
+                    MSG_HEAD,
+                    rkyv_encode(&HeadReq {
+                        part_id,
+                        key: key.clone().into_bytes(),
+                    }),
+                )
                 .await
-                .context("head")?
-                .into_inner();
-            if let Some(info) = resp.info {
-                println!("key: {}, length: {}", key, info.len);
+                .context("head")?;
+            let resp: HeadResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+            if resp.found {
+                println!("key: {}, length: {}", key, resp.value_length);
             } else {
                 println!("key not found");
             }
@@ -1260,20 +1266,23 @@ async fn main() -> Result<()> {
             };
             let (part_id, ps_addr) = client.resolve_key(search_key).await?;
             let ps = client.get_ps_client(&ps_addr).await?;
-            let resp = ps
-                .range(Request::new(RangeRequest {
-                    prefix: prefix.into_bytes(),
-                    start: start.into_bytes(),
-                    limit,
-                    part_id,
-                }))
+            let resp_bytes = ps
+                .call(
+                    MSG_RANGE,
+                    rkyv_encode(&RangeReq {
+                        part_id,
+                        prefix: prefix.into_bytes(),
+                        start: start.into_bytes(),
+                        limit,
+                    }),
+                )
                 .await
-                .context("range")?
-                .into_inner();
-            for k in &resp.keys {
-                println!("{}", String::from_utf8_lossy(k));
+                .context("range")?;
+            let resp: RangeResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+            for e in &resp.entries {
+                println!("{}", String::from_utf8_lossy(&e.key));
             }
-            if resp.truncated {
+            if resp.has_more {
                 eprintln!("(truncated, more results available)");
             }
         }
@@ -1281,7 +1290,7 @@ async fn main() -> Result<()> {
         Command::Split { part_id } => {
             let ps_addr = client.resolve_part_id(part_id).await?;
             let ps = client.get_ps_client(&ps_addr).await?;
-            ps.split_part(Request::new(SplitPartRequest { part_id }))
+            ps.call(MSG_SPLIT_PART, rkyv_encode(&SplitPartReq { part_id }))
                 .await
                 .context("split")?;
             println!("split ok");
@@ -1290,12 +1299,14 @@ async fn main() -> Result<()> {
         Command::Compact { part_id } => {
             let ps_addr = client.resolve_part_id(part_id).await?;
             let ps = client.get_ps_client(&ps_addr).await?;
-            ps.maintenance(Request::new(MaintenanceRequest {
-                part_id,
-                op: Some(autumn_proto::autumn::maintenance_request::Op::Compact(
-                    CompactOp {},
-                )),
-            }))
+            ps.call(
+                MSG_MAINTENANCE,
+                rkyv_encode(&MaintenanceReq {
+                    part_id,
+                    op: MAINTENANCE_COMPACT,
+                    extent_ids: vec![],
+                }),
+            )
             .await
             .context("compact")?;
             println!("compact triggered for partition {part_id}");
@@ -1304,12 +1315,14 @@ async fn main() -> Result<()> {
         Command::Gc { part_id } => {
             let ps_addr = client.resolve_part_id(part_id).await?;
             let ps = client.get_ps_client(&ps_addr).await?;
-            ps.maintenance(Request::new(MaintenanceRequest {
-                part_id,
-                op: Some(autumn_proto::autumn::maintenance_request::Op::AutoGc(
-                    AutoGcOp {},
-                )),
-            }))
+            ps.call(
+                MSG_MAINTENANCE,
+                rkyv_encode(&MaintenanceReq {
+                    part_id,
+                    op: MAINTENANCE_AUTO_GC,
+                    extent_ids: vec![],
+                }),
+            )
             .await
             .context("gc")?;
             println!("gc triggered for partition {part_id}");
@@ -1321,17 +1334,36 @@ async fn main() -> Result<()> {
         } => {
             let ps_addr = client.resolve_part_id(part_id).await?;
             let ps = client.get_ps_client(&ps_addr).await?;
-            ps.maintenance(Request::new(MaintenanceRequest {
-                part_id,
-                op: Some(autumn_proto::autumn::maintenance_request::Op::ForceGc(
-                    ForceGcOp {
-                        extent_ids: extent_ids.clone(),
-                    },
-                )),
-            }))
+            ps.call(
+                MSG_MAINTENANCE,
+                rkyv_encode(&MaintenanceReq {
+                    part_id,
+                    op: MAINTENANCE_FORCE_GC,
+                    extent_ids: extent_ids.clone(),
+                }),
+            )
             .await
             .context("forcegc")?;
             println!("forcegc triggered for partition {part_id}, extents={extent_ids:?}");
+        }
+
+        Command::RegisterNode { addr, disks } => {
+            let resp_bytes = client
+                .mgr
+                .call(
+                    MSG_REGISTER_NODE,
+                    rkyv_encode(&RegisterNodeReq {
+                        addr: addr.clone(),
+                        disk_uuids: disks,
+                    }),
+                )
+                .await
+                .context("register node")?;
+            let resp: RegisterNodeResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+            println!("node registered: node_id={}, addr={}", resp.node_id, addr);
+            for (uuid, disk_id) in &resp.disk_uuids {
+                println!("  disk {uuid} → disk_id={disk_id}");
+            }
         }
 
         Command::Format {
@@ -1339,7 +1371,6 @@ async fn main() -> Result<()> {
             advertise,
             dirs,
         } => {
-            // Format each disk directory
             let mut disk_uuids = Vec::new();
             for dir in &dirs {
                 std::fs::create_dir_all(dir).with_context(|| format!("create dir {dir}"))?;
@@ -1348,23 +1379,29 @@ async fn main() -> Result<()> {
                 disk_uuids.push(uuid);
             }
 
-            // Register the node with the stream manager
-            let resp = client
-                .sm
-                .register_node(Request::new(RegisterNodeRequest {
-                    addr: advertise.clone(),
-                    disk_uuids: disk_uuids.clone(),
-                }))
+            let resp_bytes = client
+                .mgr
+                .call(
+                    MSG_REGISTER_NODE,
+                    rkyv_encode(&RegisterNodeReq {
+                        addr: advertise.clone(),
+                        disk_uuids: disk_uuids.clone(),
+                    }),
+                )
                 .await
-                .context("register node")?
-                .into_inner();
+                .context("register node")?;
+            let resp: RegisterNodeResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
 
             let node_id = resp.node_id;
             println!("node registered: node_id={node_id}");
 
-            // Write node_id and disk_id files into each directory
             for (dir, disk_uuid) in dirs.iter().zip(disk_uuids.iter()) {
-                let disk_id = resp.disk_uuids.get(disk_uuid).copied().unwrap_or(0);
+                let disk_id = resp
+                    .disk_uuids
+                    .iter()
+                    .find(|(u, _)| u == disk_uuid)
+                    .map(|(_, id)| *id)
+                    .unwrap_or(0);
                 std::fs::write(format!("{dir}/node_id"), node_id.to_string())
                     .with_context(|| format!("write node_id in {dir}"))?;
                 std::fs::write(format!("{dir}/disk_id"), disk_id.to_string())
@@ -1391,20 +1428,19 @@ async fn main() -> Result<()> {
             part_id,
             reuse_value,
         } => {
-            // Raise the file-descriptor limit so that one connection per thread
-            // doesn't hit the default macOS/Linux ulimit (often 256 or 1024).
             #[cfg(unix)]
             {
-                let needed = (threads * 4 + 512) as u64; // each connection uses several fds
+                let needed = (threads * 4 + 512) as u64;
                 unsafe {
-                    let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+                    let mut rl = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
                     if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
                         if rl.rlim_cur < needed {
                             let target = needed.min(rl.rlim_max);
                             rl.rlim_cur = target;
-                            if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) != 0
-                                || target < needed
-                            {
+                            if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) != 0 || target < needed {
                                 eprintln!(
                                     "warning: need {} open files for {} threads, \
                                      but limit is {} (hard limit {}). \
@@ -1417,7 +1453,6 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Gather partition list for routing.
             let partitions = if let Some(part_id) = part_id {
                 vec![(part_id, client.resolve_part_id(part_id).await?)]
             } else {
@@ -1427,15 +1462,11 @@ async fn main() -> Result<()> {
                 bail!("no partitions found, run bootstrap first");
             }
 
-            // Each simulated user (thread) gets its own dedicated connection,
-            // matching real-world usage where N independent clients each hold
-            // one TCP/HTTP2 connection to the PS.
-            let mut thread_targets: Vec<(u64, PartitionKvClient<Channel>)> =
-                Vec::with_capacity(threads);
+            // Resolve PS addresses for each thread
+            let mut thread_targets: Vec<(u64, SocketAddr)> = Vec::with_capacity(threads);
             for tid in 0..threads {
                 let (part_id, ps_addr) = &partitions[tid % partitions.len()];
-                let ps = connect_ps_client(ps_addr).await?;
-                thread_targets.push((*part_id, ps));
+                thread_targets.push((*part_id, parse_addr(ps_addr)?));
             }
 
             let deadline =
@@ -1443,87 +1474,94 @@ async fn main() -> Result<()> {
             let total_ops = Arc::new(AtomicU64::new(0));
             let total_errors = Arc::new(AtomicU64::new(0));
             let bench_start = Instant::now();
-            let ops_samples = Arc::new(tokio::sync::Mutex::new(Vec::<BenchSample>::new()));
+            let ops_samples = Arc::new(Mutex::new(Vec::<BenchSample>::new()));
 
             let mut handles = Vec::new();
-            for (tid, (part_id, mut ps)) in thread_targets.into_iter().enumerate() {
+            for (tid, (part_id, ps_addr)) in thread_targets.into_iter().enumerate() {
                 let deadline = Arc::clone(&deadline);
                 let total_ops = Arc::clone(&total_ops);
                 let total_errors = Arc::clone(&total_errors);
-                let value_template = (0..value_size)
-                    .map(|i| (i % 256) as u8)
-                    .collect::<Vec<u8>>();
-                let value_bytes = Bytes::from(value_template);
+                let value_template = (0..value_size).map(|i| (i % 256) as u8).collect::<Vec<u8>>();
 
-                let handle = tokio::spawn(async move {
-                    let mut seq: u64 = 0;
-                    // Per-thread local buffers — merged into global vecs after the run.
-                    let mut local_latencies: Vec<f64> = Vec::new();
-                    let mut local_results: Vec<BenchResult> = Vec::new();
-
-                    loop {
-                        if std::time::SystemTime::now() >= *deadline {
-                            break;
-                        }
-                        let key = format!("bench_{}_{}", tid, seq);
-                        seq += 1;
-
-                        let t0 = Instant::now();
-                        let op_start = bench_start.elapsed().as_secs_f64();
-                        let value = if reuse_value {
-                            value_bytes.clone()
-                        } else {
-                            Bytes::copy_from_slice(value_bytes.as_ref())
-                        };
-                        let res = ps
-                            .put(Request::new(PutRequest {
-                                key: Bytes::copy_from_slice(key.as_bytes()),
-                                value,
-                                expires_at: 0,
-                                part_id,
-                                must_sync: !nosync,
-                            }))
-                            .await;
-                        let elapsed = t0.elapsed();
-
-                        match res {
-                            Ok(_) => {
-                                total_ops.fetch_add(1, Ordering::Relaxed);
-                                local_latencies.push(elapsed.as_secs_f64() * 1000.0);
-                                local_results.push(BenchResult {
-                                    key,
-                                    start_time: op_start,
-                                    elapsed: elapsed.as_secs_f64(),
-                                });
-                            }
+                let handle = std::thread::spawn(move || {
+                    compio::runtime::Runtime::new().unwrap().block_on(async {
+                        let ps = match RpcClient::connect(ps_addr).await {
+                            Ok(c) => c,
                             Err(e) => {
-                                total_errors.fetch_add(1, Ordering::Relaxed);
-                                // Log only the first error per thread to avoid spam.
-                                if seq == 1 {
-                                    eprintln!("thread {tid} put error: {e}");
+                                eprintln!("thread {tid} connect error: {e}");
+                                return (Vec::new(), Vec::new());
+                            }
+                        };
+                        let mut seq: u64 = 0;
+                        let mut local_latencies: Vec<f64> = Vec::new();
+                        let mut local_results: Vec<BenchResult> = Vec::new();
+
+                        loop {
+                            if std::time::SystemTime::now() >= *deadline {
+                                break;
+                            }
+                            let key = format!("bench_{}_{}", tid, seq);
+                            seq += 1;
+
+                            let t0 = Instant::now();
+                            let op_start = bench_start.elapsed().as_secs_f64();
+                            let value = if reuse_value {
+                                value_template.clone()
+                            } else {
+                                value_template.clone()
+                            };
+                            let res = ps
+                                .call(
+                                    MSG_PUT,
+                                    rkyv_encode(&PutReq {
+                                        part_id,
+                                        key: key.as_bytes().to_vec(),
+                                        value,
+                                        must_sync: !nosync,
+                                        expires_at: 0,
+                                    }),
+                                )
+                                .await;
+                            let elapsed = t0.elapsed();
+
+                            match res {
+                                Ok(_) => {
+                                    total_ops.fetch_add(1, Ordering::Relaxed);
+                                    local_latencies.push(elapsed.as_secs_f64() * 1000.0);
+                                    local_results.push(BenchResult {
+                                        key,
+                                        start_time: op_start,
+                                        elapsed: elapsed.as_secs_f64(),
+                                    });
                                 }
-                                tokio::time::sleep(Duration::from_millis(1)).await;
+                                Err(e) => {
+                                    total_errors.fetch_add(1, Ordering::Relaxed);
+                                    if seq == 1 {
+                                        eprintln!("thread {tid} put error: {e}");
+                                    }
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
                             }
                         }
-                    }
-                    (local_latencies, local_results)
+                        (local_latencies, local_results)
+                    })
                 });
                 handles.push(handle);
             }
 
-            // Print live progress
+            // Progress reporter
             let total_ops_clone = Arc::clone(&total_ops);
             let ops_samples_clone = Arc::clone(&ops_samples);
-            let progress = tokio::spawn(async move {
+            let progress = std::thread::spawn(move || {
                 let mut last = 0u64;
                 let mut second = 0u64;
                 loop {
-                    tokio::time::sleep(Duration::from_secs(report_interval_secs)).await;
+                    std::thread::sleep(Duration::from_secs(report_interval_secs));
                     let cur = total_ops_clone.load(Ordering::Relaxed);
                     second += report_interval_secs;
                     let delta = cur - last;
                     eprint!("\rops/s={delta}");
-                    ops_samples_clone.lock().await.push(BenchSample {
+                    ops_samples_clone.lock().unwrap().push(BenchSample {
                         second,
                         ops: delta,
                         cumulative_ops: cur,
@@ -1535,12 +1573,12 @@ async fn main() -> Result<()> {
             let mut all_latencies: Vec<f64> = Vec::new();
             let mut all_results: Vec<BenchResult> = Vec::new();
             for h in handles {
-                if let Ok((lats, res)) = h.await {
+                if let Ok((lats, res)) = h.join() {
                     all_latencies.extend(lats);
                     all_results.extend(res);
                 }
             }
-            progress.abort();
+            drop(progress);
             eprintln!();
 
             let elapsed = bench_start.elapsed();
@@ -1567,12 +1605,12 @@ async fn main() -> Result<()> {
                     reuse_value,
                 },
                 summary,
-                ops_samples: ops_samples.lock().await.drain(..).collect(),
+                ops_samples: ops_samples.lock().unwrap().drain(..).collect(),
                 results: all_results,
             };
 
             let json = serde_json::to_string_pretty(&report)?;
-            tokio::fs::write("write_result.json", json).await?;
+            std::fs::write("write_result.json", json)?;
             println!("results written to write_result.json");
         }
 
@@ -1581,9 +1619,7 @@ async fn main() -> Result<()> {
             duration_secs,
             result_file,
         } => {
-            // Load keys from write_result.json
-            let json = tokio::fs::read_to_string(&result_file)
-                .await
+            let json = std::fs::read_to_string(&result_file)
                 .with_context(|| format!("read {result_file}"))?;
             let (write_results, value_size) = parse_write_results(&json)?;
             let keys: Vec<String> = write_results.into_iter().map(|r| r.key).collect();
@@ -1609,86 +1645,91 @@ async fn main() -> Result<()> {
                 let total_ops = Arc::clone(&total_ops);
                 let total_errors = Arc::clone(&total_errors);
 
-                let handle = tokio::spawn(async move {
-                    let mut cc = match ClusterClient::connect(&manager_addr).await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            eprintln!("thread {tid} connect error: {e}");
+                let handle = std::thread::spawn(move || {
+                    compio::runtime::Runtime::new().unwrap().block_on(async {
+                        let mut cc = match ClusterClient::connect(&manager_addr).await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                eprintln!("thread {tid} connect error: {e}");
+                                return Vec::new();
+                            }
+                        };
+                        let start_idx = tid * keys_per_thread;
+                        let end_idx = (start_idx + keys_per_thread).min(keys.len());
+                        if start_idx >= end_idx {
                             return Vec::new();
                         }
-                    };
-                    let start_idx = tid * keys_per_thread;
-                    let end_idx = (start_idx + keys_per_thread).min(keys.len());
-                    if start_idx >= end_idx {
-                        return Vec::new();
-                    }
-                    let my_keys = &keys[start_idx..end_idx];
-                    let mut ki = 0usize;
-                    let mut local_latencies: Vec<f64> = Vec::new();
-                    let mut logged_errors = 0u32;
+                        let my_keys = &keys[start_idx..end_idx];
+                        let mut ki = 0usize;
+                        let mut local_latencies: Vec<f64> = Vec::new();
+                        let mut logged_errors = 0u32;
 
-                    loop {
-                        if std::time::SystemTime::now() >= *deadline {
-                            break;
-                        }
-                        let key = &my_keys[ki % my_keys.len()];
-                        ki += 1;
+                        loop {
+                            if std::time::SystemTime::now() >= *deadline {
+                                break;
+                            }
+                            let key = &my_keys[ki % my_keys.len()];
+                            ki += 1;
 
-                        let (part_id, ps_addr) = match cc.resolve_key(key.as_bytes()).await {
-                            Ok(r) => r,
-                            Err(e) => {
-                                total_errors.fetch_add(1, Ordering::Relaxed);
-                                if logged_errors < 3 {
-                                    eprintln!("thread {tid} resolve_key error: {e}");
-                                    logged_errors += 1;
+                            let (part_id, ps_addr) = match cc.resolve_key(key.as_bytes()).await {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    total_errors.fetch_add(1, Ordering::Relaxed);
+                                    if logged_errors < 3 {
+                                        eprintln!("thread {tid} resolve_key error: {e}");
+                                        logged_errors += 1;
+                                    }
+                                    continue;
                                 }
-                                continue;
-                            }
-                        };
-                        let ps = match cc.get_ps_client(&ps_addr).await {
-                            Ok(ps) => ps,
-                            Err(e) => {
-                                total_errors.fetch_add(1, Ordering::Relaxed);
-                                if logged_errors < 3 {
-                                    eprintln!("thread {tid} get_ps_client error: {e}");
-                                    logged_errors += 1;
+                            };
+                            let ps = match cc.get_ps_client(&ps_addr).await {
+                                Ok(ps) => ps,
+                                Err(e) => {
+                                    total_errors.fetch_add(1, Ordering::Relaxed);
+                                    if logged_errors < 3 {
+                                        eprintln!("thread {tid} get_ps_client error: {e}");
+                                        logged_errors += 1;
+                                    }
+                                    continue;
                                 }
-                                continue;
-                            }
-                        };
-                        let t0 = Instant::now();
-                        let res = ps
-                            .get(Request::new(GetRequest {
-                                key: key.as_bytes().to_vec(),
-                                part_id,
-                            }))
-                            .await;
-                        let elapsed = t0.elapsed();
+                            };
+                            let t0 = Instant::now();
+                            let res = ps
+                                .call(
+                                    MSG_GET,
+                                    rkyv_encode(&GetReq {
+                                        part_id,
+                                        key: key.as_bytes().to_vec(),
+                                    }),
+                                )
+                                .await;
+                            let elapsed = t0.elapsed();
 
-                        match res {
-                            Ok(_) => {
-                                total_ops.fetch_add(1, Ordering::Relaxed);
-                                local_latencies.push(elapsed.as_secs_f64() * 1000.0);
-                            }
-                            Err(e) => {
-                                total_errors.fetch_add(1, Ordering::Relaxed);
-                                if logged_errors < 3 {
-                                    eprintln!("thread {tid} get error: {e}");
-                                    logged_errors += 1;
+                            match res {
+                                Ok(_) => {
+                                    total_ops.fetch_add(1, Ordering::Relaxed);
+                                    local_latencies.push(elapsed.as_secs_f64() * 1000.0);
+                                }
+                                Err(e) => {
+                                    total_errors.fetch_add(1, Ordering::Relaxed);
+                                    if logged_errors < 3 {
+                                        eprintln!("thread {tid} get error: {e}");
+                                        logged_errors += 1;
+                                    }
                                 }
                             }
                         }
-                    }
-                    local_latencies
+                        local_latencies
+                    })
                 });
                 handles.push(handle);
             }
 
             let total_ops_clone = Arc::clone(&total_ops);
-            let progress = tokio::spawn(async move {
+            let progress = std::thread::spawn(move || {
                 let mut last = 0u64;
                 loop {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    std::thread::sleep(Duration::from_secs(1));
                     let cur = total_ops_clone.load(Ordering::Relaxed);
                     eprint!("\rops/s={}", cur - last);
                     last = cur;
@@ -1697,11 +1738,11 @@ async fn main() -> Result<()> {
 
             let mut all_latencies: Vec<f64> = Vec::new();
             for h in handles {
-                if let Ok(lats) = h.await {
+                if let Ok(lats) = h.join() {
                     all_latencies.extend(lats);
                 }
             }
-            progress.abort();
+            drop(progress);
             eprintln!();
 
             let elapsed = bench_start.elapsed();
@@ -1725,7 +1766,6 @@ async fn main() -> Result<()> {
             threshold,
             update_baseline,
         } => {
-
             // ---- Write phase ----
             println!("==> perf-check: write ({threads} threads, {duration_secs}s, {value_size}B)");
 
@@ -1734,12 +1774,10 @@ async fn main() -> Result<()> {
                 bail!("no partitions found, run bootstrap first");
             }
 
-            let mut thread_targets: Vec<(u64, PartitionKvClient<Channel>)> =
-                Vec::with_capacity(threads);
+            let mut thread_targets: Vec<(u64, SocketAddr)> = Vec::with_capacity(threads);
             for tid in 0..threads {
                 let (part_id, ps_addr) = &partitions[tid % partitions.len()];
-                let ps = connect_ps_client(ps_addr).await?;
-                thread_targets.push((*part_id, ps));
+                thread_targets.push((*part_id, parse_addr(ps_addr)?));
             }
 
             let deadline =
@@ -1748,46 +1786,61 @@ async fn main() -> Result<()> {
             let bench_start = Instant::now();
 
             let mut write_handles = Vec::new();
-            for (tid, (part_id, mut ps)) in thread_targets.into_iter().enumerate() {
+            for (tid, (part_id, ps_addr)) in thread_targets.into_iter().enumerate() {
                 let deadline = Arc::clone(&deadline);
                 let total_ops = Arc::clone(&total_ops);
-                let value_bytes = Bytes::from((0..value_size).map(|i| (i % 256) as u8).collect::<Vec<u8>>());
+                let value_bytes =
+                    (0..value_size).map(|i| (i % 256) as u8).collect::<Vec<u8>>();
 
-                let handle = tokio::spawn(async move {
-                    let mut seq: u64 = 0;
-                    let mut local_latencies: Vec<f64> = Vec::new();
-                    let mut local_keys: Vec<String> = Vec::new();
-                    loop {
-                        if std::time::SystemTime::now() >= *deadline { break; }
-                        let key = format!("pc_{tid}_{seq}");
-                        seq += 1;
-                        let t0 = Instant::now();
-                        let res = ps
-                            .put(Request::new(PutRequest {
-                                key: Bytes::copy_from_slice(key.as_bytes()),
-                                value: value_bytes.clone(),
-                                expires_at: 0,
-                                part_id,
-                                must_sync: !nosync,
-                            }))
-                            .await;
-                        let elapsed = t0.elapsed();
-                        if res.is_ok() {
-                            total_ops.fetch_add(1, Ordering::Relaxed);
-                            local_latencies.push(elapsed.as_secs_f64() * 1000.0);
-                            local_keys.push(key);
+                let handle = std::thread::spawn(move || {
+                    compio::runtime::Runtime::new().unwrap().block_on(async {
+                        let ps = match RpcClient::connect(ps_addr).await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                eprintln!("thread {tid} connect error: {e}");
+                                return (Vec::new(), Vec::new());
+                            }
+                        };
+                        let mut seq: u64 = 0;
+                        let mut local_latencies: Vec<f64> = Vec::new();
+                        let mut local_keys: Vec<String> = Vec::new();
+                        loop {
+                            if std::time::SystemTime::now() >= *deadline {
+                                break;
+                            }
+                            let key = format!("pc_{tid}_{seq}");
+                            seq += 1;
+                            let t0 = Instant::now();
+                            let res = ps
+                                .call(
+                                    MSG_PUT,
+                                    rkyv_encode(&PutReq {
+                                        part_id,
+                                        key: key.as_bytes().to_vec(),
+                                        value: value_bytes.clone(),
+                                        must_sync: !nosync,
+                                        expires_at: 0,
+                                    }),
+                                )
+                                .await;
+                            let elapsed = t0.elapsed();
+                            if res.is_ok() {
+                                total_ops.fetch_add(1, Ordering::Relaxed);
+                                local_latencies.push(elapsed.as_secs_f64() * 1000.0);
+                                local_keys.push(key);
+                            }
                         }
-                    }
-                    (local_latencies, local_keys)
+                        (local_latencies, local_keys)
+                    })
                 });
                 write_handles.push(handle);
             }
 
             let total_ops_w = Arc::clone(&total_ops);
-            let progress_w = tokio::spawn(async move {
+            let progress_w = std::thread::spawn(move || {
                 let mut last = 0u64;
                 loop {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    std::thread::sleep(Duration::from_secs(1));
                     let cur = total_ops_w.load(Ordering::Relaxed);
                     eprint!("\r[write] ops/s={}", cur - last);
                     last = cur;
@@ -1797,19 +1850,27 @@ async fn main() -> Result<()> {
             let mut all_write_latencies: Vec<f64> = Vec::new();
             let mut all_write_keys: Vec<String> = Vec::new();
             for h in write_handles {
-                if let Ok((lats, keys)) = h.await {
+                if let Ok((lats, keys)) = h.join() {
                     all_write_latencies.extend(lats);
                     all_write_keys.extend(keys);
                 }
             }
-            progress_w.abort();
+            drop(progress_w);
             eprintln!();
 
             let write_elapsed = bench_start.elapsed();
             let write_ops = total_ops.load(Ordering::Relaxed);
-            let mut write_hist = LatencyHist { samples_ms: all_write_latencies };
-            let write_summary =
-                print_bench_summary("Write", threads, value_size, write_elapsed, write_ops, &mut write_hist);
+            let mut write_hist = LatencyHist {
+                samples_ms: all_write_latencies,
+            };
+            let write_summary = print_bench_summary(
+                "Write",
+                threads,
+                value_size,
+                write_elapsed,
+                write_ops,
+                &mut write_hist,
+            );
 
             if all_write_keys.is_empty() {
                 bail!("write phase produced no keys — is the cluster running?");
@@ -1833,47 +1894,65 @@ async fn main() -> Result<()> {
                 let deadline = Arc::clone(&deadline);
                 let total_ops = Arc::clone(&total_ops);
 
-                let handle = tokio::spawn(async move {
-                    let mut cc = match ClusterClient::connect(&manager_addr).await {
-                        Ok(c) => c,
-                        Err(e) => { eprintln!("thread {tid} connect error: {e}"); return Vec::new(); }
-                    };
-                    let start_idx = tid * keys_per_thread;
-                    let end_idx = (start_idx + keys_per_thread).min(pc_keys.len());
-                    if start_idx >= end_idx { return Vec::new(); }
-                    let my_keys = &pc_keys[start_idx..end_idx];
-                    let mut ki = 0usize;
-                    let mut local_latencies: Vec<f64> = Vec::new();
-
-                    loop {
-                        if std::time::SystemTime::now() >= *deadline { break; }
-                        let key = &my_keys[ki % my_keys.len()];
-                        ki += 1;
-                        let Ok((part_id, ps_addr)) = cc.resolve_key(key.as_bytes()).await else { continue };
-                        let Ok(ps) = cc.get_ps_client(&ps_addr).await else { continue };
-                        let t0 = Instant::now();
-                        let res = ps
-                            .get(Request::new(GetRequest {
-                                key: key.as_bytes().to_vec(),
-                                part_id,
-                            }))
-                            .await;
-                        let elapsed = t0.elapsed();
-                        if res.is_ok() {
-                            total_ops.fetch_add(1, Ordering::Relaxed);
-                            local_latencies.push(elapsed.as_secs_f64() * 1000.0);
+                let handle = std::thread::spawn(move || {
+                    compio::runtime::Runtime::new().unwrap().block_on(async {
+                        let mut cc = match ClusterClient::connect(&manager_addr).await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                eprintln!("thread {tid} connect error: {e}");
+                                return Vec::new();
+                            }
+                        };
+                        let start_idx = tid * keys_per_thread;
+                        let end_idx = (start_idx + keys_per_thread).min(pc_keys.len());
+                        if start_idx >= end_idx {
+                            return Vec::new();
                         }
-                    }
-                    local_latencies
+                        let my_keys = &pc_keys[start_idx..end_idx];
+                        let mut ki = 0usize;
+                        let mut local_latencies: Vec<f64> = Vec::new();
+
+                        loop {
+                            if std::time::SystemTime::now() >= *deadline {
+                                break;
+                            }
+                            let key = &my_keys[ki % my_keys.len()];
+                            ki += 1;
+                            let Ok((part_id, ps_addr)) =
+                                cc.resolve_key(key.as_bytes()).await
+                            else {
+                                continue;
+                            };
+                            let Ok(ps) = cc.get_ps_client(&ps_addr).await else {
+                                continue;
+                            };
+                            let t0 = Instant::now();
+                            let res = ps
+                                .call(
+                                    MSG_GET,
+                                    rkyv_encode(&GetReq {
+                                        part_id,
+                                        key: key.as_bytes().to_vec(),
+                                    }),
+                                )
+                                .await;
+                            let elapsed = t0.elapsed();
+                            if res.is_ok() {
+                                total_ops.fetch_add(1, Ordering::Relaxed);
+                                local_latencies.push(elapsed.as_secs_f64() * 1000.0);
+                            }
+                        }
+                        local_latencies
+                    })
                 });
                 read_handles.push(handle);
             }
 
             let total_ops_r = Arc::clone(&total_ops);
-            let progress_r = tokio::spawn(async move {
+            let progress_r = std::thread::spawn(move || {
                 let mut last = 0u64;
                 loop {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    std::thread::sleep(Duration::from_secs(1));
                     let cur = total_ops_r.load(Ordering::Relaxed);
                     eprint!("\r[read] ops/s={}", cur - last);
                     last = cur;
@@ -1882,16 +1961,26 @@ async fn main() -> Result<()> {
 
             let mut all_read_latencies: Vec<f64> = Vec::new();
             for h in read_handles {
-                if let Ok(lats) = h.await { all_read_latencies.extend(lats); }
+                if let Ok(lats) = h.join() {
+                    all_read_latencies.extend(lats);
+                }
             }
-            progress_r.abort();
+            drop(progress_r);
             eprintln!();
 
             let read_elapsed = bench_start.elapsed();
             let read_ops = total_ops.load(Ordering::Relaxed);
-            let mut read_hist = LatencyHist { samples_ms: all_read_latencies };
-            let read_summary =
-                print_bench_summary("Read", threads, 0, read_elapsed, read_ops, &mut read_hist);
+            let mut read_hist = LatencyHist {
+                samples_ms: all_read_latencies,
+            };
+            let read_summary = print_bench_summary(
+                "Read",
+                threads,
+                0,
+                read_elapsed,
+                read_ops,
+                &mut read_hist,
+            );
 
             // ---- Regression check ----
             let mut regressed = false;
@@ -1900,8 +1989,6 @@ async fn main() -> Result<()> {
                 .and_then(|s| serde_json::from_str(&s).ok());
 
             if let Some(ref bl) = baseline_opt {
-                // Throughput: warn if current < baseline * threshold.
-                // Latency: warn if current > baseline * (2 - threshold), i.e. 120% for threshold=0.8.
                 let lat_ceil = 2.0 - threshold;
 
                 macro_rules! check_throughput {
@@ -1910,7 +1997,8 @@ async fn main() -> Result<()> {
                         if pct < threshold {
                             println!(
                                 "WARNING: {} ops/sec regressed: {:.0} vs baseline {:.0} ({:.0}%)",
-                                $label, $cur, $base, pct * 100.0
+                                $label, $cur, $base,
+                                pct * 100.0
                             );
                             regressed = true;
                         }
@@ -1923,7 +2011,8 @@ async fn main() -> Result<()> {
                             if ratio > lat_ceil {
                                 println!(
                                     "WARNING: {} p99 latency spiked: {:.2}ms vs baseline {:.2}ms ({:.0}%)",
-                                    $label, $cur, $base, ratio * 100.0
+                                    $label, $cur, $base,
+                                    ratio * 100.0
                                 );
                                 regressed = true;
                             }
@@ -1932,21 +2021,23 @@ async fn main() -> Result<()> {
                 }
 
                 check_throughput!("write", write_summary.ops_per_sec, bl.write.ops_per_sec);
-                check_throughput!("read",  read_summary.ops_per_sec,  bl.read.ops_per_sec);
+                check_throughput!("read", read_summary.ops_per_sec, bl.read.ops_per_sec);
                 check_latency!("write", write_summary.p99_ms, bl.write.p99_ms);
-                check_latency!("read",  read_summary.p99_ms,  bl.read.p99_ms);
+                check_latency!("read", read_summary.p99_ms, bl.read.p99_ms);
 
                 if !regressed {
                     println!(
                         "perf-check OK (write={:.0} ops/s read={:.0} ops/s, within {:.0}% of baseline)",
-                        write_summary.ops_per_sec, read_summary.ops_per_sec, threshold * 100.0
+                        write_summary.ops_per_sec, read_summary.ops_per_sec,
+                        threshold * 100.0
                     );
                 }
             } else {
-                println!("no baseline at '{baseline_file}' — run with --update-baseline to create one");
+                println!(
+                    "no baseline at '{baseline_file}' — run with --update-baseline to create one"
+                );
             }
 
-            // ---- Optionally update baseline ----
             if update_baseline {
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1968,7 +2059,7 @@ async fn main() -> Result<()> {
                     recorded_at: now_secs,
                 };
                 let json = serde_json::to_string_pretty(&bl)?;
-                tokio::fs::write(&baseline_file, json).await?;
+                std::fs::write(&baseline_file, json)?;
                 println!("baseline saved to {baseline_file}");
             }
 
@@ -1978,48 +2069,55 @@ async fn main() -> Result<()> {
         }
 
         Command::Info => {
-            let stream_resp = client
-                .sm
-                .stream_info(Request::new(StreamInfoRequest {
-                    stream_ids: Vec::new(),
-                }))
+            let stream_resp_bytes = client
+                .mgr
+                .call(
+                    MSG_STREAM_INFO,
+                    rkyv_encode(&StreamInfoReq {
+                        stream_ids: Vec::new(),
+                    }),
+                )
                 .await
-                .context("stream info")?
-                .into_inner();
+                .context("stream info")?;
+            let stream_resp: StreamInfoResp =
+                rkyv_decode(&stream_resp_bytes).map_err(decode_err)?;
 
-            let nodes_resp: NodesInfoResponse = client
-                .sm
-                .nodes_info(Request::new(Empty {}))
+            let nodes_resp_bytes = client
+                .mgr
+                .call(MSG_NODES_INFO, Bytes::new())
                 .await
-                .context("nodes info")?
-                .into_inner();
+                .context("nodes info")?;
+            let nodes_resp: NodesInfoResp =
+                rkyv_decode(&nodes_resp_bytes).map_err(decode_err)?;
 
-            let regions_resp = client
-                .pm
-                .get_regions(Request::new(Empty {}))
+            let regions_resp_bytes = client
+                .mgr
+                .call(MSG_GET_REGIONS, Bytes::new())
                 .await
-                .context("get regions")?
-                .into_inner();
+                .context("get regions")?;
+            let regions_resp: GetRegionsResp =
+                rkyv_decode(&regions_resp_bytes).map_err(decode_err)?;
 
             println!("=== Nodes ===");
-            let mut node_ids: Vec<u64> = nodes_resp.nodes.keys().copied().collect();
-            node_ids.sort();
-            for nid in node_ids {
-                let n = &nodes_resp.nodes[&nid];
+            let mut nodes: Vec<(u64, MgrNodeInfo)> = nodes_resp.nodes.into_iter().collect();
+            nodes.sort_by_key(|(id, _)| *id);
+            for (nid, n) in &nodes {
                 println!("  node {}: addr={}, disks={:?}", nid, n.address, n.disks);
             }
 
             println!("\n=== Streams ===");
-            let mut stream_ids: Vec<u64> = stream_resp.streams.keys().copied().collect();
-            stream_ids.sort();
-            for sid in stream_ids {
-                let s = &stream_resp.streams[&sid];
+            let mut streams: Vec<(u64, MgrStreamInfo)> =
+                stream_resp.streams.into_iter().collect();
+            streams.sort_by_key(|(id, _)| *id);
+            for (sid, s) in &streams {
                 println!("  stream {}: extents={:?}", sid, s.extent_ids);
             }
 
             println!("\n=== Partitions ===");
-            let regions = regions_resp.regions.unwrap_or_default().regions;
-            let ps_details = regions_resp.ps_details;
+            let regions: HashMap<u64, MgrRegionInfo> =
+                regions_resp.regions.into_iter().collect();
+            let ps_details: HashMap<u64, MgrPsDetail> =
+                regions_resp.ps_details.into_iter().collect();
             let mut part_ids: Vec<u64> = regions.keys().copied().collect();
             part_ids.sort();
             for pid in part_ids {

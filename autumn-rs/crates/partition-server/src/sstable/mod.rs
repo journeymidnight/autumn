@@ -5,6 +5,5 @@ pub mod iterator;
 pub mod reader;
 
 pub use builder::SstBuilder;
-pub use format::DecodedBlock;
 pub use iterator::{IterItem, MemtableIterator, MergeIterator, TableIterator};
 pub use reader::SstReader;

@@ -2,22 +2,24 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
-use autumn_proto::autumn::{DiskInfo, ExtentInfo, NodeInfo, PartitionMeta, RegionInfo, StreamInfo};
+use autumn_rpc::manager_rpc::{
+    MgrDiskInfo, MgrExtentInfo, MgrNodeInfo, MgrPartitionMeta, MgrRegionInfo, MgrStreamInfo,
+};
 
 use crate::{AppError, AppResult};
 
 #[derive(Debug, Default)]
 pub struct MetadataState {
     pub next_id: u64,
-    pub streams: HashMap<u64, StreamInfo>,
-    pub extents: HashMap<u64, ExtentInfo>,
-    pub nodes: HashMap<u64, NodeInfo>,
-    pub disks: HashMap<u64, DiskInfo>,
+    pub streams: HashMap<u64, MgrStreamInfo>,
+    pub extents: HashMap<u64, MgrExtentInfo>,
+    pub nodes: HashMap<u64, MgrNodeInfo>,
+    pub disks: HashMap<u64, MgrDiskInfo>,
     pub owner_revisions: HashMap<String, i64>,
     pub next_revision: i64,
-    pub partitions: HashMap<u64, PartitionMeta>,
+    pub partitions: HashMap<u64, MgrPartitionMeta>,
     pub ps_nodes: HashMap<u64, String>,
-    pub regions: BTreeMap<u64, RegionInfo>,
+    pub regions: BTreeMap<u64, MgrRegionInfo>,
 }
 
 impl MetadataState {
