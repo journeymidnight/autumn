@@ -10,6 +10,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -18,6 +19,7 @@ use compio::net::TcpStream;
 use compio::BufResult;
 use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::runtime::spawn;
+use futures::StreamExt;
 use tracing;
 
 use crate::error::{RpcError, StatusCode};
@@ -85,13 +87,14 @@ impl RpcServer {
 
         let handler = self.handler;
 
-        // Use a channel to receive accepted connections from a blocking thread.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<(std::net::TcpStream, SocketAddr)>(256);
+        // Use futures channel to receive accepted connections from a blocking thread.
+        let (tx, mut rx) = futures::channel::mpsc::channel::<(std::net::TcpStream, SocketAddr)>(256);
 
         // Spawn a blocking accept thread.
         std::thread::Builder::new()
             .name("autumn-rpc-accept".to_string())
             .spawn(move || {
+                let mut tx = tx;
                 loop {
                     match std_listener.accept() {
                         Ok((stream, peer_addr)) => {
@@ -99,8 +102,9 @@ impl RpcServer {
                                 tracing::warn!(peer = %peer_addr, error = %e, "set_nonblocking failed");
                                 continue;
                             }
-                            if tx.blocking_send((stream, peer_addr)).is_err() {
-                                break; // receiver dropped, server shutting down
+                            // try_send: if channel full (256 pending), drop connection
+                            if tx.try_send((stream, peer_addr)).is_err() {
+                                tracing::warn!("accept channel full, dropping connection");
                             }
                         }
                         Err(e) => {
@@ -113,7 +117,7 @@ impl RpcServer {
 
         // Dispatch accepted connections to compio workers.
         loop {
-            let (std_stream, peer_addr) = match rx.recv().await {
+            let (std_stream, peer_addr) = match rx.next().await {
                 Some(v) => v,
                 None => return Ok(()), // accept thread exited
             };
@@ -153,7 +157,9 @@ async fn handle_connection(
     handler: BoxHandler,
 ) -> Result<(), RpcError> {
     let (mut reader, writer) = stream.into_split();
-    let writer = Arc::new(tokio::sync::Mutex::new(writer));
+    // Must be async Mutex: multiple spawned handler tasks write responses
+    // concurrently, and write_all().await crosses the await point.
+    let writer = Rc::new(futures::lock::Mutex::new(writer));
     let mut decoder = FrameDecoder::new();
     let mut buf = vec![0u8; 64 * 1024];
 

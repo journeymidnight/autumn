@@ -1,7 +1,6 @@
 [workspace]
 members = [
   "crates/common",
-  "crates/io-engine",
   "crates/rpc",
   "crates/etcd",
   "crates/stream",
@@ -18,13 +17,10 @@ license = "Apache-2.0"
 [workspace.dependencies]
 anyhow = "1"
 bytes = "1"
-async-trait = "0.1"
 crossbeam-skiplist = "0.1"
 dashmap = "6"
-parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "fs", "io-util"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 crc32c = "0.6"

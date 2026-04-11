@@ -1,32 +1,29 @@
-Date: 2026-04-11
-TaskStatus: not_completed
-Task scope: F046 — Migrate CLI tools, proto codegen, and tests to compio
+Date: 2026-04-10
+TaskStatus: completed
+Task scope: Code cleanup — delete io-engine, remove tokio, split long lib.rs files
 
 Current summary:
-  F046 proto/tonic elimination complete:
-  - autumn-proto crate deleted entirely (prost only in crates/etcd now)
-  - MetadataStore (common/store.rs) uses rkyv Mgr* types from manager_rpc.rs
-  - Manager etcd persistence uses rkyv_encode/rkyv_decode instead of protobuf
-  - Partition server TableLocations uses rkyv (new SstLocation type in partition_rpc.rs)
-  - autumn-client rewritten: autumn-rpc + compio, no tonic/protobuf
-  - stream-cli deleted (autumn-client now has register-node subcommand)
-  - Manager integration tests rewritten: compio + autumn-rpc
-  - tonic/prost/tonic-build removed from workspace deps
-  - ConnPool fixed: take/put pattern avoids RefCell borrow across await
-  - 48 unit tests pass (2 common + 7 rpc + 18 stream + 5 manager + 11 partition + 5 client)
-  - All 4 binaries build (manager, extent-node, ps, client)
+  Cleanup complete:
+  1. Deleted autumn-io-engine crate (unused since compio migration)
+     - Removed from workspace members, server Cargo.toml, bench references
+     - Removed async-trait and parking_lot workspace deps (unused)
+  2. Removed ALL tokio dependencies from autumn-rs crates
+     - RpcClient: tokio::sync::{oneshot, Mutex} → futures::channel::oneshot + futures::lock::Mutex
+       (Mutex needed because write_all().await crosses await point)
+     - RpcServer: tokio::sync::mpsc → futures::channel::mpsc; writer Mutex same pattern
+     - ConnPool: Arc → Rc, DashMap → HashMap (single-threaded compio)
+     - partition-server: tokio::sync::{mpsc, oneshot} → futures::channel equivalents
+     - Removed tokio from all Cargo.toml files including workspace
+  3. Split long lib.rs files
+     - manager/src/lib.rs: 2776 → 1189 lines (extracted rpc_handlers.rs 1154, recovery.rs 468)
+     - partition-server/src/lib.rs: 2522 → 1324 lines (extracted background.rs 917, rpc_handlers.rs 319)
+  All 49 unit tests pass. All 4 binaries build.
 
-Main gaps:
-  - compio timer issue: spawned task timers don't fire when main task is in
-    timeout(accept) loop. PS heartbeat_loop and region_sync_loop don't execute.
-    Affects both PS and manager background loops. Unit tests pass (timers work in
-    test context) but real binary has the issue. Needs deeper investigation of
-    compio's block_on/run/poll_with interaction.
-  - tokio::sync not yet replaced (RpcClient, RpcServer, partition-server channels).
-    Plan exists but blocked on understanding compio timer behavior first.
+Key design insight (compio concurrency):
+  - Rc<RefCell<T>>: use when borrow does NOT cross await points (fastest)
+  - Rc<futures::lock::Mutex<T>>: use when lock MUST be held across await (e.g. write_all)
+  - Never use std::sync::Mutex in async (blocks entire runtime)
 
 Next steps:
-  - Debug compio timer issue — key question: why do spawned task timers fire in
-    unit tests but not in the real binary's accept loop?
-  - Once timer issue resolved: replace tokio::sync with futures::channel everywhere
-  - Run perf_check.sh to verify end-to-end functionality
+  - Investigate write perf regression (5938 vs 17388 ops/s)
+  - Update remaining CLAUDE.md files

@@ -8,7 +8,6 @@ license.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 crossbeam-skiplist.workspace = true
-tokio = { version = "1", features = ["sync"] }
 tracing.workspace = true
 autumn-rpc = { path = "../rpc" }
 autumn-stream = { path = "../stream" }

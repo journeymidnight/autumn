@@ -17,18 +17,8 @@ fn main() {
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::write(data_dir.join("disk_id"), "1").unwrap();
 
-        let node = {
-            let tokio_rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            tokio_rt.block_on(async {
-                let config = autumn_stream::ExtentNodeConfig::new(
-                    data_dir, autumn_io_engine::IoMode::Standard, 1,
-                );
-                autumn_stream::ExtentNode::new(config).await.unwrap()
-            })
-        };
+        let config = autumn_stream::ExtentNodeConfig::new(data_dir, 1);
+        let node = autumn_stream::ExtentNode::new(config).await.unwrap();
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let listener = std::net::TcpListener::bind(addr).unwrap();

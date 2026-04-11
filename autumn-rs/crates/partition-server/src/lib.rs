@@ -1,4 +1,9 @@
+mod background;
+mod rpc_handlers;
 mod sstable;
+
+use background::*;
+use rpc_handlers::dispatch_partition_rpc;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -18,7 +23,8 @@ use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::net::TcpStream;
 use compio::BufResult;
 use crossbeam_skiplist::SkipMap;
-use tokio::sync::{mpsc, oneshot};
+use futures::channel::{mpsc, oneshot};
+use futures::{FutureExt, SinkExt, StreamExt};
 
 use sstable::{IterItem, MemtableIterator, MergeIterator, SstBuilder, SstReader, TableIterator};
 
@@ -46,7 +52,7 @@ const COMPACT_N: usize = 5;
 const TS_BYTES: usize = 8;
 const TS_SIZE: usize = TS_BYTES + 1;
 
-fn key_with_ts(user_key: &[u8], ts: u64) -> Vec<u8> {
+pub(crate) fn key_with_ts(user_key: &[u8], ts: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(user_key.len() + TS_SIZE);
     out.extend_from_slice(user_key);
     out.push(0u8);
@@ -54,14 +60,14 @@ fn key_with_ts(user_key: &[u8], ts: u64) -> Vec<u8> {
     out
 }
 
-fn parse_key(internal_key: &[u8]) -> &[u8] {
+pub(crate) fn parse_key(internal_key: &[u8]) -> &[u8] {
     if internal_key.len() <= TS_SIZE {
         return internal_key;
     }
     &internal_key[..internal_key.len() - TS_SIZE]
 }
 
-fn parse_ts(internal_key: &[u8]) -> u64 {
+pub(crate) fn parse_ts(internal_key: &[u8]) -> u64 {
     if internal_key.len() <= TS_SIZE {
         return 0;
     }
@@ -80,7 +86,7 @@ const VALUE_POINTER_SIZE: usize = 16;
 const OP_VALUE_POINTER: u8 = 0x80;
 
 #[derive(Debug, Clone, Copy)]
-struct ValuePointer {
+pub(crate) struct ValuePointer {
     extent_id: u64,
     offset: u32,
     len: u32,
@@ -108,13 +114,13 @@ impl ValuePointer {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-struct MemEntry {
+pub(crate) struct MemEntry {
     op: u8,
     value: Vec<u8>,
     expires_at: u64,
 }
 
-struct Memtable {
+pub(crate) struct Memtable {
     data: SkipMap<Vec<u8>, MemEntry>,
     bytes: AtomicU64,
 }
@@ -168,7 +174,7 @@ impl Memtable {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
-struct TableMeta {
+pub(crate) struct TableMeta {
     extent_id: u64,
     offset: u32,
     len: u32,
@@ -186,7 +192,7 @@ impl TableMeta {
 // PartitionData — lives on a dedicated partition thread (Rc, no locks)
 // ---------------------------------------------------------------------------
 
-struct PartitionData {
+pub(crate) struct PartitionData {
     rg: Range,
     active: Memtable,
     imm: VecDeque<Rc<Memtable>>,
@@ -210,7 +216,7 @@ struct PartitionData {
 // GC task
 // ---------------------------------------------------------------------------
 
-enum GcTask {
+pub(crate) enum GcTask {
     Auto,
     Force { extent_ids: Vec<u64> },
 }
@@ -219,7 +225,7 @@ enum GcTask {
 // Group-commit write channel types
 // ---------------------------------------------------------------------------
 
-enum WriteOp {
+pub(crate) enum WriteOp {
     Put {
         user_key: Bytes,
         value: Bytes,
@@ -230,7 +236,7 @@ enum WriteOp {
     },
 }
 
-struct WriteRequest {
+pub(crate) struct WriteRequest {
     op: WriteOp,
     must_sync: bool,
     resp_tx: oneshot::Sender<Result<Vec<u8>, String>>,
@@ -248,7 +254,7 @@ impl WriteRequest {
 }
 
 #[derive(Debug, Default)]
-struct BatchStats {
+pub(crate) struct BatchStats {
     ops: u64,
     batch_size: u64,
     phase1_ns: u64,
@@ -257,7 +263,7 @@ struct BatchStats {
     end_to_end_ns: u64,
 }
 
-struct WriteLoopMetrics {
+pub(crate) struct WriteLoopMetrics {
     started_at: Instant,
     ops: u64,
     batches: u64,
@@ -622,13 +628,14 @@ impl PartitionServer {
                         let resp_frame = if let Some(handle) =
                             server.partitions.borrow().get(&part_id)
                         {
+                            let mut req_tx = handle.req_tx.clone();
                             let (resp_tx, resp_rx) = oneshot::channel();
                             let req = PartitionRequest {
                                 msg_type,
                                 payload,
                                 resp_tx,
                             };
-                            if handle.req_tx.send(req).await.is_err() {
+                            if req_tx.send(req).await.is_err() {
                                 Frame::error(
                                     req_id,
                                     msg_type,
@@ -711,7 +718,7 @@ async fn partition_thread_main(
         recover_partition(part_id, &rg, log_stream_id, row_stream_id, meta_stream_id, &part_sc)
             .await?;
 
-    let (flush_tx, flush_rx) = mpsc::unbounded_channel::<()>();
+    let (flush_tx, flush_rx) = mpsc::unbounded::<()>();
     let (compact_tx, compact_rx) = mpsc::channel::<bool>(1);
     let (gc_tx, gc_rx) = mpsc::channel::<GcTask>(1);
     let (write_tx, write_rx) = mpsc::channel::<WriteRequest>(WRITE_CHANNEL_CAP);
@@ -767,7 +774,7 @@ async fn partition_thread_main(
     }
 
     // Main request processing loop.
-    while let Some(req) = req_rx.recv().await {
+    while let Some(req) = req_rx.next().await {
         let result = dispatch_partition_rpc(req.msg_type, req.payload, &part, &part_sc, &pool, &manager_addr, &owner_key, revision).await;
         let _ = req.resp_tx.send(result);
     }
@@ -962,7 +969,7 @@ async fn recover_partition(
 // Record encoding/decoding
 // ---------------------------------------------------------------------------
 
-fn encode_record(op: u8, key: &[u8], value: &[u8], expires_at: u64) -> Vec<u8> {
+pub(crate) fn encode_record(op: u8, key: &[u8], value: &[u8], expires_at: u64) -> Vec<u8> {
     let mut buf = Vec::with_capacity(17 + key.len() + value.len());
     buf.push(op);
     buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
@@ -973,7 +980,7 @@ fn encode_record(op: u8, key: &[u8], value: &[u8], expires_at: u64) -> Vec<u8> {
     buf
 }
 
-fn decode_records_full(bytes: &[u8]) -> Vec<(u8, Vec<u8>, Vec<u8>, u64)> {
+pub(crate) fn decode_records_full(bytes: &[u8]) -> Vec<(u8, Vec<u8>, Vec<u8>, u64)> {
     let mut out = Vec::new();
     let mut cursor = 0usize;
     while cursor + 17 <= bytes.len() {
@@ -997,7 +1004,7 @@ fn decode_records_full(bytes: &[u8]) -> Vec<(u8, Vec<u8>, Vec<u8>, u64)> {
     out
 }
 
-fn decode_records_with_offsets(bytes: &[u8]) -> Vec<(usize, u8, Vec<u8>, Vec<u8>, u64)> {
+pub(crate) fn decode_records_with_offsets(bytes: &[u8]) -> Vec<(usize, u8, Vec<u8>, Vec<u8>, u64)> {
     let mut out = Vec::new();
     let mut cursor = 0usize;
     while cursor + 17 <= bytes.len() {
@@ -1022,7 +1029,7 @@ fn decode_records_with_offsets(bytes: &[u8]) -> Vec<(usize, u8, Vec<u8>, Vec<u8>
     out
 }
 
-fn decode_last_table_locations(data: &[u8]) -> Result<TableLocations> {
+pub(crate) fn decode_last_table_locations(data: &[u8]) -> Result<TableLocations> {
     // Format: sequence of [len: u32 LE][rkyv payload] records.
     // We want the last successfully decoded record.
     let mut last: Option<TableLocations> = None;
@@ -1044,7 +1051,7 @@ fn decode_last_table_locations(data: &[u8]) -> Result<TableLocations> {
     last.ok_or_else(|| anyhow!("decode TableLocations: no valid record"))
 }
 
-fn in_range(rg: &Range, key: &[u8]) -> bool {
+pub(crate) fn in_range(rg: &Range, key: &[u8]) -> bool {
     if key < rg.start_key.as_slice() {
         return false;
     }
@@ -1058,7 +1065,7 @@ fn in_range(rg: &Range, key: &[u8]) -> bool {
 // MetaStream persistence
 // ---------------------------------------------------------------------------
 
-async fn save_table_locs_raw(
+pub(crate) async fn save_table_locs_raw(
     stream_client: &Rc<StreamClient>,
     meta_stream_id: u64,
     tables: &[TableMeta],
@@ -1094,7 +1101,7 @@ async fn save_table_locs_raw(
 // SSTable building
 // ---------------------------------------------------------------------------
 
-fn build_sst_bytes(imm: &Memtable, vp_extent_id: u64, vp_offset: u32) -> (Vec<u8>, u64) {
+pub(crate) fn build_sst_bytes(imm: &Memtable, vp_extent_id: u64, vp_offset: u32) -> (Vec<u8>, u64) {
     let mut builder = SstBuilder::new(vp_extent_id, vp_offset);
     let mut last_seq = 0u64;
     for entry in imm.data.iter() {
@@ -1117,7 +1124,7 @@ fn build_sst_bytes(imm: &Memtable, vp_extent_id: u64, vp_offset: u32) -> (Vec<u8
 // Memtable rotation + flush
 // ---------------------------------------------------------------------------
 
-fn rotate_active(part: &mut PartitionData) {
+pub(crate) fn rotate_active(part: &mut PartitionData) {
     if part.active.is_empty() {
         return;
     }
@@ -1128,16 +1135,16 @@ fn rotate_active(part: &mut PartitionData) {
     }
     part.imm.push_back(Rc::new(frozen));
     part.active = Memtable::new();
-    let _ = part.flush_tx.send(());
+    let _ = part.flush_tx.unbounded_send(());
 }
 
-fn maybe_rotate(part: &mut PartitionData) {
+pub(crate) fn maybe_rotate(part: &mut PartitionData) {
     if part.active.mem_bytes() >= FLUSH_MEM_BYTES {
         rotate_active(part);
     }
 }
 
-async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<bool> {
+pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<bool> {
     let (imm_mem, row_stream_id, meta_stream_id, snap_vp_eid, snap_vp_off, part_sc) = {
         let p = part.borrow();
         let Some(imm_mem) = p.imm.front().cloned() else {
@@ -1185,7 +1192,7 @@ async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<bool> {
     Ok(true)
 }
 
-async fn flush_memtable_locked(part: &Rc<RefCell<PartitionData>>) -> Result<bool> {
+pub(crate) async fn flush_memtable_locked(part: &Rc<RefCell<PartitionData>>) -> Result<bool> {
     {
         let mut p = part.borrow_mut();
         rotate_active(&mut p);
@@ -1209,7 +1216,7 @@ async fn background_flush_loop(
     part: Rc<RefCell<PartitionData>>,
     mut flush_rx: mpsc::UnboundedReceiver<()>,
 ) {
-    while flush_rx.recv().await.is_some() {
+    while flush_rx.next().await.is_some() {
         loop {
             match flush_one_imm(&part).await {
                 Ok(true) => continue,
@@ -1223,1216 +1230,11 @@ async fn background_flush_loop(
     }
 }
 
-async fn background_compact_loop(
-    _part_id: u64,
-    part: Rc<RefCell<PartitionData>>,
-    mut compact_rx: mpsc::Receiver<bool>,
-) {
-    fn random_delay() -> Duration {
-        Duration::from_millis(10_000 + rand_u64() % 10_000)
-    }
-
-    let mut next_minor_delay = random_delay();
-
-    loop {
-        use std::future::Future;
-        use std::pin::Pin;
-        use std::task::Poll;
-
-        enum CompactSelected {
-            Recv(Option<bool>),
-            Timeout,
-        }
-
-        let task = {
-            let mut recv_fut = std::pin::pin!(compact_rx.recv());
-            let mut sleep_fut = std::pin::pin!(compio::time::sleep(next_minor_delay));
-
-            std::future::poll_fn(|cx| {
-                if let Poll::Ready(v) = Pin::new(&mut recv_fut).poll(cx) {
-                    return Poll::Ready(CompactSelected::Recv(v));
-                }
-                if let Poll::Ready(()) = Pin::new(&mut sleep_fut).poll(cx) {
-                    return Poll::Ready(CompactSelected::Timeout);
-                }
-                Poll::Pending
-            })
-            .await
-        };
-
-        match task {
-            CompactSelected::Recv(None) => break,
-            CompactSelected::Recv(Some(_)) => {
-                let tbls = part.borrow().tables.clone();
-                if tbls.len() < 2 && part.borrow().has_overlap.get() == 0 {
-                    continue;
-                }
-                let last_extent = tbls.last().map(|t| t.extent_id).unwrap_or(0);
-                match do_compact(&part, tbls, true).await {
-                    Ok(_) => {
-                        part.borrow().has_overlap.set(0);
-                        if last_extent != 0 {
-                            let (row_stream_id, part_sc) = {
-                                let p = part.borrow();
-                                (p.row_stream_id, p.stream_client.clone())
-                            };
-                            if let Err(e) = part_sc.truncate(row_stream_id, last_extent).await {
-                                tracing::warn!("major compaction truncate: {e}");
-                            }
-                        }
-                    }
-                    Err(e) => tracing::error!("major compaction: {e}"),
-                }
-                next_minor_delay = random_delay();
-            }
-            CompactSelected::Timeout => {
-                next_minor_delay = random_delay();
-                let tbls = part.borrow().tables.clone();
-                let (compact_tbls, truncate_id) = pickup_tables(&tbls, 2 * MAX_SKIP_LIST);
-                if compact_tbls.len() < 2 {
-                    continue;
-                }
-                match do_compact(&part, compact_tbls, false).await {
-                    Ok(_) => {
-                        if truncate_id != 0 {
-                            let (row_stream_id, part_sc) = {
-                                let p = part.borrow();
-                                (p.row_stream_id, p.stream_client.clone())
-                            };
-                            if let Err(e) = part_sc.truncate(row_stream_id, truncate_id).await {
-                                tracing::warn!("minor compaction truncate: {e}");
-                            }
-                        }
-                    }
-                    Err(e) => tracing::error!("minor compaction: {e}"),
-                }
-            }
-        }
-    }
-}
-
-
-async fn background_gc_loop(
-    part: Rc<RefCell<PartitionData>>,
-    mut gc_rx: mpsc::Receiver<GcTask>,
-) {
-    const MAX_GC_ONCE: usize = 3;
-    const GC_DISCARD_RATIO: f64 = 0.4;
-    fn random_delay() -> Duration {
-        Duration::from_millis(30_000 + rand_u64() % 30_000)
-    }
-
-    let mut next_auto_delay = random_delay();
-
-    loop {
-        use std::future::Future;
-        use std::pin::Pin;
-        use std::task::Poll;
-
-        enum GcSel {
-            Recv(Option<GcTask>),
-            Timeout,
-        }
-
-        let task = {
-            let mut recv_fut = std::pin::pin!(gc_rx.recv());
-            let mut sleep_fut = std::pin::pin!(compio::time::sleep(next_auto_delay));
-
-            std::future::poll_fn(|cx| {
-                if let Poll::Ready(v) = Pin::new(&mut recv_fut).poll(cx) {
-                    return Poll::Ready(GcSel::Recv(v));
-                }
-                if let Poll::Ready(()) = Pin::new(&mut sleep_fut).poll(cx) {
-                    return Poll::Ready(GcSel::Timeout);
-                }
-                Poll::Pending
-            })
-            .await
-        };
-
-        let gc_task = match task {
-            GcSel::Recv(None) => break,
-            GcSel::Recv(Some(t)) => t,
-            GcSel::Timeout => {
-                next_auto_delay = random_delay();
-                GcTask::Auto
-            }
-        };
-
-        let (log_stream_id, readers_snapshot, part_sc) = {
-            let p = part.borrow();
-            (p.log_stream_id, p.sst_readers.clone(), p.stream_client.clone())
-        };
-
-        let stream_info = match part_sc.get_stream_info(log_stream_id).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("GC get_stream_info: {e}");
-                continue;
-            }
-        };
-        let extent_ids = stream_info.extent_ids;
-        if extent_ids.len() < 2 {
-            continue;
-        }
-
-        let sealed_extents = &extent_ids[..extent_ids.len() - 1];
-
-        let holes: Vec<u64> = match gc_task {
-            GcTask::Force { ref extent_ids } => {
-                let idx: HashSet<u64> = sealed_extents.iter().copied().collect();
-                extent_ids.iter().copied().filter(|e| idx.contains(e)).take(MAX_GC_ONCE).collect()
-            }
-            GcTask::Auto => {
-                let mut discards = get_discards_rc(&readers_snapshot);
-                valid_discard(&mut discards, sealed_extents);
-
-                let mut candidates: Vec<u64> = discards.keys().copied().collect();
-                candidates.sort_by(|a, b| discards[b].cmp(&discards[a]));
-
-                let mut holes = Vec::new();
-                for eid in candidates.into_iter().take(MAX_GC_ONCE) {
-                    let sealed_length = match part_sc.get_extent_info(eid).await {
-                        Ok(info) => info.sealed_length as u32,
-                        Err(e) => {
-                            tracing::warn!("GC extent_info {eid}: {e}");
-                            continue;
-                        }
-                    };
-                    if sealed_length == 0 {
-                        continue;
-                    }
-                    let ratio = discards[&eid] as f64 / sealed_length as f64;
-                    if ratio > GC_DISCARD_RATIO {
-                        holes.push(eid);
-                    }
-                }
-                holes
-            }
-        };
-
-        if holes.is_empty() {
-            continue;
-        }
-
-        for eid in holes {
-            let sealed_length = match part_sc.get_extent_info(eid).await {
-                Ok(info) => info.sealed_length as u32,
-                Err(e) => {
-                    tracing::warn!("GC extent_info {eid}: {e}");
-                    continue;
-                }
-            };
-            if let Err(e) = run_gc(&part, eid, sealed_length).await {
-                tracing::error!("GC run_gc extent {eid}: {e}");
-            }
-        }
-    }
-}
-
-
-async fn background_write_loop(
-    part_id: u64,
-    part: Rc<RefCell<PartitionData>>,
-    mut write_rx: mpsc::Receiver<WriteRequest>,
-) {
-    let mut metrics = WriteLoopMetrics::new();
-    let mut pending: Vec<WriteRequest> = Vec::new();
-
-    loop {
-        if pending.is_empty() {
-            match write_rx.recv().await {
-                Some(req) => pending.push(req),
-                None => break,
-            }
-        }
-
-        // Try to drain more without blocking.
-        while pending.len() < MAX_WRITE_BATCH {
-            match write_rx.try_recv() {
-                Ok(req) => pending.push(req),
-                Err(_) => break,
-            }
-        }
-
-        // Process the batch.
-        let batch = std::mem::take(&mut pending);
-        match process_write_batch(&part, batch).await {
-            Ok(stats) => metrics.record(stats),
-            Err(e) => tracing::error!("write batch error: {e}"),
-        }
-        metrics.maybe_report(part_id);
-    }
-
-    // Drain remaining.
-    if !pending.is_empty() {
-        let batch = std::mem::take(&mut pending);
-        match process_write_batch(&part, batch).await {
-            Ok(stats) => metrics.record(stats),
-            Err(e) => tracing::error!("write batch error: {e}"),
-        }
-    }
-    metrics.flush(part_id);
-}
-
-// ---------------------------------------------------------------------------
-// Write batch processing (single-threaded, no locks needed)
-// ---------------------------------------------------------------------------
-
-async fn process_write_batch(
-    part: &Rc<RefCell<PartitionData>>,
-    batch: Vec<WriteRequest>,
-) -> Result<BatchStats> {
-    struct ValidatedEntry {
-        internal_key: Vec<u8>,
-        user_key: Bytes,
-        op: u8,
-        value: Bytes,
-        expires_at: u64,
-        must_sync: bool,
-        resp_tx: oneshot::Sender<Result<Vec<u8>, String>>,
-    }
-
-    let picked_at = Instant::now();
-    let phase1_started_at = Instant::now();
-
-    // Phase 1: validate + encode (no async, just borrow_mut).
-    let (valid, record_sizes, segments, batch_must_sync, log_stream_id, part_sc) = {
-        let mut p = part.borrow_mut();
-
-        let mut valid: Vec<ValidatedEntry> = Vec::with_capacity(batch.len());
-        for req in batch {
-            let (user_key, op, value, expires_at) = match req.op {
-                WriteOp::Put {
-                    user_key,
-                    value,
-                    expires_at,
-                } => (user_key, 1u8, value, expires_at),
-                WriteOp::Delete { user_key } => {
-                    (Bytes::from(user_key), 2u8, Bytes::new(), 0u64)
-                }
-            };
-            if !in_range(&p.rg, &user_key) {
-                let _ = req.resp_tx.send(Err("key is out of range".to_string()));
-                continue;
-            }
-            p.seq_number += 1;
-            let seq = p.seq_number;
-            let internal_key = key_with_ts(&user_key, seq);
-            valid.push(ValidatedEntry {
-                internal_key,
-                user_key,
-                op,
-                value,
-                expires_at,
-                must_sync: req.must_sync,
-                resp_tx: req.resp_tx,
-            });
-        }
-
-        if valid.is_empty() {
-            return Ok(BatchStats::default());
-        }
-
-        let mut segments: Vec<Bytes> = Vec::with_capacity(valid.len() * 2);
-        let mut record_sizes: Vec<u32> = Vec::with_capacity(valid.len());
-        for e in &valid {
-            let hdr_size = 17 + e.internal_key.len();
-            let mut hdr_buf = BytesMut::with_capacity(hdr_size);
-            hdr_buf.put_u8(e.op);
-            hdr_buf.put_u32_le(e.internal_key.len() as u32);
-            hdr_buf.put_u32_le(e.value.len() as u32);
-            hdr_buf.put_u64_le(e.expires_at);
-            hdr_buf.extend_from_slice(&e.internal_key);
-            segments.push(hdr_buf.freeze());
-            if !e.value.is_empty() {
-                segments.push(e.value.clone());
-            }
-            record_sizes.push((hdr_size + e.value.len()) as u32);
-        }
-
-        let batch_must_sync = valid.iter().any(|e| e.must_sync);
-        let log_stream_id = p.log_stream_id;
-        let part_sc = p.stream_client.clone();
-
-        (valid, record_sizes, segments, batch_must_sync, log_stream_id, part_sc)
-    };
-    let phase1_elapsed = phase1_started_at.elapsed();
-
-    // Phase 2: append to logStream (async I/O, borrow released).
-    let phase2_started_at = Instant::now();
-    let result = match part_sc
-        .append_segments(log_stream_id, segments, batch_must_sync)
-        .await
-    {
-        Ok(result) => result,
-        Err(e) => {
-            let msg = format!("log_stream append_segments: {e}");
-            for entry in valid {
-                let _ = entry.resp_tx.send(Err(msg.clone()));
-            }
-            return Err(anyhow!(msg));
-        }
-    };
-    let phase2_elapsed = phase2_started_at.elapsed();
-
-    // Phase 3: insert into memtable + update VP head.
-    let phase3_started_at = Instant::now();
-    let mut responses: Vec<(Vec<u8>, oneshot::Sender<Result<Vec<u8>, String>>)> = Vec::new();
-    {
-        let mut p = part.borrow_mut();
-
-        let mut cumulative: u32 = 0;
-        for (i, entry) in valid.into_iter().enumerate() {
-            let record_offset = result.offset + cumulative;
-            cumulative += record_sizes[i];
-
-            let mem_entry = if entry.value.len() > VALUE_THROTTLE {
-                let vp = ValuePointer {
-                    extent_id: result.extent_id,
-                    offset: record_offset,
-                    len: entry.value.len() as u32,
-                };
-                MemEntry {
-                    op: entry.op | OP_VALUE_POINTER,
-                    value: vp.encode().to_vec(),
-                    expires_at: entry.expires_at,
-                }
-            } else {
-                MemEntry {
-                    op: entry.op,
-                    value: entry.value.to_vec(),
-                    expires_at: entry.expires_at,
-                }
-            };
-
-            let write_size = (entry.user_key.len() + mem_entry.value.len() + 32) as u64;
-            p.active.insert(entry.internal_key, mem_entry, write_size);
-            responses.push((entry.user_key.to_vec(), entry.resp_tx));
-        }
-
-        p.vp_extent_id = result.extent_id;
-        p.vp_offset = result.end;
-
-        maybe_rotate(&mut p);
-    }
-    let phase3_elapsed = phase3_started_at.elapsed();
-
-    for (key, tx) in responses {
-        let _ = tx.send(Ok(key));
-    }
-
-    Ok(BatchStats {
-        ops: record_sizes.len() as u64,
-        batch_size: record_sizes.len() as u64,
-        phase1_ns: duration_to_ns(phase1_elapsed),
-        phase2_ns: duration_to_ns(phase2_elapsed),
-        phase3_ns: duration_to_ns(phase3_elapsed),
-        end_to_end_ns: duration_to_ns(picked_at.elapsed()),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Compaction
-// ---------------------------------------------------------------------------
-
-fn pickup_tables(tables: &[TableMeta], max_capacity: u64) -> (Vec<TableMeta>, u64) {
-    if tables.len() < 2 {
-        return (vec![], 0);
-    }
-
-    let total_size: u64 = tables.iter().map(|t| t.estimated_size).sum();
-    let head_extent = tables[0].extent_id;
-    let head_size: u64 = tables.iter().filter(|t| t.extent_id == head_extent).map(|t| t.estimated_size).sum();
-    let head_threshold = (HEAD_RATIO * total_size as f64).round() as u64;
-
-    if head_size < head_threshold {
-        let chosen: Vec<TableMeta> = tables.iter().filter(|t| t.extent_id == head_extent).take(COMPACT_N).cloned().collect();
-        let truncate_id = tables.iter().find(|t| t.extent_id != head_extent).map(|t| t.extent_id).unwrap_or(0);
-
-        let mut tbls_sorted = tables.to_vec();
-        tbls_sorted.sort_by_key(|t| t.last_seq);
-        let mut chosen_sorted = chosen.clone();
-        chosen_sorted.sort_by_key(|t| t.last_seq);
-        if chosen_sorted.is_empty() {
-            return (vec![], 0);
-        }
-
-        let start_seq = chosen_sorted[0].last_seq;
-        let start_idx = tbls_sorted.partition_point(|t| t.last_seq < start_seq);
-        let mut compact_tbls: Vec<TableMeta> = Vec::new();
-        let mut ci = 0usize;
-        let mut ti = start_idx;
-        while ti < tbls_sorted.len() && ci < chosen_sorted.len() && compact_tbls.len() < COMPACT_N {
-            if tbls_sorted[ti].last_seq <= chosen_sorted[ci].last_seq {
-                compact_tbls.push(tbls_sorted[ti].clone());
-                if tbls_sorted[ti].last_seq == chosen_sorted[ci].last_seq {
-                    ci += 1;
-                }
-                ti += 1;
-            } else {
-                break;
-            }
-        }
-        if ci == chosen_sorted.len() && compact_tbls.len() >= 2 {
-            return (compact_tbls, truncate_id);
-        }
-        if compact_tbls.len() >= 2 {
-            return (compact_tbls, 0);
-        }
-        return (vec![], 0);
-    }
-
-    // Size-tiered rule
-    let mut tbls_sorted = tables.to_vec();
-    tbls_sorted.sort_by_key(|t| t.last_seq);
-    let throttle = (COMPACT_RATIO * MAX_SKIP_LIST as f64).round() as u64;
-    let mut compact_tbls: Vec<TableMeta> = Vec::new();
-    let mut i = 0usize;
-    while i < tbls_sorted.len() {
-        while i < tbls_sorted.len() && tbls_sorted[i].estimated_size < throttle && compact_tbls.len() < COMPACT_N {
-            if i > 0 && compact_tbls.is_empty() && tbls_sorted[i].estimated_size + tbls_sorted[i - 1].estimated_size < max_capacity {
-                compact_tbls.push(tbls_sorted[i - 1].clone());
-            }
-            compact_tbls.push(tbls_sorted[i].clone());
-            i += 1;
-        }
-        if !compact_tbls.is_empty() {
-            if compact_tbls.len() == 1 {
-                if i < tbls_sorted.len() && compact_tbls[0].estimated_size + tbls_sorted[i].estimated_size < max_capacity {
-                    compact_tbls.push(tbls_sorted[i].clone());
-                } else {
-                    compact_tbls.clear();
-                    i += 1;
-                    continue;
-                }
-            }
-            break;
-        }
-        i += 1;
-    }
-    if compact_tbls.len() >= 2 {
-        return (compact_tbls, 0);
-    }
-    (vec![], 0)
-}
-
-async fn do_compact(
-    part: &Rc<RefCell<PartitionData>>,
-    tbls: Vec<TableMeta>,
-    major: bool,
-) -> Result<bool> {
-    if tbls.is_empty() {
-        return Ok(false);
-    }
-
-    let compact_keys: HashSet<(u64, u32)> = tbls.iter().map(|t| t.loc()).collect();
-
-    let (readers, row_stream_id, meta_stream_id, compact_vp_eid, compact_vp_off, rg, part_sc) = {
-        let p = part.borrow();
-        let mut rds: Vec<Rc<SstReader>> = Vec::new();
-        for t in &tbls {
-            if let Some(idx) = p.tables.iter().position(|x| x.loc() == t.loc()) {
-                rds.push(p.sst_readers[idx].clone());
-            }
-        }
-        (rds, p.row_stream_id, p.meta_stream_id, p.vp_extent_id, p.vp_offset, p.rg.clone(), p.stream_client.clone())
-    };
-
-    if readers.is_empty() {
-        return Ok(false);
-    }
-
-    let mut readers_with_meta: Vec<(Rc<SstReader>, u64)> = readers.iter().zip(tbls.iter()).map(|(r, t)| (r.clone(), t.last_seq)).collect();
-    readers_with_meta.sort_by(|a, b| b.1.cmp(&a.1));
-
-    let iters: Vec<TableIterator> = readers_with_meta.iter().map(|(r, _)| {
-        // SstReader needs Arc for TableIterator — convert Rc to Arc by cloning data.
-        // This is a limitation: TableIterator expects Arc<SstReader>.
-        // For now, we need to use Arc in sst_readers even in single-threaded mode.
-        // TODO: make TableIterator generic over Rc/Arc.
-        let arc_reader = unsafe {
-            // SAFETY: single-threaded, Rc and Arc have the same layout.
-            // We're transmuting Rc<SstReader> to Arc<SstReader>.
-            std::mem::transmute::<Rc<SstReader>, Arc<SstReader>>(r.clone())
-        };
-        let mut it = TableIterator::new(arc_reader);
-        it.rewind();
-        it
-    }).collect();
-    let mut merge = MergeIterator::new(iters);
-    merge.rewind();
-
-    let mut discards = get_discards_rc(&readers);
-
-    let now = now_secs();
-    let max_chunk = 2 * MAX_SKIP_LIST as usize;
-    let mut chunks: Vec<(Vec<IterItem>, u64)> = Vec::new();
-
-    let mut current_entries: Vec<IterItem> = Vec::new();
-    let mut current_size: usize = 0;
-    let mut chunk_last_seq: u64 = 0;
-    let mut prev_user_key: Option<Vec<u8>> = None;
-
-    let add_discard = |item: &IterItem, discards: &mut HashMap<u64, i64>| {
-        if item.op & OP_VALUE_POINTER != 0 && item.value.len() >= VALUE_POINTER_SIZE {
-            let vp = ValuePointer::decode(&item.value);
-            *discards.entry(vp.extent_id).or_insert(0) += vp.len as i64;
-        }
-    };
-
-    while merge.valid() {
-        let item = match merge.item() {
-            Some(i) => i.clone(),
-            None => break,
-        };
-
-        let user_key = parse_key(&item.key).to_vec();
-        if prev_user_key.as_deref() == Some(&user_key) {
-            add_discard(&item, &mut discards);
-            merge.next();
-            continue;
-        }
-        prev_user_key = Some(user_key);
-
-        if !in_range(&rg, prev_user_key.as_ref().unwrap()) {
-            add_discard(&item, &mut discards);
-            merge.next();
-            continue;
-        }
-
-        if major {
-            if item.op == 2 {
-                add_discard(&item, &mut discards);
-                merge.next();
-                continue;
-            }
-            if item.expires_at > 0 && item.expires_at <= now {
-                add_discard(&item, &mut discards);
-                merge.next();
-                continue;
-            }
-        }
-
-        let ts = parse_ts(&item.key);
-        if ts > chunk_last_seq {
-            chunk_last_seq = ts;
-        }
-
-        let entry_size = item.key.len() + item.value.len() + 20;
-        if current_size + entry_size > max_chunk && !current_entries.is_empty() {
-            chunks.push((std::mem::take(&mut current_entries), chunk_last_seq));
-            current_size = 0;
-            chunk_last_seq = ts;
-        }
-        current_size += entry_size;
-        current_entries.push(item);
-        merge.next();
-    }
-    if !current_entries.is_empty() {
-        chunks.push((current_entries, chunk_last_seq));
-    }
-
-    let log_stream_id = part.borrow().log_stream_id;
-    let log_extent_ids = part_sc
-        .get_stream_info(log_stream_id)
-        .await
-        .map(|s| s.extent_ids)
-        .unwrap_or_default();
-    valid_discard(&mut discards, &log_extent_ids);
-
-    if chunks.is_empty() {
-        let mut p = part.borrow_mut();
-        remove_compacted_tables(&mut p, &compact_keys);
-        let tables_snapshot = p.tables.clone();
-        let veid = p.vp_extent_id.max(compact_vp_eid);
-        let voff = if veid == p.vp_extent_id { p.vp_offset } else { compact_vp_off };
-        drop(p);
-        save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, veid, voff).await?;
-        return Ok(true);
-    }
-
-    let last_chunk_idx = chunks.len().saturating_sub(1);
-    let mut new_readers: Vec<(TableMeta, Rc<SstReader>)> = Vec::new();
-    for (chunk_idx, (entries, chunk_last_seq)) in chunks.into_iter().enumerate() {
-        let mut b = SstBuilder::new(compact_vp_eid, compact_vp_off);
-        if chunk_idx == last_chunk_idx {
-            b.set_discards(discards.clone());
-        }
-        for item in &entries {
-            b.add(&item.key, item.op, &item.value, item.expires_at);
-        }
-        let sst_bytes = b.finish();
-        let result = part_sc.append(row_stream_id, &sst_bytes, true).await?;
-        let estimated_size = sst_bytes.len() as u64;
-        let reader = Rc::new(SstReader::from_bytes(Arc::new(sst_bytes))?);
-        new_readers.push((
-            TableMeta {
-                extent_id: result.extent_id,
-                offset: result.offset,
-                len: result.end - result.offset,
-                estimated_size,
-                last_seq: chunk_last_seq,
-            },
-            reader,
-        ));
-    }
-
-    let (tables_snapshot, final_vp_eid, final_vp_off) = {
-        let mut p = part.borrow_mut();
-        remove_compacted_tables(&mut p, &compact_keys);
-        for (tbl_meta, reader) in new_readers {
-            p.sst_readers.push(reader);
-            p.tables.push(tbl_meta);
-        }
-        let veid = p.vp_extent_id.max(compact_vp_eid);
-        let voff = if veid == p.vp_extent_id { p.vp_offset } else { compact_vp_off };
-        (p.tables.clone(), veid, voff)
-    };
-
-    save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, final_vp_eid, final_vp_off).await?;
-    Ok(true)
-}
-
-fn remove_compacted_tables(part: &mut PartitionData, compact_keys: &HashSet<(u64, u32)>) {
-    let mut i = 0;
-    while i < part.tables.len() {
-        if compact_keys.contains(&part.tables[i].loc()) {
-            part.tables.remove(i);
-            part.sst_readers.remove(i);
-        } else {
-            i += 1;
-        }
-    }
-}
-
-fn get_discards(readers: &[Arc<SstReader>]) -> HashMap<u64, i64> {
-    let mut out: HashMap<u64, i64> = HashMap::new();
-    for r in readers {
-        for (&eid, &sz) in &r.discards {
-            *out.entry(eid).or_insert(0) += sz;
-        }
-    }
-    out
-}
-
-fn get_discards_rc(readers: &[Rc<SstReader>]) -> HashMap<u64, i64> {
-    let mut out: HashMap<u64, i64> = HashMap::new();
-    for r in readers {
-        for (&eid, &sz) in &r.discards {
-            *out.entry(eid).or_insert(0) += sz;
-        }
-    }
-    out
-}
-
-fn valid_discard(discards: &mut HashMap<u64, i64>, extent_ids: &[u64]) {
-    let idx: HashSet<u64> = extent_ids.iter().copied().collect();
-    discards.retain(|eid, _| idx.contains(eid));
-}
-
-// ---------------------------------------------------------------------------
-// GC
-// ---------------------------------------------------------------------------
-
-async fn run_gc(
-    part: &Rc<RefCell<PartitionData>>,
-    extent_id: u64,
-    sealed_length: u32,
-) -> Result<()> {
-    let (log_stream_id, rg, part_sc) = {
-        let p = part.borrow();
-        (p.log_stream_id, p.rg.clone(), p.stream_client.clone())
-    };
-
-    let (data, _end) = part_sc.read_bytes_from_extent(extent_id, 0, sealed_length).await?;
-    let records = decode_records_full(&data);
-
-    let mut moved = 0usize;
-    for (op, key, value, expires_at) in records {
-        if op & OP_VALUE_POINTER == 0 {
-            continue;
-        }
-        let user_key = parse_key(&key).to_vec();
-        if !in_range(&rg, &user_key) {
-            continue;
-        }
-
-        let current: Option<(u8, Vec<u8>, u64)> = {
-            let p = part.borrow();
-            let mem = p.active.seek_user_key(&user_key)
-                .or_else(|| p.imm.iter().rev().find_map(|m| m.seek_user_key(&user_key)))
-                .map(|e| (e.op, e.value, e.expires_at));
-            if mem.is_some() {
-                mem
-            } else {
-                let mut found = None;
-                for r in p.sst_readers.iter().rev() {
-                    if let Some(e) = lookup_in_sst(r, &user_key) {
-                        found = Some(e);
-                        break;
-                    }
-                }
-                found
-            }
-        };
-
-        if let Some((cur_op, cur_val, _)) = current {
-            if cur_op & OP_VALUE_POINTER != 0 && cur_val.len() >= VALUE_POINTER_SIZE {
-                let vp = ValuePointer::decode(&cur_val);
-                if vp.extent_id == extent_id {
-                    let mut p = part.borrow_mut();
-                    p.seq_number += 1;
-                    let seq = p.seq_number;
-                    let internal_key = key_with_ts(&user_key, seq);
-                    let log_entry = encode_record(1, &internal_key, &value, expires_at);
-                    let result = part_sc.append(log_stream_id, &log_entry, true).await?;
-                    let new_vp = ValuePointer {
-                        extent_id: result.extent_id,
-                        offset: result.offset,
-                        len: vp.len,
-                    };
-                    p.vp_extent_id = result.extent_id;
-                    p.vp_offset = result.end;
-                    let mem_entry = MemEntry {
-                        op: 1 | OP_VALUE_POINTER,
-                        value: new_vp.encode().to_vec(),
-                        expires_at,
-                    };
-                    let write_size = (user_key.len() + value.len() + 32) as u64;
-                    p.active.insert(internal_key, mem_entry, write_size);
-                    moved += 1;
-                }
-            }
-        }
-    }
-
-    part_sc.punch_holes(log_stream_id, vec![extent_id]).await?;
-    tracing::info!("GC: punched extent {extent_id}, moved {moved} entries");
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Lookup helpers
-// ---------------------------------------------------------------------------
-
-fn lookup_in_memtable(mem: &Memtable, user_key: &[u8]) -> Option<(u8, Vec<u8>, u64)> {
-    mem.seek_user_key(user_key)
-        .map(|e| (e.op, e.value, e.expires_at))
-}
-
-fn lookup_in_sst(reader: &SstReader, user_key: &[u8]) -> Option<(u8, Vec<u8>, u64)> {
-    if !reader.bloom_may_contain(user_key) {
-        return None;
-    }
-    let target = key_with_ts(user_key, u64::MAX);
-    let block_idx = reader.find_block_for_key(&target);
-    let block = reader.read_block(block_idx).ok()?;
-    let n = block.num_entries();
-    for i in 0..n {
-        let (key, op, value, expires_at) = block.get_entry(i).ok()?;
-        let uk = parse_key(&key);
-        if uk == user_key {
-            return Some((op, value.to_vec(), expires_at));
-        }
-        if uk > user_key {
-            break;
-        }
-    }
-    None
-}
-
-fn collect_mem_items(part: &PartitionData) -> Vec<IterItem> {
-    let mut items = part.active.snapshot_sorted();
-    for imm in part.imm.iter().rev() {
-        items.extend(imm.snapshot_sorted());
-    }
-    items
-}
-
-fn unique_user_keys(part: &PartitionData) -> Vec<Vec<u8>> {
-    let now = now_secs();
-    let mut seen: BTreeMap<Vec<u8>, (u8, u64)> = BTreeMap::new();
-
-    let mem_items = collect_mem_items(part);
-    for item in &mem_items {
-        let uk = parse_key(&item.key).to_vec();
-        seen.entry(uk).or_insert((item.op, item.expires_at));
-    }
-
-    for reader in part.sst_readers.iter().rev() {
-        let arc_reader = unsafe {
-            std::mem::transmute::<Rc<SstReader>, Arc<SstReader>>(reader.clone())
-        };
-        let mut it = TableIterator::new(arc_reader);
-        it.rewind();
-        while it.valid() {
-            let item = it.item().unwrap();
-            let uk = parse_key(&item.key).to_vec();
-            seen.entry(uk).or_insert((item.op, item.expires_at));
-            it.next();
-        }
-    }
-
-    seen.into_iter()
-        .filter_map(|(uk, (op, expires_at))| {
-            if op == 2 { return None; }
-            if expires_at > 0 && expires_at <= now { return None; }
-            Some(uk)
-        })
-        .collect()
-}
-
-async fn resolve_value(
-    op: u8,
-    raw_value: Vec<u8>,
-    stream_client: &Rc<StreamClient>,
-) -> Result<Vec<u8>> {
-    if op & OP_VALUE_POINTER != 0 {
-        if raw_value.len() < VALUE_POINTER_SIZE {
-            return Err(anyhow!("ValuePointer too short"));
-        }
-        let vp = ValuePointer::decode(&raw_value[..VALUE_POINTER_SIZE]);
-        read_value_from_log(&vp, stream_client).await
-    } else {
-        Ok(raw_value)
-    }
-}
-
-async fn read_value_from_log(vp: &ValuePointer, stream_client: &Rc<StreamClient>) -> Result<Vec<u8>> {
-    let read_len = 17 + 0 + vp.len;
-    let read_bytes = (read_len + 512).max(1024);
-    let (data, _end) = stream_client
-        .read_bytes_from_extent(vp.extent_id, vp.offset, read_bytes)
-        .await?;
-    if data.len() < 17 {
-        return Err(anyhow!("logStream record too short"));
-    }
-    let key_len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
-    let val_len = u32::from_le_bytes(data[5..9].try_into().unwrap()) as usize;
-    let val_start = 17 + key_len;
-    let val_end = val_start + val_len;
-    if val_end > data.len() {
-        return Err(anyhow!("logStream record value out of range"));
-    }
-    Ok(data[val_start..val_end].to_vec())
-}
-
-// ---------------------------------------------------------------------------
-// RPC dispatch (runs on partition thread)
-// ---------------------------------------------------------------------------
-
-async fn dispatch_partition_rpc(
-    msg_type: u8,
-    payload: Bytes,
-    part: &Rc<RefCell<PartitionData>>,
-    part_sc: &Rc<StreamClient>,
-    pool: &Rc<ConnPool>,
-    manager_addr: &str,
-    owner_key: &str,
-    revision: i64,
-) -> HandlerResult {
-    match msg_type {
-        MSG_PUT => handle_put(payload, part).await,
-        MSG_GET => handle_get(payload, part, part_sc).await,
-        MSG_DELETE => handle_delete(payload, part).await,
-        MSG_HEAD => handle_head(payload, part).await,
-        MSG_RANGE => handle_range(payload, part).await,
-        MSG_SPLIT_PART => handle_split_part(payload, part, part_sc, pool, manager_addr, owner_key, revision).await,
-        MSG_STREAM_PUT => handle_stream_put(payload, part).await,
-        MSG_MAINTENANCE => handle_maintenance(payload, part).await,
-        _ => Err((StatusCode::InvalidArgument, format!("unknown msg_type {msg_type}"))),
-    }
-}
-
-async fn handle_put(payload: Bytes, part: &Rc<RefCell<PartitionData>>) -> HandlerResult {
-    let req: PutReq = partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-
-    let (resp_tx, resp_rx) = oneshot::channel();
-    let write_tx = part.borrow().write_tx.clone();
-    let permit = write_tx.reserve().await.map_err(|_| (StatusCode::Internal, "write channel closed".to_string()))?;
-    permit.send(WriteRequest {
-        op: WriteOp::Put {
-            user_key: req.key.clone().into(),
-            value: req.value.into(),
-            expires_at: req.expires_at,
-        },
-        must_sync: req.must_sync,
-        resp_tx,
-    });
-
-    let key = resp_rx.await.map_err(|_| (StatusCode::Internal, "write response dropped".to_string()))?
-        .map_err(|e| (StatusCode::Internal, e))?;
-    Ok(partition_rpc::rkyv_encode(&PutResp {
-        code: CODE_OK,
-        message: String::new(),
-        key,
-    }))
-}
-
-async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>, _part_sc: &Rc<StreamClient>) -> HandlerResult {
-    let req: GetReq = partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-
-    let p = part.borrow();
-    if !in_range(&p.rg, &req.key) {
-        return Err((StatusCode::InvalidArgument, "key is out of range".to_string()));
-    }
-
-    let found: Option<(u8, Vec<u8>, u64)> = lookup_in_memtable(&p.active, &req.key)
-        .or_else(|| {
-            for imm in p.imm.iter().rev() {
-                if let Some(r) = lookup_in_memtable(imm, &req.key) { return Some(r); }
-            }
-            None
-        })
-        .or_else(|| {
-            for reader in p.sst_readers.iter().rev() {
-                if let Some(r) = lookup_in_sst(reader, &req.key) { return Some(r); }
-            }
-            None
-        });
-
-    let (op, raw_value, expires_at) = match found {
-        Some(v) => v,
-        None => return Ok(partition_rpc::rkyv_encode(&GetResp { code: CODE_NOT_FOUND, message: "key not found".to_string(), value: vec![] })),
-    };
-    if op == 2 || (expires_at > 0 && expires_at <= now_secs()) {
-        return Ok(partition_rpc::rkyv_encode(&GetResp { code: CODE_NOT_FOUND, message: "key not found".to_string(), value: vec![] }));
-    }
-
-    let sc = p.stream_client.clone();
-    drop(p);
-
-    let value = resolve_value(op, raw_value, &sc).await.map_err(|e| (StatusCode::Internal, e.to_string()))?;
-    Ok(partition_rpc::rkyv_encode(&GetResp { code: CODE_OK, message: String::new(), value }))
-}
-
-async fn handle_delete(payload: Bytes, part: &Rc<RefCell<PartitionData>>) -> HandlerResult {
-    let req: DeleteReq = partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-
-    let (resp_tx, resp_rx) = oneshot::channel();
-    let write_tx = part.borrow().write_tx.clone();
-    let permit = write_tx.reserve().await.map_err(|_| (StatusCode::Internal, "write channel closed".to_string()))?;
-    permit.send(WriteRequest {
-        op: WriteOp::Delete { user_key: req.key.clone() },
-        must_sync: false,
-        resp_tx,
-    });
-
-    let key = resp_rx.await.map_err(|_| (StatusCode::Internal, "write response dropped".to_string()))?
-        .map_err(|e| (StatusCode::Internal, e))?;
-    Ok(partition_rpc::rkyv_encode(&DeleteResp { code: CODE_OK, message: String::new(), key }))
-}
-
-async fn handle_head(payload: Bytes, part: &Rc<RefCell<PartitionData>>) -> HandlerResult {
-    let req: HeadReq = partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-
-    let p = part.borrow();
-    if !in_range(&p.rg, &req.key) {
-        return Err((StatusCode::InvalidArgument, "key is out of range".to_string()));
-    }
-
-    let found = lookup_in_memtable(&p.active, &req.key)
-        .or_else(|| { for imm in p.imm.iter().rev() { if let Some(r) = lookup_in_memtable(imm, &req.key) { return Some(r); } } None })
-        .or_else(|| { for reader in p.sst_readers.iter().rev() { if let Some(r) = lookup_in_sst(reader, &req.key) { return Some(r); } } None });
-
-    let (op, raw_value, expires_at) = match found {
-        Some(v) => v,
-        None => return Ok(partition_rpc::rkyv_encode(&HeadResp { code: CODE_NOT_FOUND, message: "key not found".to_string(), found: false, value_length: 0 })),
-    };
-    if op == 2 || (expires_at > 0 && expires_at <= now_secs()) {
-        return Ok(partition_rpc::rkyv_encode(&HeadResp { code: CODE_NOT_FOUND, message: "key not found".to_string(), found: false, value_length: 0 }));
-    }
-
-    let value_len = if op & OP_VALUE_POINTER != 0 && raw_value.len() >= VALUE_POINTER_SIZE {
-        ValuePointer::decode(&raw_value[..VALUE_POINTER_SIZE]).len as u64
-    } else {
-        raw_value.len() as u64
-    };
-
-    Ok(partition_rpc::rkyv_encode(&HeadResp { code: CODE_OK, message: String::new(), found: true, value_length: value_len }))
-}
-
-async fn handle_range(payload: Bytes, part: &Rc<RefCell<PartitionData>>) -> HandlerResult {
-    let req: RangeReq = partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-
-    let p = part.borrow();
-    if req.limit == 0 {
-        return Ok(partition_rpc::rkyv_encode(&RangeResp { code: CODE_OK, message: String::new(), entries: vec![], has_more: true }));
-    }
-
-    let start_user_key = if req.start.is_empty() { req.prefix.clone() } else { req.start.clone() };
-    let seek_key = key_with_ts(&start_user_key, u64::MAX);
-
-    let mem_items = collect_mem_items(&p);
-    let mut mem_it = MemtableIterator::new(mem_items);
-    mem_it.seek(&seek_key);
-
-    let sst_iters: Vec<TableIterator> = p.sst_readers.iter().rev().map(|r| {
-        let arc_reader = unsafe { std::mem::transmute::<Rc<SstReader>, Arc<SstReader>>(r.clone()) };
-        let mut it = TableIterator::new(arc_reader);
-        it.seek(&seek_key);
-        it
-    }).collect();
-    let mut merge = MergeIterator::new(sst_iters);
-
-    let now = now_secs();
-    let check_overlap = p.has_overlap.get() != 0;
-    let part_rg = p.rg.clone();
-    drop(p);
-
-    let mut out: Vec<RangeEntry> = Vec::new();
-    let mut last_user_key: Option<Vec<u8>> = None;
-
-    loop {
-        let mem_key = if mem_it.valid() { mem_it.item().map(|i| i.key.as_slice()) } else { None };
-        let sst_key = if merge.valid() { merge.item().map(|i| i.key.as_slice()) } else { None };
-
-        let item = match (mem_key, sst_key) {
-            (None, None) => break,
-            (Some(_), None) => { let item = mem_it.item().unwrap().clone(); mem_it.next(); item }
-            (None, Some(_)) => { let item = merge.item().unwrap().clone(); merge.next(); item }
-            (Some(mk), Some(sk)) => {
-                if mk <= sk {
-                    let item = mem_it.item().unwrap().clone();
-                    let uk_owned = parse_key(mk).to_vec();
-                    mem_it.next();
-                    while merge.valid() {
-                        if let Some(si) = merge.item() {
-                            if parse_key(&si.key) == uk_owned.as_slice() { merge.next(); } else { break; }
-                        } else { break; }
-                    }
-                    item
-                } else {
-                    let item = merge.item().unwrap().clone();
-                    let uk_owned = parse_key(sk).to_vec();
-                    merge.next();
-                    while mem_it.valid() {
-                        if let Some(mi) = mem_it.item() {
-                            if parse_key(&mi.key) == uk_owned.as_slice() { mem_it.next(); } else { break; }
-                        } else { break; }
-                    }
-                    item
-                }
-            }
-        };
-
-        let uk = parse_key(&item.key);
-        if check_overlap && !in_range(&part_rg, uk) { continue; }
-        if !req.prefix.is_empty() && !uk.starts_with(&req.prefix as &[u8]) { break; }
-        if last_user_key.as_deref() == Some(uk) { continue; }
-        last_user_key = Some(uk.to_vec());
-
-        if item.op == 2 { continue; }
-        if item.expires_at > 0 && item.expires_at <= now { continue; }
-
-        out.push(RangeEntry { key: uk.to_vec(), value: vec![] });
-        if out.len() >= req.limit as usize { break; }
-    }
-
-    let has_more = out.len() == req.limit as usize;
-    Ok(partition_rpc::rkyv_encode(&RangeResp { code: CODE_OK, message: String::new(), entries: out, has_more }))
-}
-
-async fn handle_split_part(
-    payload: Bytes,
-    part: &Rc<RefCell<PartitionData>>,
-    part_sc: &Rc<StreamClient>,
-    _pool: &Rc<ConnPool>,
-    _manager_addr: &str,
-    _owner_key: &str,
-    _revision: i64,
-) -> HandlerResult {
-    let req: SplitPartReq = partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-
-    if part.borrow().has_overlap.get() != 0 {
-        return Err((StatusCode::FailedPrecondition, "cannot split: partition has overlapping keys".to_string()));
-    }
-
-    let user_keys = unique_user_keys(&part.borrow());
-    if user_keys.len() < 2 {
-        return Err((StatusCode::FailedPrecondition, "part has less than 2 keys".to_string()));
-    }
-
-    flush_memtable_locked(part).await.map_err(|e| (StatusCode::Internal, e.to_string()))?;
-
-    let mid = user_keys[user_keys.len() / 2].clone();
-    let (log_stream_id, row_stream_id, meta_stream_id) = {
-        let p = part.borrow();
-        (p.log_stream_id, p.row_stream_id, p.meta_stream_id)
-    };
-
-    let log_end = part_sc.commit_length(log_stream_id).await.unwrap_or(0).max(1);
-    let row_end = part_sc.commit_length(row_stream_id).await.unwrap_or(0).max(1);
-    let meta_end = part_sc.commit_length(meta_stream_id).await.unwrap_or(0).max(1);
-
-    // Call multi_modify_split on manager via StreamClient.
-    let mut split_ok = false;
-    let mut split_err = String::new();
-    let mut backoff = Duration::from_millis(100);
-    for _ in 0..8 {
-        match part_sc
-            .multi_modify_split(mid.clone(), req.part_id, [log_end as u64, row_end as u64, meta_end as u64])
-            .await
-        {
-            Ok(()) => {
-                split_ok = true;
-                break;
-            }
-            Err(err) => {
-                split_err = err.to_string();
-                compio::time::sleep(backoff).await;
-                backoff = backoff.saturating_mul(2).min(Duration::from_secs(2));
-            }
-        }
-    }
-
-    if !split_ok {
-        return Err((StatusCode::FailedPrecondition, split_err));
-    }
-
-    Ok(partition_rpc::rkyv_encode(&SplitPartResp { code: CODE_OK, message: String::new() }))
-}
-
-async fn handle_stream_put(payload: Bytes, part: &Rc<RefCell<PartitionData>>) -> HandlerResult {
-    let req: StreamPutReq = partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-    // Delegate to put handler logic.
-    let put_req = PutReq {
-        part_id: req.part_id,
-        key: req.key,
-        value: req.value,
-        must_sync: req.must_sync,
-        expires_at: req.expires_at,
-    };
-    let payload = partition_rpc::rkyv_encode(&put_req);
-    handle_put(payload, part).await
-}
-
-async fn handle_maintenance(payload: Bytes, part: &Rc<RefCell<PartitionData>>) -> HandlerResult {
-    let req: MaintenanceReq = partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-    if req.op == MAINTENANCE_FLUSH {
-        // Synchronous flush: rotate active memtable and flush all immutables.
-        flush_memtable_locked(part).await.map_err(|e| (StatusCode::Internal, e.to_string()))?;
-        return Ok(partition_rpc::rkyv_encode(&MaintenanceResp { code: CODE_OK, message: String::new() }));
-    }
-    let p = part.borrow();
-    let result = match req.op {
-        MAINTENANCE_COMPACT => p.compact_tx.try_send(true).map_err(|_| "compaction busy"),
-        MAINTENANCE_AUTO_GC => p.gc_tx.try_send(GcTask::Auto).map_err(|_| "gc busy"),
-        MAINTENANCE_FORCE_GC => p.gc_tx.try_send(GcTask::Force { extent_ids: req.extent_ids }).map_err(|_| "gc busy"),
-        _ => Err("unknown op"),
-    };
-    match result {
-        Ok(()) => Ok(partition_rpc::rkyv_encode(&MaintenanceResp { code: CODE_OK, message: String::new() })),
-        Err(e) => Ok(partition_rpc::rkyv_encode(&MaintenanceResp { code: CODE_ERROR, message: e.to_string() })),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Utility
 // ---------------------------------------------------------------------------
 
-fn rand_u64() -> u64 {
+pub(crate) fn rand_u64() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -2443,7 +1245,7 @@ fn rand_u64() -> u64 {
             .as_millis() as u64
 }
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

@@ -4,6 +4,7 @@ extern crate libc;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,8 +39,8 @@ fn decode_err(e: String) -> anyhow::Error {
 struct ClusterClient {
     #[allow(dead_code)]
     manager: String,
-    mgr: Arc<RpcClient>,
-    ps_conns: HashMap<String, Arc<RpcClient>>,
+    mgr: Rc<RpcClient>,
+    ps_conns: HashMap<String, Rc<RpcClient>>,
     regions: Vec<(u64, MgrRegionInfo)>,
     ps_details: HashMap<u64, MgrPsDetail>,
 }
@@ -107,7 +108,7 @@ impl ClusterClient {
         Ok(())
     }
 
-    async fn get_ps_client(&mut self, ps_addr: &str) -> Result<Arc<RpcClient>> {
+    async fn get_ps_client(&mut self, ps_addr: &str) -> Result<Rc<RpcClient>> {
         if let Some(c) = self.ps_conns.get(ps_addr) {
             return Ok(c.clone());
         }

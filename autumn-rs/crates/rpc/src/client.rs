@@ -4,17 +4,18 @@
 //! multiplexed via `req_id`: a background reader task routes incoming response
 //! frames to the corresponding `oneshot::Sender`.
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::rc::Rc;
 
 use bytes::Bytes;
 use compio::net::TcpStream;
 use compio::BufResult;
 use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::runtime::spawn;
-use dashmap::DashMap;
-use tokio::sync::{oneshot, Mutex};
+use futures::channel::oneshot;
+use futures::lock::Mutex;
 
 use crate::error::RpcError;
 use crate::frame::{Frame, FrameDecoder};
@@ -24,33 +25,38 @@ type ReadHalf = compio::net::OwnedReadHalf<TcpStream>;
 
 /// A multiplexed RPC client over a single TCP connection.
 ///
-/// Thread safety: the writer half is behind a Mutex (serialized writes),
-/// and the reader half runs as a spawned background task that routes
-/// responses to pending oneshot channels.
+/// Writer uses `futures::lock::Mutex` because write_all().await must hold
+/// the lock across the await point (borrow-across-await pattern).
+/// Reader runs as a spawned background task routing responses via oneshot.
+/// Other fields use Cell/RefCell (no await crossing).
 pub struct RpcClient {
+    /// Must be async Mutex: held across write_all().await
     writer: Mutex<WriteHalf>,
-    pending: Arc<DashMap<u32, oneshot::Sender<Frame>>>,
-    next_id: AtomicU32,
+    /// No await crossing: borrow_mut() → insert/remove → drop guard immediately
+    pending: Rc<RefCell<HashMap<u32, oneshot::Sender<Frame>>>>,
+    /// Single-threaded, no await crossing
+    next_id: Cell<u32>,
     peer_addr: SocketAddr,
 }
 
 impl RpcClient {
     /// Connect to a remote address and start the background reader.
-    pub async fn connect(addr: SocketAddr) -> Result<Arc<Self>, RpcError> {
+    pub async fn connect(addr: SocketAddr) -> Result<Rc<Self>, RpcError> {
         let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
         Self::from_stream(stream, addr)
     }
 
     /// Build an RpcClient from an already-connected TcpStream.
-    pub fn from_stream(stream: TcpStream, peer_addr: SocketAddr) -> Result<Arc<Self>, RpcError> {
+    pub fn from_stream(stream: TcpStream, peer_addr: SocketAddr) -> Result<Rc<Self>, RpcError> {
         let (reader, writer) = stream.into_split();
-        let pending: Arc<DashMap<u32, oneshot::Sender<Frame>>> = Arc::new(DashMap::new());
+        let pending: Rc<RefCell<HashMap<u32, oneshot::Sender<Frame>>>> =
+            Rc::new(RefCell::new(HashMap::new()));
 
-        let client = Arc::new(Self {
+        let client = Rc::new(Self {
             writer: Mutex::new(writer),
             pending: pending.clone(),
-            next_id: AtomicU32::new(1),
+            next_id: Cell::new(1),
             peer_addr,
         });
 
@@ -61,7 +67,7 @@ impl RpcClient {
                 tracing::warn!(addr = %peer_addr, error = %e, "rpc client reader exited");
             }
             // On disconnect, drop all pending senders so callers get RecvError.
-            pending_for_reader.clear();
+            pending_for_reader.borrow_mut().clear();
         })
         .detach();
 
@@ -70,7 +76,8 @@ impl RpcClient {
 
     /// Send a request and wait for the response.
     pub async fn call(&self, msg_type: u8, payload: Bytes) -> Result<Bytes, RpcError> {
-        let req_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let req_id = self.next_id.get();
+        self.next_id.set(req_id.wrapping_add(1));
         let frame = Frame::request(req_id, msg_type, payload);
         let rx = self.send_frame(frame).await?;
 
@@ -88,17 +95,19 @@ impl RpcClient {
         frame: Frame,
     ) -> Result<oneshot::Receiver<Frame>, RpcError> {
         let (tx, rx) = oneshot::channel();
-        self.pending.insert(frame.req_id, tx);
+        // No await crossing: borrow_mut → insert → drop
+        self.pending.borrow_mut().insert(frame.req_id, tx);
 
         if let Err(e) = self.write_frame(&frame).await {
-            self.pending.remove(&frame.req_id);
+            self.pending.borrow_mut().remove(&frame.req_id);
             return Err(e);
         }
 
         Ok(rx)
     }
 
-    /// Write a frame to the TCP connection (serialized by Mutex).
+    /// Write a frame to the TCP connection.
+    /// Uses futures::lock::Mutex because write_all().await crosses the await point.
     async fn write_frame(&self, frame: &Frame) -> Result<(), RpcError> {
         let data = frame.encode();
         let mut writer = self.writer.lock().await;
@@ -120,7 +129,7 @@ impl RpcClient {
 
     /// Number of in-flight requests.
     pub fn pending_count(&self) -> usize {
-        self.pending.len()
+        self.pending.borrow().len()
     }
 }
 
@@ -128,7 +137,7 @@ impl RpcClient {
 /// response frames to the matching pending oneshot sender.
 async fn read_loop(
     mut reader: ReadHalf,
-    pending: Arc<DashMap<u32, oneshot::Sender<Frame>>>,
+    pending: Rc<RefCell<HashMap<u32, oneshot::Sender<Frame>>>>,
     addr: SocketAddr,
 ) -> Result<(), RpcError> {
     let mut decoder = FrameDecoder::new();
@@ -145,10 +154,11 @@ async fn read_loop(
 
         decoder.feed(&buf[..n]);
 
+        // No await crossing: borrow_mut → remove → drop within each iteration
         loop {
             match decoder.try_decode()? {
                 Some(frame) => {
-                    if let Some((_, tx)) = pending.remove(&frame.req_id) {
+                    if let Some(tx) = pending.borrow_mut().remove(&frame.req_id) {
                         let _ = tx.send(frame);
                     } else {
                         tracing::trace!(

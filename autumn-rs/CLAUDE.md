@@ -28,20 +28,18 @@ autumn-rs is a distributed KV storage engine rewritten from Go to Rust. It is ar
 ## Crate Dependency DAG
 
 ```
-autumn-proto          (leaf: generated gRPC stubs)
+autumn-rpc            (custom binary RPC framework on compio)
     ├── autumn-common         (metadata store, AppError)
-    └── autumn-io-engine      (leaf: async file I/O abstraction)
+    └── autumn-etcd           (compio-native etcd v3 client)
           │
      autumn-stream            (ExtentNode server + StreamClient library)
           │
      autumn-partition-server  (LSM-tree PartitionServer)
           │
-     autumn-server            (5 binary entry points)
+     autumn-server            (4 binary entry points)
           │
-     autumn-manager           (depends on: proto + common; NOT stream)
+     autumn-manager           (depends on: rpc + common + stream + etcd)
 ```
-
-Key constraint: **`autumn-manager` does NOT depend on `autumn-stream`**. The manager only speaks to extent nodes via gRPC.
 
 ## The Three-Stream Model per Partition
 
@@ -169,9 +167,10 @@ cargo test --workspace
 
 ## Key External Dependencies
 
-- `tonic` / `prost`: gRPC + protobuf
+- `compio`: completion-based I/O runtime (thread-per-core, replaces tokio)
+- `autumn-rpc`: custom binary RPC (10-byte frame header, replaces tonic/gRPC)
+- `autumn-etcd`: compio-native etcd v3 client (replaces etcd-client)
+- `rkyv`: zero-copy serialization (hot path), `prost` only in etcd persistence
 - `crossbeam-skiplist`: concurrent ordered memtable
-- `etcd-client`: manager leader election + metadata persistence
-- `dashmap`: concurrent hash map (ExtentNode extent registry)
 - `xxhash-rust` + `crc32c`: bloom filter hashing + block checksums (also WAL chunk CRC)
-- `tokio`: async runtime throughout
+- `futures`: async utilities (channel, lock::Mutex for cross-await, StreamExt)

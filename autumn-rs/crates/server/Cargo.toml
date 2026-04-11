@@ -27,7 +27,6 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 autumn-manager = { path = "../manager" }
 autumn-stream = { path = "../stream" }
-autumn-io-engine = { path = "../io-engine" }
 autumn-partition-server = { path = "../partition-server" }
 autumn-rpc = { path = "../rpc" }
 rkyv = { version = "0.8.15", features = ["alloc"] }
