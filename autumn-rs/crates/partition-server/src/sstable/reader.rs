@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -10,7 +11,7 @@ use super::format::{BlockOffset, DecodedBlock, MetaBlock};
 ///
 /// Blocks are decoded on demand from the in-memory bytes.
 /// The MetaBlock (block index + bloom filter) is parsed at open time.
-#[derive(Clone)]
+/// Decoded blocks are cached to avoid repeated CRC checks and memcpy.
 pub struct SstReader {
     data: Arc<Vec<u8>>,
     block_offsets: Vec<BlockOffset>,
@@ -22,8 +23,9 @@ pub struct SstReader {
     pub vp_offset: u32,
     estimated_size: u64,
     pub discards: HashMap<u64, i64>,
-    /// Byte offset of the first block within `data` (= 0, the SSTable starts at the beginning).
     sst_base: u32,
+    /// Decoded block cache — avoids re-decoding (CRC + memcpy) on repeated reads.
+    block_cache: RefCell<Vec<Option<Arc<DecodedBlock>>>>,
 }
 
 impl SstReader {
@@ -79,6 +81,7 @@ impl SstReader {
             BloomFilter::decode(&meta.bloom_data)
         };
 
+        let num_blocks = meta.block_offsets.len();
         Ok(SstReader {
             block_offsets: meta.block_offsets,
             bloom,
@@ -90,6 +93,7 @@ impl SstReader {
             estimated_size: meta.estimated_size,
             discards: meta.discards,
             sst_base: sst_base as u32,
+            block_cache: RefCell::new(vec![None; num_blocks]),
             data,
         })
     }
@@ -131,8 +135,12 @@ impl SstReader {
         &self.biggest_key
     }
 
-    /// Read and decode block at index `idx`.
-    pub fn read_block(&self, idx: usize) -> Result<DecodedBlock> {
+    /// Read and decode block at index `idx`. Cached after first decode.
+    pub fn read_block(&self, idx: usize) -> Result<Arc<DecodedBlock>> {
+        // Check cache first.
+        if let Some(cached) = self.block_cache.borrow().get(idx).and_then(|c| c.clone()) {
+            return Ok(cached);
+        }
         let bo = self.block_offsets.get(idx).ok_or_else(|| {
             anyhow!(
                 "block index {idx} out of range (total={})",
@@ -147,7 +155,9 @@ impl SstReader {
                 self.data.len()
             ));
         }
-        DecodedBlock::decode(&self.data[start..end], &bo.key)
+        let block = Arc::new(DecodedBlock::decode(&self.data[start..end], &bo.key)?);
+        self.block_cache.borrow_mut()[idx] = Some(block.clone());
+        Ok(block)
     }
 
     /// Find the block index whose base key is <= `target_key` using binary search.

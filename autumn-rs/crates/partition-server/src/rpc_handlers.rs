@@ -1,7 +1,8 @@
 //! RPC dispatch and handler functions for partition operations.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use autumn_rpc::manager_rpc::MgrRange as Range;
 use autumn_rpc::partition_rpc::{self, *};
@@ -11,6 +12,55 @@ use bytes::Bytes;
 use futures::SinkExt;
 
 use crate::*;
+
+// Per-partition read metrics, tracked in thread-local since partition thread is single-threaded.
+thread_local! {
+    static READ_METRICS: RefCell<ReadMetrics> = RefCell::new(ReadMetrics::new());
+}
+
+struct ReadMetrics {
+    started_at: Instant,
+    ops: u64,
+    lookup_ns: u64,
+    encode_ns: u64,
+    found_in_mem: u64,
+    found_in_imm: u64,
+    found_in_sst: u64,
+    not_found: u64,
+}
+
+impl ReadMetrics {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            ops: 0,
+            lookup_ns: 0,
+            encode_ns: 0,
+            found_in_mem: 0,
+            found_in_imm: 0,
+            found_in_sst: 0,
+            not_found: 0,
+        }
+    }
+    fn maybe_report(&mut self) {
+        if self.started_at.elapsed() >= Duration::from_secs(1) && self.ops > 0 {
+            let elapsed = self.started_at.elapsed();
+            let ops = self.ops.max(1);
+            tracing::info!(
+                ops = self.ops,
+                ops_per_sec = self.ops as f64 / elapsed.as_secs_f64(),
+                avg_lookup_us = self.lookup_ns as f64 / ops as f64 / 1000.0,
+                avg_encode_us = self.encode_ns as f64 / ops as f64 / 1000.0,
+                mem = self.found_in_mem,
+                imm = self.found_in_imm,
+                sst = self.found_in_sst,
+                miss = self.not_found,
+                "partition read summary",
+            );
+            *self = Self::new();
+        }
+    }
+}
 
 pub(crate) async fn dispatch_partition_rpc(
     msg_type: u8,
@@ -62,30 +112,47 @@ pub(crate) async fn handle_put(payload: Bytes, part: &Rc<RefCell<PartitionData>>
 pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>, _part_sc: &Rc<StreamClient>) -> HandlerResult {
     let req: GetReq = partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
+    let lookup_t0 = Instant::now();
     let p = part.borrow();
     if !in_range(&p.rg, &req.key) {
         return Err((StatusCode::InvalidArgument, "key is out of range".to_string()));
     }
 
+    // Track where the key was found.
+    let mut source = 0u8; // 0=miss, 1=mem, 2=imm, 3=sst
     let found: Option<(u8, Vec<u8>, u64)> = lookup_in_memtable(&p.active, &req.key)
+        .map(|r| { source = 1; r })
         .or_else(|| {
             for imm in p.imm.iter().rev() {
-                if let Some(r) = lookup_in_memtable(imm, &req.key) { return Some(r); }
+                if let Some(r) = lookup_in_memtable(imm, &req.key) { source = 2; return Some(r); }
             }
             None
         })
         .or_else(|| {
             for reader in p.sst_readers.iter().rev() {
-                if let Some(r) = lookup_in_sst(reader, &req.key) { return Some(r); }
+                if let Some(r) = lookup_in_sst(reader, &req.key) { source = 3; return Some(r); }
             }
             None
         });
+    let lookup_ns = lookup_t0.elapsed().as_nanos() as u64;
 
     let (op, raw_value, expires_at) = match found {
         Some(v) => v,
-        None => return Ok(partition_rpc::rkyv_encode(&GetResp { code: CODE_NOT_FOUND, message: "key not found".to_string(), value: vec![] })),
+        None => {
+            READ_METRICS.with(|m| {
+                let mut m = m.borrow_mut();
+                m.ops += 1; m.lookup_ns += lookup_ns; m.not_found += 1;
+                m.maybe_report();
+            });
+            return Ok(partition_rpc::rkyv_encode(&GetResp { code: CODE_NOT_FOUND, message: "key not found".to_string(), value: vec![] }));
+        }
     };
     if op == 2 || (expires_at > 0 && expires_at <= now_secs()) {
+        READ_METRICS.with(|m| {
+            let mut m = m.borrow_mut();
+            m.ops += 1; m.lookup_ns += lookup_ns; m.not_found += 1;
+            m.maybe_report();
+        });
         return Ok(partition_rpc::rkyv_encode(&GetResp { code: CODE_NOT_FOUND, message: "key not found".to_string(), value: vec![] }));
     }
 
@@ -93,7 +160,25 @@ pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>
     drop(p);
 
     let value = resolve_value(op, raw_value, &sc).await.map_err(|e| (StatusCode::Internal, e.to_string()))?;
-    Ok(partition_rpc::rkyv_encode(&GetResp { code: CODE_OK, message: String::new(), value }))
+    let encode_t0 = Instant::now();
+    let resp = partition_rpc::rkyv_encode(&GetResp { code: CODE_OK, message: String::new(), value });
+    let encode_ns = encode_t0.elapsed().as_nanos() as u64;
+
+    READ_METRICS.with(|m| {
+        let mut m = m.borrow_mut();
+        m.ops += 1;
+        m.lookup_ns += lookup_ns;
+        m.encode_ns += encode_ns;
+        match source {
+            1 => m.found_in_mem += 1,
+            2 => m.found_in_imm += 1,
+            3 => m.found_in_sst += 1,
+            _ => m.not_found += 1,
+        }
+        m.maybe_report();
+    });
+
+    Ok(resp)
 }
 
 pub(crate) async fn handle_delete(payload: Bytes, part: &Rc<RefCell<PartitionData>>) -> HandlerResult {

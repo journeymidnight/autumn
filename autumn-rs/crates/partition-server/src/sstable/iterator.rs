@@ -215,7 +215,7 @@ impl TableIterator {
             return Ok(None);
         }
         let block = self.reader.read_block(idx)?;
-        Ok(Some(BlockIterator::new(Arc::new(block))))
+        Ok(Some(BlockIterator::new(block)))
     }
 }
 
