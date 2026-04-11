@@ -1172,7 +1172,15 @@ pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<b
         )
     };
 
-    let (sst_bytes, last_seq) = build_sst_bytes(&imm_mem, snap_vp_eid, snap_vp_off);
+    // Build SSTable on a blocking thread so the CPU-intensive work doesn't
+    // stall the partition thread's compio event loop (which needs to service
+    // write loop fanout I/O concurrently).
+    let imm_clone = imm_mem.clone();
+    let (sst_bytes, last_seq) = compio::runtime::spawn_blocking(move || {
+        build_sst_bytes(&imm_clone, snap_vp_eid, snap_vp_off)
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("SSTable build task failed"))?;
     let result = part_sc.append(row_stream_id, &sst_bytes, true).await?;
 
     let estimated_size = sst_bytes.len() as u64;
