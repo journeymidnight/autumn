@@ -233,15 +233,70 @@ pub(crate) async fn background_write_loop(
     let mut metrics = WriteLoopMetrics::new();
     let mut pending: Vec<WriteRequest> = Vec::new();
 
+    // Double-buffer pipeline (Go doWrites pattern):
+    // While Phase2 (append I/O) is in-flight, collect the next batch from
+    // write_rx. Only block when the next batch is full but Phase2 hasn't
+    // finished yet.
+    //
+    // pending_batch: None = no in-flight Phase2.
+    //                Some = Phase2 running, holds the future + validated entries.
+    let mut in_flight: Option<InFlightBatch> = None;
+
     loop {
+        // ── Collect requests into `pending` ──
         if pending.is_empty() {
-            match write_rx.next().await {
-                Some(req) => pending.push(req),
-                None => break,
+            if in_flight.is_none() {
+                // Nothing in-flight, nothing pending — block for first request.
+                match write_rx.next().await {
+                    Some(req) => pending.push(req),
+                    None => break,
+                }
+            } else {
+                // Phase2 in-flight — select: new request OR Phase2 done.
+                let flight = in_flight.as_mut().unwrap();
+                enum Sel {
+                    Req(WriteRequest),
+                    Done(Result<autumn_stream::AppendResult>),
+                    Closed,
+                }
+                let sel = {
+                    let mut rx_fut = std::pin::pin!(write_rx.next());
+                    let mut p2_fut = std::pin::pin!(&mut flight.phase2_fut);
+                    std::future::poll_fn(|cx| {
+                        use std::future::Future;
+                        use std::pin::Pin;
+                        use std::task::Poll;
+                        if let Poll::Ready(v) = Pin::new(&mut rx_fut).poll(cx) {
+                            return match v {
+                                Some(r) => Poll::Ready(Sel::Req(r)),
+                                None => Poll::Ready(Sel::Closed),
+                            };
+                        }
+                        if let Poll::Ready(r) = Pin::new(&mut p2_fut).poll(cx) {
+                            return Poll::Ready(Sel::Done(r));
+                        }
+                        Poll::Pending
+                    })
+                    .await
+                };
+                match sel {
+                    Sel::Req(r) => pending.push(r),
+                    Sel::Done(r) => {
+                        // Phase2 finished — complete the batch (Phase3 + reply).
+                        let flight = in_flight.take().unwrap();
+                        match finish_write_batch(&part, flight.data, r).await {
+                            Ok(stats) => metrics.record(stats),
+                            Err(e) => tracing::error!("write batch error: {e}"),
+                        }
+                        metrics.maybe_report(part_id);
+                        continue;
+                    }
+                    Sel::Closed => break,
+                }
             }
         }
 
-        // Try to drain more without blocking.
+        // Drain more without blocking.
         while pending.len() < MAX_WRITE_BATCH {
             match write_rx.next().now_or_never() {
                 Some(Some(req)) => pending.push(req),
@@ -249,48 +304,83 @@ pub(crate) async fn background_write_loop(
             }
         }
 
-        // Process the batch.
-        let batch = std::mem::take(&mut pending);
-        match process_write_batch(&part, batch).await {
-            Ok(stats) => metrics.record(stats),
-            Err(e) => tracing::error!("write batch error: {e}"),
+        // ── If Phase2 still in-flight, wait for it before starting next batch ──
+        if let Some(mut flight) = in_flight.take() {
+            let r = flight.phase2_fut.await;
+            match finish_write_batch(&part, flight.data, r).await {
+                Ok(stats) => metrics.record(stats),
+                Err(e) => tracing::error!("write batch error: {e}"),
+            }
+            metrics.maybe_report(part_id);
         }
-        metrics.maybe_report(part_id);
+
+        // ── Start new batch: Phase1 + launch Phase2 ──
+        let batch = std::mem::take(&mut pending);
+        match start_write_batch(&part, batch) {
+            Ok(Some(flight)) => {
+                in_flight = Some(flight);
+                // Loop back to collect next batch while Phase2 runs.
+            }
+            Ok(None) => {} // empty batch (all out-of-range)
+            Err(e) => tracing::error!("write batch start error: {e}"),
+        }
     }
 
     // Drain remaining.
+    if let Some(mut flight) = in_flight.take() {
+        let r = flight.phase2_fut.await;
+        let _ = finish_write_batch(&part, flight.data, r).await;
+    }
     if !pending.is_empty() {
         let batch = std::mem::take(&mut pending);
-        match process_write_batch(&part, batch).await {
-            Ok(stats) => metrics.record(stats),
-            Err(e) => tracing::error!("write batch error: {e}"),
+        if let Ok(Some(mut flight)) = start_write_batch(&part, batch) {
+            let r = flight.phase2_fut.await;
+            let _ = finish_write_batch(&part, flight.data, r).await;
         }
     }
     metrics.flush(part_id);
 }
 
 // ---------------------------------------------------------------------------
-// Write batch processing (single-threaded, no locks needed)
+// Write batch processing — split into start (Phase1) + finish (Phase3)
+// with Phase2 (append I/O) as an in-flight future for double-buffering.
 // ---------------------------------------------------------------------------
 
-pub(crate) async fn process_write_batch(
+struct ValidatedEntry {
+    internal_key: Vec<u8>,
+    user_key: Bytes,
+    op: u8,
+    value: Bytes,
+    expires_at: u64,
+    must_sync: bool,
+    resp_tx: oneshot::Sender<Result<Vec<u8>, String>>,
+}
+
+type Phase2Fut = std::pin::Pin<Box<dyn std::future::Future<Output = Result<autumn_stream::AppendResult>>>>;
+
+/// In-flight batch data (without the future).
+struct BatchData {
+    picked_at: Instant,
+    phase1_ns: u64,
+    phase2_started_at: Instant,
+    valid: Vec<ValidatedEntry>,
+    record_sizes: Vec<u32>,
+}
+
+/// In-flight batch: Phase1 done, Phase2 future running.
+struct InFlightBatch {
+    data: BatchData,
+    phase2_fut: Phase2Fut,
+}
+
+/// Phase 1: validate + encode + launch Phase2 future (no await).
+fn start_write_batch(
     part: &Rc<RefCell<PartitionData>>,
     batch: Vec<WriteRequest>,
-) -> Result<BatchStats> {
-    struct ValidatedEntry {
-        internal_key: Vec<u8>,
-        user_key: Bytes,
-        op: u8,
-        value: Bytes,
-        expires_at: u64,
-        must_sync: bool,
-        resp_tx: oneshot::Sender<Result<Vec<u8>, String>>,
-    }
-
+) -> Result<Option<InFlightBatch>> {
     let picked_at = Instant::now();
     let phase1_started_at = Instant::now();
 
-    // Phase 1: validate + encode (no async, just borrow_mut).
     let (valid, record_sizes, segments, batch_must_sync, log_stream_id, part_sc) = {
         let mut p = part.borrow_mut();
 
@@ -325,7 +415,7 @@ pub(crate) async fn process_write_batch(
         }
 
         if valid.is_empty() {
-            return Ok(BatchStats::default());
+            return Ok(None);
         }
 
         let mut segments: Vec<Bytes> = Vec::with_capacity(valid.len() * 2);
@@ -351,24 +441,44 @@ pub(crate) async fn process_write_batch(
 
         (valid, record_sizes, segments, batch_must_sync, log_stream_id, part_sc)
     };
-    let phase1_elapsed = phase1_started_at.elapsed();
+    let phase1_ns = duration_to_ns(phase1_started_at.elapsed());
 
-    // Phase 2: append to logStream (async I/O, borrow released).
+    // Launch Phase 2 as a future (not awaited yet).
     let phase2_started_at = Instant::now();
-    let result = match part_sc
-        .append_segments(log_stream_id, segments, batch_must_sync)
-        .await
-    {
+    let phase2_fut = Box::pin(async move {
+        part_sc.append_segments(log_stream_id, segments, batch_must_sync).await
+    });
+
+    Ok(Some(InFlightBatch {
+        data: BatchData {
+            picked_at,
+            phase1_ns,
+            phase2_started_at,
+            valid,
+            record_sizes,
+        },
+        phase2_fut,
+    }))
+}
+
+/// Phase 3: given Phase2 result, insert into memtable, reply to callers.
+async fn finish_write_batch(
+    part: &Rc<RefCell<PartitionData>>,
+    bd: BatchData,
+    phase2_result: Result<autumn_stream::AppendResult>,
+) -> Result<BatchStats> {
+    let phase2_elapsed = bd.phase2_started_at.elapsed();
+
+    let result = match phase2_result {
         Ok(result) => result,
         Err(e) => {
             let msg = format!("log_stream append_segments: {e}");
-            for entry in valid {
+            for entry in bd.valid {
                 let _ = entry.resp_tx.send(Err(msg.clone()));
             }
             return Err(anyhow!(msg));
         }
     };
-    let phase2_elapsed = phase2_started_at.elapsed();
 
     // Phase 3: insert into memtable + update VP head.
     let phase3_started_at = Instant::now();
@@ -377,9 +487,9 @@ pub(crate) async fn process_write_batch(
         let mut p = part.borrow_mut();
 
         let mut cumulative: u32 = 0;
-        for (i, entry) in valid.into_iter().enumerate() {
+        for (i, entry) in bd.valid.into_iter().enumerate() {
             let record_offset = result.offset + cumulative;
-            cumulative += record_sizes[i];
+            cumulative += bd.record_sizes[i];
 
             let mem_entry = if entry.value.len() > VALUE_THROTTLE {
                 let vp = ValuePointer {
@@ -417,13 +527,27 @@ pub(crate) async fn process_write_batch(
     }
 
     Ok(BatchStats {
-        ops: record_sizes.len() as u64,
-        batch_size: record_sizes.len() as u64,
-        phase1_ns: duration_to_ns(phase1_elapsed),
+        ops: bd.record_sizes.len() as u64,
+        batch_size: bd.record_sizes.len() as u64,
+        phase1_ns: bd.phase1_ns,
         phase2_ns: duration_to_ns(phase2_elapsed),
         phase3_ns: duration_to_ns(phase3_elapsed),
-        end_to_end_ns: duration_to_ns(picked_at.elapsed()),
+        end_to_end_ns: duration_to_ns(bd.picked_at.elapsed()),
     })
+}
+
+/// Legacy entry point used by flush_memtable_locked path.
+pub(crate) async fn process_write_batch(
+    part: &Rc<RefCell<PartitionData>>,
+    batch: Vec<WriteRequest>,
+) -> Result<BatchStats> {
+    match start_write_batch(part, batch)? {
+        Some(mut flight) => {
+            let r = flight.phase2_fut.await;
+            finish_write_batch(part, flight.data, r).await
+        }
+        None => Ok(BatchStats::default()),
+    }
 }
 
 // ---------------------------------------------------------------------------
