@@ -98,6 +98,7 @@ name = "autumn-partition-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "autumn-common",
  "autumn-rpc",
  "autumn-stream",
  "bytes",
@@ -149,6 +150,7 @@ name = "autumn-stream"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "autumn-common",
  "autumn-manager",
  "autumn-rpc",
  "bytes",

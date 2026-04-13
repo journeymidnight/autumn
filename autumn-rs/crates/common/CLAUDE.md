@@ -2,9 +2,21 @@
 
 ## Purpose
 
-Shared in-memory metadata store and error types used by `autumn-manager`. Not used by the stream layer or partition layer directly — those interact with the manager only via gRPC.
+Shared utilities, metadata store, and error types. Used by `autumn-manager` (store + error), `autumn-stream` and `autumn-partition-server` (metrics helpers).
 
 ## Modules
+
+### `metrics.rs` — Shared Performance Measurement Helpers
+
+Standardized helpers for periodic performance reporting across all crates. All latency fields use milliseconds (`_ms`).
+
+| Function | Purpose |
+|----------|---------|
+| `duration_to_ns(Duration) -> u64` | Convert Duration to nanoseconds (clamped to u64::MAX) |
+| `ns_to_ms(total_ns, count) -> f64` | Accumulated nanoseconds → average milliseconds |
+| `unix_time_ms() -> u64` | Current UNIX epoch time in milliseconds |
+
+Used by `StreamAppendMetrics` (stream crate), `WriteLoopMetrics` and `ReadMetrics` (partition-server crate).
 
 ### `error.rs` — Domain Error Types
 

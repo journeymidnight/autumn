@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use autumn_common::metrics::{duration_to_ns, ns_to_ms};
 use autumn_rpc::manager_rpc::{self, MgrRange as Range, rkyv_encode, rkyv_decode};
 use autumn_rpc::partition_rpc::{self, *, TableLocations, SstLocation};
 use autumn_rpc::{Frame, FrameDecoder, HandlerResult, StatusCode};
@@ -323,14 +324,6 @@ impl WriteLoopMetrics {
     }
 }
 
-fn duration_to_ns(dur: Duration) -> u64 {
-    dur.as_nanos().min(u64::MAX as u128) as u64
-}
-
-fn ns_to_ms(total_ns: u64, denom: u64) -> f64 {
-    if denom == 0 { return 0.0; }
-    total_ns as f64 / denom as f64 / 1_000_000.0
-}
 
 fn write_batch_too_big(batch: &[WriteRequest]) -> bool {
     let mut size = 0usize;

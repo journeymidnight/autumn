@@ -1,9 +1,10 @@
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
+use autumn_common::metrics::{duration_to_ns, ns_to_ms, unix_time_ms};
 use autumn_rpc::manager_rpc::{self, *};
 use crate::ConnPool;
 use crate::extent_rpc::{
@@ -110,24 +111,6 @@ impl StreamAppendMetrics {
     }
 }
 
-fn duration_to_ns(dur: Duration) -> u64 {
-    dur.as_nanos().min(u64::MAX as u128) as u64
-}
-
-fn ns_to_ms(total_ns: u64, denom: u64) -> f64 {
-    if denom == 0 {
-        return 0.0;
-    }
-    total_ns as f64 / denom as f64 / 1_000_000.0
-}
-
-fn unix_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u64::MAX as u128) as u64
-}
 
 /// A lock-free StreamClient where operations on different stream_ids
 /// never block each other.  No external Mutex is required.

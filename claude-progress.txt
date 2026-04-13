@@ -1,35 +1,28 @@
-Date: 2026-04-11
+Date: 2026-04-13
 TaskStatus: completed
-Task scope: PS write performance optimization (F048, F049)
+Task scope: F024 metrics standardization (partial — helpers only)
 
 Current summary:
-  Write throughput: 6.3K → 32.9K ops/s (5.2x improvement)
+  Extracted duplicated metrics helpers into autumn-common::metrics module.
+  - duration_to_ns, ns_to_ms, unix_time_ms now defined once in common crate
+  - Removed duplicate definitions from stream/client.rs and partition-server/lib.rs
+  - Standardized ReadMetrics fields from _us to _ms (avg_lookup_ms, avg_encode_ms)
+  - Added autumn-common dependency to autumn-stream and autumn-partition-server
 
-  Optimizations applied:
-  1. partition_thread_main: spawn concurrent tasks (batch_size 1→60-80)
-     - Root cause: sequential request processing defeated group commit
-     - Effect: 6.3K → 25K ops/s (4x)
-  2. TCP/read buffer 512KB (SO_SNDBUF/SO_RCVBUF + read buf)
-     - Root cause: 128KB TCP buf + 64KB read buf for 280KB batch payloads
-     - Effect: best-case fanout 1.1→0.86ms, extent_bench +20%
-  3. F048: Zero-copy frame write (vectored write in ConnPool)
-     - Root cause: 280KB memcpy per append in Frame::encode()
-     - Effect: p99 93→34ms
-  4. F049: spawn_blocking for SSTable build in flush
-     - Root cause: CPU-intensive build_sst_bytes blocked compio event loop
-     - Effect: 25.8K → 32.9K ops/s, bad seconds 4-15K → 21-35K
-
-  Stream layer baseline (confirmed, no degradation):
-  - extent_bench depth=64: 482 MB/s (4KB append)
-  - append_benchmark 1-replica batch=16: 197K ops/s
+  Files changed:
+  - autumn-rs/crates/common/src/metrics.rs (new)
+  - autumn-rs/crates/common/src/lib.rs (add pub mod metrics)
+  - autumn-rs/crates/common/Cargo.toml (no change needed — no new deps for metrics.rs)
+  - autumn-rs/crates/stream/Cargo.toml (add autumn-common dep)
+  - autumn-rs/crates/stream/src/client.rs (use shared helpers, remove locals)
+  - autumn-rs/crates/partition-server/Cargo.toml (add autumn-common dep)
+  - autumn-rs/crates/partition-server/src/lib.rs (use shared helpers, remove locals)
+  - autumn-rs/crates/partition-server/src/rpc_handlers.rs (use ns_to_ms, _us → _ms)
 
 Main gaps:
-  - Still ~2x from 80K target. Remaining bottleneck: 3-replica fanout
-    avg ~1.5ms (good seconds 0.9ms, bad seconds 2.3ms).
-  - Compaction CPU work still on partition thread (lower priority than flush)
-  - PS main thread handles 256 connections on single compio thread
+  - F024 still passes: false — distributed tracing / OTel export not implemented
+  - rpc/pool.rs now_millis() left as-is (different purpose: health check, i64 return type)
 
 Next steps:
-  - Profile remaining fanout variance (bad seconds still 2-3ms)
-  - Consider multi-threaded PS connection handling (Dispatcher model)
-  - Consider pipelining in benchmark client (depth>1 per thread)
+  - (Optional future) Add OpenTelemetry tracing export if needed
+  - Continue with other feature work

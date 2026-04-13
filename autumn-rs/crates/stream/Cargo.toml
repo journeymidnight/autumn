@@ -12,6 +12,7 @@ reed-solomon-erasure = "6"
 dashmap.workspace = true
 futures = "0.3"
 tracing.workspace = true
+autumn-common = { path = "../common" }
 autumn-rpc = { path = "../rpc" }
 compio = { version = "0.18", features = ["net", "time", "macros", "dispatcher", "fs"] }
 libc = "0.2"

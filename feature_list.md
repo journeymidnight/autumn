@@ -226,6 +226,6 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 ### F024 · Observability: distributed tracing and structured logging
 - **Target:** Jaeger/OpenTelemetry tracing with configurable sampling. Equivalent to Go xlog + trace-sampler flags.
 - **Evidence:** `xlog/xlog.go` · `cmd/autumn-ps/main.go` (trace-sampler) · `cmd/extent-node/main.go`
-- **Notes:** Rust uses basic tracing_subscriber with no distributed tracing export.
+- **Notes:** Metrics helpers standardized in `autumn-common::metrics` (duration_to_ns, ns_to_ms, unix_time_ms). All periodic summaries use `_ms` units. No distributed tracing export yet.
 - **passes:** false
 

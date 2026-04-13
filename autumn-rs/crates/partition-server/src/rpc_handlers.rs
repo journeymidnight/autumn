@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use autumn_common::metrics::ns_to_ms;
 use autumn_rpc::manager_rpc::MgrRange as Range;
 use autumn_rpc::partition_rpc::{self, *};
 use autumn_rpc::{HandlerResult, StatusCode};
@@ -49,8 +50,8 @@ impl ReadMetrics {
             tracing::info!(
                 ops = self.ops,
                 ops_per_sec = self.ops as f64 / elapsed.as_secs_f64(),
-                avg_lookup_us = self.lookup_ns as f64 / ops as f64 / 1000.0,
-                avg_encode_us = self.encode_ns as f64 / ops as f64 / 1000.0,
+                avg_lookup_ms = ns_to_ms(self.lookup_ns, ops),
+                avg_encode_ms = ns_to_ms(self.encode_ns, ops),
                 mem = self.found_in_mem,
                 imm = self.found_in_imm,
                 sst = self.found_in_sst,
