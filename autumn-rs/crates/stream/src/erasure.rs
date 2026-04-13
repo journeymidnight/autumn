@@ -305,4 +305,71 @@ mod tests {
             assert_eq!(s.len(), first_len, "all shards must have equal length");
         }
     }
+
+    /// Verify that data shards contain raw payload slices — the fast-path
+    /// assumption that sub-range reads from a data shard return original bytes.
+    #[test]
+    fn test_data_shards_contain_raw_payload() {
+        let payload: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        let shards = ec_encode(&payload, 2, 1).unwrap();
+        let per_shard = shards[0].len();
+
+        // shard[0] should contain payload[0..per_shard] (minus trailer area)
+        assert_eq!(&shards[0][..per_shard.min(payload.len())], &payload[..per_shard.min(payload.len())]);
+
+        // Reading a sub-range from shard[0] gives the original payload bytes
+        assert_eq!(&shards[0][100..200], &payload[100..200]);
+
+        // shard[1] starts at payload[per_shard..]
+        let remaining = payload.len() - per_shard;
+        assert_eq!(&shards[1][..remaining], &payload[per_shard..per_shard + remaining]);
+    }
+
+    /// Verify that partial shards cannot be decoded — this is the bug that
+    /// ec_read_from_extent had (passing offset/length to all shards).
+    #[test]
+    fn test_partial_shards_cannot_decode() {
+        let payload: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        let shards = ec_encode(&payload, 2, 1).unwrap();
+        let per_shard = shards[0].len();
+
+        // Take a sub-range from each shard (simulating the old buggy behavior)
+        let partial: Vec<Option<Vec<u8>>> = shards
+            .iter()
+            .map(|s| Some(s[100..200].to_vec()))
+            .collect();
+
+        // This should fail because partial shards have wrong length for RS decode
+        let result = ec_decode(partial, 2, 1);
+        // The decode itself may "succeed" but return garbage (wrong length trailer).
+        // Either way, the output won't match the expected payload sub-range.
+        if let Ok(decoded) = result {
+            // If it somehow decodes, the result is garbage — not payload[100..200]
+            assert_ne!(decoded, payload[100..200].to_vec(),
+                "partial shard decode should NOT return correct payload sub-range");
+        }
+        // If it errors, that's also correct — partial shards can't be decoded.
+    }
+
+    /// 2+1 EC: missing one data shard, decode from remaining data + parity.
+    #[test]
+    fn test_2_plus_1_missing_data_shard_0() {
+        let payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let shards = ec_encode(&payload, 2, 1).unwrap();
+        let mut shards_opt: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
+        shards_opt[0] = None; // data shard 0 gone
+        let decoded = ec_decode(shards_opt, 2, 1).unwrap();
+        assert_eq!(decoded, payload, "should recover from 1 data + 1 parity");
+    }
+
+    /// 2+1 EC: missing data shard 1, decode from shard 0 + parity.
+    #[test]
+    fn test_2_plus_1_missing_data_shard_1() {
+        let payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let shards = ec_encode(&payload, 2, 1).unwrap();
+        let mut shards_opt: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
+        shards_opt[1] = None; // data shard 1 gone
+        let decoded = ec_decode(shards_opt, 2, 1).unwrap();
+        assert_eq!(decoded, payload, "should recover from 1 data + 1 parity");
+    }
 }
