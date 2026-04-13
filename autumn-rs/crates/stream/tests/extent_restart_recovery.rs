@@ -2,7 +2,7 @@ mod test_helpers;
 
 use std::time::Duration;
 
-use autumn_stream::extent_rpc::{CODE_OK, CODE_PRECONDITION};
+use autumn_stream::extent_rpc::{CODE_OK, CODE_LOCKED_BY_OTHER};
 use test_helpers::{pick_addr, start_node, TestConn};
 
 /// After restart, commit_length is preserved.
@@ -67,7 +67,7 @@ async fn restart_preserves_meta_fields() {
         .append(2002, 1, 4, 10, true, b"x".to_vec())
         .await;
     assert_eq!(
-        stale.code, CODE_PRECONDITION,
+        stale.code, CODE_LOCKED_BY_OTHER,
         "stale revision should be rejected after restart"
     );
 }

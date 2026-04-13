@@ -158,7 +158,12 @@ impl ConnPool {
         let conn = self.get_or_connect(sock).await?;
         // SAFETY: single-threaded compio runtime — no concurrent borrow possible.
         let conn_ptr = conn.as_ptr();
-        unsafe { &mut *conn_ptr }.call(msg_type, payload).await
+        let result = unsafe { &mut *conn_ptr }.call(msg_type, payload).await;
+        if result.is_err() {
+            // Evict broken connection so next call reconnects.
+            self.conns.borrow_mut().remove(&sock);
+        }
+        result
     }
 
     async fn get_or_connect(&self, addr: SocketAddr) -> Result<Rc<RefCell<RpcConn>>> {

@@ -9,7 +9,7 @@ use autumn_rpc::manager_rpc::{self, *};
 use crate::ConnPool;
 use crate::extent_rpc::{
     AppendReq, AppendResp, CommitLengthReq, CommitLengthResp, ExtentInfo, ReadBytesReq,
-    ReadBytesResp, StreamInfo, CODE_NOT_FOUND, CODE_OK,
+    ReadBytesResp, StreamInfo, CODE_LOCKED_BY_OTHER, CODE_NOT_FOUND, CODE_OK,
     MSG_APPEND, MSG_COMMIT_LENGTH, MSG_READ_BYTES,
 };
 use bytes::{Bytes, BytesMut};
@@ -134,6 +134,35 @@ pub struct StreamClient {
 }
 
 impl StreamClient {
+    /// Retry a manager RPC with backoff. Used for critical manager calls
+    /// (alloc, commit check, stream info) to tolerate brief manager outages.
+    async fn retry_manager_call<F, Fut, T>(&self, label: &str, max_retries: u32, f: F) -> Result<T>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let mut attempt = 0u32;
+        loop {
+            match f().await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    attempt += 1;
+                    if attempt > max_retries {
+                        return Err(e.context(format!("{label} failed after {max_retries} retries")));
+                    }
+                    tracing::warn!(
+                        attempt,
+                        max_retries,
+                        error = %e,
+                        "{} failed, retrying in 500ms",
+                        label,
+                    );
+                    compio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+    }
+
     pub async fn connect(
         manager_endpoint: &str,
         owner_key: String,
@@ -331,7 +360,7 @@ impl StreamClient {
         Ok((stream, extent, resp.end))
     }
 
-    async fn alloc_new_extent(&self, stream_id: u64, end: u32) -> Result<(StreamInfo, ExtentInfo)> {
+    async fn alloc_new_extent_once(&self, stream_id: u64, end: u32) -> Result<(StreamInfo, ExtentInfo)> {
         let req = manager_rpc::rkyv_encode(&StreamAllocExtentReq {
             stream_id,
             owner_key: self.owner_key.clone(),
@@ -357,6 +386,12 @@ impl StreamClient {
             .ok_or_else(|| anyhow!("alloc_new_extent: missing last_ex_info"))?;
         self.extent_info_cache.insert(extent.extent_id, extent.clone());
         Ok((stream, extent))
+    }
+
+    async fn alloc_new_extent(&self, stream_id: u64, end: u32) -> Result<(StreamInfo, ExtentInfo)> {
+        self.retry_manager_call("alloc_new_extent", 20, || {
+            self.alloc_new_extent_once(stream_id, end)
+        }).await
     }
 
     /// Core append implementation.  Acquires the per-stream state lock so that
@@ -473,6 +508,9 @@ impl StreamClient {
                 if inner.code == CODE_NOT_FOUND {
                     saw_not_found = true;
                     break;
+                }
+                if inner.code == CODE_LOCKED_BY_OTHER {
+                    return Err(anyhow!("LockedByOther: a newer owner holds extent {extent_id}"));
                 }
                 if inner.code != CODE_OK {
                     append_error = Some(anyhow!(

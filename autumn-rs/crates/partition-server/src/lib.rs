@@ -453,13 +453,32 @@ impl PartitionServer {
     }
 
     async fn heartbeat_loop(&self) {
+        const MAX_CONSECUTIVE_FAILURES: u32 = 6; // 6 × 5s = 30s
+        let mut consecutive_failures: u32 = 0;
         let mut ticker = compio::time::interval(Duration::from_secs(5));
         ticker.tick().await; // first tick is immediate
         loop {
             ticker.tick().await;
             let req = manager_rpc::rkyv_encode(&manager_rpc::HeartbeatPsReq { ps_id: self.ps_id });
-            if let Err(e) = self.pool.call(&self.manager_addr, manager_rpc::MSG_HEARTBEAT_PS, req).await {
-                tracing::warn!("PS {} heartbeat failed: {e}", self.ps_id);
+            match self.pool.call(&self.manager_addr, manager_rpc::MSG_HEARTBEAT_PS, req).await {
+                Ok(_) => {
+                    consecutive_failures = 0;
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    tracing::warn!(
+                        "PS {} heartbeat failed ({}/{}): {e}",
+                        self.ps_id, consecutive_failures, MAX_CONSECUTIVE_FAILURES,
+                    );
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                        tracing::error!(
+                            "PS {} heartbeat lost for {}s, exiting to prevent stale serving",
+                            self.ps_id,
+                            consecutive_failures * 5,
+                        );
+                        std::process::exit(1);
+                    }
+                }
             }
         }
     }
@@ -787,8 +806,36 @@ async fn partition_thread_main(
         .context("create per-partition StreamClient")?,
     );
 
+    // Check commit length on all streams before recovery (Go: checkCommitLength).
+    // This ensures the last extent of each stream has consistent commit length
+    // across all replicas before we start reading from it.
+    for (label, sid) in [
+        ("logStream", log_stream_id),
+        ("rowStream", row_stream_id),
+        ("metaStream", meta_stream_id),
+    ] {
+        loop {
+            match part_sc.commit_length(sid).await {
+                Ok(end) => {
+                    tracing::info!(part_id, stream_id = sid, end, "{} commit_length OK", label);
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        part_id,
+                        stream_id = sid,
+                        error = %e,
+                        "{} commit_length failed, retrying in 5s",
+                        label,
+                    );
+                    compio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        }
+    }
+
     // Recovery: read metaStream → rowStream → logStream replay
-    let (tables, sst_readers, max_seq, vp_eid, vp_off, detected_overlap) =
+    let (tables, sst_readers, max_seq, vp_eid, vp_off, detected_overlap, recovered_active) =
         recover_partition(part_id, &rg, log_stream_id, row_stream_id, meta_stream_id, &part_sc)
             .await?;
 
@@ -799,7 +846,7 @@ async fn partition_thread_main(
 
     let part = Rc::new(RefCell::new(PartitionData {
         rg,
-        active: Memtable::new(),
+        active: recovered_active,
         imm: VecDeque::new(),
         flush_tx,
         compact_tx,
@@ -839,10 +886,12 @@ async fn partition_thread_main(
         })
         .detach();
     }
+    let locked_by_other = Rc::new(Cell::new(false));
     {
         let p = part.clone();
+        let lbo = locked_by_other.clone();
         compio::runtime::spawn(async move {
-            background_write_loop(part_id, p, write_rx).await;
+            background_write_loop(part_id, p, write_rx, lbo).await;
         })
         .detach();
     }
@@ -852,6 +901,11 @@ async fn partition_thread_main(
     // Writes (PUT/DELETE/STREAM_PUT) and control ops: spawn — they await
     // write_tx and must run concurrently for group commit batching.
     while let Some(req) = req_rx.next().await {
+        // Self-eviction: if the write loop detected LockedByOther, stop serving.
+        if locked_by_other.get() {
+            tracing::error!(part_id, "partition poisoned by LockedByOther, shutting down");
+            break;
+        }
         if is_read_op(req.msg_type) {
             let result = dispatch_partition_rpc(
                 req.msg_type, req.payload, &part, &part_sc, &pool,
@@ -922,7 +976,7 @@ async fn recover_partition(
     _row_stream_id: u64,
     meta_stream_id: u64,
     part_sc: &Rc<StreamClient>,
-) -> Result<(Vec<TableMeta>, Vec<Rc<SstReader>>, u64, u64, u32, bool)> {
+) -> Result<(Vec<TableMeta>, Vec<Rc<SstReader>>, u64, u64, u32, bool, Memtable)> {
     let mut tables: Vec<TableMeta> = Vec::new();
     let mut sst_readers: Vec<Rc<SstReader>> = Vec::new();
     let mut max_seq: u64 = 0;
@@ -1072,25 +1126,7 @@ async fn recover_partition(
         }
     }
 
-    // Transfer recovered entries from active memtable — caller will create PartitionData
-    // with this active memtable data.
-    // For simplicity, we return max_seq and the recovered active entries will already be
-    // in the PartitionData.active that the caller creates.
-    // HACK: we need to return the active memtable entries. Since Memtable is not Send,
-    // and we're already on the partition thread, we can just put it directly.
-    // Actually, this function runs on the partition thread, so no Send issue.
-    // But we can't easily return the Memtable struct. Let's just not replay here
-    // and let the caller handle it... Actually, let's just return the max_seq and
-    // handle the replay in partition_thread_main.
-
-    // For now, we already inserted into `active` which will be dropped.
-    // Let's restructure: the caller should handle this.
-    // Actually, since this function is called from the partition thread, we can just
-    // use the function to fill the PartitionData's active memtable.
-    // The simplest approach: don't return active, return the replay info and let
-    // the caller do the replay.
-
-    Ok((tables, sst_readers, max_seq, recovered_vp_eid, recovered_vp_off, detected_overlap))
+    Ok((tables, sst_readers, max_seq, recovered_vp_eid, recovered_vp_off, detected_overlap, active))
 }
 
 // ---------------------------------------------------------------------------

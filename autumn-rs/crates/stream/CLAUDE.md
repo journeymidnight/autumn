@@ -90,7 +90,7 @@ Append(AppendReq via autumn-rpc binary frame):
        - If client eversion < local: reject (PRECONDITION_FAILED)
   3. Sealed check: reject if sealed_length > 0 or avali > 0
   4. Revision fencing:
-       - If header.revision < last_revision: reject (stale owner)
+       - If header.revision < last_revision: reject (CODE_LOCKED_BY_OTHER — stale owner)
        - If header.revision > last_revision: update last_revision, persist meta
   5. Commit reconciliation:
        - If local file len < header.commit: reject (data loss on our side)
@@ -131,13 +131,14 @@ The `StreamClient` computes `commit = min(commit_length on all replicas)` before
 Triggered by the manager when a replica node fails:
 
 1. Validates manager endpoint is configured, extent doesn't exist locally, no in-flight recovery for this extent.
-2. Spawns background task `run_recovery_task`:
+2. Spawns background task `run_recovery_task` **with retry** (up to 10 attempts, 10s backoff between failures):
    - Fetches `ExtentInfo` from manager to get all replica addresses.
    - Calls `fetch_full_extent_from_sources`: iterates replicas (skipping self and failed node), reads the full extent via `copy_bytes_from_source` (CopyExtent RPC).
    - Truncates local file to 0, writes full payload, syncs.
    - Updates all atomics and persists metadata sidecar.
 3. On completion, pushes `RecoveryTaskStatus` to `recovery_done` channel.
 4. The `df` RPC (called periodically by the manager) drains `recovery_done` and reports completed tasks.
+5. On max retries exhausted, removes from `recovery_inflight`; manager will re-dispatch on next loop.
 
 ### Re-Avali (`re_avali` RPC)
 
@@ -222,7 +223,7 @@ All caches use `DashMap` for lock-free concurrent access.
 
 ## Programming Notes
 
-1. **Always pass the correct `revision`** — passing 0 or a stale revision will cause `PRECONDITION_FAILED` from ExtentNode. The revision is set at `StreamClient::connect` time.
+1. **Always pass the correct `revision`** — passing 0 or a stale revision will cause `CODE_LOCKED_BY_OTHER` from ExtentNode (propagated as immediate non-retried error by StreamClient). The revision is set at `StreamClient::connect` time.
 
 2. **Eversion changes on seal** — if the manager seals an extent (e.g., during split or extent rolling), the eversion is bumped. The next append will see a mismatched eversion, fetch the updated ExtentInfo, and handle accordingly.
 

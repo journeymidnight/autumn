@@ -276,6 +276,8 @@ pub const CODE_OK: u8 = 0;
 pub const CODE_NOT_FOUND: u8 = 1;
 pub const CODE_PRECONDITION: u8 = 3;
 pub const CODE_ERROR: u8 = 4;
+/// Returned when `header.revision < last_revision` — a newer owner has taken the lock.
+pub const CODE_LOCKED_BY_OTHER: u8 = 5;
 
 /// Convert a u8 code from binary wire format to autumn_rpc::StatusCode.
 pub fn code_to_status(code: u8) -> StatusCode {

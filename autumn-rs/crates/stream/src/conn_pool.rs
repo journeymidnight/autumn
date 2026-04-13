@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use autumn_rpc::{Frame, FrameDecoder, RpcError};
@@ -110,20 +111,46 @@ impl ConnPool {
     }
 
     /// Send an RPC to an extent node and return the response payload.
+    /// On error, the connection is discarded (not returned to pool) so
+    /// the next call creates a fresh connection.
     pub async fn call(&self, addr: &str, msg_type: u8, payload: Bytes) -> Result<Bytes> {
         let sock = parse_addr(addr)?;
         let mut conn = self.take_conn(sock).await?;
         let result = conn.call(msg_type, payload).await;
-        self.put_conn(sock, conn);
+        if result.is_ok() {
+            self.put_conn(sock, conn);
+        }
+        // On error: conn is dropped, pool entry stays None → next call reconnects.
         result
     }
 
+    /// Send an RPC with a timeout.
+    pub async fn call_timeout(
+        &self,
+        addr: &str,
+        msg_type: u8,
+        payload: Bytes,
+        timeout: Duration,
+    ) -> Result<Bytes> {
+        use futures::FutureExt;
+        let call_fut = self.call(addr, msg_type, payload);
+        let timer_fut = compio::time::sleep(timeout);
+        futures::pin_mut!(call_fut, timer_fut);
+        match futures::future::select(call_fut, timer_fut).await {
+            futures::future::Either::Left((result, _)) => result,
+            futures::future::Either::Right(_) => Err(anyhow!("RPC timed out after {:?}", timeout)),
+        }
+    }
+
     /// Send an RPC with payload split into parts (zero-copy vectored write).
+    /// On error, the connection is discarded so next call reconnects.
     pub async fn call_vectored(&self, addr: &str, msg_type: u8, payload_parts: Vec<Bytes>) -> Result<Bytes> {
         let sock = parse_addr(addr)?;
         let mut conn = self.take_conn(sock).await?;
         let result = conn.call_vectored(msg_type, payload_parts).await;
-        self.put_conn(sock, conn);
+        if result.is_ok() {
+            self.put_conn(sock, conn);
+        }
         result
     }
 

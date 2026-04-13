@@ -383,6 +383,19 @@ impl ExtentNode {
         })
     }
 
+    /// Mark the disk hosting an extent as offline after an I/O error.
+    fn mark_disk_offline_for_extent(&self, extent_id: u64) {
+        if let Some(entry) = self.extents.get(&extent_id) {
+            let disk_id = entry.disk_id;
+            if let Some(disk) = self.disks.get(&disk_id) {
+                if disk.online() {
+                    tracing::error!(extent_id, disk_id, "marking disk offline due to I/O error");
+                    disk.set_offline();
+                }
+            }
+        }
+    }
+
     /// Replay WAL records into extent files. Called on startup after load_extents().
     async fn replay_wal(&self, replay_files: &[std::path::PathBuf]) {
         let mut records = Vec::new();
@@ -1062,7 +1075,7 @@ impl ExtentNode {
         let last_revision = extent.last_revision.load(Ordering::SeqCst);
         if req.revision < last_revision {
             return Ok(AppendResp {
-                code: CODE_PRECONDITION,
+                code: CODE_LOCKED_BY_OTHER,
                 offset: 0,
                 end: 0,
             }
@@ -1104,14 +1117,20 @@ impl ExtentNode {
             self.wal.as_ref().unwrap().borrow_mut().write(&record)
                 .map_err(|e| (StatusCode::Internal, e.to_string()))?;
             // Extent write — no sync needed, WAL provides durability.
-            file_pwrite(&extent.file, start, data_payload.clone()).await
-                .map_err(|e| (StatusCode::Internal, e.to_string()))?;
+            if let Err(e) = file_pwrite(&extent.file, start, data_payload.clone()).await {
+                self.mark_disk_offline_for_extent(req.extent_id);
+                return Err((StatusCode::Internal, e.to_string()));
+            }
         } else {
-            file_pwrite(&extent.file, start, data_payload.clone()).await
-                .map_err(|e| (StatusCode::Internal, e.to_string()))?;
+            if let Err(e) = file_pwrite(&extent.file, start, data_payload.clone()).await {
+                self.mark_disk_offline_for_extent(req.extent_id);
+                return Err((StatusCode::Internal, e.to_string()));
+            }
             if req.must_sync {
-                file_ref(&extent.file).sync_all().await
-                    .map_err(|e| (StatusCode::Internal, e.to_string()))?;
+                if let Err(e) = file_ref(&extent.file).sync_all().await {
+                    self.mark_disk_offline_for_extent(req.extent_id);
+                    return Err((StatusCode::Internal, e.to_string()));
+                }
             }
         }
 
@@ -1233,7 +1252,7 @@ impl ExtentNode {
             // Revision fencing (first request sets the tone for the whole batch).
             let last_revision = extent.last_revision.load(Ordering::SeqCst);
             if first.revision < last_revision {
-                let resp_payload = AppendResp { code: CODE_PRECONDITION, offset: 0, end: 0 }.encode();
+                let resp_payload = AppendResp { code: CODE_LOCKED_BY_OTHER, offset: 0, end: 0 }.encode();
                 for k in sub_start..sub_end {
                     out.push(Frame::response(frames[k].req_id, MSG_APPEND, resp_payload.clone()));
                 }
@@ -1441,7 +1460,7 @@ impl ExtentNode {
             let last = entry.last_revision.load(Ordering::SeqCst);
             if req.revision < last {
                 return Ok(CommitLengthResp {
-                    code: CODE_PRECONDITION,
+                    code: CODE_LOCKED_BY_OTHER,
                     length: 0,
                 }
                 .encode());
@@ -1608,11 +1627,35 @@ impl ExtentNode {
         let node = self.clone();
         compio::runtime::spawn(async move {
             let extent_id = task.extent_id;
-            let result = node.run_recovery_task(task).await;
-            node.recovery_inflight.remove(&extent_id);
-            if let Ok(done) = result {
-                node.recovery_done.borrow_mut().push(done);
+            const MAX_RECOVERY_RETRIES: u32 = 10;
+            for attempt in 1..=MAX_RECOVERY_RETRIES {
+                match node.run_recovery_task(task.clone()).await {
+                    Ok(done) => {
+                        node.recovery_inflight.remove(&extent_id);
+                        node.recovery_done.borrow_mut().push(done);
+                        return;
+                    }
+                    Err(e) => {
+                        if attempt >= MAX_RECOVERY_RETRIES {
+                            tracing::error!(
+                                extent_id,
+                                attempt,
+                                error = %e,
+                                "recovery task failed after max retries, giving up",
+                            );
+                            break;
+                        }
+                        tracing::warn!(
+                            extent_id,
+                            attempt,
+                            error = %e,
+                            "recovery task failed, retrying in 10s",
+                        );
+                        compio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    }
+                }
             }
+            node.recovery_inflight.remove(&extent_id);
         })
         .detach();
 

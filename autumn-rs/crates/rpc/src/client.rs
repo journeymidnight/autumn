@@ -8,6 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use compio::net::TcpStream;
@@ -151,6 +152,46 @@ impl RpcClient {
             return Err(RpcError::status(code, message));
         }
         Ok(resp.payload)
+    }
+
+    /// Send a request and wait for the response with a timeout.
+    pub async fn call_timeout(
+        &self,
+        msg_type: u8,
+        payload: Bytes,
+        timeout: Duration,
+    ) -> Result<Bytes, RpcError> {
+        use futures::FutureExt;
+        let call_fut = self.call(msg_type, payload);
+        let timer_fut = compio::time::sleep(timeout);
+        futures::pin_mut!(call_fut, timer_fut);
+        match futures::future::select(call_fut, timer_fut).await {
+            futures::future::Either::Left((result, _)) => result,
+            futures::future::Either::Right(_) => Err(RpcError::Status {
+                code: crate::error::StatusCode::Unavailable,
+                message: format!("RPC timed out after {:?}", timeout),
+            }),
+        }
+    }
+
+    /// Send a vectored request with a timeout.
+    pub async fn call_vectored_timeout(
+        &self,
+        msg_type: u8,
+        payload_parts: Vec<Bytes>,
+        timeout: Duration,
+    ) -> Result<Bytes, RpcError> {
+        use futures::FutureExt;
+        let call_fut = self.call_vectored(msg_type, payload_parts);
+        let timer_fut = compio::time::sleep(timeout);
+        futures::pin_mut!(call_fut, timer_fut);
+        match futures::future::select(call_fut, timer_fut).await {
+            futures::future::Either::Left((result, _)) => result,
+            futures::future::Either::Right(_) => Err(RpcError::Status {
+                code: crate::error::StatusCode::Unavailable,
+                message: format!("RPC timed out after {:?}", timeout),
+            }),
+        }
     }
 
     /// Send a fire-and-forget frame (no response expected).

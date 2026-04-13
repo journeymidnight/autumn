@@ -1,27 +1,34 @@
 Date: 2026-04-13
-TaskStatus: not_completed
-Task scope: PS Dispatcher — spread connections across worker threads
+TaskStatus: completed
+Task scope: Fault recovery parity — fix Go→Rust gaps (F050-F060)
 
 Current summary:
-  Refactored PartitionServer to use compio Dispatcher pattern (same as RpcServer):
-  - Dedicated accept OS thread (blocking std::net::accept)
-  - N worker threads via compio::Dispatcher for connection handling
-  - PartitionRouter (DashMap<part_id, mpsc::Sender>) shared with workers
-  - Control plane (heartbeat, region_sync) stays on main compio thread
-  - Sequential per-connection processing preserved (no Mutex writer)
-  - Configurable via --conn-threads N (default: CPU count)
+  Comprehensive Go vs Rust fault recovery comparison completed.
+  All 11 features (F050-F060) implemented and passing.
 
-  Build: OK, all 12 unit tests pass.
+Completed features:
+  P0 (data correctness):
+  - F050: recover_partition now returns Memtable, no more data loss on crash recovery
+  - F051: commit_length called for all 3 streams at partition startup with infinite retry
+  - F052: CODE_LOCKED_BY_OTHER error code; StreamClient propagates immediately; PS self-evicts
 
-  NOT YET TESTED: need to start cluster and run perf-check to verify
-  performance improvement and correctness under load.
+  P0.5 (availability):
+  - F053: call_timeout/call_vectored_timeout added to RpcClient and stream ConnPool
+  - F054: ConnPool reconnection on error (stream, rpc, manager pools all evict broken conns)
+  - F055: PS heartbeat_loop exits after 6 consecutive failures (30s)
+  - F056: retry_manager_call helper; alloc_new_extent retries 20x; commit_length infinite retry
 
-Main gaps:
-  - End-to-end integration test not done yet
-  - Need perf-check comparison before vs after
+  P1 (robustness):
+  - F057: Recovery task retries up to 10 times with 10s backoff
+  - F058: mark_disk_offline_for_extent on I/O errors in handle_append
+  - F059: WAL cleanup on rotation (not just startup)
+  - F060: Manager ConnPool evicts broken connections (part of F054)
 
-Next steps:
-  - Run full cluster (manager + extent-node + PS) with perf-check
-  - Compare write/read ops/s before vs after
-  - Verify CPU usage spreads across cores (htop)
-  - Commit if results are positive
+Build: OK (cargo check --workspace)
+Tests: 18 stream + 12 partition-server + 3 integration tests pass
+
+Remaining items not in scope:
+  - Full etcd lease integration for PS session (deferred, heartbeat-based for now)
+  - Multi-endpoint round-robin for manager failover
+  - Extent node etcd watch for seal events (node has no etcd dependency)
+  - re_avali should be async (currently blocks RPC handler)

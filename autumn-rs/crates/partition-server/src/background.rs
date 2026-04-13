@@ -1,6 +1,6 @@
 //! Background loops: compaction, GC, write, and their helper functions.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -229,6 +229,7 @@ pub(crate) async fn background_write_loop(
     part_id: u64,
     part: Rc<RefCell<PartitionData>>,
     mut write_rx: mpsc::Receiver<WriteRequest>,
+    locked_by_other: Rc<Cell<bool>>,
 ) {
     let mut metrics = WriteLoopMetrics::new();
     let mut pending: Vec<WriteRequest> = Vec::new();
@@ -286,7 +287,14 @@ pub(crate) async fn background_write_loop(
                         let flight = in_flight.take().unwrap();
                         match finish_write_batch(&part, flight.data, r).await {
                             Ok(stats) => metrics.record(stats),
-                            Err(e) => tracing::error!("write batch error: {e}"),
+                            Err(e) => {
+                                if is_locked_by_other(&e) {
+                                    tracing::error!(part_id, "LockedByOther detected, poisoning partition");
+                                    locked_by_other.set(true);
+                                    return;
+                                }
+                                tracing::error!("write batch error: {e}");
+                            }
                         }
                         metrics.maybe_report(part_id);
                         continue;
@@ -309,7 +317,14 @@ pub(crate) async fn background_write_loop(
             let r = flight.phase2_fut.await;
             match finish_write_batch(&part, flight.data, r).await {
                 Ok(stats) => metrics.record(stats),
-                Err(e) => tracing::error!("write batch error: {e}"),
+                Err(e) => {
+                    if is_locked_by_other(&e) {
+                        tracing::error!(part_id, "LockedByOther detected, poisoning partition");
+                        locked_by_other.set(true);
+                        return;
+                    }
+                    tracing::error!("write batch error: {e}");
+                }
             }
             metrics.maybe_report(part_id);
         }
@@ -459,6 +474,10 @@ fn start_write_batch(
         },
         phase2_fut,
     }))
+}
+
+fn is_locked_by_other(e: &anyhow::Error) -> bool {
+    format!("{e}").contains("LockedByOther")
 }
 
 /// Phase 3: given Phase2 result, insert into memtable, reply to callers.

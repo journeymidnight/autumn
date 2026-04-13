@@ -77,6 +77,11 @@ impl ConnPool {
         Ok(client)
     }
 
+    /// Remove a dead connection so next `connect` creates a fresh one.
+    pub fn evict(&mut self, addr: &SocketAddr) {
+        self.entries.remove(addr);
+    }
+
     /// Returns `true` if the connection to `addr` has received a pong within
     /// the health window.
     pub fn is_healthy(&self, addr: &SocketAddr) -> bool {

@@ -2,7 +2,7 @@ mod test_helpers;
 
 use std::time::Duration;
 
-use autumn_stream::extent_rpc::{CODE_OK, CODE_PRECONDITION};
+use autumn_stream::extent_rpc::{CODE_OK, CODE_LOCKED_BY_OTHER};
 use test_helpers::{pick_addr, start_node, TestConn};
 
 #[compio::test]
@@ -23,7 +23,7 @@ async fn append_rejects_stale_revision() {
     let stale = conn
         .append(1001, 1, 3, 10, true, b"x".to_vec())
         .await;
-    assert_eq!(stale.code, CODE_PRECONDITION, "stale revision should be rejected");
+    assert_eq!(stale.code, CODE_LOCKED_BY_OTHER, "stale revision should be rejected");
 }
 
 #[compio::test]

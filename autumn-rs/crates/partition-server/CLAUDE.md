@@ -204,17 +204,28 @@ After split, both child partitions will detect `has_overlap = true` on next open
 ## Crash Recovery (`open_partition`)
 
 ```
+  0. Check commit_length on all 3 streams (log/row/meta) — infinite retry with 5s backoff
+       Ensures last extent of each stream has consistent commit length across replicas
+       (equivalent to Go checkCommitLength)
   1. Read last TableLocations checkpoint from metaStream
        (iterate all extents backward, find first non-empty)
   2. For each location: read SST bytes from rowStream, open SstReader
   3. Compute max seq_number and VP head (vp_extent_id, vp_offset) from SSTables
   4. Replay logStream from VP head forward:
        - Read extent data from vp_extent_id onward
-       - Decode WAL records, re-insert into memtable (active)
+       - Decode WAL records, re-insert into recovered memtable (active)
        - Large values (>4KB): VP points to record in logStream
        - Records with ts ≤ max_seq (already in SSTables) are skipped
-  5. Spawn background loops: flush_loop, compact_loop, gc_loop, write_loop
+  5. PartitionData.active = recovered memtable (preserves unflushed entries)
+  6. Spawn background loops: flush_loop, compact_loop, gc_loop, write_loop
 ```
+
+## Fault Recovery: LockedByOther Self-Eviction
+
+If the `background_write_loop` receives a `CODE_LOCKED_BY_OTHER` error from the stream layer
+(meaning a newer partition owner has taken the lock), it sets a `locked_by_other` flag.
+The main partition loop checks this flag on each request and exits if set.
+This prevents split-brain where two PS nodes serve the same partition.
 
 ## SSTable Format
 

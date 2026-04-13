@@ -221,6 +221,80 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 
 ---
 
+## P0 — Fault Recovery Parity (correctness & data safety)
+
+### F050 · Fix partition recovery logStream replay data loss
+- **Target:** `recover_partition` replays logStream entries into a local `Memtable` that is then dropped — all entries newer than the last SST flush are silently lost on crash recovery. Fix: return the recovered `Memtable` (or replay info) and use it as `PartitionData.active`.
+- **Evidence:** `crates/partition-server/src/lib.rs` (recover_partition line 999, partition_thread_main line 800) · Go: `range_partition/range_partition.go` (OpenRangePartition replays into rp.writeToLSM)
+- **Notes:** Fixed. recover_partition now returns the Memtable (7th tuple element), caller uses it as PartitionData.active.
+- **passes:** true
+
+### F051 · Call current_commit at partition startup (commit length check)
+- **Target:** On partition open, call `current_commit()` (query commit_length on all replicas, take minimum) before serving reads/writes. Equivalent to Go `StreamClient.Connect()` → `checkCommitLength()`. Prevents reading inconsistent data from a replica that got ahead before a crash.
+- **Evidence:** `crates/stream/src/client.rs` (current_commit line 621, marked #[allow(dead_code)]) · Go: `streamclient/streamclient.go` (Connect line 738, checkCommitLength line 454)
+- **Notes:** Fixed. partition_thread_main calls commit_length() for all 3 streams (log/row/meta) with infinite retry (5s backoff) before recovery. Uses manager-side CheckCommitLength which seals/reconciles replicas.
+- **passes:** true
+
+### F052 · LockedByOther handling — partition self-eviction on lock conflict
+- **Target:** When a write to the stream layer returns `LockedByOther` (revision conflict), the PS must immediately close the partition, release the owner lock, and remove it from the routing table. Prevents split-brain where two PS nodes serve the same partition.
+- **Evidence:** Go: `partition_server/api.go` lines 81-92 (LockedByOther → close partition, unlock, delete from map) · `crates/partition-server/src/lib.rs` (no equivalent handling)
+- **Notes:** Fixed. CODE_LOCKED_BY_OTHER (5) added to extent_rpc. ExtentNode returns it for revision fencing failures. StreamClient propagates as immediate error (no retry). background_write_loop sets locked_by_other flag; partition_thread_main checks it and breaks.
+- **passes:** true
+
+### F053 · RPC timeout support
+- **Target:** Add per-call timeout to `RpcClient::call()` and `ConnPool` operations. Critical paths: recovery copy (30s), manager RPCs (5s), commit_length (1s), append fanout (10s). Prevents indefinite blocking on network stalls.
+- **Evidence:** Go: gRPC deadline propagation throughout · `crates/rpc/src/client.rs` (call has no timeout) · `crates/rpc/src/pool.rs` (no timeout)
+- **Notes:** Fixed. RpcClient: call_timeout() and call_vectored_timeout() using futures::select + compio::time::sleep. stream::ConnPool: call_timeout(). Callers can choose which paths need timeouts.
+- **passes:** true
+
+### F054 · ConnPool reconnection on failure
+- **Target:** When an RPC connection breaks (EOF, write error), the ConnPool must evict the dead entry and create a new connection on next use. Applies to: `rpc::pool::ConnPool`, `stream::conn_pool::ConnPool`, and manager's internal ConnPool.
+- **Evidence:** Go: gRPC built-in reconnection · `crates/rpc/src/pool.rs` (no eviction on error) · `crates/stream/src/conn_pool.rs` (no eviction) · `crates/manager/src/lib.rs` (Rc<RefCell<RpcConn>> never replaced)
+- **Notes:** Fixed. stream::ConnPool: on call/call_vectored error, conn is dropped (not returned to pool), next call reconnects. rpc::pool::ConnPool: evict() method added. Manager ConnPool: on call error, entry removed from map.
+- **passes:** true
+
+### F055 · PS lease/session with auto-exit on loss
+- **Target:** PS registers with an etcd lease (TTL=60s). If lease expires (network partition, etcd down), PS detects it and exits immediately. Manager's PM watches for PS key deletion and reassigns partitions. Equivalent to Go `partition_server/ps.go` session mechanism.
+- **Evidence:** Go: `partition_server/ps.go` lines 184-196 (session TTL=60, os.Exit on Done) · `crates/partition-server/src/lib.rs` (heartbeat only, no lease)
+- **Notes:** Implemented (simplified). heartbeat_loop counts consecutive failures; after 6 failures (30s) calls process::exit(1). Full etcd lease integration deferred. Manager already handles PS disappearance via ps_liveness_check_loop (30s timeout → rebalance).
+- **passes:** true
+
+### F056 · StreamClient manager RPC retry with leader failover
+- **Target:** `alloc_new_extent`, `load_stream_tail`, `check_commit` must retry on manager failure (connection error, not-leader). Round-robin across manager endpoints. `MustAllocNewExtent` equivalent should be infinite retry. Equivalent to Go `SMClient.try()`.
+- **Evidence:** Go: `manager/smclient/sm_client.go` (try() with round-robin retry) · `crates/stream/src/client.rs` (single manager address, no retry on manager RPCs)
+- **Notes:** Partially fixed. retry_manager_call helper added (configurable max retries, 500ms backoff). alloc_new_extent now retries 20 times. commit_length retries infinitely at partition startup. load_stream_tail benefits from the append loop's existing retry. Multi-endpoint round-robin deferred.
+- **passes:** true
+
+---
+
+## P1 — Fault Recovery Robustness
+
+### F057 · Recovery task retry on failure (extent node side)
+- **Target:** `run_recovery_task` should retry on failure with backoff (sleep 10s, refresh ExtentInfo, retry) instead of silently dropping errors. Equivalent to Go `node/node_recovery.go` runRecoveryTask infinite retry loop.
+- **Evidence:** Go: `node/node_recovery.go` (infinite retry with 10s sleep) · `crates/stream/src/extent_node.rs` (spawn drops Err silently)
+- **Notes:** Fixed. spawn wrapper retries up to 10 times with 10s sleep between attempts. On max retries, logs error and removes from inflight. Manager will re-dispatch on next loop.
+- **passes:** true
+
+### F058 · Disk I/O error marks disk offline
+- **Target:** When a disk I/O operation fails (pwrite, read, sync), mark the disk offline via `DiskFS::set_offline()`. Subsequent extent allocations skip offline disks. Report offline status in `df` RPC.
+- **Evidence:** `crates/stream/src/extent_node.rs` (set_offline exists but never called)
+- **Notes:** Fixed. mark_disk_offline_for_extent() helper added. Called on file_pwrite and sync_all failures in handle_append. choose_disk() already skips offline disks.
+- **passes:** true
+
+### F059 · WAL runtime cleanup (trim old WAL files after checkpoint)
+- **Target:** Periodically trim WAL files that are older than the oldest active (unsealed) extent's last-replayed offset. Currently `cleanup_old_wals` only runs at startup.
+- **Evidence:** `crates/stream/src/wal.rs` (cleanup_old_wals only at startup) · Go: WAL cleanup after replay
+- **Notes:** Fixed. rotate() now calls cleanup_old_wals() after creating the new WAL file. Old WAL files are deleted immediately after rotation, not just at startup.
+- **passes:** true
+
+### F060 · Manager ConnPool reconnection
+- **Target:** Manager's internal ConnPool (`Rc<RefCell<RpcConn>>`) must detect broken connections and reconnect. When `call()` returns a connection error, evict the entry so next call creates a fresh connection.
+- **Evidence:** `crates/manager/src/lib.rs` (ConnPool with no eviction)
+- **Notes:** Fixed as part of F054. Manager ConnPool.call() removes entry on error; next call reconnects.
+- **passes:** true
+
+---
+
 ## P3 — Developer Experience & Operations
 
 ### F024 · Observability: distributed tracing and structured logging

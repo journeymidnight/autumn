@@ -379,6 +379,8 @@ impl Wal {
             .append(true)
             .open(&new_path)?;
         self.writer = RecordWriter::new(file);
+        // Clean up old WAL files on rotation (not just at startup).
+        self.cleanup_old_wals();
         Ok(())
     }
 
