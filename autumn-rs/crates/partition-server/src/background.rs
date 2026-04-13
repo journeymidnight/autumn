@@ -947,14 +947,28 @@ pub(crate) fn lookup_in_sst(reader: &SstReader, user_key: &[u8]) -> Option<(u8, 
     let block_idx = reader.find_block_for_key(&target);
     let block = reader.read_block(block_idx).ok()?;
     let n = block.num_entries();
-    for i in 0..n {
-        let (key, op, value, expires_at) = block.get_entry(i).ok()?;
-        let uk = parse_key(&key);
-        if uk == user_key {
-            return Some((op, value.to_vec(), expires_at));
+    if n == 0 {
+        return None;
+    }
+
+    // Binary search: find first entry whose key >= target.
+    let mut lo = 0usize;
+    let mut hi = n;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let key = block.get_key(mid).ok()?;
+        if key.as_slice() < target.as_slice() {
+            lo = mid + 1;
+        } else {
+            hi = mid;
         }
-        if uk > user_key {
-            break;
+    }
+
+    // Check the entry at `lo` — it's the first with key >= target (the newest version for user_key).
+    if lo < n {
+        let (key, op, value, expires_at) = block.get_entry(lo).ok()?;
+        if parse_key(&key) == user_key {
+            return Some((op, value.to_vec(), expires_at));
         }
     }
     None

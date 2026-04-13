@@ -251,6 +251,29 @@ impl DecodedBlock {
         self.entry_offsets.len()
     }
 
+    /// Reconstruct only the key at index `idx` (no value parsing).
+    /// Cheaper than `get_entry` for binary search comparisons.
+    pub fn get_key(&self, idx: usize) -> Result<Vec<u8>> {
+        let offset = self.entry_offsets[idx] as usize;
+        let data = &self.data;
+        if offset + EntryHeader::SIZE > data.len() {
+            return Err(anyhow!("entry header out of bounds at idx={idx}"));
+        }
+        let hdr = EntryHeader::decode(&data[offset..offset + EntryHeader::SIZE]);
+        let diff_start = offset + EntryHeader::SIZE;
+        let diff_end = diff_start + hdr.diff_len as usize;
+        if diff_end > data.len() {
+            return Err(anyhow!("diff_key out of bounds at idx={idx}"));
+        }
+        let overlap = hdr.overlap as usize;
+        let mut full_key = Vec::with_capacity(overlap + hdr.diff_len as usize);
+        if overlap > 0 {
+            full_key.extend_from_slice(&self.base_key[..overlap.min(self.base_key.len())]);
+        }
+        full_key.extend_from_slice(&data[diff_start..diff_end]);
+        Ok(full_key)
+    }
+
     /// Decode the entry at index `idx` within this block.
     /// Returns (full_internal_key, op, value_bytes, expires_at).
     pub fn get_entry(&self, idx: usize) -> Result<(Vec<u8>, u8, &[u8], u64)> {
