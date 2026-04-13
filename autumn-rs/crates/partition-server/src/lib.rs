@@ -8,6 +8,7 @@ use rpc_handlers::dispatch_partition_rpc;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -20,10 +21,12 @@ use autumn_rpc::partition_rpc::{self, *, TableLocations, SstLocation};
 use autumn_rpc::{Frame, FrameDecoder, HandlerResult, StatusCode};
 use autumn_stream::{ConnPool, StreamClient};
 use bytes::{BufMut, Bytes, BytesMut};
+use compio::dispatcher::Dispatcher;
 use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::net::TcpStream;
 use compio::BufResult;
 use crossbeam_skiplist::SkipMap;
+use dashmap::DashMap;
 use futures::channel::{mpsc, oneshot};
 use futures::{FutureExt, SinkExt, StreamExt};
 
@@ -351,6 +354,12 @@ struct PartitionHandle {
     join: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Thread-safe routing table shared with Dispatcher worker threads.
+/// Maps partition ID to its request channel sender.
+struct PartitionRouter {
+    routes: DashMap<u64, mpsc::Sender<PartitionRequest>>,
+}
+
 // ---------------------------------------------------------------------------
 // PartitionServer — runs on the main compio thread
 // ---------------------------------------------------------------------------
@@ -365,6 +374,10 @@ pub struct PartitionServer {
     /// Server-level owner key and revision for split coordination.
     server_owner_key: String,
     server_revision: Rc<Cell<i64>>,
+    /// Send-safe routing table shared with connection worker threads.
+    router: Arc<PartitionRouter>,
+    /// Number of connection worker threads (None = CPU count).
+    conn_threads: Option<NonZeroUsize>,
 }
 
 impl PartitionServer {
@@ -400,12 +413,21 @@ impl PartitionServer {
             pool,
             server_owner_key: owner_key,
             server_revision: Rc::new(Cell::new(resp.revision)),
+            router: Arc::new(PartitionRouter {
+                routes: DashMap::new(),
+            }),
+            conn_threads: None,
         };
 
         server.register_ps().await?;
         server.sync_regions_once().await?;
 
         Ok(server)
+    }
+
+    /// Set the number of connection worker threads (default: CPU count).
+    pub fn set_conn_threads(&mut self, n: NonZeroUsize) {
+        self.conn_threads = Some(n);
     }
 
     async fn register_ps(&self) -> Result<()> {
@@ -493,6 +515,7 @@ impl PartitionServer {
         for part_id in current {
             if !wanted.contains_key(&part_id) {
                 self.partitions.borrow_mut().remove(&part_id);
+                self.router.routes.remove(&part_id);
             }
         }
 
@@ -521,6 +544,8 @@ impl PartitionServer {
         meta_stream_id: u64,
     ) -> Result<PartitionHandle> {
         let (req_tx, req_rx) = mpsc::channel::<PartitionRequest>(WRITE_CHANNEL_CAP);
+        // Publish to router so worker threads can route requests to this partition.
+        self.router.routes.insert(part_id, req_tx.clone());
         let manager_addr = self.manager_addr.clone();
         let owner_key = self.server_owner_key.clone();
         let revision = self.server_revision.get();
@@ -556,72 +581,127 @@ impl PartitionServer {
     }
 
     // ── Serve ──────────────────────────────────────────────────────────
+    //
+    // Uses the same Dispatcher pattern as autumn-rpc's RpcServer:
+    //   - Dedicated OS thread for blocking accept
+    //   - compio Dispatcher spreads connections across N worker threads
+    //   - Control-plane (heartbeat, region_sync) stays on main thread
 
     pub async fn serve(&self, addr: SocketAddr) -> Result<()> {
-        let listener = compio::net::TcpListener::bind(addr).await?;
-        tracing::info!(addr = %addr, "partition server listening");
+        let std_listener = std::net::TcpListener::bind(addr)?;
+        let local_addr = std_listener.local_addr()?;
+        tracing::info!(addr = %local_addr, "partition server listening");
 
-        // Spawn heartbeat and region_sync as background tasks.
+        // Control-plane stays on main compio thread.
         let s = self.clone();
         compio::runtime::spawn(async move { s.heartbeat_loop().await }).detach();
         let s = self.clone();
         compio::runtime::spawn(async move { s.region_sync_loop().await }).detach();
 
-        // Main task: just a timer loop that keeps the runtime polling.
-        // Accept loop is also spawned so it doesn't block the timer.
-        let s = self.clone();
-        compio::runtime::spawn(async move { s.accept_loop(listener).await }).detach();
-
-        // Keep the main task alive with a timer so the runtime keeps polling timers.
-        loop {
-            compio::time::sleep(Duration::from_secs(3600)).await;
-        }
-    }
-
-    async fn accept_loop(&self, listener: compio::net::TcpListener) -> Result<()> {
-        loop {
-            let (stream, peer) = listener.accept().await?;
-            if let Err(e) = stream.set_nodelay(true) {
-                tracing::warn!(peer = %peer, error = %e, "set_nodelay failed");
+        // Dispatcher for connection worker threads.
+        let dispatcher = {
+            let mut builder = Dispatcher::builder();
+            if let Some(n) = self.conn_threads {
+                builder = builder.worker_threads(n);
             }
-            let server = self.clone();
-            compio::runtime::spawn(async move {
-                if let Err(e) = Self::handle_connection(stream, server).await {
-                    tracing::debug!(peer = %peer, error = %e, "ps connection ended");
+            builder
+                .thread_names(|i| format!("ps-conn-{i}"))
+                .build()
+                .context("build ps dispatcher")?
+        };
+
+        // Blocking accept thread → channel → main thread → Dispatcher.
+        let (tx, mut rx) =
+            futures::channel::mpsc::channel::<(std::net::TcpStream, SocketAddr)>(256);
+        std::thread::Builder::new()
+            .name("ps-accept".into())
+            .spawn(move || {
+                let mut tx = tx;
+                loop {
+                    match std_listener.accept() {
+                        Ok((stream, peer)) => {
+                            if let Err(e) = stream.set_nonblocking(true) {
+                                tracing::warn!(peer = %peer, error = %e, "set_nonblocking failed");
+                                continue;
+                            }
+                            if tx.try_send((stream, peer)).is_err() {
+                                tracing::warn!("ps accept channel full, dropping connection");
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, "ps accept failed"),
+                    }
                 }
             })
-            .detach();
-        }
-    }
+            .context("spawn ps accept thread")?;
 
-    async fn handle_connection(stream: TcpStream, server: PartitionServer) -> Result<()> {
-        let (mut reader, mut writer) = stream.into_split();
-        let mut decoder = FrameDecoder::new();
-        let mut buf = vec![0u8; 64 * 1024];
+        // Dispatch accepted connections to worker threads.
+        let router = self.router.clone();
+        loop {
+            let (std_stream, peer) = match rx.next().await {
+                Some(v) => v,
+                None => return Ok(()),
+            };
+            let router = router.clone();
+            if dispatcher
+                .dispatch(move || async move {
+                    let stream = match TcpStream::from_std(std_stream) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(peer = %peer, error = %e, "from_std failed");
+                            return;
+                        }
+                    };
+                    let _ = stream.set_nodelay(true);
+                    if let Err(e) = handle_ps_connection(stream, router).await {
+                        tracing::debug!(peer = %peer, error = %e, "ps connection ended");
+                    }
+                })
+                .is_err()
+            {
+                tracing::error!("all ps worker threads panicked");
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connection handler — runs on Dispatcher worker threads
+// ---------------------------------------------------------------------------
+
+/// Handle a single client connection on a worker thread.
+/// Sequential per-connection: decode → route to partition → await response → write.
+async fn handle_ps_connection(
+    stream: TcpStream,
+    router: Arc<PartitionRouter>,
+) -> Result<()> {
+    let (mut reader, mut writer) = stream.into_split();
+    let mut decoder = FrameDecoder::new();
+    let mut buf = vec![0u8; 64 * 1024];
+
+    loop {
+        let BufResult(result, buf_back) = reader.read(buf).await;
+        buf = buf_back;
+        let n = result?;
+        if n == 0 {
+            return Ok(());
+        }
+
+        decoder.feed(&buf[..n]);
 
         loop {
-            let BufResult(result, buf_back) = reader.read(buf).await;
-            buf = buf_back;
-            let n = result?;
-            if n == 0 {
-                return Ok(());
-            }
+            match decoder.try_decode().map_err(|e| anyhow!(e))? {
+                Some(frame) if frame.req_id != 0 => {
+                    let req_id = frame.req_id;
+                    let msg_type = frame.msg_type;
+                    let payload = frame.payload;
 
-            decoder.feed(&buf[..n]);
-
-            loop {
-                match decoder.try_decode().map_err(|e| anyhow!(e))? {
-                    Some(frame) if frame.req_id != 0 => {
-                        let req_id = frame.req_id;
-                        let msg_type = frame.msg_type;
-                        let payload = frame.payload;
-
-                        // Route partition RPCs to the correct partition thread.
-                        let part_id = partition_rpc::extract_part_id(msg_type, &payload);
-                        let resp_frame = if let Some(handle) =
-                            server.partitions.borrow().get(&part_id)
-                        {
-                            let mut req_tx = handle.req_tx.clone();
+                    let part_id = partition_rpc::extract_part_id(msg_type, &payload);
+                    let resp_frame =
+                        if let Some(tx) = router.routes.get(&part_id) {
+                            let mut req_tx: mpsc::Sender<PartitionRequest> = tx.clone();
+                            drop(tx); // release DashMap ref before await
                             let (resp_tx, resp_rx) = oneshot::channel();
                             let req = PartitionRequest {
                                 msg_type,
@@ -643,7 +723,9 @@ impl PartitionServer {
                                     Ok(Err((code, message))) => Frame::error(
                                         req_id,
                                         msg_type,
-                                        autumn_rpc::RpcError::encode_status(code, &message),
+                                        autumn_rpc::RpcError::encode_status(
+                                            code, &message,
+                                        ),
                                     ),
                                     Err(_) => Frame::error(
                                         req_id,
@@ -666,13 +748,12 @@ impl PartitionServer {
                             )
                         };
 
-                        let data = resp_frame.encode();
-                        let BufResult(result, _) = writer.write_all(data).await;
-                        result?;
-                    }
-                    Some(_) => continue,
-                    None => break,
+                    let data = resp_frame.encode();
+                    let BufResult(result, _) = writer.write_all(data).await;
+                    result?;
                 }
+                Some(_) => continue,
+                None => break,
             }
         }
     }

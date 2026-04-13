@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 
 use anyhow::{Context, Result};
 #[cfg(unix)]
@@ -10,6 +11,7 @@ struct Args {
     psid: u64,
     manager: String,
     advertise: Option<String>,
+    conn_threads: Option<NonZeroUsize>,
 }
 
 fn parse_args() -> Args {
@@ -17,6 +19,7 @@ fn parse_args() -> Args {
     let mut psid: u64 = 0;
     let mut manager = String::from("127.0.0.1:9001");
     let mut advertise: Option<String> = None;
+    let mut conn_threads: Option<NonZeroUsize> = None;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -38,14 +41,20 @@ fn parse_args() -> Args {
                 i += 1;
                 advertise = Some(args[i].clone());
             }
+            "--conn-threads" => {
+                i += 1;
+                let n: usize = args[i].parse().expect("--conn-threads must be a positive number");
+                conn_threads = NonZeroUsize::new(n);
+            }
             "--help" | "-h" => {
                 eprintln!("Usage: autumn-ps --psid <ID> [OPTIONS]");
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!("  --psid <ID>          Partition server ID (required, non-zero)");
-                eprintln!("  --port <PORT>        gRPC listen port [default: 9201]");
+                eprintln!("  --port <PORT>        Listen port [default: 9201]");
                 eprintln!("  --manager <ADDR>     Manager endpoint [default: 127.0.0.1:9001]");
                 eprintln!("  --advertise <ADDR>   Advertise address for cluster discovery");
+                eprintln!("  --conn-threads <N>   Connection worker threads [default: CPU count]");
                 std::process::exit(0);
             }
             other => eprintln!("unknown arg: {other}"),
@@ -63,6 +72,7 @@ fn parse_args() -> Args {
         psid,
         manager,
         advertise,
+        conn_threads,
     }
 }
 
@@ -101,9 +111,13 @@ async fn main() -> Result<()> {
         advertise,
     );
 
-    let ps = PartitionServer::connect_with_advertise(args.psid, &args.manager, Some(advertise))
+    let mut ps = PartitionServer::connect_with_advertise(args.psid, &args.manager, Some(advertise))
         .await
         .context("connect partition server")?;
+
+    if let Some(n) = args.conn_threads {
+        ps.set_conn_threads(n);
+    }
 
     tracing::info!("autumn-ps ready, serving on {addr}");
 

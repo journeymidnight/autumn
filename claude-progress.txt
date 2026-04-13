@@ -1,28 +1,27 @@
 Date: 2026-04-13
-TaskStatus: completed
-Task scope: F024 metrics standardization (partial — helpers only)
+TaskStatus: not_completed
+Task scope: PS Dispatcher — spread connections across worker threads
 
 Current summary:
-  Extracted duplicated metrics helpers into autumn-common::metrics module.
-  - duration_to_ns, ns_to_ms, unix_time_ms now defined once in common crate
-  - Removed duplicate definitions from stream/client.rs and partition-server/lib.rs
-  - Standardized ReadMetrics fields from _us to _ms (avg_lookup_ms, avg_encode_ms)
-  - Added autumn-common dependency to autumn-stream and autumn-partition-server
+  Refactored PartitionServer to use compio Dispatcher pattern (same as RpcServer):
+  - Dedicated accept OS thread (blocking std::net::accept)
+  - N worker threads via compio::Dispatcher for connection handling
+  - PartitionRouter (DashMap<part_id, mpsc::Sender>) shared with workers
+  - Control plane (heartbeat, region_sync) stays on main compio thread
+  - Sequential per-connection processing preserved (no Mutex writer)
+  - Configurable via --conn-threads N (default: CPU count)
 
-  Files changed:
-  - autumn-rs/crates/common/src/metrics.rs (new)
-  - autumn-rs/crates/common/src/lib.rs (add pub mod metrics)
-  - autumn-rs/crates/common/Cargo.toml (no change needed — no new deps for metrics.rs)
-  - autumn-rs/crates/stream/Cargo.toml (add autumn-common dep)
-  - autumn-rs/crates/stream/src/client.rs (use shared helpers, remove locals)
-  - autumn-rs/crates/partition-server/Cargo.toml (add autumn-common dep)
-  - autumn-rs/crates/partition-server/src/lib.rs (use shared helpers, remove locals)
-  - autumn-rs/crates/partition-server/src/rpc_handlers.rs (use ns_to_ms, _us → _ms)
+  Build: OK, all 12 unit tests pass.
+
+  NOT YET TESTED: need to start cluster and run perf-check to verify
+  performance improvement and correctness under load.
 
 Main gaps:
-  - F024 still passes: false — distributed tracing / OTel export not implemented
-  - rpc/pool.rs now_millis() left as-is (different purpose: health check, i64 return type)
+  - End-to-end integration test not done yet
+  - Need perf-check comparison before vs after
 
 Next steps:
-  - (Optional future) Add OpenTelemetry tracing export if needed
-  - Continue with other feature work
+  - Run full cluster (manager + extent-node + PS) with perf-check
+  - Compare write/read ops/s before vs after
+  - Verify CPU usage spreads across cores (htop)
+  - Commit if results are positive

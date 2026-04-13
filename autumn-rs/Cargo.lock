@@ -105,6 +105,7 @@ dependencies = [
  "compio",
  "crc32c",
  "crossbeam-skiplist",
+ "dashmap",
  "futures",
  "rkyv",
  "tempfile",

@@ -6,11 +6,36 @@ An LSM-tree based KV store built on top of the stream layer. Each `PartitionServ
 
 ## Architecture
 
+### Thread Model
+
+```
+Main compio thread (control plane)
+├─ heartbeat_loop          ← periodic manager heartbeat
+├─ region_sync_loop        ← discover/open/close partitions
+└─ dispatch loop           ← rx.next() → Dispatcher
+
+Accept OS thread (blocking)
+└─ std::net::accept → tx   ← dedicated accept, sends to main via channel
+
+Dispatcher worker threads (N = CPU count, configurable via --conn-threads)
+├─ worker-0: handle_ps_connection × K
+├─ worker-1: handle_ps_connection × K
+└─ worker-N: handle_ps_connection × K
+
+Partition threads (1 OS thread per partition, each with own compio runtime)
+├─ part-1: write_loop, flush_loop, compact_loop, gc_loop, dispatch_rpc
+└─ part-2: ...
+```
+
+Workers communicate with partition threads via `PartitionRouter` (DashMap<part_id, mpsc::Sender>).
+Each connection is sequential: decode → route → await response → write. No Mutex writer.
+
 ```
 ┌─────────────────── PartitionServer ────────────────────┐
-│  DashMap<part_id, Arc<RwLock<PartitionData>>>           │
+│  Rc<RefCell<HashMap<part_id, PartitionHandle>>>         │
+│  Arc<PartitionRouter>  ← shared with worker threads     │
 │                                                          │
-│  ┌──────── PartitionData ──────────────────────────┐    │
+│  ┌──────── PartitionData (per partition thread) ───┐    │
 │  │  active: Memtable (SkipMap)                      │    │
 │  │  imm: VecDeque<Arc<Memtable>>   ← frozen tables  │    │
 │  │  sst_readers: Vec<Arc<SstReader>>  ← oldest→new  │    │
@@ -25,8 +50,7 @@ An LSM-tree based KV store built on top of the stream layer. Each `PartitionServ
 │  │  has_overlap: AtomicU32                           │    │
 │  └───────────────────────────────────────────────────┘   │
 │                                                          │
-│  stream_client: Arc<Mutex<StreamClient>>                 │
-│  io: Arc<dyn IoEngine>                                   │
+│  stream_client: Arc<StreamClient>                        │
 └──────────────────────────────────────────────────────────┘
 ```
 
