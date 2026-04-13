@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
+use autumn_client::{ClusterClient, parse_addr, decode_err};
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::*;
 use autumn_rpc::partition_rpc::{self, PutReq, PutResp, GetReq, GetResp, DeleteReq, DeleteResp,
@@ -18,171 +19,6 @@ use autumn_rpc::partition_rpc::{self, PutReq, PutResp, GetReq, GetResp, DeleteRe
     MAINTENANCE_COMPACT, MAINTENANCE_AUTO_GC, MAINTENANCE_FORCE_GC};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-
-// ---------------------------------------------------------------------------
-// RPC helpers
-// ---------------------------------------------------------------------------
-
-fn parse_addr(addr: &str) -> Result<SocketAddr> {
-    addr.parse()
-        .with_context(|| format!("invalid address: {addr}"))
-}
-
-fn decode_err(e: String) -> anyhow::Error {
-    anyhow!("rkyv decode: {e}")
-}
-
-// ---------------------------------------------------------------------------
-// ClusterClient
-// ---------------------------------------------------------------------------
-
-struct ClusterClient {
-    #[allow(dead_code)]
-    manager: String,
-    mgr: Rc<RpcClient>,
-    ps_conns: HashMap<String, Rc<RpcClient>>,
-    regions: Vec<(u64, MgrRegionInfo)>,
-    ps_details: HashMap<u64, MgrPsDetail>,
-}
-
-impl ClusterClient {
-    async fn connect(manager: &str) -> Result<Self> {
-        let addr = parse_addr(manager)?;
-        let mgr = RpcClient::connect(addr)
-            .await
-            .with_context(|| format!("connect manager {manager}"))?;
-        let mut client = Self {
-            manager: manager.to_string(),
-            mgr,
-            ps_conns: HashMap::new(),
-            regions: Vec::new(),
-            ps_details: HashMap::new(),
-        };
-        client.refresh_regions().await?;
-        Ok(client)
-    }
-
-    async fn refresh_regions(&mut self) -> Result<()> {
-        let resp_bytes = self
-            .mgr
-            .call(MSG_GET_REGIONS, Bytes::new())
-            .await
-            .context("get regions")?;
-        let resp: GetRegionsResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-        let mut sorted: Vec<(u64, MgrRegionInfo)> = resp.regions.into_iter().collect();
-        sorted.sort_by(|a, b| {
-            a.1.rg
-                .as_ref()
-                .map(|r| r.start_key.as_slice())
-                .unwrap_or(&[])
-                .cmp(
-                    b.1.rg
-                        .as_ref()
-                        .map(|r| r.start_key.as_slice())
-                        .unwrap_or(&[]),
-                )
-        });
-        for i in 0..sorted.len().saturating_sub(1) {
-            let end_key = sorted[i]
-                .1
-                .rg
-                .as_ref()
-                .map(|r| r.end_key.as_slice())
-                .unwrap_or(&[]);
-            let next_start = sorted[i + 1]
-                .1
-                .rg
-                .as_ref()
-                .map(|r| r.start_key.as_slice())
-                .unwrap_or(&[]);
-            if end_key != next_start {
-                eprintln!(
-                    "WARNING: region gap: partition {} end_key != partition {} start_key",
-                    sorted[i].1.part_id,
-                    sorted[i + 1].1.part_id
-                );
-            }
-        }
-        self.regions = sorted;
-        self.ps_details = resp.ps_details.into_iter().collect();
-        Ok(())
-    }
-
-    async fn get_ps_client(&mut self, ps_addr: &str) -> Result<Rc<RpcClient>> {
-        if let Some(c) = self.ps_conns.get(ps_addr) {
-            return Ok(c.clone());
-        }
-        let addr = parse_addr(ps_addr)?;
-        let client = RpcClient::connect(addr)
-            .await
-            .with_context(|| format!("connect PS {ps_addr}"))?;
-        self.ps_conns.insert(ps_addr.to_string(), client.clone());
-        Ok(client)
-    }
-
-    fn lookup_key(&self, key: &[u8]) -> Option<(u64, String)> {
-        if self.regions.is_empty() {
-            return None;
-        }
-        let idx = self.regions.partition_point(|(_, region)| match region.rg.as_ref() {
-            Some(rg) if !rg.end_key.is_empty() => rg.end_key.as_slice() <= key,
-            _ => false,
-        });
-        if idx >= self.regions.len() {
-            return None;
-        }
-        let (_, region) = &self.regions[idx];
-        let addr = self.ps_details.get(&region.ps_id)?.address.clone();
-        Some((region.part_id, addr))
-    }
-
-    async fn resolve_key(&mut self, key: &[u8]) -> Result<(u64, String)> {
-        if let Some(result) = self.lookup_key(key) {
-            return Ok(result);
-        }
-        self.refresh_regions().await?;
-        self.lookup_key(key)
-            .ok_or_else(|| anyhow!("key is out of range"))
-    }
-
-    async fn resolve_part_id(&mut self, part_id: u64) -> Result<String> {
-        let lookup = |regions: &Vec<(u64, MgrRegionInfo)>,
-                      ps_details: &HashMap<u64, MgrPsDetail>| {
-            regions
-                .iter()
-                .find(|(_, r)| r.part_id == part_id)
-                .and_then(|(_, region)| {
-                    ps_details.get(&region.ps_id).map(|d| d.address.clone())
-                })
-        };
-        if let Some(addr) = lookup(&self.regions, &self.ps_details) {
-            return Ok(addr);
-        }
-        self.refresh_regions().await?;
-        lookup(&self.regions, &self.ps_details)
-            .ok_or_else(|| anyhow!("partition {} not found", part_id))
-    }
-
-    async fn all_partitions(&mut self) -> Result<Vec<(u64, String)>> {
-        if self.regions.is_empty() {
-            self.refresh_regions().await?;
-        }
-        let mut result: Vec<(u64, String)> = self
-            .regions
-            .iter()
-            .map(|(_, region)| {
-                let addr = self
-                    .ps_details
-                    .get(&region.ps_id)
-                    .map(|d| d.address.clone())
-                    .unwrap_or_default();
-                (region.part_id, addr)
-            })
-            .collect();
-        result.sort_by_key(|(pid, _)| *pid);
-        Ok(result)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Hex presplit algorithm
@@ -1052,7 +888,7 @@ async fn main() -> Result<()> {
 
             for (idx, (start_key, end_key)) in ranges.iter().enumerate() {
                 let create_stream = async {
-                    let resp_bytes = client.mgr
+                    let resp_bytes = client.mgr()
                         .call(
                             MSG_CREATE_STREAM,
                             rkyv_encode(&CreateStreamReq {
@@ -1070,7 +906,7 @@ async fn main() -> Result<()> {
                 let log_stream_id = create_stream.await.context("create log stream")?;
 
                 let create_stream = async {
-                    let resp_bytes = client.mgr
+                    let resp_bytes = client.mgr()
                         .call(MSG_CREATE_STREAM, rkyv_encode(&CreateStreamReq { replicates, ec_data_shard: 0, ec_parity_shard: 0 }))
                         .await.context("create stream")?;
                     let resp: CreateStreamResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
@@ -1079,7 +915,7 @@ async fn main() -> Result<()> {
                 let row_stream_id = create_stream.await.context("create row stream")?;
 
                 let create_stream = async {
-                    let resp_bytes = client.mgr
+                    let resp_bytes = client.mgr()
                         .call(MSG_CREATE_STREAM, rkyv_encode(&CreateStreamReq { replicates, ec_data_shard: 0, ec_parity_shard: 0 }))
                         .await.context("create stream")?;
                     let resp: CreateStreamResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
@@ -1105,7 +941,7 @@ async fn main() -> Result<()> {
                 };
 
                 let resp_bytes = client
-                    .mgr
+                    .mgr()
                     .call(
                         MSG_UPSERT_PARTITION,
                         rkyv_encode(&UpsertPartitionReq { meta }),
@@ -1194,6 +1030,8 @@ async fn main() -> Result<()> {
                     rkyv_encode(&GetReq {
                         part_id,
                         key: key.into_bytes(),
+                        offset: 0,
+                        length: 0,
                     }),
                 )
                 .await
@@ -1350,7 +1188,7 @@ async fn main() -> Result<()> {
 
         Command::RegisterNode { addr, disks } => {
             let resp_bytes = client
-                .mgr
+                .mgr()
                 .call(
                     MSG_REGISTER_NODE,
                     rkyv_encode(&RegisterNodeReq {
@@ -1381,7 +1219,7 @@ async fn main() -> Result<()> {
             }
 
             let resp_bytes = client
-                .mgr
+                .mgr()
                 .call(
                     MSG_REGISTER_NODE,
                     rkyv_encode(&RegisterNodeReq {
@@ -1701,6 +1539,8 @@ async fn main() -> Result<()> {
                                     rkyv_encode(&GetReq {
                                         part_id,
                                         key: key.as_bytes().to_vec(),
+                                        offset: 0,
+                                        length: 0,
                                     }),
                                 )
                                 .await;
@@ -1934,6 +1774,8 @@ async fn main() -> Result<()> {
                                     rkyv_encode(&GetReq {
                                         part_id,
                                         key: key.as_bytes().to_vec(),
+                                        offset: 0,
+                                        length: 0,
                                     }),
                                 )
                                 .await;
@@ -2071,7 +1913,7 @@ async fn main() -> Result<()> {
 
         Command::Info => {
             let stream_resp_bytes = client
-                .mgr
+                .mgr()
                 .call(
                     MSG_STREAM_INFO,
                     rkyv_encode(&StreamInfoReq {
@@ -2084,7 +1926,7 @@ async fn main() -> Result<()> {
                 rkyv_decode(&stream_resp_bytes).map_err(decode_err)?;
 
             let nodes_resp_bytes = client
-                .mgr
+                .mgr()
                 .call(MSG_NODES_INFO, Bytes::new())
                 .await
                 .context("nodes info")?;
@@ -2092,7 +1934,7 @@ async fn main() -> Result<()> {
                 rkyv_decode(&nodes_resp_bytes).map_err(decode_err)?;
 
             let regions_resp_bytes = client
-                .mgr
+                .mgr()
                 .call(MSG_GET_REGIONS, Bytes::new())
                 .await
                 .context("get regions")?;

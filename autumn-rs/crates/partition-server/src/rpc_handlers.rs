@@ -160,7 +160,7 @@ pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>
     let sc = p.stream_client.clone();
     drop(p);
 
-    let value = resolve_value(op, raw_value, &sc).await.map_err(|e| (StatusCode::Internal, e.to_string()))?;
+    let value = resolve_value(op, raw_value, &sc, req.offset, req.length).await.map_err(|e| (StatusCode::Internal, e.to_string()))?;
     let encode_t0 = Instant::now();
     let resp = partition_rpc::rkyv_encode(&GetResp { code: CODE_OK, message: String::new(), value });
     let encode_ns = encode_t0.elapsed().as_nanos() as u64;

@@ -49,6 +49,10 @@ pub struct PutResp {
 pub struct GetReq {
     pub part_id: u64,
     pub key: Vec<u8>,
+    /// Sub-range read: byte offset within the value. 0 = start.
+    pub offset: u32,
+    /// Sub-range read: number of bytes to read. 0 = read entire value.
+    pub length: u32,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]

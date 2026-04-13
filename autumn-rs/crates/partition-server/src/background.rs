@@ -1034,32 +1034,55 @@ pub(crate) fn unique_user_keys(part: &PartitionData) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Resolve a value, optionally reading only a sub-range.
+/// `offset` and `length` are byte offsets within the value (0/0 = full read).
 pub(crate) async fn resolve_value(
     op: u8,
     raw_value: Bytes,
     stream_client: &Rc<StreamClient>,
+    offset: u32,
+    length: u32,
 ) -> Result<Vec<u8>> {
     if op & OP_VALUE_POINTER != 0 {
         if raw_value.len() < VALUE_POINTER_SIZE {
             return Err(anyhow!("ValuePointer too short"));
         }
         let vp = ValuePointer::decode(&raw_value[..VALUE_POINTER_SIZE]);
-        read_value_from_log(&vp, stream_client).await
+        read_value_from_log(&vp, stream_client, offset, length).await
     } else {
-        Ok(raw_value.to_vec())
+        let v = raw_value.to_vec();
+        if offset == 0 && length == 0 {
+            Ok(v)
+        } else {
+            let start = (offset as usize).min(v.len());
+            let end = if length == 0 { v.len() } else { (start + length as usize).min(v.len()) };
+            Ok(v[start..end].to_vec())
+        }
     }
 }
 
-pub(crate) async fn read_value_from_log(vp: &ValuePointer, stream_client: &Rc<StreamClient>) -> Result<Vec<u8>> {
-    // VP.offset points directly to the value start (past header + key),
-    // so one exact-size read is all we need.
+/// Read value bytes from logStream. VP.offset points to value start.
+/// `offset`/`length` = 0/0 means read the entire value.
+pub(crate) async fn read_value_from_log(
+    vp: &ValuePointer,
+    stream_client: &Rc<StreamClient>,
+    offset: u32,
+    length: u32,
+) -> Result<Vec<u8>> {
+    let (read_off, read_len) = if offset == 0 && length == 0 {
+        (vp.offset, vp.len)
+    } else {
+        let off = offset.min(vp.len);
+        let len = if length == 0 { vp.len - off } else { length.min(vp.len - off) };
+        (vp.offset + off, len)
+    };
     let (data, _) = stream_client
-        .read_bytes_from_extent(vp.extent_id, vp.offset, vp.len)
+        .read_bytes_from_extent(vp.extent_id, read_off, read_len)
         .await?;
-    if (data.len() as u32) < vp.len {
+    if (data.len() as u32) < read_len {
         return Err(anyhow!(
             "logStream value short: need {} bytes, got {}, extent={}, offset={}",
-            vp.len, data.len(), vp.extent_id, vp.offset
+            read_len, data.len(), vp.extent_id, read_off
         ));
     }
     Ok(data)

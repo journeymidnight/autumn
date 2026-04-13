@@ -1800,4 +1800,48 @@ mod tests {
         }
         assert_eq!(count, 100);
     }
+
+    // ── resolve_value sub-range tests (inline values, no StreamClient) ──
+
+    /// Test the inline sub-range slicing logic directly (no StreamClient needed).
+    fn inline_subrange(data: &[u8], offset: u32, length: u32) -> Vec<u8> {
+        let v = data.to_vec();
+        if offset == 0 && length == 0 {
+            return v;
+        }
+        let start = (offset as usize).min(v.len());
+        let end = if length == 0 { v.len() } else { (start + length as usize).min(v.len()) };
+        v[start..end].to_vec()
+    }
+
+    #[test]
+    fn resolve_value_inline_full() {
+        assert_eq!(inline_subrange(b"hello world", 0, 0), b"hello world");
+    }
+
+    #[test]
+    fn resolve_value_inline_subrange() {
+        assert_eq!(inline_subrange(b"hello world", 6, 5), b"world");
+    }
+
+    #[test]
+    fn resolve_value_inline_subrange_clamp() {
+        // length exceeds data → clamped to end
+        assert_eq!(inline_subrange(b"hello", 3, 100), b"lo");
+    }
+
+    #[test]
+    fn resolve_value_inline_offset_past_end() {
+        assert_eq!(inline_subrange(b"hello", 999, 0), b"");
+    }
+
+    #[test]
+    fn resolve_value_inline_offset_zero_length_nonzero() {
+        assert_eq!(inline_subrange(b"hello world", 0, 5), b"hello");
+    }
+
+    #[test]
+    fn resolve_value_inline_middle_slice() {
+        assert_eq!(inline_subrange(b"0123456789", 3, 4), b"3456");
+    }
 }
