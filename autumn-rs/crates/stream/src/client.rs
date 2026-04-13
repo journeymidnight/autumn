@@ -904,7 +904,11 @@ impl StreamClient {
         Ok((resp.payload.to_vec(), resp.end))
     }
 
-    /// Seal-after-write EC sub-range read.
+    /// EC sub-range read with data-shard fast path.
+    ///
+    /// Data shards contain raw payload slices (shard[i] = payload[i*per_shard..(i+1)*per_shard]),
+    /// so reads that fall within data shards can be served directly without EC decode.
+    /// Only when a data shard is unavailable do we fall back to full EC decode.
     async fn ec_subrange_read(
         &self,
         extent_id: u64,
@@ -929,6 +933,7 @@ impl StreamClient {
 
         let addrs = self.replica_addrs_for_extent(ex).await?;
 
+        // Fast path: single data shard — read sub-range directly, no EC decode.
         if start_shard == end_shard && start_shard < data_shards {
             let shard_offset = (start % shard_size) as u32;
             let shard_len = read_len as u32;
@@ -936,11 +941,13 @@ impl StreamClient {
             match self.read_shard_from_addr(addr, extent_id, shard_offset, shard_len).await {
                 Ok(result) => return Ok(result),
                 Err(_) => {
-                    return self.ec_read_from_extent(extent_id, offset, length, ex).await;
+                    // Data shard unavailable — fall back to full EC decode.
+                    return self.ec_read_full_and_slice(extent_id, offset, length, ex).await;
                 }
             }
         }
 
+        // Fast path: two adjacent data shards — read both directly.
         if end_shard < data_shards {
             let offset_in_first = (start % shard_size) as u32;
             let first_len = (shard_size - start % shard_size) as u32;
@@ -960,21 +967,45 @@ impl StreamClient {
                     return Ok((d0, end_val));
                 }
                 _ => {
-                    return self.ec_read_from_extent(extent_id, offset, length, ex).await;
+                    // One or both data shards unavailable — fall back to full EC decode.
+                    return self.ec_read_full_and_slice(extent_id, offset, length, ex).await;
                 }
             }
         }
 
-        self.ec_read_from_extent(extent_id, offset, length, ex).await
+        // Read spans beyond data shards or complex range — full EC decode.
+        self.ec_read_full_and_slice(extent_id, offset, length, ex).await
     }
 
-    /// EC-aware read: fire parallel reads to all shard nodes, collect data_shards
-    /// successful responses, decode to recover original payload.
-    async fn ec_read_from_extent(
+    /// Full EC decode fallback: read complete shards, decode, then slice.
+    async fn ec_read_full_and_slice(
         &self,
         extent_id: u64,
         offset: u32,
         length: u32,
+        ex: &ExtentInfo,
+    ) -> Result<(Vec<u8>, u32)> {
+        let (full_payload, end) = self.ec_read_full(extent_id, ex).await?;
+
+        if offset == 0 && length == 0 {
+            return Ok((full_payload, end));
+        }
+
+        let start = offset as usize;
+        let read_len = if length == 0 {
+            full_payload.len().saturating_sub(start)
+        } else {
+            length as usize
+        };
+        let slice_end = (start + read_len).min(full_payload.len());
+        Ok((full_payload[start..slice_end].to_vec(), end))
+    }
+
+    /// EC-aware read: fire parallel reads to all shard nodes (full shard),
+    /// collect data_shards successful responses, decode to recover original payload.
+    async fn ec_read_full(
+        &self,
+        extent_id: u64,
         ex: &ExtentInfo,
     ) -> Result<(Vec<u8>, u32)> {
         let data_shards = ex.replicates.len();
@@ -999,11 +1030,12 @@ impl StreamClient {
                 if !delay.is_zero() {
                     compio::time::sleep(delay).await;
                 }
+                // Always read full shard (offset=0, length=0).
                 let req = ReadBytesReq {
                     extent_id,
                     eversion: 0,
-                    offset,
-                    length,
+                    offset: 0,
+                    length: 0,
                 };
                 let result = match pool.call(&addr, MSG_READ_BYTES, req.encode()).await {
                     Ok(resp_bytes) => match ReadBytesResp::decode(resp_bytes) {
