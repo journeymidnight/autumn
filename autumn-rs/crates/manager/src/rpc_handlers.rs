@@ -19,6 +19,7 @@ impl AutumnManager {
     // ── Serve ──────────────────────────────────────────────────────────
 
     pub async fn serve(&self, addr: SocketAddr) -> Result<()> {
+        self.start_runtime_tasks();
         let listener = compio::net::TcpListener::bind(addr).await?;
         tracing::info!(addr = %addr, "manager listening");
         loop {

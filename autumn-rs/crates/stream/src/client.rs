@@ -849,6 +849,12 @@ impl StreamClient {
         Ok(ex)
     }
 
+    /// Evict cached ExtentInfo so next read fetches fresh metadata.
+    /// Needed after EC conversion changes the extent's topology.
+    pub fn invalidate_extent_cache(&self, extent_id: u64) {
+        self.extent_info_cache.remove(&extent_id);
+    }
+
     /// Read bytes from a specific extent.
     /// Pass `length=0` to read from offset to the end of the extent.
     pub async fn read_bytes_from_extent(

@@ -1856,7 +1856,25 @@ impl ExtentNode {
 
         // Read the full sealed extent from local storage.
         let entry = self.get_extent(extent_id).await?;
-        let sealed_length = entry.sealed_length.load(Ordering::SeqCst);
+        let mut sealed_length = entry.sealed_length.load(Ordering::SeqCst);
+
+        // If not sealed locally, check with manager — the seal event may
+        // not have propagated yet (no etcd watch in Rust implementation).
+        if sealed_length == 0 {
+            if let Ok(Some(mgr_info)) = self.extent_info_from_manager(extent_id).await {
+                if mgr_info.sealed_length > 0 {
+                    let local_len = entry.len.load(Ordering::SeqCst);
+                    let target = mgr_info.sealed_length.min(local_len);
+                    entry.sealed_length.store(target, Ordering::SeqCst);
+                    entry.eversion.store(mgr_info.eversion, Ordering::SeqCst);
+                    entry.avali.store(mgr_info.avali, Ordering::SeqCst);
+                    let _ = self.save_meta(extent_id, &entry).await;
+                    sealed_length = target;
+                    tracing::info!(extent_id, sealed_length, "applied seal from manager for EC convert");
+                }
+            }
+        }
+
         if sealed_length == 0 {
             return Err((
                 StatusCode::FailedPrecondition,

@@ -243,20 +243,22 @@ impl AutumnManager {
         }
     }
 
-    fn start_runtime_tasks(&self) {
-        if self.etcd.is_none() {
-            return;
-        }
+    /// Start background loops. Called from `new_with_etcd` and `serve`.
+    /// Idempotent — safe to call multiple times.
+    pub fn start_runtime_tasks(&self) {
         if self.runtime_started.get() {
             return;
         }
         self.runtime_started.set(true);
 
-        let mgr = self.clone();
-        compio::runtime::spawn(async move {
-            mgr.leader_election_loop().await;
-        })
-        .detach();
+        // Leader election only needed with etcd (non-etcd is always leader).
+        if self.etcd.is_some() {
+            let mgr = self.clone();
+            compio::runtime::spawn(async move {
+                mgr.leader_election_loop().await;
+            })
+            .detach();
+        }
 
         let mgr = self.clone();
         compio::runtime::spawn(async move {
