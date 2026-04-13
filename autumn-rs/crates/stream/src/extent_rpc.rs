@@ -53,6 +53,23 @@ impl AppendReq {
         buf.freeze()
     }
 
+    /// Encode only the 29-byte header (for vectored writes — payload sent separately).
+    pub fn encode_header(
+        extent_id: u64,
+        eversion: u64,
+        commit: u32,
+        revision: i64,
+        must_sync: bool,
+    ) -> Bytes {
+        let mut buf = BytesMut::with_capacity(APPEND_HEADER_LEN);
+        buf.put_u64_le(extent_id);
+        buf.put_u64_le(eversion);
+        buf.put_u32_le(commit);
+        buf.put_i64_le(revision);
+        buf.put_u8(if must_sync { 1 } else { 0 });
+        buf.freeze()
+    }
+
     pub fn decode(mut data: Bytes) -> Result<Self, &'static str> {
         if data.len() < APPEND_HEADER_LEN {
             return Err("append request too short");

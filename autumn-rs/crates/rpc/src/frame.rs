@@ -94,6 +94,16 @@ impl Frame {
         hdr[6..10].copy_from_slice(&(self.payload.len() as u32).to_le_bytes());
         hdr
     }
+
+    /// Build a request frame header without the payload (for vectored writes).
+    pub fn encode_request_header(req_id: u32, msg_type: u8, payload_len: u32) -> [u8; HEADER_LEN] {
+        let mut hdr = [0u8; HEADER_LEN];
+        hdr[0..4].copy_from_slice(&req_id.to_le_bytes());
+        hdr[4] = msg_type;
+        hdr[5] = 0; // flags: request
+        hdr[6..10].copy_from_slice(&payload_len.to_le_bytes());
+        hdr
+    }
 }
 
 /// Decode state machine for reading frames from a byte stream.

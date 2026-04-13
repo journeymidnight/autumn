@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use bytes::Bytes;
 
 use super::bloom::BloomFilter;
 use super::format::{BlockOffset, DecodedBlock, MetaBlock};
@@ -13,7 +14,7 @@ use super::format::{BlockOffset, DecodedBlock, MetaBlock};
 /// The MetaBlock (block index + bloom filter) is parsed at open time.
 /// Decoded blocks are cached to avoid repeated CRC checks and memcpy.
 pub struct SstReader {
-    data: Arc<Vec<u8>>,
+    data: Bytes,
     block_offsets: Vec<BlockOffset>,
     bloom: Option<BloomFilter>,
     pub smallest_key: Vec<u8>,
@@ -29,28 +30,23 @@ pub struct SstReader {
 }
 
 impl SstReader {
-    /// Open an SSTable from an Arc<Vec<u8>> containing the full SSTable bytes.
-    pub fn from_bytes(data: Arc<Vec<u8>>) -> Result<Self> {
+    /// Open an SSTable from a Bytes buffer containing the full SSTable bytes.
+    pub fn from_bytes(data: Bytes) -> Result<Self> {
         Self::open_at(data, 0)
     }
 
     /// Open an SSTable starting at `sst_base` within a larger buffer.
-    /// `sst_len` is the length of the SSTable (so data[sst_base..sst_base+sst_len] is the SST).
-    pub fn open_at(data: Arc<Vec<u8>>, sst_base: u32) -> Result<Self> {
+    pub fn open_at(data: Bytes, sst_base: u32) -> Result<Self> {
         let base = sst_base as usize;
         if data.len() < base + 8 {
             return Err(anyhow!("SSTable too short at base={sst_base}"));
         }
-        // Read meta_len from the last 4 bytes of the SSTable.
-        // We don't know sst_len here (open_at only has the base), but from_bytes uses the
-        // full data slice and sst_base=0, so sst_end = data.len().
-        // For open_at with a known length, use open_slice instead.
         let sst_end = data.len();
         Self::parse(data, base, sst_end)
     }
 
     /// Open from a slice: data[sst_base..sst_base+sst_len].
-    pub fn open_slice(data: Arc<Vec<u8>>, sst_base: u32, sst_len: u32) -> Result<Self> {
+    pub fn open_slice(data: Bytes, sst_base: u32, sst_len: u32) -> Result<Self> {
         let base = sst_base as usize;
         let end = base + sst_len as usize;
         if end > data.len() {
@@ -62,7 +58,7 @@ impl SstReader {
         Self::parse(data, base, end)
     }
 
-    fn parse(data: Arc<Vec<u8>>, sst_base: usize, sst_end: usize) -> Result<Self> {
+    fn parse(data: Bytes, sst_base: usize, sst_end: usize) -> Result<Self> {
         if sst_end < sst_base + 8 {
             return Err(anyhow!("SSTable too short"));
         }
@@ -155,7 +151,7 @@ impl SstReader {
                 self.data.len()
             ));
         }
-        let block = Arc::new(DecodedBlock::decode(&self.data[start..end], &bo.key)?);
+        let block = Arc::new(DecodedBlock::decode(self.data.slice(start..end), &bo.key)?);
         self.block_cache.borrow_mut()[idx] = Some(block.clone());
         Ok(block)
     }

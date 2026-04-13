@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
+use bytes::Bytes;
 
 pub const BLOCK_SIZE_TARGET: usize = 64 * 1024; // 64 KB
 pub const MAX_ENTRIES_PER_BLOCK: usize = 1000;
@@ -193,9 +194,9 @@ impl MetaBlock {
 /// A decoded data block ready for iteration.
 #[derive(Debug)]
 pub struct DecodedBlock {
-    /// Raw block bytes: [entry data...][entry_offsets * 4B each][num_entries:4B][crc:4B]
-    /// We store the raw bytes including footer so entry_offsets are absolute into `data`.
-    pub data: Vec<u8>,
+    /// Raw block bytes (CRC-verified payload, without trailing CRC).
+    /// Stored as `Bytes` so value slices can be returned zero-copy.
+    pub data: Bytes,
     /// Byte offsets of each entry from the start of `data`.
     pub entry_offsets: Vec<u32>,
     /// First (base) key in the block. Required for prefix decompression.
@@ -205,26 +206,28 @@ pub struct DecodedBlock {
 impl DecodedBlock {
     /// Decode a raw block (bytes from SSTable, including the entry_offsets footer and CRC).
     /// `base_key_hint` is the key from BlockOffset (= first key in block, from MetaBlock index).
-    pub fn decode(raw: &[u8], base_key_hint: &[u8]) -> Result<Self> {
+    /// `raw` is a `Bytes` slice from the SSTable data — the decoded block keeps a zero-copy
+    /// reference to it so value lookups don't require memcpy.
+    pub fn decode(raw: Bytes, base_key_hint: &[u8]) -> Result<Self> {
         if raw.len() < 8 {
             return Err(anyhow!("block too short: {} bytes", raw.len()));
         }
         // Last 4 bytes: CRC32C
-        let (payload, crc_b) = raw.split_at(raw.len() - 4);
-        let stored_crc = u32::from_le_bytes(crc_b.try_into().unwrap());
-        let computed_crc = crc32c::crc32c(payload);
+        let crc_start = raw.len() - 4;
+        let stored_crc = u32::from_le_bytes(raw[crc_start..].try_into().unwrap());
+        let computed_crc = crc32c::crc32c(&raw[..crc_start]);
         if stored_crc != computed_crc {
             return Err(anyhow!(
                 "block CRC mismatch: stored={stored_crc:#x} computed={computed_crc:#x}"
             ));
         }
-        // Next 4 bytes before CRC: num_entries
+        // Payload is everything before the CRC.
+        let payload = raw.slice(..crc_start);
         let n = payload.len();
         if n < 8 {
             return Err(anyhow!("block payload too short"));
         }
         let num_entries = u32::from_le_bytes(payload[n - 4..n].try_into().unwrap()) as usize;
-        // Before num_entries: num_entries * 4 bytes of offsets
         let offsets_start = n - 4 - num_entries * 4;
         if offsets_start > n - 4 {
             return Err(anyhow!("block entry_offsets overflow"));
@@ -238,10 +241,9 @@ impl DecodedBlock {
             );
             entry_offsets.push(off);
         }
-        // base_key from hint (MetaBlock block index)
         let base_key = base_key_hint.to_vec();
         Ok(DecodedBlock {
-            data: payload.to_vec(),
+            data: payload,
             entry_offsets,
             base_key,
         })
@@ -276,7 +278,8 @@ impl DecodedBlock {
 
     /// Decode the entry at index `idx` within this block.
     /// Returns (full_internal_key, op, value_bytes, expires_at).
-    pub fn get_entry(&self, idx: usize) -> Result<(Vec<u8>, u8, &[u8], u64)> {
+    /// Value is returned as a zero-copy `Bytes` slice into the block data.
+    pub fn get_entry(&self, idx: usize) -> Result<(Vec<u8>, u8, Bytes, u64)> {
         let offset = self.entry_offsets[idx] as usize;
         let data = &self.data;
         if offset + EntryHeader::SIZE > data.len() {
@@ -311,7 +314,8 @@ impl DecodedBlock {
                 data.len()
             ));
         }
-        let value = &data[vs + ENTRY_VALUE_HEADER..ve];
+        // Zero-copy: slice into the block's Bytes buffer.
+        let value = self.data.slice(vs + ENTRY_VALUE_HEADER..ve);
         Ok((full_key, op, value, expires_at))
     }
 }

@@ -950,15 +950,15 @@ async fn recover_partition(
                     )
                 })?;
 
-            let sst_arc = Arc::new(sst_bytes);
-            let reader = SstReader::from_bytes(sst_arc.clone()).with_context(|| {
-                let preview_len = sst_arc.len().min(32);
+            let sst_bytes = Bytes::from(sst_bytes);
+            let reader = SstReader::from_bytes(sst_bytes.clone()).with_context(|| {
+                let preview_len = sst_bytes.len().min(32);
                 format!(
                     "open SST extent={} offset={} read_len={} preview={:02x?}",
                     loc.extent_id,
                     loc.offset,
-                    sst_arc.len(),
-                    &sst_arc[..preview_len]
+                    sst_bytes.len(),
+                    &sst_bytes[..preview_len]
                 )
             })?;
 
@@ -1300,8 +1300,7 @@ pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<b
     let result = part_sc.append(row_stream_id, &sst_bytes, true).await?;
 
     let estimated_size = sst_bytes.len() as u64;
-    let sst_arc = Arc::new(sst_bytes);
-    let reader = Rc::new(SstReader::from_bytes(sst_arc)?);
+    let reader = Rc::new(SstReader::from_bytes(Bytes::from(sst_bytes))?);
 
     let (tables_snapshot, vp_eid, vp_off) = {
         let mut p = part.borrow_mut();

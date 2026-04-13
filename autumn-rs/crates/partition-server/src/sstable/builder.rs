@@ -255,7 +255,7 @@ mod tests {
         let data = b.finish();
         assert!(!data.is_empty());
 
-        let reader = SstReader::from_bytes(std::sync::Arc::new(data)).expect("reader");
+        let reader = SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader");
         assert_eq!(
             reader.block_count(),
             1,
@@ -274,7 +274,7 @@ mod tests {
             b.add(&ikey(uk.as_bytes(), i), 1, &vec![0u8; 64], 0);
         }
         let data = b.finish();
-        let reader = SstReader::from_bytes(std::sync::Arc::new(data)).expect("reader");
+        let reader = SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader");
         assert!(reader.block_count() > 1, "should have multiple blocks");
     }
 
@@ -288,7 +288,7 @@ mod tests {
             data[5] ^= 0xFF;
         }
         // Reading should fail with a CRC error
-        let reader = SstReader::from_bytes(std::sync::Arc::new(data)).expect("reader opens");
+        let reader = SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader opens");
         // Trying to read the first block should produce a CRC error
         let result = reader.read_block(0);
         assert!(result.is_err(), "expected CRC error");
@@ -304,7 +304,7 @@ mod tests {
         b.set_discards(discards.clone());
         let data = b.finish();
 
-        let reader = SstReader::from_bytes(std::sync::Arc::new(data)).expect("reader");
+        let reader = SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader");
         assert_eq!(reader.discards.get(&10), Some(&500i64));
         assert_eq!(reader.discards.get(&20), Some(&1024i64));
         assert_eq!(reader.discards.len(), 2);

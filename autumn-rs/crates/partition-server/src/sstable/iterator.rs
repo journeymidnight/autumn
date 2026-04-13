@@ -347,7 +347,7 @@ mod tests {
             b.add(&ikey(uk, *seq), 1, val, 0);
         }
         let data = b.finish();
-        Arc::new(SstReader::from_bytes(Arc::new(data)).expect("reader"))
+        Arc::new(SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader"))
     }
 
     #[test]

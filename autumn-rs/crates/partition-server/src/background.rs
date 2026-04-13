@@ -783,7 +783,7 @@ pub(crate) async fn do_compact(
         let sst_bytes = b.finish();
         let result = part_sc.append(row_stream_id, &sst_bytes, true).await?;
         let estimated_size = sst_bytes.len() as u64;
-        let reader = Rc::new(SstReader::from_bytes(Arc::new(sst_bytes))?);
+        let reader = Rc::new(SstReader::from_bytes(Bytes::from(sst_bytes))?);
         new_readers.push((
             TableMeta {
                 extent_id: result.extent_id,
@@ -876,11 +876,11 @@ pub(crate) async fn run_gc(
             continue;
         }
 
-        let current: Option<(u8, Vec<u8>, u64)> = {
+        let current: Option<(u8, Bytes, u64)> = {
             let p = part.borrow();
             let mem = p.active.seek_user_key(&user_key)
                 .or_else(|| p.imm.iter().rev().find_map(|m| m.seek_user_key(&user_key)))
-                .map(|e| (e.op, e.value, e.expires_at));
+                .map(|e| (e.op, Bytes::from(e.value), e.expires_at));
             if mem.is_some() {
                 mem
             } else {
@@ -934,12 +934,12 @@ pub(crate) async fn run_gc(
 // Lookup helpers
 // ---------------------------------------------------------------------------
 
-pub(crate) fn lookup_in_memtable(mem: &Memtable, user_key: &[u8]) -> Option<(u8, Vec<u8>, u64)> {
+pub(crate) fn lookup_in_memtable(mem: &Memtable, user_key: &[u8]) -> Option<(u8, Bytes, u64)> {
     mem.seek_user_key(user_key)
-        .map(|e| (e.op, e.value, e.expires_at))
+        .map(|e| (e.op, Bytes::from(e.value), e.expires_at))
 }
 
-pub(crate) fn lookup_in_sst(reader: &SstReader, user_key: &[u8]) -> Option<(u8, Vec<u8>, u64)> {
+pub(crate) fn lookup_in_sst(reader: &SstReader, user_key: &[u8]) -> Option<(u8, Bytes, u64)> {
     if !reader.bloom_may_contain(user_key) {
         return None;
     }
@@ -968,7 +968,7 @@ pub(crate) fn lookup_in_sst(reader: &SstReader, user_key: &[u8]) -> Option<(u8, 
     if lo < n {
         let (key, op, value, expires_at) = block.get_entry(lo).ok()?;
         if parse_key(&key) == user_key {
-            return Some((op, value.to_vec(), expires_at));
+            return Some((op, value, expires_at));
         }
     }
     None
@@ -1017,7 +1017,7 @@ pub(crate) fn unique_user_keys(part: &PartitionData) -> Vec<Vec<u8>> {
 
 pub(crate) async fn resolve_value(
     op: u8,
-    raw_value: Vec<u8>,
+    raw_value: Bytes,
     stream_client: &Rc<StreamClient>,
 ) -> Result<Vec<u8>> {
     if op & OP_VALUE_POINTER != 0 {
@@ -1027,7 +1027,7 @@ pub(crate) async fn resolve_value(
         let vp = ValuePointer::decode(&raw_value[..VALUE_POINTER_SIZE]);
         read_value_from_log(&vp, stream_client).await
     } else {
-        Ok(raw_value)
+        Ok(raw_value.to_vec())
     }
 }
 

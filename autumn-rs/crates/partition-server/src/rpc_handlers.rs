@@ -121,7 +121,7 @@ pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>
 
     // Track where the key was found.
     let mut source = 0u8; // 0=miss, 1=mem, 2=imm, 3=sst
-    let found: Option<(u8, Vec<u8>, u64)> = lookup_in_memtable(&p.active, &req.key)
+    let found: Option<(u8, Bytes, u64)> = lookup_in_memtable(&p.active, &req.key)
         .map(|r| { source = 1; r })
         .or_else(|| {
             for imm in p.imm.iter().rev() {

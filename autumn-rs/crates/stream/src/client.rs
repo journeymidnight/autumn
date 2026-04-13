@@ -388,16 +388,8 @@ impl StreamClient {
         let mut state = state_arc.lock().await;
         let lock_wait = lock_started_at.elapsed();
 
-        // Concatenate segments into a single payload.
-        let payload = if segments.len() == 1 {
-            segments.into_iter().next().unwrap()
-        } else {
-            let mut buf = BytesMut::with_capacity(payload_len);
-            for seg in &segments {
-                buf.extend_from_slice(seg);
-            }
-            buf.freeze()
-        };
+        // Wrap segments in Arc so all replicas can share without copying.
+        let segments = Arc::new(segments);
 
         let mut retry = 0usize;
         let mut alloc_count = 0u32;
@@ -423,25 +415,35 @@ impl StreamClient {
             extent_lookup_elapsed += extent_lookup_started_at.elapsed();
 
             // Fan out identical append to all replicas in parallel.
+            // Zero-copy: AppendReq header (29B) + segments sent via vectored write.
             let extent_id = tail.extent.extent_id;
+            let append_hdr = AppendReq::encode_header(
+                extent_id,
+                tail.extent.eversion,
+                commit,
+                revision,
+                must_sync,
+            );
 
             let fanout_started_at = Instant::now();
             let futs: Vec<_> = tail
                 .replica_addrs
                 .iter()
                 .map(|addr| {
-                    let req = AppendReq {
-                        extent_id,
-                        eversion: tail.extent.eversion,
-                        commit,
-                        revision,
-                        must_sync,
-                        payload: payload.clone(),
-                    };
                     let pool = &self.pool;
                     let addr = addr.clone();
+                    let append_hdr = append_hdr.clone();
+                    let segments = segments.clone();
                     async move {
-                        let result = pool.call(&addr, MSG_APPEND, req.encode()).await;
+                        // Build vectored parts: [append_header][seg0][seg1]...
+                        let mut parts = Vec::with_capacity(1 + segments.len());
+                        parts.push(append_hdr);
+                        for seg in segments.iter() {
+                            parts.push(seg.clone()); // Bytes::clone = refcount, not memcpy
+                        }
+                        let result = pool
+                            .call_vectored(&addr, MSG_APPEND, parts)
+                            .await;
                         (addr, result)
                     }
                 })

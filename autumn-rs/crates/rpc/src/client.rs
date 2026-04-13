@@ -116,6 +116,43 @@ impl RpcClient {
         Ok(())
     }
 
+    /// Send a request whose payload is already split into parts.
+    /// Uses vectored write: [frame_header][part0][part1]... — zero payload copy.
+    pub async fn call_vectored(
+        &self,
+        msg_type: u8,
+        payload_parts: Vec<Bytes>,
+    ) -> Result<Bytes, RpcError> {
+        let req_id = self.next_id.get();
+        self.next_id.set(req_id.wrapping_add(1));
+
+        let payload_len: usize = payload_parts.iter().map(|p| p.len()).sum();
+        let hdr = Frame::encode_request_header(req_id, msg_type, payload_len as u32);
+
+        let (tx, rx) = oneshot::channel();
+        self.pending.borrow_mut().insert(req_id, tx);
+
+        let mut bufs: Vec<Bytes> = Vec::with_capacity(1 + payload_parts.len());
+        bufs.push(Bytes::copy_from_slice(&hdr));
+        bufs.extend(payload_parts);
+
+        {
+            let mut writer = self.writer.lock().await;
+            let BufResult(result, _) = writer.write_vectored_all(bufs).await;
+            if let Err(e) = result {
+                self.pending.borrow_mut().remove(&req_id);
+                return Err(RpcError::Io(e));
+            }
+        }
+
+        let resp = rx.await.map_err(|_| RpcError::ConnectionClosed)?;
+        if resp.is_error() {
+            let (code, message) = RpcError::decode_status(&resp.payload);
+            return Err(RpcError::status(code, message));
+        }
+        Ok(resp.payload)
+    }
+
     /// Send a fire-and-forget frame (no response expected).
     pub async fn send_oneshot(&self, msg_type: u8, payload: Bytes) -> Result<(), RpcError> {
         let req_id = 0; // req_id 0 = no response expected

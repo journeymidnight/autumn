@@ -46,6 +46,28 @@ impl RpcConn {
         let BufResult(result, _) = self.writer.write_vectored_all(bufs).await;
         result?;
 
+        self.read_response(req_id).await
+    }
+
+    /// Send a request whose payload is already split into parts (zero-copy).
+    async fn call_vectored(&mut self, msg_type: u8, payload_parts: Vec<Bytes>) -> Result<Bytes> {
+        let req_id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+
+        let payload_len: u32 = payload_parts.iter().map(|p| p.len() as u32).sum();
+        let hdr = Frame::encode_request_header(req_id, msg_type, payload_len);
+
+        let mut bufs = Vec::with_capacity(1 + payload_parts.len());
+        bufs.push(Bytes::copy_from_slice(&hdr));
+        bufs.extend(payload_parts);
+        let BufResult(result, _) = self.writer.write_vectored_all(bufs).await;
+        result?;
+
+        self.read_response(req_id).await
+    }
+
+    async fn read_response(&mut self, req_id: u32) -> Result<Bytes> {
+
         loop {
             match self.decoder.try_decode().map_err(|e| anyhow!("{e}"))? {
                 Some(resp) if resp.req_id == req_id => {
@@ -92,6 +114,15 @@ impl ConnPool {
         let sock = parse_addr(addr)?;
         let mut conn = self.take_conn(sock).await?;
         let result = conn.call(msg_type, payload).await;
+        self.put_conn(sock, conn);
+        result
+    }
+
+    /// Send an RPC with payload split into parts (zero-copy vectored write).
+    pub async fn call_vectored(&self, addr: &str, msg_type: u8, payload_parts: Vec<Bytes>) -> Result<Bytes> {
+        let sock = parse_addr(addr)?;
+        let mut conn = self.take_conn(sock).await?;
+        let result = conn.call_vectored(msg_type, payload_parts).await;
         self.put_conn(sock, conn);
         result
     }
