@@ -847,26 +847,68 @@ async fn partition_thread_main(
         .detach();
     }
 
-    // Main request processing loop — spawn each request as a separate task so
-    // multiple handle_put can enqueue to write_tx concurrently, enabling group
-    // commit batching in background_write_loop.
+    // Main request processing loop.
+    // Reads (GET/HEAD/RANGE): inline — no spawn, no Rc clone overhead.
+    // Writes (PUT/DELETE/STREAM_PUT) and control ops: spawn — they await
+    // write_tx and must run concurrently for group commit batching.
     while let Some(req) = req_rx.next().await {
-        let part = part.clone();
-        let part_sc = part_sc.clone();
-        let pool = pool.clone();
-        let manager_addr = manager_addr.clone();
-        let owner_key = owner_key.clone();
-        compio::runtime::spawn(async move {
+        if is_read_op(req.msg_type) {
             let result = dispatch_partition_rpc(
                 req.msg_type, req.payload, &part, &part_sc, &pool,
                 &manager_addr, &owner_key, revision,
             ).await;
             let _ = req.resp_tx.send(result);
-        }).detach();
+            // Drain and process more reads without blocking.
+            loop {
+                match req_rx.next().now_or_never() {
+                    Some(Some(req)) if is_read_op(req.msg_type) => {
+                        let result = dispatch_partition_rpc(
+                            req.msg_type, req.payload, &part, &part_sc, &pool,
+                            &manager_addr, &owner_key, revision,
+                        ).await;
+                        let _ = req.resp_tx.send(result);
+                    }
+                    Some(Some(req)) => {
+                        spawn_write_request(req, &part, &part_sc, &pool, &manager_addr, &owner_key, revision);
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+        } else {
+            spawn_write_request(req, &part, &part_sc, &pool, &manager_addr, &owner_key, revision);
+        }
     }
 
     tracing::info!(part_id, "partition thread exiting");
     Ok(())
+}
+
+fn is_read_op(msg_type: u8) -> bool {
+    matches!(msg_type, MSG_GET | MSG_HEAD | MSG_RANGE)
+}
+
+fn spawn_write_request(
+    req: PartitionRequest,
+    part: &Rc<RefCell<PartitionData>>,
+    part_sc: &Rc<StreamClient>,
+    pool: &Rc<ConnPool>,
+    manager_addr: &str,
+    owner_key: &str,
+    revision: i64,
+) {
+    let part = part.clone();
+    let part_sc = part_sc.clone();
+    let pool = pool.clone();
+    let manager_addr = manager_addr.to_string();
+    let owner_key = owner_key.to_string();
+    compio::runtime::spawn(async move {
+        let result = dispatch_partition_rpc(
+            req.msg_type, req.payload, &part, &part_sc, &pool,
+            &manager_addr, &owner_key, revision,
+        ).await;
+        let _ = req.resp_tx.send(result);
+    }).detach();
 }
 
 // ---------------------------------------------------------------------------
