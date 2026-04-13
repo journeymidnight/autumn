@@ -1,0 +1,24 @@
+[package]
+name = "autumn-etcd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+prost = "0.12"
+anyhow.workspace = true
+tracing.workspace = true
+
+compio = { version = "0.18.0", features = ["net", "time", "io-compat"] }
+cyper-core = "0.8.0"
+hyper = { version = "1.4.1", features = ["client", "http2"] }
+hyper-util = { version = "0.1.8", features = ["client-legacy", "http2"] }
+http = "1"
+http-body-util = "0.1"
+send_wrapper = { version = "0.6", features = ["futures"] }
+http-body = "1"
+
+[dev-dependencies]
+compio = { version = "0.18.0", features = ["net", "time", "io-compat", "macros"] }
+tracing-subscriber = "0.3"

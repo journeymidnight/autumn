@@ -288,14 +288,42 @@ impl AutumnManager {
     // ── Leader election ────────────────────────────────────────────────
 
     async fn leader_election_loop(self) {
+        const LEADER_KEY: &str = "autumn-rs/stream-manager/leader";
         const RETRY: Duration = Duration::from_secs(2);
         loop {
             if self.leader.get() {
                 compio::time::sleep(RETRY).await;
                 continue;
             }
-            let _ = self.try_become_leader().await;
-            compio::time::sleep(RETRY).await;
+            match self.try_become_leader().await {
+                Ok(true) => continue,
+                Ok(false) => {
+                    // CAS failed — another leader holds the key.
+                    // Watch for deletion instead of blind polling.
+                    if let Some(etcd) = &self.etcd {
+                        let addr = etcd.client.borrow().current_endpoint();
+                        tracing::info!("watching leader key for deletion");
+                        match autumn_etcd::watch_key_until_delete(&addr, LEADER_KEY.as_bytes())
+                            .await
+                        {
+                            Ok(()) => {
+                                tracing::info!("leader key deleted, retrying election");
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "watch leader key failed");
+                                compio::time::sleep(RETRY).await;
+                            }
+                        }
+                    } else {
+                        compio::time::sleep(RETRY).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "leader election error");
+                    compio::time::sleep(RETRY).await;
+                }
+            }
         }
     }
 

@@ -3,9 +3,10 @@
 #
 # Usage:
 #   ./cluster.sh start [N]      # start N extent-node cluster (default 1, e.g. 3, 4, 5)
-#   ./cluster.sh stop           # kill all cluster processes
+#   ./cluster.sh stop           # kill all cluster processes (data preserved)
+#   ./cluster.sh restart [N]    # stop + start (data preserved)
 #   ./cluster.sh clean          # stop + wipe data dirs
-#   ./cluster.sh restart [N]    # clean + start
+#   ./cluster.sh reset [N]      # clean + start (fresh cluster, all data wiped)
 #   ./cluster.sh status         # show running processes
 #   ./cluster.sh logs           # tail log files (Ctrl-C to exit)
 
@@ -75,7 +76,7 @@ kill_proc() {
 }
 
 wait_port() {
-    local port="$1" name="$2" retries=20
+    local port="$1" name="$2" retries="${3:-20}"
     echo -n "[cluster] waiting for $name on :$port ..."
     for _ in $(seq 1 $retries); do
         if nc -z 127.0.0.1 "$port" 2>/dev/null; then echo " ok"; return 0; fi
@@ -140,7 +141,7 @@ do_start() {
         --psid 1 --port 9201 \
         --manager "$MANAGER_ADDR" \
         --advertise 127.0.0.1:9201
-    wait_port 9201 ps
+    wait_port 9201 ps 60  # longer timeout: PS waits for manager leader election
 
     # bootstrap (create 3 streams + 1 partition) — only on a fresh data dir
     local bootstrap_marker="$DATA_ROOT/bootstrapped"
@@ -247,12 +248,13 @@ REPLICAS="${2:-1}"
 case "$CMD" in
     start)   do_start "$REPLICAS" ;;
     stop)    do_stop ;;
+    restart) do_stop; do_start "$REPLICAS" ;;
     clean)   do_clean ;;
-    restart) do_clean; do_start "$REPLICAS" ;;
+    reset)   do_clean; do_start "$REPLICAS" ;;
     status)  do_status ;;
     logs)    do_logs ;;
     *)
-        echo "Usage: $0 {start [N] | stop | clean | restart [N] | status | logs}"
+        echo "Usage: $0 {start [N] | stop | restart [N] | clean | reset [N] | status | logs}"
         exit 1
         ;;
 esac

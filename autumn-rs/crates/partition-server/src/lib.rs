@@ -419,7 +419,21 @@ impl PartitionServer {
             conn_threads: None,
         };
 
-        server.register_ps().await?;
+        // Retry register_ps — manager may still be electing leader after restart.
+        let mut retries = 15;
+        loop {
+            match server.register_ps().await {
+                Ok(()) => break,
+                Err(e) if retries > 0 && e.to_string().contains("not leader") => {
+                    retries -= 1;
+                    tracing::warn!(
+                        "register_ps: manager not leader yet, retrying in 1s ({retries} left)"
+                    );
+                    compio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
         server.sync_regions_once().await?;
 
         Ok(server)
