@@ -1118,7 +1118,7 @@ async fn recover_partition(
                 let mem_entry = if value.len() > VALUE_THROTTLE {
                     let vp = ValuePointer {
                         extent_id: eid,
-                        offset: record_extent_off,
+                        offset: record_extent_off + 17 + key.len() as u32,
                         len: value.len() as u32,
                     };
                     MemEntry {

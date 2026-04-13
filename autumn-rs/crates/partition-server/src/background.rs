@@ -513,7 +513,7 @@ async fn finish_write_batch(
             let mem_entry = if entry.value.len() > VALUE_THROTTLE {
                 let vp = ValuePointer {
                     extent_id: result.extent_id,
-                    offset: record_offset,
+                    offset: record_offset + 17 + entry.internal_key.len() as u32,
                     len: entry.value.len() as u32,
                 };
                 MemEntry {
@@ -926,7 +926,7 @@ pub(crate) async fn run_gc(
                     let result = part_sc.append(log_stream_id, &log_entry, true).await?;
                     let new_vp = ValuePointer {
                         extent_id: result.extent_id,
-                        offset: result.offset,
+                        offset: result.offset + 17 + internal_key.len() as u32,
                         len: vp.len,
                     };
                     p.vp_extent_id = result.extent_id;
@@ -1051,22 +1051,18 @@ pub(crate) async fn resolve_value(
 }
 
 pub(crate) async fn read_value_from_log(vp: &ValuePointer, stream_client: &Rc<StreamClient>) -> Result<Vec<u8>> {
-    let read_len = 17 + 0 + vp.len;
-    let read_bytes = (read_len + 512).max(1024);
-    let (data, _end) = stream_client
-        .read_bytes_from_extent(vp.extent_id, vp.offset, read_bytes)
+    // VP.offset points directly to the value start (past header + key),
+    // so one exact-size read is all we need.
+    let (data, _) = stream_client
+        .read_bytes_from_extent(vp.extent_id, vp.offset, vp.len)
         .await?;
-    if data.len() < 17 {
-        return Err(anyhow!("logStream record too short"));
+    if (data.len() as u32) < vp.len {
+        return Err(anyhow!(
+            "logStream value short: need {} bytes, got {}, extent={}, offset={}",
+            vp.len, data.len(), vp.extent_id, vp.offset
+        ));
     }
-    let key_len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
-    let val_len = u32::from_le_bytes(data[5..9].try_into().unwrap()) as usize;
-    let val_start = 17 + key_len;
-    let val_end = val_start + val_len;
-    if val_end > data.len() {
-        return Err(anyhow!("logStream record value out of range"));
-    }
-    Ok(data[val_start..val_end].to_vec())
+    Ok(data)
 }
 
 // ---------------------------------------------------------------------------
