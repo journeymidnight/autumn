@@ -1492,4 +1492,298 @@ mod tests {
         assert_eq!(0x81u8 & !OP_VALUE_POINTER, 1u8);
         assert_eq!(1u8 & OP_VALUE_POINTER, 0);
     }
+
+    // ── Tests ported from Go range_partition/entry_test.go ───────────────────
+
+    #[test]
+    fn record_encode_decode_roundtrip() {
+        let encoded = encode_record(1, b"key", b"hello world", 0);
+        let records = decode_records_full(&encoded);
+        assert_eq!(records.len(), 1);
+        let (op, key, value, expires_at) = &records[0];
+        assert_eq!(*op, 1);
+        assert_eq!(key, b"key");
+        assert_eq!(value, b"hello world");
+        assert_eq!(*expires_at, 0);
+    }
+
+    #[test]
+    fn record_encode_decode_with_expiry() {
+        let encoded = encode_record(1, b"ttl_key", b"ttl_val", 1700000000);
+        let records = decode_records_full(&encoded);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].3, 1700000000);
+    }
+
+    #[test]
+    fn record_encode_decode_delete() {
+        let encoded = encode_record(2, b"del_key", b"", 0);
+        let records = decode_records_full(&encoded);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0, 2); // op=delete
+        assert!(records[0].2.is_empty()); // empty value
+    }
+
+    #[test]
+    fn record_encode_decode_multiple() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&encode_record(1, b"k1", b"v1", 0));
+        buf.extend_from_slice(&encode_record(1, b"k2", b"v2_longer", 100));
+        buf.extend_from_slice(&encode_record(2, b"k3", b"", 0));
+
+        let records = decode_records_full(&buf);
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].1, b"k1");
+        assert_eq!(records[0].2, b"v1");
+        assert_eq!(records[1].1, b"k2");
+        assert_eq!(records[1].2, b"v2_longer");
+        assert_eq!(records[1].3, 100);
+        assert_eq!(records[2].0, 2);
+        assert_eq!(records[2].1, b"k3");
+    }
+
+    #[test]
+    fn record_encode_decode_big_value() {
+        let big_val = vec![0xAB; 1024 * 1024]; // 1MB
+        let encoded = encode_record(1, b"bigkey", &big_val, 0);
+        let records = decode_records_full(&encoded);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].2.len(), 1024 * 1024);
+        assert_eq!(records[0].2[0], 0xAB);
+    }
+
+    #[test]
+    fn record_with_offsets() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&encode_record(1, b"k1", b"v1", 0));
+        let off1 = buf.len();
+        buf.extend_from_slice(&encode_record(1, b"k2", b"v2", 0));
+
+        let records = decode_records_with_offsets(&buf);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].0, 0); // first record at offset 0
+        assert_eq!(records[1].0, off1); // second record at correct offset
+    }
+
+    #[test]
+    fn record_decode_truncated_data() {
+        let encoded = encode_record(1, b"key", b"value", 0);
+        // Truncate in the middle
+        let truncated = &encoded[..10];
+        let records = decode_records_full(truncated);
+        assert!(records.is_empty(), "truncated data should produce no records");
+    }
+
+    // ── Memtable tests ported from Go skiplist tests ─────────────────────────
+
+    #[test]
+    fn memtable_empty() {
+        let mt = Memtable::new();
+        assert!(mt.is_empty());
+        assert_eq!(mt.mem_bytes(), 0);
+        assert!(mt.seek_user_key(b"anything").is_none());
+    }
+
+    #[test]
+    fn memtable_basic_put_get() {
+        let mt = Memtable::new();
+        let k1 = key_with_ts(b"apple", 1);
+        mt.insert(
+            k1.clone(),
+            MemEntry { op: 1, value: b"red".to_vec(), expires_at: 0 },
+            100,
+        );
+        let k2 = key_with_ts(b"banana", 2);
+        mt.insert(
+            k2.clone(),
+            MemEntry { op: 1, value: b"yellow".to_vec(), expires_at: 0 },
+            100,
+        );
+
+        let got = mt.seek_user_key(b"apple").expect("apple should exist");
+        assert_eq!(got.value, b"red");
+        let got = mt.seek_user_key(b"banana").expect("banana should exist");
+        assert_eq!(got.value, b"yellow");
+        assert!(mt.seek_user_key(b"cherry").is_none());
+    }
+
+    #[test]
+    fn memtable_update_returns_newest() {
+        let mt = Memtable::new();
+        // Insert same key with increasing seq — newest should win on seek
+        for seq in 1..=100u64 {
+            let k = key_with_ts(b"key", seq);
+            let val = format!("value{seq}");
+            mt.insert(
+                k,
+                MemEntry { op: 1, value: val.into_bytes(), expires_at: 0 },
+                50,
+            );
+        }
+        let got = mt.seek_user_key(b"key").expect("key should exist");
+        assert_eq!(got.value, b"value100", "should return newest version");
+    }
+
+    #[test]
+    fn memtable_snapshot_sorted() {
+        let mt = Memtable::new();
+        // Insert in reverse order
+        for i in (0..10).rev() {
+            let uk = format!("key{i:02}");
+            let k = key_with_ts(uk.as_bytes(), i as u64);
+            mt.insert(
+                k,
+                MemEntry { op: 1, value: format!("v{i}").into_bytes(), expires_at: 0 },
+                50,
+            );
+        }
+        let snapshot = mt.snapshot_sorted();
+        assert_eq!(snapshot.len(), 10);
+        // Verify sorted by internal key
+        for i in 1..snapshot.len() {
+            assert!(
+                snapshot[i - 1].key <= snapshot[i].key,
+                "snapshot should be sorted"
+            );
+        }
+    }
+
+    #[test]
+    fn memtable_mem_bytes_tracking() {
+        let mt = Memtable::new();
+        mt.insert(
+            key_with_ts(b"k1", 1),
+            MemEntry { op: 1, value: b"v1".to_vec(), expires_at: 0 },
+            100,
+        );
+        assert_eq!(mt.mem_bytes(), 100);
+        mt.insert(
+            key_with_ts(b"k2", 2),
+            MemEntry { op: 1, value: b"v2".to_vec(), expires_at: 0 },
+            200,
+        );
+        assert_eq!(mt.mem_bytes(), 300);
+    }
+
+    // ── in_range tests ported from Go split algorithm tests ─────────────────
+
+    #[test]
+    fn in_range_basic() {
+        let rg = Range {
+            start_key: b"b".to_vec(),
+            end_key: b"e".to_vec(),
+            ..Default::default()
+        };
+        assert!(!in_range(&rg, b"a")); // before start
+        assert!(in_range(&rg, b"b"));  // exactly start
+        assert!(in_range(&rg, b"c"));  // in range
+        assert!(in_range(&rg, b"d"));  // in range
+        assert!(!in_range(&rg, b"e")); // exactly end (exclusive)
+        assert!(!in_range(&rg, b"f")); // after end
+    }
+
+    #[test]
+    fn in_range_open_end() {
+        let rg = Range {
+            start_key: b"a".to_vec(),
+            end_key: vec![], // open-ended
+            ..Default::default()
+        };
+        assert!(in_range(&rg, b"a"));
+        assert!(in_range(&rg, b"z"));
+        assert!(in_range(&rg, b"zzzzzzz"));
+        assert!(!in_range(&rg, b"")); // before "a"
+    }
+
+    // ── decode_last_table_locations test ──────────────────────────────────────
+
+    #[test]
+    fn decode_table_locations_roundtrip() {
+        let locs = TableLocations {
+            locs: vec![
+                SstLocation { extent_id: 1, offset: 0, len: 1000 },
+                SstLocation { extent_id: 2, offset: 100, len: 2000 },
+            ],
+            vp_extent_id: 42,
+            vp_offset: 512,
+        };
+        let payload = rkyv_encode(&locs);
+        let mut data = Vec::new();
+        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(&payload);
+
+        let decoded = decode_last_table_locations(&data).unwrap();
+        assert_eq!(decoded.locs.len(), 2);
+        assert_eq!(decoded.locs[0].extent_id, 1);
+        assert_eq!(decoded.locs[1].len, 2000);
+        assert_eq!(decoded.vp_extent_id, 42);
+        assert_eq!(decoded.vp_offset, 512);
+    }
+
+    #[test]
+    fn decode_table_locations_multiple_records_returns_last() {
+        let locs1 = TableLocations {
+            locs: vec![SstLocation { extent_id: 1, offset: 0, len: 100 }],
+            vp_extent_id: 10,
+            vp_offset: 0,
+        };
+        let locs2 = TableLocations {
+            locs: vec![
+                SstLocation { extent_id: 1, offset: 0, len: 100 },
+                SstLocation { extent_id: 2, offset: 0, len: 200 },
+            ],
+            vp_extent_id: 20,
+            vp_offset: 50,
+        };
+
+        let mut data = Vec::new();
+        let p1 = rkyv_encode(&locs1);
+        data.extend_from_slice(&(p1.len() as u32).to_le_bytes());
+        data.extend_from_slice(&p1);
+        let p2 = rkyv_encode(&locs2);
+        data.extend_from_slice(&(p2.len() as u32).to_le_bytes());
+        data.extend_from_slice(&p2);
+
+        let decoded = decode_last_table_locations(&data).unwrap();
+        // Should return the LAST valid record
+        assert_eq!(decoded.locs.len(), 2);
+        assert_eq!(decoded.vp_extent_id, 20);
+        assert_eq!(decoded.vp_offset, 50);
+    }
+
+    #[test]
+    fn decode_table_locations_empty_fails() {
+        assert!(decode_last_table_locations(&[]).is_err());
+        assert!(decode_last_table_locations(&[0, 0, 0]).is_err());
+    }
+
+    // ── build_sst_bytes test ─────────────────────────────────────────────────
+
+    #[test]
+    fn build_sst_from_memtable() {
+        let mt = Memtable::new();
+        for i in 0u64..100 {
+            let uk = format!("key{i:04}");
+            let k = key_with_ts(uk.as_bytes(), i);
+            mt.insert(
+                k,
+                MemEntry { op: 1, value: format!("val{i}").into_bytes(), expires_at: 0 },
+                50,
+            );
+        }
+        let (sst_bytes, last_seq) = build_sst_bytes(&mt, 0, 0);
+        assert!(!sst_bytes.is_empty());
+        assert_eq!(last_seq, 99);
+
+        let reader = SstReader::from_bytes(Bytes::from(sst_bytes)).unwrap();
+        // Verify all keys are readable
+        let mut it = TableIterator::new(Arc::new(reader));
+        it.rewind();
+        let mut count = 0;
+        while it.valid() {
+            count += 1;
+            it.next();
+        }
+        assert_eq!(count, 100);
+    }
 }

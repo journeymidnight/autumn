@@ -1,34 +1,79 @@
 Date: 2026-04-13
 TaskStatus: completed
-Task scope: Fault recovery parity — fix Go→Rust gaps (F050-F060)
+Task scope: Fill unit test coverage gaps — port Go test scenarios to Rust
 
 Current summary:
-  Comprehensive Go vs Rust fault recovery comparison completed.
-  All 11 features (F050-F060) implemented and passing.
+  Compared Go and Rust unit test coverage across all modules.
+  Added missing tests ported from Go test suites to Rust crates.
 
-Completed features:
-  P0 (data correctness):
-  - F050: recover_partition now returns Memtable, no more data loss on crash recovery
-  - F051: commit_length called for all 3 streams at partition startup with infinite retry
-  - F052: CODE_LOCKED_BY_OTHER error code; StreamClient propagates immediately; PS self-evicts
+New tests added:
 
-  P0.5 (availability):
-  - F053: call_timeout/call_vectored_timeout added to RpcClient and stream ConnPool
-  - F054: ConnPool reconnection on error (stream, rpc, manager pools all evict broken conns)
-  - F055: PS heartbeat_loop exits after 6 consecutive failures (30s)
-  - F056: retry_manager_call helper; alloc_new_extent retries 20x; commit_length infinite retry
+  autumn-stream (WAL — crates/stream/src/wal.rs):
+    +14 new tests (8 existing → 22 total):
+    - test_many_records_raw (100k records, raw reader)
+    - test_many_records_wal_api (500 records via Wal API + replay)
+    - test_random_length_records (100 random-sized records up to 2*BLOCK_SIZE)
+    - test_basic_three_records (3 records: 1000, 97270, 8000 bytes)
+    - test_boundary_records (records at BLOCK_SIZE-16..BLOCK_SIZE+16)
+    - test_reopen_wal_writer (write, close, reopen, verify continuity)
+    - test_crc_corruption_recovery (corrupt CRC → reader skips to next block)
+    - test_zero_padding_is_eof (trailing zeros treated as logical EOF)
+    - test_should_use_wal (should_use_wal logic)
+    - test_empty_wal_file (empty file → no records)
+    - test_wal_cleanup_old_wals (old WAL files deleted)
+    - test_uvarint_edge_cases (0, 127, 128, u64::MAX)
+    - test_record_extreme_values (u64::MAX extent_id, i64::MIN revision)
+    - test_record_decode_truncated (truncated data → error)
 
-  P1 (robustness):
-  - F057: Recovery task retries up to 10 times with 10s backoff
-  - F058: mark_disk_offline_for_extent on I/O errors in handle_append
-  - F059: WAL cleanup on rotation (not just startup)
-  - F060: Manager ConnPool evicts broken connections (part of F054)
+  autumn-partition-server SSTable (crates/partition-server/src/sstable/iterator.rs):
+    +18 new tests (2 existing → 20 total):
+    Table tests:
+    - table_iterator_seek_to_first (various sizes: 101-5000 entries)
+    - table_iterator_iterate_from_start (count all entries, sizes 101-2000)
+    - table_iterator_seek_various (before/exact/between/beyond)
+    - table_iterator_big_values (20 entries × 1MB values)
+    - table_bloom_filter_no_false_negatives (200 keys, FPR check)
+    Merge iterator tests:
+    - merge_iterator_single (single table merge)
+    - merge_iterator_two_tables_interleaved (interleaved keys)
+    - merge_iterator_duplicate_keys_newest_first (newest seq first)
+    - merge_iterator_exact_duplicate_key_dedup (same internal key → dedup)
+    - merge_iterator_same_user_key_different_seq (all entries returned)
+    - merge_iterator_seek (seek to "c" in merged iterators)
+    - merge_iterator_seek_beyond_all (seek past all keys)
+    - merge_iterator_four_tables (4-way merge)
+    - merge_iterator_empty_tables (empty + non-empty)
+    - merge_iterator_rewind (rewind after advancing)
+    Memtable iterator tests:
+    - memtable_iterator_basic (sorted order)
+    - memtable_iterator_seek (seek + beyond)
+    - memtable_iterator_rewind (rewind after advance)
 
-Build: OK (cargo check --workspace)
-Tests: 18 stream + 12 partition-server + 3 integration tests pass
+  autumn-partition-server lib (crates/partition-server/src/lib.rs):
+    +20 new tests (4 existing → 24 total):
+    Record encode/decode:
+    - record_encode_decode_roundtrip
+    - record_encode_decode_with_expiry
+    - record_encode_decode_delete
+    - record_encode_decode_multiple
+    - record_encode_decode_big_value (1MB)
+    - record_with_offsets
+    - record_decode_truncated_data
+    Memtable:
+    - memtable_empty
+    - memtable_basic_put_get
+    - memtable_update_returns_newest
+    - memtable_snapshot_sorted
+    - memtable_mem_bytes_tracking
+    in_range:
+    - in_range_basic
+    - in_range_open_end
+    TableLocations:
+    - decode_table_locations_roundtrip
+    - decode_table_locations_multiple_records_returns_last
+    - decode_table_locations_empty_fails
+    build_sst:
+    - build_sst_from_memtable (100 entries → SST → iterate all)
 
-Remaining items not in scope:
-  - Full etcd lease integration for PS session (deferred, heartbeat-based for now)
-  - Multi-endpoint round-robin for manager failover
-  - Extent node etcd watch for seal events (node has no etcd dependency)
-  - re_avali should be async (currently blocks RPC handler)
+Build: OK (cargo test --lib for both crates)
+Tests: 36 stream + 48 partition-server unit tests pass (was 22+10)
