@@ -154,6 +154,167 @@ fuser 回调线程 → crossbeam::channel::send(FsRequest) → compio 线程 rec
 
 Big Endian 保证自然排序，同父目录项聚集、同文件 chunk 连续有序。
 
+### KV 数据模型详解
+
+所有文件系统数据存在同一个 autumn-rs KV namespace 中，靠 key 的第一个字节区分类型。
+
+#### 完整示例
+
+假设文件系统内容：
+```
+/                          (ino=1, 目录)
+└── docs/                  (ino=2, 目录)
+    └── readme.txt         (ino=3, 文件, 600KB)
+```
+
+KV 存储的全部内容：
+
+```
+─── 0x01: InodeMeta (每个文件/目录一条) ───────────────────────
+
+  [0x01][ino=1]  →  { mode=S_IFDIR|0755, nlink=3, uid=501, gid=20,
+                       size=0, atime, mtime, ctime,
+                       inline_data=None, symlink_target=None }
+
+  [0x01][ino=2]  →  { mode=S_IFDIR|0755, nlink=2, ... }
+
+  [0x01][ino=3]  →  { mode=S_IFREG|0644, nlink=1, size=614400,
+                       inline_data=None, ... }
+
+─── 0x02: DirentValue (每个"父→子"关系一条) ──────────────────
+
+  [0x02][parent=1]["docs"]        →  { child_inode=2, file_type=DT_DIR }
+  [0x02][parent=2]["readme.txt"]  →  { child_inode=3, file_type=DT_REG }
+
+  注意: 文件名编码在 key 里 (第 9 字节之后), 不在 value 里。
+
+─── 0x03: Chunk (文件数据, 每块最大 256KB) ────────────────────
+
+  [0x03][ino=3][chunk=0]  →  [256KB 原始字节]   ← 文件 0-256KB
+  [0x03][ino=3][chunk=1]  →  [256KB 原始字节]   ← 文件 256-512KB
+  [0x03][ino=3][chunk=2]  →  [88KB 原始字节]    ← 文件 512-600KB
+
+  目录没有 chunk。chunk 数量 = ceil(size / 256KB)。
+
+─── 0x04: Superblock (全局状态) ──────────────────────────────
+
+  [0x04]["next_inode"]  →  [u64 BE: 1001]   ← 下一批 inode 分配起点
+```
+
+#### 三者的关系
+
+```
+     DirentValue                 InodeMeta                Chunk Data
+  (父子关系 + 名字)           (文件/目录属性)             (文件内容)
+
+[0x02][parent=1]["docs"]      [0x01][ino=2]
+{ child_inode: 2 ──────────→ { mode: DIR               (目录没有 chunk)
+  file_type: DIR }              nlink: 2, ... }
+
+[0x02][parent=2]["readme.txt"] [0x01][ino=3]            [0x03][ino=3][0] → 256KB
+{ child_inode: 3 ──────────→ { mode: REG               [0x03][ino=3][1] → 256KB
+  file_type: REG }              size: 614400            [0x03][ino=3][2] → 88KB
+                                nlink: 1, ... }
+```
+
+DirentValue.child_inode 指向 InodeMeta。InodeMeta.size 隐含了 chunk 数量。
+chunk key 中的 ino 就是 InodeMeta 的 inode 号。
+
+#### InodeMeta — "这个东西是什么"
+
+存储在 key `[0x01][ino BE]`，描述一个文件或目录**自身的全部属性**。
+对应 Linux `struct stat`，`ls -l` 显示的所有信息都来自这里。
+
+| 字段 | 说明 |
+|------|------|
+| `mode` | 文件类型 + 权限。如 `S_IFREG\|0644` = 普通文件 owner 读写 |
+| `uid` / `gid` | 所属用户和组 |
+| `size` | 文件逻辑大小（字节），目录为 0 |
+| `nlink` | 硬链接计数。文件默认 1，目录默认 2（`. ` 和父目录的指向） |
+| `atime` | 最后访问时间 |
+| `mtime` | 最后数据修改时间 |
+| `ctime` | 最后元数据变更时间（chmod、chown 等） |
+| `inline_data` | ≤4KB 小文件的数据直接存在这里，省掉 chunk KV 操作 |
+| `symlink_target` | 符号链接的目标路径 |
+
+**不包含**：文件名、父目录。一个 inode 不知道自己叫什么名字，也不知道在哪个目录下。
+这样硬链接才能工作——同一个 inode 可以有多个名字。
+
+#### DirentValue — "谁在哪个目录下叫什么名字"
+
+存储在 key `[0x02][parent_ino BE][name]`，只有两个字段：
+
+| 字段 | 说明 |
+|------|------|
+| `child_inode` | 指向的 inode 号 |
+| `file_type` | DT_REG(8)=文件, DT_DIR(4)=目录, DT_LNK(10)=符号链接 |
+
+文件名不在 value 里，而是编码在 **key 本身**的第 9 字节之后。
+
+`file_type` 和 InodeMeta.mode 中的信息是冗余的，但 `readdir` 需要返回每个条目的类型。
+如果不冗余存储，readdir 就要为每个条目额外查一次 InodeMeta，N 个文件就是 N 次 KV Get。
+这是用空间换时间——和 Linux ext4 的 `struct ext4_dir_entry_2.file_type` 设计一致。
+
+#### Chunk — 文件的原始字节
+
+存储在 key `[0x03][ino BE][chunk_idx BE]`，value 是原始文件字节，最大 256KB。
+
+对一个 600KB 的文件：
+- chunk 0: 字节 0-262143 (256KB)
+- chunk 1: 字节 262144-524287 (256KB)
+- chunk 2: 字节 524288-614399 (88KB，最后一块不满)
+
+目录没有 chunk。小文件 (≤4KB) 也没有 chunk，数据 inline 在 InodeMeta 中。
+
+#### 为什么 InodeMeta 和 DirentValue 分开存储
+
+类比 Linux 文件系统，inode 和目录项是分离的两种数据结构：
+
+| 操作 | 只改 DirentValue | 只改 InodeMeta | 两者都改 |
+|------|:---:|:---:|:---:|
+| `rename` | ✓ | | |
+| `chmod` / `chown` | | ✓ | |
+| `write` (改内容) | | ✓ (size/mtime) | |
+| `link` (硬链接) | ✓ (新目录项) | ✓ (nlink++) | ✓ |
+| `mkdir` | ✓ | ✓ | ✓ |
+| `unlink` | ✓ (删目录项) | ✓ (nlink--) | ✓ |
+
+如果把 InodeMeta 嵌入 DirentValue：
+- **硬链接无法实现**：同一文件两个名字需要共享同一份属性
+- **rename 变重**：要读写更大的 value
+- **chmod 要找到所有目录项**：不知道文件有几个名字、在哪些目录下
+
+#### 小文件特例 (≤4KB)
+
+小文件不产生 chunk，数据直接存在 InodeMeta.inline_data 中：
+
+```
+[0x01][ino=5]  →  InodeMeta{
+    size: 18,
+    inline_data: Some(b"hello autumn-fuse\n"),  ← 数据在这里
+    ...
+}
+[0x02][parent=1]["hello.txt"]  →  { child_inode=5, file_type=DT_REG }
+```
+
+只有 2 条 KV 记录（1 InodeMeta + 1 DirentValue），没有 `[0x03]` chunk。
+读写各省一次 KV 操作。当文件增长超过 4KB 时，迁移到 chunk 存储。
+
+#### 各操作的 KV 访问模式
+
+| FUSE 操作 | KV 操作 |
+|-----------|---------|
+| `lookup(parent, name)` | 1× Get dirent + 1× Get inode |
+| `readdir(ino)` | 1× Range(prefix=[0x02][ino BE]) |
+| `getattr(ino)` | 1× Get inode |
+| `mkdir(parent, name)` | 1× Put inode + 1× Put dirent + 1× Put parent inode (nlink) |
+| `create(parent, name)` | 同 mkdir |
+| `unlink(parent, name)` | 1× Get dirent + 1× Delete dirent + N× Delete chunks + 1× Delete inode |
+| `rename(old, new)` | 1× Get old dirent + 1× Delete old dirent + 1× Put new dirent |
+| `read(ino, off, size)` | ceil(size/256KB)× Get chunk |
+| `write(ino, off, data)` | 缓冲后: per-chunk 1× Put (对齐) 或 1× Get + 1× Put (非对齐) |
+| `truncate(ino, 0)` | N× Delete chunk + 1× Put inode |
+
 ### 数据存储
 
 - **Chunk 大小**: 256KB
