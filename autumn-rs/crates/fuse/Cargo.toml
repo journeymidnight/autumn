@@ -1,0 +1,32 @@
+[package]
+name = "autumn-fuse"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "autumn-fuse"
+path = "src/main.rs"
+required-features = ["fuse"]
+
+[features]
+default = ["fuse"]
+fuse = ["dep:fuser", "dep:libc", "dep:clap", "dep:crossbeam-channel", "dep:futures", "dep:compio", "dep:rand", "dep:tracing-subscriber"]
+
+[dependencies]
+autumn-rpc = { path = "../rpc" }
+autumn-client = { path = "../client" }
+
+anyhow.workspace = true
+bytes.workspace = true
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
+rkyv = { version = "0.8", features = ["alloc"] }
+fuser = { version = "0.15", optional = true }
+libc = { version = "0.2", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+crossbeam-channel = { version = "0.5", optional = true }
+futures = { version = "0.3", optional = true }
+compio = { version = "0.18", features = ["runtime", "time", "io", "net"], optional = true }
+rand = { version = "0.8", optional = true }

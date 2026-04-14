@@ -8,6 +8,7 @@ members = [
   "crates/partition-server",
   "crates/server",
   "crates/client",
+  "crates/fuse",
   "examples/gallery",
 ]
 resolver = "2"

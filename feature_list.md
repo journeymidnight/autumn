@@ -295,6 +295,16 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 
 ---
 
+## P2.5 — FUSE Filesystem Layer
+
+### F061 · FUSE filesystem: mount autumn-rs KV as POSIX filesystem
+- **Target:** 新 crate `autumn-fuse`，通过 FUSE 将 autumn-rs KV 挂载为 POSIX 文件系统。借鉴 3FS 的高性能 FUSE 架构：1MB 写缓冲 + 30s 周期 sync + 内核级元数据缓存 (attr_timeout=30s)。Inode-based 路径映射（rename O(1)、hardlink 支持）。数据分 256KB chunk 存储。FUSE 线程通过 channel 桥接到 compio 线程。
+- **Evidence:** `3FS/src/fuse/FuseOps.cc` (write buffering, periodic sync) · `3FS/src/fuse/FuseClients.cc` (worker model, dirty inode tracking) · `3FS/src/fuse/IoRing.h` (I/O ring, skipped for v1) · `crates/client/src/lib.rs` (ClusterClient) · `crates/rpc/src/partition_rpc.rs` (Put/Get/Range/Delete RPCs)
+- **Notes:** Phase 1 MVP: init/destroy, lookup/forget/getattr/setattr, mkdir/rmdir/unlink/rename, create/open/read/write/flush/release/fsync, opendir/readdir/releasedir, statfs. Key encoding: [type_prefix:1][inode:u64 BE][name_or_chunk_idx]. 小文件 (≤4KB) inline 在 InodeMeta 中。无跨 key 事务（rename 非原子，v1 接受此限制）。
+- **passes:** false
+
+---
+
 ## P3 — Developer Experience & Operations
 
 ### F024 · Observability: distributed tracing and structured logging
