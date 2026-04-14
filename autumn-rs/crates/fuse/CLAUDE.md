@@ -315,6 +315,45 @@ chunk key 中的 ino 就是 InodeMeta 的 inode 号。
 | `write(ino, off, data)` | 缓冲后: per-chunk 1× Put (对齐) 或 1× Get + 1× Put (非对齐) |
 | `truncate(ino, 0)` | N× Delete chunk + 1× Put inode |
 
+#### 与 Linux ext4 的架构对比
+
+从 dirent 到文件数据的完整查找链路：
+
+```
+Linux ext4:                              autumn-fuse:
+
+dirent("readme.txt") → ino=42          [0x02][parent]["readme.txt"] → {ino=42}
+         │                                        │
+         ▼                                        ▼
+inode_table[42]       O(1) 算术         KV Get [0x01][ino=42]     O(log N)
+  { size, mode,                           { size, mode,
+    extents → disk blocks }                 inline_data }
+         │                                        │
+         ▼                                        ▼
+disk block 1001,1002,1003               KV Get [0x03][ino=42][chunk=0,1,2]
+```
+
+ext4 的 inode table 是 mkfs 时预分配的**固定大小数组**，inode 号直接当下标算磁盘偏移：
+
+```
+ext4:    &inode_table + ino * 256B      → 一次算术，O(1)
+autumn:  KV Get([0x01][ino BE])         → LSM-tree 查找，O(log N)
+         (memtable SkipMap.seek → bloom filter → SSTable 二分查找)
+```
+
+| | ext4 | autumn-fuse |
+|---|---|---|
+| ino → inode 数据 | **O(1) 算术**（ino 是数组下标） | **O(log N) KV Get**（ino 编码在 key 里） |
+| inode → file data | inode 里存 block 指针/extent tree | ino 编码在 chunk key 里，隐式关联 |
+| 数据位置管理 | inode 自己管（extent tree） | KV 存储层管（LSM-tree + ValuePointer） |
+
+ext4 的 inode 里存了 `i_block[15]` 数组或 extent tree，直接指向数据所在的磁盘 block 号。
+autumn-fuse 不需要显式的 block 指针——chunk key `[0x03][ino][chunk_idx]` 本身就是寻址方式，
+数据的物理位置由 KV 存储层（LSM-tree → stream layer → extent node）透明管理。
+
+实际性能差距主要在**网络 RTT**（每次 KV Get 是一次 RPC 到 PartitionServer），
+而非查找算法本身。FUSE 内核缓存（entry_timeout=30s）抵消了大部分重复 lookup 开销。
+
 ### 数据存储
 
 - **Chunk 大小**: 256KB
