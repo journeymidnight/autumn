@@ -443,7 +443,16 @@ impl StreamClient {
             };
 
             let revision = self.revision;
-            let commit = state.commit;
+            // On first append to an existing extent (commit==0 but tail cached),
+            // query actual commit_length from replicas to avoid truncating data
+            // that was written before this StreamClient was created (e.g. after restart).
+            let commit = if state.commit == 0 && state.tail.is_some() {
+                let c = self.current_commit(&tail).await.unwrap_or(0);
+                state.commit = c;
+                c
+            } else {
+                state.commit
+            };
 
             let extent_lookup_started_at = Instant::now();
             // No per-address client setup needed — ConnPool handles it.
@@ -653,9 +662,8 @@ impl StreamClient {
         }
     }
 
-    /// Query commit length from all replicas (min).  Used at partition load
-    /// time (checkCommitLength equivalent), NOT in the hot append path.
-    #[allow(dead_code)]
+    /// Query commit length from all replicas (min). Called on first append
+    /// to an existing extent (commit==0) to avoid truncating pre-existing data.
     async fn current_commit(&self, tail: &StreamTail) -> Result<u32> {
         let mut min_len: Option<u32> = None;
         let revision = self.revision;

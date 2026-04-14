@@ -911,11 +911,18 @@ async fn partition_thread_main(
     }
 
     // Main request processing loop.
-    // Reads (GET/HEAD/RANGE): inline — no spawn, no Rc clone overhead.
-    // Writes (PUT/DELETE/STREAM_PUT) and control ops: spawn — they await
-    // write_tx and must run concurrently for group commit batching.
+    //
+    // Reads (GET/HEAD/RANGE): processed inline (await) — serial, depth=1.
+    //   Spawning reads was tested but showed no improvement due to Rc clone
+    //   overhead and contention on the single-threaded compio runtime.
+    //
+    // Writes (PUT/DELETE/STREAM_PUT): spawned — they await write_tx and must
+    //   run concurrently for group commit batching.
+    //
+    // The now_or_never drain loop serves a mixed read/write workload: when
+    // reads are being processed, any queued write is immediately spawned
+    // rather than waiting behind remaining reads.
     while let Some(req) = req_rx.next().await {
-        // Self-eviction: if the write loop detected LockedByOther, stop serving.
         if locked_by_other.get() {
             tracing::error!(part_id, "partition poisoned by LockedByOther, shutting down");
             break;
@@ -926,7 +933,7 @@ async fn partition_thread_main(
                 &manager_addr, &owner_key, revision,
             ).await;
             let _ = req.resp_tx.send(result);
-            // Drain and process more reads without blocking.
+            // Drain queued requests: continue reads inline, spawn writes immediately.
             loop {
                 match req_rx.next().now_or_never() {
                     Some(Some(req)) if is_read_op(req.msg_type) => {
