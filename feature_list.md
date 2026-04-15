@@ -357,6 +357,12 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 - **Notes:** Fixed. Verifies both flushed (SSTable) and unflushed (logStream only) data survives sequential crashes.
 - **passes:** true
 
+### F063 · System test: owner lock revision fencing (LockedByOther)
+- **Target:** 两个 StreamClient 用不同 owner_key 获取 lock。第二个 client 的更高 revision fence 掉第一个 client 的写入。
+- **Evidence:** `crates/manager/tests/system_locked_by_other.rs`
+- **Notes:** Fixed. Verifies: sc1 writes succeed, sc2 acquires higher revision and writes, sc1's next write gets LockedByOther error, sc2 continues serving.
+- **passes:** true
+
 ---
 
 ## P2.5 — FUSE Filesystem Layer

@@ -7,8 +7,9 @@ Current summary:
     F077: Etcd-first mutation pattern
     F078: Per-disk health check in recovery dispatch
 
-  System tests (9 test cases across 5 files, all pass):
+  System tests (10 test cases across 6 files, all pass):
     F062: Shared test infra (support/mod.rs)
+    F063: Owner lock fencing (LockedByOther)
     F064: Seal during active writes
     F066: Split preserves all data
     F067: Split overlap compaction enables second split
@@ -18,14 +19,9 @@ Current summary:
     F076: Alloc extent falls back on dead node
 
 Remaining system tests (needs etcd or complex setup):
-  F063: PS LockedByOther self-eviction
   F065: Extent recovery end-to-end (needs etcd)
   F068: Manager leader failover (needs etcd)
   F069: PS crash → partition reassigned (needs 30s timeout)
   F071: Manager crash during split (needs etcd)
   F073: Split with large values VP
   F074: Compound: split + PS crash
-
-Next steps:
-  - F063 (LockedByOther) is doable without etcd
-  - F065/F068/F071 require embedded etcd
