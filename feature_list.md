@@ -363,6 +363,18 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 - **Notes:** Fixed. Verifies: sc1 writes succeed, sc2 acquires higher revision and writes, sc1's next write gets LockedByOther error, sc2 continues serving.
 - **passes:** true
 
+### F073 · System test: split with large values — VP resolution across shared extents
+- **Target:** 写入 8KB value (VP)，flush，split。两个 child partition 都能 resolve 指向共享 logStream extent 的 VP。
+- **Evidence:** `crates/manager/tests/system_split_large_values.rs`
+- **Notes:** Fixed. Writes 10 keys with 8KB values, flush, split, verifies all VP resolutions work from both children.
+- **passes:** true
+
+### F074 · System test: compound failure — split + PS crash
+- **Target:** PS1 写入数据 + flush + split 后 crash。PS2 接管，打开两个 child partition，所有数据可读，新写入成功。
+- **Evidence:** `crates/manager/tests/system_compound_failures.rs`
+- **Notes:** Fixed. Writes 23 keys, flush, split → 2 partitions, PS crash, PS2 recovers both children, reads all data, writes new data to both.
+- **passes:** true
+
 ---
 
 ## P2.5 — FUSE Filesystem Layer
