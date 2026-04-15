@@ -160,6 +160,12 @@
 - **Notes:** Fixed. (1) StreamClient: `manager_addr: String` → `manager_addrs: Vec<String>` + `current_mgr: Cell<usize>`, `connect()` tries each manager, `retry_manager_call` rotates on failure, all 10 manager RPC call sites use `self.manager_addr()`. (2) PartitionServer: `connect_with_advertise()` tries each manager for owner lock, `heartbeat_loop` rotates on failure, `region_sync_loop` uses current manager. (3) CLIs accept comma-separated `--manager` addresses (parsed by StreamClient/PartitionServer). All existing tests pass unchanged (single manager = backward compatible).
 - **passes:** true
 
+### F082 · ClusterClient auto-reconnect and multi-manager support
+- **Target:** `ClusterClient`（autumn-client CLI 和 SDK 用的客户端）当前直接持有 `Rc<RpcClient>` 到 manager 和 PS，TCP 断开后所有 call 返回 ConnectionClosed，无重连。修复：(1) 改为使用 `ConnPool`（和 StreamClient 一样），自动在错误时 drop 连接、下次 call 重连；(2) 支持多 manager 地址 + NotLeader round-robin；(3) PS 连接失败时自动 refresh_regions 重新路由。
+- **Evidence:** `crates/client/src/lib.rs` (mgr: Rc<RpcClient>, ps_conns: HashMap<String, Rc<RpcClient>>) · `crates/stream/src/conn_pool.rs` (ConnPool 已实现 error→drop→reconnect)
+- **Notes:** Fixed. ClusterClient 重写：(1) `mgr: Rc<RpcClient>` → `mgr_conn: RefCell<Option<Rc<RpcClient>>>` + `manager_addrs: Vec<String>` + `current_mgr: Cell<usize>`；(2) `mgr_call()` 错误时 drop 连接，下次自动重连；(3) `mgr_call_retry()` round-robin 所有 manager；(4) `ps_call()` 错误时 drop PS 连接自动重连；(5) `connect()` 支持逗号分隔 manager 地址。CLI `autumn_client.rs` 所有 `.mgr()` 调用更新为 `.mgr()?`。
+- **passes:** true
+
 ### F012 · Erasure coding parity with Go implementation
 - **Target:** EC encode/decode/recovery path equivalent to Go `erasure_code` package (Reed-Solomon, K-of-N recovery).
 - **Evidence:** `erasure_code/*.go` · `autumn-rs/crates/stream/src/*`

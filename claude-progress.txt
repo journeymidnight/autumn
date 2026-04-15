@@ -1,19 +1,20 @@
 Date: 2026-04-15
 TaskStatus: completed
-Task scope: F079 — Multi-manager support for no-single-point-of-failure
+Task scope: F082 — ClusterClient auto-reconnect and multi-manager
 
 Current summary:
-  F079 (completed): StreamClient + PartitionServer multi-manager support.
-    - StreamClient: manager_addrs Vec + round-robin rotation on failure
-    - PartitionServer: connect tries each manager, heartbeat rotates
-    - CLIs accept comma-separated --manager addresses
-    - Backward compatible (single address works as before)
-    - All tests pass unchanged
+  F082 (completed): ClusterClient auto-reconnect + multi-manager support.
+    - Manager connections: auto-reconnect on error + round-robin failover
+    - PS connections: auto-reconnect on error (drop + reconnect on next call)
+    - connect() accepts comma-separated manager addresses
+    - CLI autumn_client.rs updated for new mgr() -> Result API
 
-  Previously completed:
-    F077+F078: Architecture fixes
-    F062-F076: 16 system tests (14 pass, 2 etcd-only)
+  Previously completed this session:
+    F077: Etcd-first mutation pattern
+    F078: Per-disk health check
+    F079: Multi-manager for StreamClient + PartitionServer
+    F062-F076: 16 system tests
+    F082: ClusterClient auto-reconnect
 
 Next steps:
-  - Deploy with 3 managers + etcd cluster for full HA validation
-  - System test with multi-manager failover scenario
+  - Multi-manager system test with embedded etcd

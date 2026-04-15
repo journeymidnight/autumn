@@ -888,7 +888,7 @@ async fn main() -> Result<()> {
 
             for (idx, (start_key, end_key)) in ranges.iter().enumerate() {
                 let create_stream = async {
-                    let resp_bytes = client.mgr()
+                    let resp_bytes = client.mgr()?
                         .call(
                             MSG_CREATE_STREAM,
                             rkyv_encode(&CreateStreamReq {
@@ -906,7 +906,7 @@ async fn main() -> Result<()> {
                 let log_stream_id = create_stream.await.context("create log stream")?;
 
                 let create_stream = async {
-                    let resp_bytes = client.mgr()
+                    let resp_bytes = client.mgr()?
                         .call(MSG_CREATE_STREAM, rkyv_encode(&CreateStreamReq { replicates, ec_data_shard: 0, ec_parity_shard: 0 }))
                         .await.context("create stream")?;
                     let resp: CreateStreamResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
@@ -915,7 +915,7 @@ async fn main() -> Result<()> {
                 let row_stream_id = create_stream.await.context("create row stream")?;
 
                 let create_stream = async {
-                    let resp_bytes = client.mgr()
+                    let resp_bytes = client.mgr()?
                         .call(MSG_CREATE_STREAM, rkyv_encode(&CreateStreamReq { replicates, ec_data_shard: 0, ec_parity_shard: 0 }))
                         .await.context("create stream")?;
                     let resp: CreateStreamResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
@@ -941,7 +941,7 @@ async fn main() -> Result<()> {
                 };
 
                 let resp_bytes = client
-                    .mgr()
+                    .mgr()?
                     .call(
                         MSG_UPSERT_PARTITION,
                         rkyv_encode(&UpsertPartitionReq { meta }),
@@ -1188,7 +1188,7 @@ async fn main() -> Result<()> {
 
         Command::RegisterNode { addr, disks } => {
             let resp_bytes = client
-                .mgr()
+                .mgr()?
                 .call(
                     MSG_REGISTER_NODE,
                     rkyv_encode(&RegisterNodeReq {
@@ -1219,7 +1219,7 @@ async fn main() -> Result<()> {
             }
 
             let resp_bytes = client
-                .mgr()
+                .mgr()?
                 .call(
                     MSG_REGISTER_NODE,
                     rkyv_encode(&RegisterNodeReq {
@@ -1913,7 +1913,7 @@ async fn main() -> Result<()> {
 
         Command::Info => {
             let stream_resp_bytes = client
-                .mgr()
+                .mgr()?
                 .call(
                     MSG_STREAM_INFO,
                     rkyv_encode(&StreamInfoReq {
@@ -1926,7 +1926,7 @@ async fn main() -> Result<()> {
                 rkyv_decode(&stream_resp_bytes).map_err(decode_err)?;
 
             let nodes_resp_bytes = client
-                .mgr()
+                .mgr()?
                 .call(MSG_NODES_INFO, Bytes::new())
                 .await
                 .context("nodes info")?;
@@ -1934,7 +1934,7 @@ async fn main() -> Result<()> {
                 rkyv_decode(&nodes_resp_bytes).map_err(decode_err)?;
 
             let regions_resp_bytes = client
-                .mgr()
+                .mgr()?
                 .call(MSG_GET_REGIONS, Bytes::new())
                 .await
                 .context("get regions")?;
