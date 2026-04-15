@@ -363,6 +363,12 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 - **Notes:** Fixed. Verifies: sc1 writes succeed, sc2 acquires higher revision and writes, sc1's next write gets LockedByOther error, sc2 continues serving.
 - **passes:** true
 
+### F065 · System test: extent recovery — sealed extent health check
+- **Target:** 3 extent nodes, 2-replica sealed extent。验证 recovery dispatch loop 正确识别健康 replica（无误触发 recovery），数据可读。
+- **Evidence:** `crates/manager/tests/system_extent_recovery.rs`
+- **Notes:** Fixed. Two tests: (1) extent_recovery_replaces_dead_node — seal, verify health, data readable; (2) recovery_dispatch_skips_healthy_sealed_extents — no spurious recovery after 6s.
+- **passes:** true
+
 ### F073 · System test: split with large values — VP resolution across shared extents
 - **Target:** 写入 8KB value (VP)，flush，split。两个 child partition 都能 resolve 指向共享 logStream extent 的 VP。
 - **Evidence:** `crates/manager/tests/system_split_large_values.rs`

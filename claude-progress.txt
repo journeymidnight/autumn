@@ -1,27 +1,30 @@
 Date: 2026-04-15
 TaskStatus: completed
-Task scope: F077+F078 (arch fixes) + F062-F076 system tests
+Task scope: Distributed system analysis + arch fixes + system tests
 
 Current summary:
-  Architecture fixes:
-    F077: Etcd-first mutation pattern
-    F078: Per-disk health check in recovery dispatch
+  Architecture fixes (2):
+    F077: Etcd-first mutation pattern for all mutating handlers
+    F078: Proactive per-disk health check in recovery dispatch
 
-  System tests (12 test cases across 8 files, all pass):
+  System tests (16 test cases across 10 files):
+    14 pass normally, 2 require etcd (#[ignore])
+
     F062: Shared test infra (support/mod.rs)
     F063: Owner lock fencing (LockedByOther)
-    F064: Seal during active writes
+    F064: Seal during active writes — client retry
+    F065: Extent recovery — sealed extent health check (2 tests)
     F066: Split preserves all data
-    F067: Split overlap compaction enables second split
+    F067: Split overlap compaction → second split
+    F068: Manager failover preserves state (#[ignore], needs etcd)
     F070: PS crash unflushed data recoverable
-    F072: Extent node crash — StreamClient retries
+    F071: Manager crash during split (#[ignore], needs etcd)
+    F072: Extent node crash — StreamClient retries (2 tests)
     F073: Split with large values VP resolution
     F074: Compound: split + PS crash
     F075: Sequential PS crash — data accumulates
     F076: Alloc extent falls back on dead node
+    +    Split extent ref counting test
 
-Remaining (needs etcd):
-  F065: Extent recovery end-to-end
-  F068: Manager leader failover
-  F069: PS crash → partition reassigned (30s timeout)
-  F071: Manager crash during split
+Remaining (not implemented):
+  F069: PS crash → partition reassigned (30s timeout, complex)
