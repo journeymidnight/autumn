@@ -339,6 +339,24 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 - **Notes:** Fixed. Covered by F072's second test case.
 - **passes:** true
 
+### F066 · System test: split preserves all data
+- **Target:** Partition `[a, z)` 写入分布在整个 range 的 keys，flush 后 split。验证所有 key 在正确的 child partition 中可读，无数据丢失。
+- **Evidence:** `crates/manager/tests/system_split_writes.rs`
+- **Notes:** Fixed. Writes 23 keys (b-key..x-key), split, verifies each key readable from correct child based on mid_key.
+- **passes:** true
+
+### F070 · System test: PS crash unflushed data recoverable from logStream
+- **Target:** PS 写入 50 个 KV（全在 memtable，不 flush），crash。新 PS 从 logStream replay，50 个 KV 全部可读。
+- **Evidence:** `crates/manager/tests/system_ps_recovery.rs`
+- **Notes:** Fixed. Test uses must_sync=true to ensure data committed to logStream. New PS with same ps_id takes over and recovers all data.
+- **passes:** true
+
+### F075 · System test: sequential PS crash — data accumulates
+- **Target:** PS1 写 batch1+flush 后 crash；PS2 写 batch2（不 flush）后 crash；PS3 恢复 batch1 + batch2。
+- **Evidence:** `crates/manager/tests/system_ps_recovery.rs`
+- **Notes:** Fixed. Verifies both flushed (SSTable) and unflushed (logStream only) data survives sequential crashes.
+- **passes:** true
+
 ---
 
 ## P2.5 — FUSE Filesystem Layer
