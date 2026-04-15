@@ -124,6 +124,8 @@ async fn ps_get(ps: &RpcClient, part_id: u64, key: &[u8]) -> partition_rpc::GetR
             partition_rpc::rkyv_encode(&partition_rpc::GetReq {
                 part_id,
                 key: key.to_vec(),
+                offset: 0,
+                length: 0,
             }),
         )
         .await

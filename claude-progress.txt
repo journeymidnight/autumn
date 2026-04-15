@@ -1,22 +1,35 @@
-Date: 2026-04-13
-TaskStatus: not_completed
-Task scope: F061 — FUSE filesystem layer (autumn-fuse crate)
+Date: 2026-04-15
+TaskStatus: completed
+Task scope: F077 + F078 + F062 + F064 + F067 + F072 + F076
 
 Current summary:
-  Created autumn-fuse crate with full Phase 1 MVP implementation.
-  Code compiles and builds. 6 unit tests pass.
-  Manual test INVALID — macFUSE kext not loaded, tests ran on local FS not autumn-rs.
-  Need macOS reboot to enable macFUSE kext, then re-test.
+  Architecture fixes:
+    F077 (completed): Etcd-first mutation pattern for all mutating handlers
+    F078 (completed): Proactive per-disk health check in recovery dispatch
 
-Implementation:
-  schema.rs, key.rs (6 unit tests), bridge.rs, state.rs, meta.rs, dir.rs,
-  read.rs, write.rs (1MB buffering), sync_task.rs (30s+jitter), ops.rs,
-  dispatch.rs, main.rs
+  System test infrastructure:
+    F062 (completed): Shared test helpers in support/mod.rs
 
-Key fix applied: compio version conflict (local vs crates.io) resolved.
+  System tests:
+    F064 (completed): Seal during active writes — client retry
+    F067 (completed): Split overlap compaction enables second split
+    F072 (completed): Extent node crash — StreamClient retries
+    F076 (completed): Stream alloc falls back on dead node
 
-Blocker: macFUSE kext blocked by macOS. User needs to:
-  1. System Settings → Privacy & Security → Allow "Benjamin Fleischer"
-  2. Reboot Mac
-  3. Verify: kextstat | grep macfuse
-  4. Then re-run tests
+  All tests pass: 10 integration + 5 EC + 4 system tests.
+
+Remaining system tests (not started):
+  F063: PS LockedByOther self-eviction
+  F065: Extent recovery end-to-end (needs etcd)
+  F066: Split during active writes — no data loss
+  F068: Manager leader failover (needs etcd)
+  F069: PS crash → partition reassigned (needs timeout wait)
+  F070: PS crash unflushed data recoverable
+  F071: Manager crash during split (needs etcd)
+  F073: Split with large values VP resolution
+  F074: Compound: split + PS crash
+  F075: Sequential PS crash data accumulates
+
+Next steps:
+  - F063 (LockedByOther) and F070 (PS crash recovery) are next priority
+  - F065/F068/F071 require etcd

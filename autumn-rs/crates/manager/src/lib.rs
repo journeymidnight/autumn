@@ -274,6 +274,12 @@ impl AutumnManager {
 
         let mgr = self.clone();
         compio::runtime::spawn(async move {
+            mgr.disk_status_update_loop().await;
+        })
+        .detach();
+
+        let mgr = self.clone();
+        compio::runtime::spawn(async move {
             mgr.ec_conversion_dispatch_loop().await;
         })
         .detach();
@@ -748,12 +754,14 @@ impl AutumnManager {
         }
     }
 
-    fn duplicate_stream(
-        state: &mut autumn_common::MetadataState,
+    /// Compute the mutations for duplicating a stream (CoW for split).
+    /// Returns (new_stream, modified_extents) WITHOUT modifying state.
+    fn compute_duplicate_stream(
+        state: &autumn_common::MetadataState,
         src_stream_id: u64,
         dst_stream_id: u64,
         sealed_length: u32,
-    ) -> Result<(), AppError> {
+    ) -> Result<(MgrStreamInfo, Vec<MgrExtentInfo>), AppError> {
         let src = state
             .streams
             .get(&src_stream_id)
@@ -767,22 +775,43 @@ impl AutumnManager {
             ec_parity_shard: src.ec_parity_shard,
         };
 
+        let mut modified_extents = Vec::new();
         for (idx, extent_id) in src.extent_ids.iter().enumerate() {
             let extent = state
                 .extents
-                .get_mut(extent_id)
+                .get(extent_id)
                 .ok_or_else(|| AppError::NotFound(format!("extent {extent_id}")))?;
-            extent.refs += 1;
-            extent.eversion += 1;
-            if idx == src.extent_ids.len() - 1 && extent.sealed_length == 0 && sealed_length > 0 {
-                extent.sealed_length = sealed_length as u64;
-                extent.avali = Self::all_bits(extent.replicates.len() + extent.parity.len());
+            let mut ex = extent.clone();
+            ex.refs += 1;
+            ex.eversion += 1;
+            if idx == src.extent_ids.len() - 1 && ex.sealed_length == 0 && sealed_length > 0 {
+                ex.sealed_length = sealed_length as u64;
+                ex.avali = Self::all_bits(ex.replicates.len() + ex.parity.len());
             }
+            modified_extents.push(ex);
             dst.extent_ids.push(*extent_id);
         }
 
-        state.streams.insert(dst_stream_id, dst);
-        Ok(())
+        Ok((dst, modified_extents))
+    }
+
+    /// Apply computed split mutations to the in-memory store.
+    fn apply_split_mutations(
+        state: &mut autumn_common::MetadataState,
+        new_streams: &[MgrStreamInfo],
+        modified_extents: &[MgrExtentInfo],
+        left: MgrPartitionMeta,
+        right: MgrPartitionMeta,
+    ) {
+        for ex in modified_extents {
+            state.extents.insert(ex.extent_id, ex.clone());
+        }
+        for st in new_streams {
+            state.streams.insert(st.stream_id, st.clone());
+        }
+        state.partitions.insert(left.part_id, left);
+        state.partitions.insert(right.part_id, right);
+        Self::rebalance_regions(state);
     }
 
     fn extent_nodes(extent: &MgrExtentInfo) -> Vec<u64> {

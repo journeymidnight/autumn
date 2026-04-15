@@ -174,11 +174,12 @@ impl AutumnManager {
                 continue;
             }
 
-            let (extents, nodes) = {
+            let (extents, nodes, disks) = {
                 let s = self.store.inner.borrow();
                 (
                     s.extents.values().cloned().collect::<Vec<_>>(),
                     s.nodes.clone(),
+                    s.disks.clone(),
                 )
             };
 
@@ -190,6 +191,26 @@ impl AutumnManager {
                 for (slot, node_id) in copies.iter().copied().enumerate() {
                     let bit = 1u32 << slot;
                     let node = nodes.get(&node_id).cloned();
+
+                    // Check per-disk health: if the disk holding this replica is
+                    // offline, dispatch recovery even if the node is reachable.
+                    let disk_id = if slot < ex.replicate_disks.len() {
+                        Some(ex.replicate_disks[slot])
+                    } else {
+                        let parity_slot = slot.checked_sub(ex.replicates.len());
+                        parity_slot.and_then(|ps| ex.parity_disks.get(ps).copied())
+                    };
+                    if let Some(did) = disk_id {
+                        if let Some(disk) = disks.get(&did) {
+                            if !disk.online {
+                                let _ = self
+                                    .dispatch_recovery_task(ex.extent_id, node_id)
+                                    .await;
+                                continue;
+                            }
+                        }
+                    }
+
                     if (ex.avali & bit) == 0 {
                         if let Some(n) = node.clone() {
                             let addr = Self::normalize_endpoint(&n.address);
@@ -269,8 +290,57 @@ impl AutumnManager {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
+                // Update disk online status from df response
+                if !df.disk_status.is_empty() {
+                    let mut s = self.store.inner.borrow_mut();
+                    for (disk_id, status) in &df.disk_status {
+                        if let Some(disk) = s.disks.get_mut(disk_id) {
+                            disk.online = status.online;
+                        }
+                    }
+                }
                 for done in df.done_tasks {
                     let _ = self.apply_recovery_done(done).await;
+                }
+            }
+        }
+    }
+
+    /// Periodically polls all extent nodes for disk status updates.
+    /// Matches Go's `routineUpdateDF` (10-20s interval).
+    pub(crate) async fn disk_status_update_loop(self) {
+        loop {
+            compio::time::sleep(Duration::from_secs(10)).await;
+            if !self.leader.get() {
+                continue;
+            }
+
+            let nodes = {
+                let s = self.store.inner.borrow();
+                s.nodes.clone()
+            };
+
+            for node in nodes.values() {
+                let addr = Self::normalize_endpoint(&node.address);
+                let payload = rkyv_encode(&ExtDfReq {
+                    tasks: Vec::new(),
+                    disk_ids: Vec::new(),
+                });
+                let resp = match self.conn_pool.call(&addr, EXT_MSG_DF, payload).await {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let df: ExtDfResp = match rkyv_decode(&resp) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if !df.disk_status.is_empty() {
+                    let mut s = self.store.inner.borrow_mut();
+                    for (disk_id, status) in &df.disk_status {
+                        if let Some(disk) = s.disks.get_mut(disk_id) {
+                            disk.online = status.online;
+                        }
+                    }
                 }
             }
         }

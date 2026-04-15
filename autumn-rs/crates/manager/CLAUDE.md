@@ -110,9 +110,13 @@ After split, both left and right partitions initially share the same physical ex
 
 ### Dispatch Loop (every 2 seconds)
 Scans all sealed extents. For each replica slot:
+- **Per-disk health check first**: looks up the disk_id from `replicate_disks`/`parity_disks`, checks `store.disks[disk_id].online`. If offline, immediately dispatch recovery (matches Go's `routineDispatchTask` pattern).
 - Probes with `commit_length` RPC (or `re_avali` for known lagging replicas).
 - If the node doesn't respond or returns an error: dispatch `require_recovery` to a healthy candidate node.
 - Tracks in-flight recoveries in `recovery_tasks` to avoid double-dispatching.
+
+### Disk Status Update Loop (every 10 seconds)
+Polls all registered extent nodes via `df` RPC to update per-disk online status in `store.disks`. Matches Go's `routineUpdateDF`. Disk status is also updated opportunistically in the collect loop when polling for recovery task completion.
 
 ### Collect Loop (every 2 seconds)
 Polls all registered nodes with the `df` RPC. The response includes completed recovery tasks. For each completion:
@@ -144,14 +148,14 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
 
 ## Programming Notes
 
-1. **Every state mutation needs etcd mirroring** — if you add a new mutation, add a corresponding etcd mirror call. Forgetting this causes state loss on leader failover.
+1. **Etcd-first mutation pattern** — all mutating RPC handlers follow: (1) compute mutations without modifying store, (2) persist to etcd, (3) apply to in-memory store. This ensures manager crash after step 1 but before step 2 leaves etcd and memory consistent. Exception: `register_ps`/`upsert_partition` apply to memory first because `mirror_partition_snapshot` reads from the store (these are idempotent on retry). The old function `duplicate_stream` (which modified state directly) has been replaced by `compute_duplicate_stream` (read-only) + `apply_split_mutations`.
 
-2. **`duplicate_stream` increments extent `refs`** — this is the ref-counting mechanism for CoW. If you add new ways to share extents, increment refs. If you add new ways to remove extents, decrement refs and only delete when refs → 0.
+2. **`compute_duplicate_stream` increments extent `refs`** — this is the ref-counting mechanism for CoW. If you add new ways to share extents, increment refs. If you add new ways to remove extents, decrement refs and only delete when refs → 0.
 
 3. **Owner revision must be validated before any stream mutation** — call `ensure_owner_revision` at the start of `stream_alloc_extent`, `stream_punch_holes`, `truncate`, `multi_modify_split`. Missing this allows split-brain.
 
 4. **Leader check** — some RPCs should only execute when `self.leader.load()` is true. Writes to etcd from a non-leader will fail (etcd lease is expired), which will surface as an error.
 
-5. **`alloc_ids` is the only ID source** — never generate IDs any other way. The `next_id` is persisted to etcd so IDs are globally unique across restarts.
+5. **`alloc_ids` is the only ID source** — never generate IDs any other way. The `next_id` is derived from `max(all_entity_ids) + 1` during `replay_from_etcd`, so wasted IDs from failed mutations are safe.
 
 6. **Rebalance is called eagerly** — `rebalance_regions` after every PS registration or partition upsert. This is safe because it's idempotent (keeps existing assignments, only changes unassigned ones).

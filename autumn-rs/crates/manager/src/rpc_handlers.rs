@@ -904,9 +904,11 @@ impl AutumnManager {
         let req: MultiModifySplitReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
+        // Phase 1: Compute all mutations without modifying store
+        // (only alloc_ids touches state.next_id, which is safe to waste on failure)
         let out = {
             let mut s = self.store.inner.borrow_mut();
-            (|| -> Result<(Vec<MgrStreamInfo>, Vec<MgrExtentInfo>), AppError> {
+            (|| -> Result<(Vec<MgrStreamInfo>, Vec<MgrExtentInfo>, MgrPartitionMeta, MgrPartitionMeta), AppError> {
                 Self::ensure_owner_revision(&req.owner_key, req.revision, &s)?;
 
                 let src_meta = s
@@ -914,31 +916,6 @@ impl AutumnManager {
                     .get(&req.part_id)
                     .cloned()
                     .ok_or_else(|| AppError::NotFound(format!("part {}", req.part_id)))?;
-                let src_log = s
-                    .streams
-                    .get(&src_meta.log_stream)
-                    .cloned()
-                    .ok_or_else(|| {
-                        AppError::NotFound(format!("stream {}", src_meta.log_stream))
-                    })?;
-                let src_row = s
-                    .streams
-                    .get(&src_meta.row_stream)
-                    .cloned()
-                    .ok_or_else(|| {
-                        AppError::NotFound(format!("stream {}", src_meta.row_stream))
-                    })?;
-                let src_meta_stream = s
-                    .streams
-                    .get(&src_meta.meta_stream)
-                    .cloned()
-                    .ok_or_else(|| {
-                        AppError::NotFound(format!("stream {}", src_meta.meta_stream))
-                    })?;
-                let mut touched_extents = HashSet::new();
-                touched_extents.extend(src_log.extent_ids.iter().copied());
-                touched_extents.extend(src_row.extent_ids.iter().copied());
-                touched_extents.extend(src_meta_stream.extent_ids.iter().copied());
 
                 let rg = src_meta
                     .rg
@@ -959,28 +936,25 @@ impl AutumnManager {
                 let new_meta_stream = start + 2;
                 let new_part_id = end - 1;
 
-                Self::duplicate_stream(
-                    &mut s,
-                    src_meta.log_stream,
-                    new_log_stream,
-                    req.log_stream_sealed_length,
+                // Compute stream duplications without modifying state
+                let (log_dup, log_exts) = Self::compute_duplicate_stream(
+                    &s, src_meta.log_stream, new_log_stream, req.log_stream_sealed_length,
                 )?;
-                Self::duplicate_stream(
-                    &mut s,
-                    src_meta.row_stream,
-                    new_row_stream,
-                    req.row_stream_sealed_length,
+                let (row_dup, row_exts) = Self::compute_duplicate_stream(
+                    &s, src_meta.row_stream, new_row_stream, req.row_stream_sealed_length,
                 )?;
-                Self::duplicate_stream(
-                    &mut s,
-                    src_meta.meta_stream,
-                    new_meta_stream,
-                    req.meta_stream_sealed_length,
+                let (meta_dup, meta_exts) = Self::compute_duplicate_stream(
+                    &s, src_meta.meta_stream, new_meta_stream, req.meta_stream_sealed_length,
                 )?;
+
+                let new_streams = vec![log_dup, row_dup, meta_dup];
+                let mut all_extents = Vec::new();
+                all_extents.extend(log_exts);
+                all_extents.extend(row_exts);
+                all_extents.extend(meta_exts);
 
                 let mut left = src_meta.clone();
                 let mut right = src_meta;
-
                 left.rg = Some(MgrRange {
                     start_key: rg.start_key.clone(),
                     end_key: req.mid_key.clone(),
@@ -994,38 +968,36 @@ impl AutumnManager {
                     end_key: rg.end_key,
                 });
 
-                s.partitions.insert(left.part_id, left);
-                s.partitions.insert(right.part_id, right);
-                Self::rebalance_regions(&mut s);
-
-                let changed_streams = vec![new_log_stream, new_row_stream, new_meta_stream]
-                    .into_iter()
-                    .filter_map(|id| s.streams.get(&id).cloned())
-                    .collect::<Vec<_>>();
-                let changed_extents = touched_extents
-                    .into_iter()
-                    .filter_map(|id| s.extents.get(&id).cloned())
-                    .collect::<Vec<_>>();
-
-                Ok((changed_streams, changed_extents))
+                Ok((new_streams, all_extents, left, right))
             })()
         };
 
         match out {
-            Ok((changed_streams, changed_extents)) => {
+            Ok((new_streams, modified_extents, left, right)) => {
+                // Phase 2: Persist streams and extents to etcd FIRST
                 if let Some(etcd) = &self.etcd {
                     let mut kvs =
-                        Vec::with_capacity(changed_streams.len() + changed_extents.len());
-                    for st in &changed_streams {
+                        Vec::with_capacity(new_streams.len() + modified_extents.len());
+                    for st in &new_streams {
                         kvs.push((format!("streams/{}", st.stream_id), rkyv_encode(st).to_vec()));
                     }
-                    for ex in &changed_extents {
+                    for ex in &modified_extents {
                         kvs.push((format!("extents/{}", ex.extent_id), rkyv_encode(ex).to_vec()));
                     }
                     etcd.put_msgs_txn(kvs)
                         .await
                         .map_err(|e| (StatusCode::Internal, e.to_string()))?;
                 }
+
+                // Phase 3: Apply to in-memory store AFTER etcd success
+                {
+                    let mut s = self.store.inner.borrow_mut();
+                    Self::apply_split_mutations(
+                        &mut s, &new_streams, &modified_extents, left, right,
+                    );
+                }
+
+                // Phase 4: Mirror partition snapshot to etcd
                 if let Err(err) = self.mirror_partition_snapshot().await {
                     return Ok(rkyv_encode(&CodeResp {
                         code: Self::err_to_code(&err),

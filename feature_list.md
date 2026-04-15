@@ -223,6 +223,18 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 
 ## P0 — Fault Recovery Parity (correctness & data safety)
 
+### F077 · Fix split etcd atomicity: etcd txn before in-memory commit
+- **Target:** `handle_multi_modify_split` 当前先更新内存状态再写 etcd txn。如果 etcd 写入失败，内存已 commit 但 etcd 没有，manager crash 后新 leader replay 丢失 split。修复：改为 Go 模式——先 etcd txn，成功后再更新内存。
+- **Evidence:** `crates/manager/src/rpc_handlers.rs` · Go: `manager/stream_manager/sm_multi_modify.go` (lines 175-178)
+- **Notes:** Fixed. All 6 mutating handlers refactored to etcd-first pattern: register_node, create_stream, stream_alloc_extent, punch_holes, truncate, multi_modify_split. `duplicate_stream` replaced by read-only `compute_duplicate_stream` + `apply_split_mutations`. Exception: register_ps/upsert_partition keep memory-first (mirror_partition_snapshot reads from store, idempotent on retry). 15 integration tests pass.
+- **passes:** true
+
+### F078 · Manager proactive per-disk health check for recovery dispatch
+- **Target:** Manager 的 `recovery_dispatch_loop` 只检查 node 级别 health，不检查 disk 级别。Go 的 `routineDispatchTask` 主动检查每个 sealed extent 对应 disk 的 online 状态，offline 的立即 dispatch recovery。
+- **Evidence:** `crates/manager/src/recovery.rs` · Go: `manager/stream_manager/sm_tasks.go` (lines 429-445)
+- **Notes:** Fixed. Three changes: (1) `disk_status_update_loop` (10s interval) polls all nodes via `df` RPC, updates `store.disks[].online`; (2) `recovery_dispatch_loop` checks per-disk online status before node-level health check — offline disk triggers immediate recovery dispatch; (3) `recovery_collect_loop` also updates disk status opportunistically from `df` responses. 15 integration + 5 EC tests pass.
+- **passes:** true
+
 ### F050 · Fix partition recovery logStream replay data loss
 - **Target:** `recover_partition` replays logStream entries into a local `Memtable` that is then dropped — all entries newer than the last SST flush are silently lost on crash recovery. Fix: return the recovered `Memtable` (or replay info) and use it as `PartitionData.active`.
 - **Evidence:** `crates/partition-server/src/lib.rs` (recover_partition line 999, partition_thread_main line 800) · Go: `range_partition/range_partition.go` (OpenRangePartition replays into rp.writeToLSM)
@@ -291,6 +303,40 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 - **Target:** Manager's internal ConnPool (`Rc<RefCell<RpcConn>>`) must detect broken connections and reconnect. When `call()` returns a connection error, evict the entry so next call creates a fresh connection.
 - **Evidence:** `crates/manager/src/lib.rs` (ConnPool with no eviction)
 - **Notes:** Fixed as part of F054. Manager ConnPool.call() removes entry on error; next call reconnects.
+- **passes:** true
+
+---
+
+## P0.8 — Distributed System Tests (fault tolerance & stability)
+
+### F062 · System test infrastructure: shared helpers and ShutdownFlag
+- **Target:** 构建系统测试基础设施：共享 helper 模块 `support/mod.rs`，包含 ShutdownFlag、pick_addr、start_manager/extent_node/partition_server、所有 RPC helper、poll_until、setup patterns。
+- **Evidence:** `crates/manager/tests/support/mod.rs` · `crates/manager/tests/integration.rs` (原始重复 helper)
+- **Notes:** Fixed. Shared module at `crates/manager/tests/support/mod.rs` with: ShutdownFlag (Arc<AtomicBool>), pick_addr, start_manager/extent_node/partition_server, register_node/create_stream/create_three_streams/upsert_partition/get_regions, ps_put/get/flush/compact/gc, setup_two_node_infra/register_two_nodes/setup_full_partition, poll_until/poll_until_async, decode_last_table_locations.
+- **passes:** true
+
+### F064 · System test: seal during active writes — client retry
+- **Target:** StreamClient 持续 append，另一个 client 调用 `stream_alloc_extent` seal 当前 tail。验证 fresh StreamClient 后续 append 落在新 extent。
+- **Evidence:** `crates/manager/tests/system_seal_during_writes.rs`
+- **Notes:** Fixed. Test verifies: pre-seal writes succeed, manager seal creates 2nd extent, fresh StreamClient appends land on new extent, old extent data still readable.
+- **passes:** true
+
+### F067 · System test: split overlap compaction enables second split
+- **Target:** 创建 partition，写入 + flush，split。验证 child 有 has_overlap，第二次 split 被 reject。Major compaction 后 overlap 清除，第二次 split 成功。
+- **Evidence:** `crates/manager/tests/system_split_overlap.rs`
+- **Notes:** Fixed. Test verifies: first split → 2 partitions, second split rejected (has_overlap), compaction clears overlap, third split → 3 partitions, data readable.
+- **passes:** true
+
+### F072 · System test: extent node crash — StreamClient retries on new extent
+- **Target:** 3 extent nodes, 2-replica stream。验证 dead node 时 stream_alloc_extent 能 fallback 到健康节点。
+- **Evidence:** `crates/manager/tests/system_extent_failover.rs`
+- **Notes:** Fixed. Two tests: (1) extent_node_unreachable_stream_client_retries — writes continue on healthy replicas; (2) alloc_extent_falls_back_on_dead_node — manager fallback to healthy nodes when preferred node is dead.
+- **passes:** true
+
+### F076 · System test: stream client alloc falls back on dead node
+- **Target:** 3 extent nodes, kill node1。stream_alloc_extent 跳过 node1，在健康节点分配 extent。
+- **Evidence:** `crates/manager/tests/system_extent_failover.rs` (alloc_extent_falls_back_on_dead_node)
+- **Notes:** Fixed. Covered by F072's second test case.
 - **passes:** true
 
 ---
