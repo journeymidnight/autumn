@@ -115,9 +115,10 @@ impl StreamAppendMetrics {
 /// A lock-free StreamClient where operations on different stream_ids
 /// never block each other.  No external Mutex is required.
 pub struct StreamClient {
-    // TODO(F044): replace with autumn-rpc manager client
-    #[allow(dead_code)]
-    manager_addr: String,
+    /// Manager addresses for round-robin failover on NotLeader.
+    manager_addrs: Vec<String>,
+    /// Current manager index (round-robin on NotLeader).
+    current_mgr: std::cell::Cell<usize>,
     owner_key: String,
     revision: i64,
     max_extent_size: u32,
@@ -134,8 +135,20 @@ pub struct StreamClient {
 }
 
 impl StreamClient {
-    /// Retry a manager RPC with backoff. Used for critical manager calls
-    /// (alloc, commit check, stream info) to tolerate brief manager outages.
+    /// Current manager address (round-robin index).
+    fn manager_addr(&self) -> &str {
+        &self.manager_addrs[self.current_mgr.get() % self.manager_addrs.len()]
+    }
+
+    /// Rotate to the next manager address (round-robin).
+    fn rotate_manager(&self) {
+        let next = (self.current_mgr.get() + 1) % self.manager_addrs.len();
+        self.current_mgr.set(next);
+    }
+
+    /// Retry a manager RPC with backoff and round-robin on NotLeader.
+    /// The closure should use `self.manager_addr()` which reflects the
+    /// current leader after rotation.
     async fn retry_manager_call<F, Fut, T>(&self, label: &str, max_retries: u32, f: F) -> Result<T>
     where
         F: Fn() -> Fut,
@@ -143,6 +156,7 @@ impl StreamClient {
     {
         let mut attempt = 0u32;
         loop {
+            let addr = self.manager_addr().to_string();
             match f().await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
@@ -150,12 +164,16 @@ impl StreamClient {
                     if attempt > max_retries {
                         return Err(e.context(format!("{label} failed after {max_retries} retries")));
                     }
+                    // Rotate to next manager on any failure (NotLeader or connection error)
+                    self.rotate_manager();
                     tracing::warn!(
                         attempt,
                         max_retries,
+                        manager = %addr,
                         error = %e,
-                        "{} failed, retrying in 500ms",
+                        "{} failed, retrying in 500ms (next: {})",
                         label,
+                        self.manager_addr(),
                     );
                     compio::time::sleep(Duration::from_millis(500)).await;
                 }
@@ -169,36 +187,54 @@ impl StreamClient {
         max_extent_size: u32,
         pool: Rc<ConnPool>,
     ) -> Result<Self> {
-        let mgr_addr = crate::conn_pool::normalize_endpoint(manager_endpoint);
+        let mgr_addrs: Vec<String> = manager_endpoint
+            .split(',')
+            .map(|s| crate::conn_pool::normalize_endpoint(s.trim()))
+            .collect();
+        let mgr_addr = &mgr_addrs[0];
         let req = manager_rpc::rkyv_encode(&AcquireOwnerLockReq {
             owner_key: owner_key.clone(),
         });
-        let resp_data = pool
-            .call(&mgr_addr, MSG_ACQUIRE_OWNER_LOCK, req)
-            .await?;
-        let resp: AcquireOwnerLockResp =
-            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
-        if resp.code != CODE_OK {
-            return Err(anyhow!(
-                "acquire_owner_lock failed: {}",
-                resp.message
-            ));
+        // Try each manager until one responds (for initial connect)
+        let mut last_err = None;
+        let mut connected_idx = 0usize;
+        for (idx, addr) in mgr_addrs.iter().enumerate() {
+            match pool.call(addr, MSG_ACQUIRE_OWNER_LOCK, req.clone()).await {
+                Ok(resp_data) => {
+                    let resp: AcquireOwnerLockResp =
+                        manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+                    if resp.code == CODE_OK {
+                        connected_idx = idx;
+                        return Ok(Self {
+                            manager_addrs: mgr_addrs,
+                            current_mgr: std::cell::Cell::new(connected_idx),
+                            owner_key,
+                            revision: resp.revision,
+                            max_extent_size,
+                            pool,
+                            nodes_cache: DashMap::new(),
+                            extent_info_cache: DashMap::new(),
+                            stream_states: DashMap::new(),
+                            append_metrics: StreamAppendMetrics::default(),
+                        });
+                    } else if resp.code == CODE_NOT_LEADER {
+                        last_err = Some(anyhow!("NotLeader from {}", addr));
+                        continue;
+                    } else {
+                        return Err(anyhow!("acquire_owner_lock failed: {}", resp.message));
+                    }
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            }
         }
-        Ok(Self {
-            manager_addr: mgr_addr,
-            owner_key,
-            revision: resp.revision,
-            max_extent_size,
-            pool,
-            nodes_cache: DashMap::new(),
-            extent_info_cache: DashMap::new(),
-            stream_states: DashMap::new(),
-            append_metrics: StreamAppendMetrics::default(),
-        })
+        Err(last_err.unwrap_or_else(|| anyhow!("no manager available")))
     }
 
     /// Create a StreamClient that reuses an existing owner-lock revision without
-    /// calling `acquire_owner_lock` again.
+    /// calling `acquire_owner_lock` again. Accepts comma-separated manager endpoints.
     pub async fn new_with_revision(
         manager_endpoint: &str,
         owner_key: String,
@@ -206,8 +242,13 @@ impl StreamClient {
         max_extent_size: u32,
         pool: Rc<ConnPool>,
     ) -> Result<Self> {
+        let mgr_addrs: Vec<String> = manager_endpoint
+            .split(',')
+            .map(|s| crate::conn_pool::normalize_endpoint(s.trim()))
+            .collect();
         Ok(Self {
-            manager_addr: manager_endpoint.to_string(),
+            manager_addrs: mgr_addrs,
+            current_mgr: std::cell::Cell::new(0),
             owner_key,
             revision,
             max_extent_size,
@@ -237,7 +278,7 @@ impl StreamClient {
     async fn refresh_nodes_map(&self) -> Result<()> {
         let resp_data = self
             .pool
-            .call(&self.manager_addr, MSG_NODES_INFO, Bytes::new())
+            .call(self.manager_addr(), MSG_NODES_INFO, Bytes::new())
             .await?;
         let resp: NodesInfoResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -296,7 +337,7 @@ impl StreamClient {
         });
         let resp_data = self
             .pool
-            .call(&self.manager_addr, MSG_STREAM_INFO, req)
+            .call(self.manager_addr(), MSG_STREAM_INFO, req)
             .await?;
         let resp: StreamInfoResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -342,7 +383,7 @@ impl StreamClient {
         });
         let resp_data = self
             .pool
-            .call(&self.manager_addr, MSG_CHECK_COMMIT_LENGTH, req)
+            .call(self.manager_addr(), MSG_CHECK_COMMIT_LENGTH, req)
             .await?;
         let resp: CheckCommitLengthResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -369,7 +410,7 @@ impl StreamClient {
         });
         let resp_data = self
             .pool
-            .call(&self.manager_addr, MSG_STREAM_ALLOC_EXTENT, req)
+            .call(self.manager_addr(), MSG_STREAM_ALLOC_EXTENT, req)
             .await?;
         let resp: StreamAllocExtentResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -777,7 +818,7 @@ impl StreamClient {
         });
         let resp_data = self
             .pool
-            .call(&self.manager_addr, MSG_STREAM_PUNCH_HOLES, req)
+            .call(self.manager_addr(), MSG_STREAM_PUNCH_HOLES, req)
             .await?;
         let resp: PunchHolesResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -798,7 +839,7 @@ impl StreamClient {
         });
         let resp_data = self
             .pool
-            .call(&self.manager_addr, MSG_TRUNCATE, req)
+            .call(self.manager_addr(), MSG_TRUNCATE, req)
             .await?;
         let resp: TruncateResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -816,7 +857,7 @@ impl StreamClient {
         });
         let resp_data = self
             .pool
-            .call(&self.manager_addr, MSG_STREAM_INFO, req)
+            .call(self.manager_addr(), MSG_STREAM_INFO, req)
             .await?;
         let resp: StreamInfoResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -842,7 +883,7 @@ impl StreamClient {
         let req = manager_rpc::rkyv_encode(&ExtentInfoReq { extent_id });
         let resp_data = self
             .pool
-            .call(&self.manager_addr, MSG_EXTENT_INFO, req)
+            .call(self.manager_addr(), MSG_EXTENT_INFO, req)
             .await?;
         let resp: ExtentInfoResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -1129,7 +1170,7 @@ impl StreamClient {
         });
         let resp_data = self
             .pool
-            .call(&self.manager_addr, MSG_MULTI_MODIFY_SPLIT, req)
+            .call(self.manager_addr(), MSG_MULTI_MODIFY_SPLIT, req)
             .await?;
         let resp: CodeResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;

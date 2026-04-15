@@ -162,8 +162,10 @@ Used by `PartitionServer` and tests. Holds autumn-rpc connections to extent node
 ```rust
 StreamClient::connect(manager_endpoint, owner_key, max_extent_size)
 ```
-- Immediately calls `acquire_owner_lock(owner_key)` on the manager.
-- The returned `revision` is stored and passed with every subsequent operation.
+- `manager_endpoint` supports **comma-separated** addresses for multi-manager HA: `"host1:9001,host2:9001,host3:9001"`.
+- Tries each manager to `acquire_owner_lock`, skipping `NotLeader` responses.
+- All subsequent manager RPCs use `self.manager_addr()` which returns the current leader.
+- On any manager RPC failure, `rotate_manager()` switches to the next address (round-robin).
 - `owner_key` should be unique per logical writer (e.g., `"ps/{ps_id}/partition/{part_id}"`).
 
 ### Append Data Flow

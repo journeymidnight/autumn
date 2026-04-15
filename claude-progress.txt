@@ -1,30 +1,19 @@
 Date: 2026-04-15
 TaskStatus: completed
-Task scope: Distributed system analysis + arch fixes + system tests
+Task scope: F079 — Multi-manager support for no-single-point-of-failure
 
 Current summary:
-  Architecture fixes (2):
-    F077: Etcd-first mutation pattern for all mutating handlers
-    F078: Proactive per-disk health check in recovery dispatch
+  F079 (completed): StreamClient + PartitionServer multi-manager support.
+    - StreamClient: manager_addrs Vec + round-robin rotation on failure
+    - PartitionServer: connect tries each manager, heartbeat rotates
+    - CLIs accept comma-separated --manager addresses
+    - Backward compatible (single address works as before)
+    - All tests pass unchanged
 
-  System tests (16 test cases across 10 files):
-    14 pass normally, 2 require etcd (#[ignore])
+  Previously completed:
+    F077+F078: Architecture fixes
+    F062-F076: 16 system tests (14 pass, 2 etcd-only)
 
-    F062: Shared test infra (support/mod.rs)
-    F063: Owner lock fencing (LockedByOther)
-    F064: Seal during active writes — client retry
-    F065: Extent recovery — sealed extent health check (2 tests)
-    F066: Split preserves all data
-    F067: Split overlap compaction → second split
-    F068: Manager failover preserves state (#[ignore], needs etcd)
-    F070: PS crash unflushed data recoverable
-    F071: Manager crash during split (#[ignore], needs etcd)
-    F072: Extent node crash — StreamClient retries (2 tests)
-    F073: Split with large values VP resolution
-    F074: Compound: split + PS crash
-    F075: Sequential PS crash — data accumulates
-    F076: Alloc extent falls back on dead node
-    +    Split extent ref counting test
-
-Remaining (not implemented):
-  F069: PS crash → partition reassigned (30s timeout, complex)
+Next steps:
+  - Deploy with 3 managers + etcd cluster for full HA validation
+  - System test with multi-manager failover scenario

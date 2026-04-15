@@ -154,6 +154,12 @@
 
 ## P2 — Distributed Capabilities & Operations
 
+### F079 · Multi-manager support: StreamClient + PartitionServer leader failover
+- **Target:** StreamClient、PartitionServer、ExtentNode、autumn-client 全部支持多 manager 地址。收到 `CODE_NOT_LEADER` 时 round-robin 切换到下一个 manager。等价于 Go `SMClient.try()` 的 round-robin retry 逻辑。
+- **Evidence:** `crates/stream/src/client.rs` (manager_addr: String 单地址) · `crates/partition-server/src/lib.rs` (connect 单 manager) · `crates/server/src/bin/autumn_client.rs` (ClusterClient 单 manager) · Go: `manager/smclient/sm_client.go` (try() round-robin)
+- **Notes:** Fixed. (1) StreamClient: `manager_addr: String` → `manager_addrs: Vec<String>` + `current_mgr: Cell<usize>`, `connect()` tries each manager, `retry_manager_call` rotates on failure, all 10 manager RPC call sites use `self.manager_addr()`. (2) PartitionServer: `connect_with_advertise()` tries each manager for owner lock, `heartbeat_loop` rotates on failure, `region_sync_loop` uses current manager. (3) CLIs accept comma-separated `--manager` addresses (parsed by StreamClient/PartitionServer). All existing tests pass unchanged (single manager = backward compatible).
+- **passes:** true
+
 ### F012 · Erasure coding parity with Go implementation
 - **Target:** EC encode/decode/recovery path equivalent to Go `erasure_code` package (Reed-Solomon, K-of-N recovery).
 - **Evidence:** `erasure_code/*.go` · `autumn-rs/crates/stream/src/*`

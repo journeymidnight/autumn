@@ -369,7 +369,10 @@ pub struct PartitionServer {
     ps_id: u64,
     advertise_addr: Option<String>,
     partitions: Rc<RefCell<HashMap<u64, PartitionHandle>>>,
-    manager_addr: String,
+    /// Manager addresses for round-robin on NotLeader.
+    manager_addrs: Vec<String>,
+    /// Current manager index.
+    current_mgr: Cell<usize>,
     pool: Rc<ConnPool>,
     /// Server-level owner key and revision for split coordination.
     server_owner_key: String,
@@ -385,39 +388,76 @@ impl PartitionServer {
         Self::connect_with_advertise(ps_id, manager_endpoint, None).await
     }
 
+    /// Current manager address (round-robin).
+    fn manager_addr(&self) -> &str {
+        &self.manager_addrs[self.current_mgr.get() % self.manager_addrs.len()]
+    }
+
+    /// Rotate to next manager on NotLeader or connection error.
+    fn rotate_manager(&self) {
+        let next = (self.current_mgr.get() + 1) % self.manager_addrs.len();
+        self.current_mgr.set(next);
+    }
+
     pub async fn connect_with_advertise(
         ps_id: u64,
         manager_endpoint: &str,
         advertise_addr: Option<String>,
     ) -> Result<Self> {
         let pool = Rc::new(ConnPool::new());
-        let mgr_addr = autumn_stream::conn_pool::normalize_endpoint(manager_endpoint);
+        let mgr_addrs: Vec<String> = manager_endpoint
+            .split(',')
+            .map(|s| autumn_stream::conn_pool::normalize_endpoint(s.trim()))
+            .collect();
         let owner_key = format!("ps-{ps_id}");
 
-        // Acquire owner lock from manager.
+        // Acquire owner lock — try each manager until one responds.
         let req = manager_rpc::rkyv_encode(&manager_rpc::AcquireOwnerLockReq {
             owner_key: owner_key.clone(),
         });
-        let resp_data = pool.call(&mgr_addr, manager_rpc::MSG_ACQUIRE_OWNER_LOCK, req).await?;
-        let resp: manager_rpc::AcquireOwnerLockResp =
-            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
-        if resp.code != manager_rpc::CODE_OK {
-            return Err(anyhow!("acquire_owner_lock failed: {}", resp.message));
+        let mut last_err = None;
+        let mut connected_idx = 0usize;
+        for (idx, addr) in mgr_addrs.iter().enumerate() {
+            match pool.call(addr, manager_rpc::MSG_ACQUIRE_OWNER_LOCK, req.clone()).await {
+                Ok(resp_data) => {
+                    let resp: manager_rpc::AcquireOwnerLockResp =
+                        manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+                    if resp.code == manager_rpc::CODE_OK {
+                        connected_idx = idx;
+                        let server = Self {
+                            ps_id,
+                            advertise_addr,
+                            partitions: Rc::new(RefCell::new(HashMap::new())),
+                            manager_addrs: mgr_addrs,
+                            current_mgr: Cell::new(connected_idx),
+                            pool,
+                            server_owner_key: owner_key,
+                            server_revision: Rc::new(Cell::new(resp.revision)),
+                            router: Arc::new(PartitionRouter {
+                                routes: DashMap::new(),
+                            }),
+                            conn_threads: None,
+                        };
+                        // Jump to register_ps below
+                        return server.finish_connect().await;
+                    } else if resp.code == manager_rpc::CODE_NOT_LEADER {
+                        last_err = Some(anyhow!("NotLeader from {}", addr));
+                        continue;
+                    } else {
+                        return Err(anyhow!("acquire_owner_lock failed: {}", resp.message));
+                    }
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            }
         }
+        Err(last_err.unwrap_or_else(|| anyhow!("no manager available")))
+    }
 
-        let server = Self {
-            ps_id,
-            advertise_addr,
-            partitions: Rc::new(RefCell::new(HashMap::new())),
-            manager_addr: mgr_addr,
-            pool,
-            server_owner_key: owner_key,
-            server_revision: Rc::new(Cell::new(resp.revision)),
-            router: Arc::new(PartitionRouter {
-                routes: DashMap::new(),
-            }),
-            conn_threads: None,
-        };
+    async fn finish_connect(self) -> Result<Self> {
+        let server = self;
 
         // Retry register_ps — manager may still be electing leader after restart.
         let mut retries = 15;
@@ -455,7 +495,7 @@ impl PartitionServer {
         });
         let resp_data = self
             .pool
-            .call(&self.manager_addr, manager_rpc::MSG_REGISTER_PS, req)
+            .call(self.manager_addr(), manager_rpc::MSG_REGISTER_PS, req)
             .await
             .context("register ps")?;
         let resp: manager_rpc::CodeResp =
@@ -474,15 +514,17 @@ impl PartitionServer {
         loop {
             ticker.tick().await;
             let req = manager_rpc::rkyv_encode(&manager_rpc::HeartbeatPsReq { ps_id: self.ps_id });
-            match self.pool.call(&self.manager_addr, manager_rpc::MSG_HEARTBEAT_PS, req).await {
+            match self.pool.call(self.manager_addr(), manager_rpc::MSG_HEARTBEAT_PS, req).await {
                 Ok(_) => {
                     consecutive_failures = 0;
                 }
                 Err(e) => {
                     consecutive_failures += 1;
+                    self.rotate_manager();
                     tracing::warn!(
-                        "PS {} heartbeat failed ({}/{}): {e}",
+                        "PS {} heartbeat failed ({}/{}): {e} (next mgr: {})",
                         self.ps_id, consecutive_failures, MAX_CONSECUTIVE_FAILURES,
+                        self.manager_addr(),
                     );
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                         tracing::error!(
@@ -512,7 +554,7 @@ impl PartitionServer {
     pub async fn sync_regions_once(&self) -> Result<()> {
         let resp_data = self
             .pool
-            .call(&self.manager_addr, manager_rpc::MSG_GET_REGIONS, Bytes::new())
+            .call(self.manager_addr(), manager_rpc::MSG_GET_REGIONS, Bytes::new())
             .await
             .context("get regions")?;
         let resp: manager_rpc::GetRegionsResp =
@@ -579,7 +621,7 @@ impl PartitionServer {
         let (req_tx, req_rx) = mpsc::channel::<PartitionRequest>(WRITE_CHANNEL_CAP);
         // Publish to router so worker threads can route requests to this partition.
         self.router.routes.insert(part_id, req_tx.clone());
-        let manager_addr = self.manager_addr.clone();
+        let manager_addr = self.manager_addrs.join(",");
         let owner_key = self.server_owner_key.clone();
         let revision = self.server_revision.get();
 
