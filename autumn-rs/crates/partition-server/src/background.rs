@@ -240,13 +240,19 @@ pub(crate) async fn background_gc_loop(
 
                 let mut holes = Vec::new();
                 for eid in candidates.into_iter().take(MAX_GC_ONCE) {
-                    let sealed_length = match part_sc.get_extent_info(eid).await {
-                        Ok(info) => info.sealed_length as u32,
+                    let info = match part_sc.get_extent_info(eid).await {
+                        Ok(info) => info,
                         Err(e) => {
                             tracing::warn!("GC extent_info {eid}: {e}");
                             continue;
                         }
                     };
+                    // Skip shared extents (split CoW) — other partitions still need them
+                    if info.refs > 1 {
+                        tracing::debug!("GC: skipping shared extent {eid} (refs={})", info.refs);
+                        continue;
+                    }
+                    let sealed_length = info.sealed_length as u32;
                     if sealed_length == 0 {
                         continue;
                     }
@@ -265,14 +271,19 @@ pub(crate) async fn background_gc_loop(
 
         tracing::info!("GC: starting, extents={:?}", holes);
         for eid in holes {
-            let sealed_length = match part_sc.get_extent_info(eid).await {
-                Ok(info) => info.sealed_length as u32,
+            let info = match part_sc.get_extent_info(eid).await {
+                Ok(info) => info,
                 Err(e) => {
                     tracing::warn!("GC extent_info {eid}: {e}");
                     continue;
                 }
             };
-            if let Err(e) = run_gc(&part, eid, sealed_length).await {
+            // Safety: never punch shared extents (split CoW)
+            if info.refs > 1 {
+                tracing::warn!("GC: refusing to punch shared extent {eid} (refs={})", info.refs);
+                continue;
+            }
+            if let Err(e) = run_gc(&part, eid, info.sealed_length as u32).await {
                 tracing::error!("GC run_gc extent {eid}: {e}");
             }
         }
