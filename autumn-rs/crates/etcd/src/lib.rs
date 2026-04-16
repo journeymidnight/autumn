@@ -161,14 +161,16 @@ impl EtcdClient {
     }
 
     /// Start a lease keep-alive stream.
-    /// Returns a `LeaseKeeper` that can send periodic keep-alive requests.
-    /// The keeper shares the connection with this client and benefits from
-    /// the same automatic reconnection on failure.
+    /// Returns a `LeaseKeeper` with its **own** dedicated connection to avoid
+    /// `RefCell` borrow conflicts with concurrent `EtcdClient` calls.
     pub async fn lease_keep_alive(&self, lease_id: i64) -> Result<LeaseKeeper> {
+        // Open a dedicated connection for keepalive (same endpoint as current).
+        let addr = &self.endpoints[*self.current_ep.borrow()];
+        let channel = GrpcChannel::connect(addr).await?;
         Ok(LeaseKeeper {
-            channel: self.channel.clone(),
+            channel: Rc::new(RefCell::new(channel)),
             endpoints: self.endpoints.clone(),
-            current_ep: self.current_ep.clone(),
+            current_ep: Rc::new(RefCell::new(*self.current_ep.borrow())),
             lease_id,
         })
     }
