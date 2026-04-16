@@ -17,6 +17,14 @@ use futures::channel::{mpsc, oneshot};
 use crate::*;
 use crate::sstable::{IterItem, MemtableIterator, MergeIterator, SstBuilder, SstReader, TableIterator};
 
+pub(crate) struct CompactStats {
+    pub input_tables: usize,
+    pub output_tables: usize,
+    pub entries_kept: usize,
+    pub entries_discarded: usize,
+    pub output_bytes: u64,
+}
+
 pub(crate) async fn background_compact_loop(
     _part_id: u64,
     part: Rc<RefCell<PartitionData>>,
@@ -63,7 +71,12 @@ pub(crate) async fn background_compact_loop(
                 }
                 let last_extent = tbls.last().map(|t| t.extent_id).unwrap_or(0);
                 match do_compact(&part, tbls, true).await {
-                    Ok(_) => {
+                    Ok(s) => {
+                        tracing::info!(
+                            "compact part {}: major, input={} tables, output={} tables, kept={}, discarded={}, output={}",
+                            _part_id, s.input_tables, s.output_tables, s.entries_kept, s.entries_discarded,
+                            crate::human_size(s.output_bytes)
+                        );
                         part.borrow().has_overlap.set(0);
                         if last_extent != 0 {
                             let (row_stream_id, part_sc) = {
@@ -95,7 +108,12 @@ pub(crate) async fn background_compact_loop(
                     if tbls.len() >= 1 {
                         let last_extent = tbls.last().map(|t| t.extent_id).unwrap_or(0);
                         match do_compact(&part, tbls, true).await {
-                            Ok(_) => {
+                            Ok(s) => {
+                                tracing::info!(
+                                    "compact part {}: expiry major, input={} tables, output={} tables, kept={}, discarded={}, output={}",
+                                    _part_id, s.input_tables, s.output_tables, s.entries_kept, s.entries_discarded,
+                                    crate::human_size(s.output_bytes)
+                                );
                                 if last_extent != 0 {
                                     let (row_stream_id, part_sc) = {
                                         let p = part.borrow();
@@ -118,7 +136,12 @@ pub(crate) async fn background_compact_loop(
                     continue;
                 }
                 match do_compact(&part, compact_tbls, false).await {
-                    Ok(_) => {
+                    Ok(s) => {
+                        tracing::info!(
+                            "compact part {}: minor, input={} tables, output={} tables, kept={}, discarded={}, output={}",
+                            _part_id, s.input_tables, s.output_tables, s.entries_kept, s.entries_discarded,
+                            crate::human_size(s.output_bytes)
+                        );
                         if truncate_id != 0 {
                             let (row_stream_id, part_sc) = {
                                 let p = part.borrow();
@@ -240,6 +263,7 @@ pub(crate) async fn background_gc_loop(
             continue;
         }
 
+        tracing::info!("GC: starting, extents={:?}", holes);
         for eid in holes {
             let sealed_length = match part_sc.get_extent_info(eid).await {
                 Ok(info) => info.sealed_length as u32,
@@ -689,11 +713,12 @@ pub(crate) async fn do_compact(
     part: &Rc<RefCell<PartitionData>>,
     tbls: Vec<TableMeta>,
     major: bool,
-) -> Result<bool> {
+) -> Result<CompactStats> {
     if tbls.is_empty() {
-        return Ok(false);
+        return Ok(CompactStats { input_tables: 0, output_tables: 0, entries_kept: 0, entries_discarded: 0, output_bytes: 0 });
     }
 
+    let input_tables = tbls.len();
     let compact_keys: HashSet<(u64, u32)> = tbls.iter().map(|t| t.loc()).collect();
 
     let (readers, row_stream_id, meta_stream_id, compact_vp_eid, compact_vp_off, rg, part_sc) = {
@@ -708,7 +733,7 @@ pub(crate) async fn do_compact(
     };
 
     if readers.is_empty() {
-        return Ok(false);
+        return Ok(CompactStats { input_tables, output_tables: 0, entries_kept: 0, entries_discarded: 0, output_bytes: 0 });
     }
 
     let mut readers_with_meta: Vec<(Rc<SstReader>, u64)> = readers.iter().zip(tbls.iter()).map(|(r, t)| (r.clone(), t.last_seq)).collect();
@@ -741,6 +766,8 @@ pub(crate) async fn do_compact(
     let mut current_size: usize = 0;
     let mut chunk_last_seq: u64 = 0;
     let mut prev_user_key: Option<Vec<u8>> = None;
+    let mut entries_kept = 0usize;
+    let mut entries_discarded = 0usize;
 
     let add_discard = |item: &IterItem, discards: &mut HashMap<u64, i64>| {
         if item.op & OP_VALUE_POINTER != 0 && item.value.len() >= VALUE_POINTER_SIZE {
@@ -758,6 +785,7 @@ pub(crate) async fn do_compact(
         let user_key = parse_key(&item.key).to_vec();
         if prev_user_key.as_deref() == Some(&user_key) {
             add_discard(&item, &mut discards);
+            entries_discarded += 1;
             merge.next();
             continue;
         }
@@ -765,6 +793,7 @@ pub(crate) async fn do_compact(
 
         if !in_range(&rg, prev_user_key.as_ref().unwrap()) {
             add_discard(&item, &mut discards);
+            entries_discarded += 1;
             merge.next();
             continue;
         }
@@ -772,11 +801,13 @@ pub(crate) async fn do_compact(
         if major {
             if item.op == 2 {
                 add_discard(&item, &mut discards);
+                entries_discarded += 1;
                 merge.next();
                 continue;
             }
             if item.expires_at > 0 && item.expires_at <= now {
                 add_discard(&item, &mut discards);
+                entries_discarded += 1;
                 merge.next();
                 continue;
             }
@@ -795,6 +826,7 @@ pub(crate) async fn do_compact(
         }
         current_size += entry_size;
         current_entries.push(item);
+        entries_kept += 1;
         merge.next();
     }
     if !current_entries.is_empty() {
@@ -817,10 +849,12 @@ pub(crate) async fn do_compact(
         let voff = if veid == p.vp_extent_id { p.vp_offset } else { compact_vp_off };
         drop(p);
         save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, veid, voff).await?;
-        return Ok(true);
+        return Ok(CompactStats { input_tables, output_tables: 0, entries_kept: 0, entries_discarded, output_bytes: 0 });
     }
 
     let last_chunk_idx = chunks.len().saturating_sub(1);
+    let output_tables = chunks.len();
+    let mut output_bytes = 0u64;
     let mut new_readers: Vec<(TableMeta, Rc<SstReader>)> = Vec::new();
     for (chunk_idx, (entries, chunk_last_seq)) in chunks.into_iter().enumerate() {
         let mut b = SstBuilder::new(compact_vp_eid, compact_vp_off);
@@ -831,6 +865,7 @@ pub(crate) async fn do_compact(
             b.add(&item.key, item.op, &item.value, item.expires_at);
         }
         let sst_bytes = b.finish();
+        output_bytes += sst_bytes.len() as u64;
         let result = part_sc.append(row_stream_id, &sst_bytes, true).await?;
         let estimated_size = sst_bytes.len() as u64;
         let reader = Rc::new(SstReader::from_bytes(Bytes::from(sst_bytes))?);
@@ -859,7 +894,7 @@ pub(crate) async fn do_compact(
     };
 
     save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, final_vp_eid, final_vp_off).await?;
-    Ok(true)
+    Ok(CompactStats { input_tables, output_tables, entries_kept, entries_discarded, output_bytes })
 }
 
 pub(crate) fn remove_compacted_tables(part: &mut PartitionData, compact_keys: &HashSet<(u64, u32)>) {
