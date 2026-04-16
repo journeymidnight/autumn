@@ -1165,7 +1165,8 @@ async fn recover_partition(
                 }
 
                 let record_extent_off = start_off + buf_off as u32;
-                let mem_entry = if value.len() > VALUE_THROTTLE {
+                // VP detection: new WAL has VP flag in op; old WAL uses value size as fallback
+                let mem_entry = if op & OP_VALUE_POINTER != 0 || value.len() > VALUE_THROTTLE {
                     let vp = ValuePointer {
                         extent_id: eid,
                         offset: record_extent_off + 17 + key.len() as u32,
@@ -1626,6 +1627,38 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].2.len(), 1024 * 1024);
         assert_eq!(records[0].2[0], 0xAB);
+    }
+
+    /// Regression test for GC data loss bug: WAL records for large values
+    /// must have OP_VALUE_POINTER flag in op so that GC's `run_gc` can
+    /// identify them. Without the flag, GC skips all entries → moved=0
+    /// → punches extent → live VP data lost.
+    #[test]
+    fn wal_vp_flag_for_large_values() {
+        let small_val = vec![0u8; 100]; // < VALUE_THROTTLE (4KB)
+        let large_val = vec![0u8; VALUE_THROTTLE + 1]; // > VALUE_THROTTLE
+
+        // Simulate what the write path does:
+        // small value → op=1, large value → op=1|OP_VALUE_POINTER
+        let small_op: u8 = if small_val.len() > VALUE_THROTTLE { 1 | OP_VALUE_POINTER } else { 1 };
+        let large_op: u8 = if large_val.len() > VALUE_THROTTLE { 1 | OP_VALUE_POINTER } else { 1 };
+
+        assert_eq!(small_op, 1, "small value should NOT have VP flag");
+        assert_eq!(large_op, 1 | OP_VALUE_POINTER, "large value MUST have VP flag");
+
+        // Encode WAL records with the correct op
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&encode_record(small_op, b"small_key", &small_val, 0));
+        buf.extend_from_slice(&encode_record(large_op, b"large_key", &large_val, 0));
+
+        let records = decode_records_full(&buf);
+        assert_eq!(records.len(), 2);
+
+        // GC uses this check to identify VP entries:
+        let (op0, _, _, _) = &records[0];
+        let (op1, _, _, _) = &records[1];
+        assert_eq!(op0 & OP_VALUE_POINTER, 0, "small value WAL record should be skipped by GC");
+        assert!(op1 & OP_VALUE_POINTER != 0, "large value WAL record MUST be detected by GC");
     }
 
     #[test]

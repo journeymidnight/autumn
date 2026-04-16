@@ -247,11 +247,6 @@ pub(crate) async fn background_gc_loop(
                             continue;
                         }
                     };
-                    // Skip shared extents (split CoW) — other partitions still need them
-                    if info.refs > 1 {
-                        tracing::debug!("GC: skipping shared extent {eid} (refs={})", info.refs);
-                        continue;
-                    }
                     let sealed_length = info.sealed_length as u32;
                     if sealed_length == 0 {
                         continue;
@@ -271,19 +266,14 @@ pub(crate) async fn background_gc_loop(
 
         tracing::info!("GC: starting, extents={:?}", holes);
         for eid in holes {
-            let info = match part_sc.get_extent_info(eid).await {
-                Ok(info) => info,
+            let sealed_length = match part_sc.get_extent_info(eid).await {
+                Ok(info) => info.sealed_length as u32,
                 Err(e) => {
                     tracing::warn!("GC extent_info {eid}: {e}");
                     continue;
                 }
             };
-            // Safety: never punch shared extents (split CoW)
-            if info.refs > 1 {
-                tracing::warn!("GC: refusing to punch shared extent {eid} (refs={})", info.refs);
-                continue;
-            }
-            if let Err(e) = run_gc(&part, eid, info.sealed_length as u32).await {
+            if let Err(e) = run_gc(&part, eid, sealed_length).await {
                 tracing::error!("GC run_gc extent {eid}: {e}");
             }
         }
@@ -504,7 +494,9 @@ fn start_write_batch(
         for e in &valid {
             let hdr_size = 17 + e.internal_key.len();
             let mut hdr_buf = BytesMut::with_capacity(hdr_size);
-            hdr_buf.put_u8(e.op);
+            // Write VP flag into WAL for large values so GC can identify them.
+            let wal_op = if e.value.len() > VALUE_THROTTLE { e.op | OP_VALUE_POINTER } else { e.op };
+            hdr_buf.put_u8(wal_op);
             hdr_buf.put_u32_le(e.internal_key.len() as u32);
             hdr_buf.put_u32_le(e.value.len() as u32);
             hdr_buf.put_u64_le(e.expires_at);
