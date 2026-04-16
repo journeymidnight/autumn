@@ -253,6 +253,8 @@ pub struct NodesInfoResp {
     pub message: String,
     /// (node_id, MgrNodeInfo) pairs
     pub nodes: Vec<(u64, MgrNodeInfo)>,
+    /// (disk_id, MgrDiskInfo) pairs
+    pub disks_info: Vec<(u64, MgrDiskInfo)>,
 }
 
 // --- CheckCommitLength ---

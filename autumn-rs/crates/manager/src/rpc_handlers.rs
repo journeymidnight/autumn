@@ -374,10 +374,16 @@ impl AutumnManager {
             .iter()
             .map(|(&id, n)| (id, n.clone()))
             .collect();
+        let disks_info = s
+            .disks
+            .iter()
+            .map(|(&id, d)| (id, d.clone()))
+            .collect();
         Ok(rkyv_encode(&NodesInfoResp {
             code: CODE_OK,
             message: String::new(),
             nodes,
+            disks_info,
         }))
     }
 
