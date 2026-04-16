@@ -24,6 +24,8 @@ pub struct SstReader {
     pub vp_offset: u32,
     estimated_size: u64,
     pub discards: HashMap<u64, i64>,
+    /// Earliest non-zero expires_at across all entries (0 = no expiring keys).
+    pub min_expires_at: u64,
     sst_base: u32,
     /// Decoded block cache — avoids re-decoding (CRC + memcpy) on repeated reads.
     block_cache: RefCell<Vec<Option<Arc<DecodedBlock>>>>,
@@ -88,6 +90,7 @@ impl SstReader {
             vp_offset: meta.vp_offset,
             estimated_size: meta.estimated_size,
             discards: meta.discards,
+            min_expires_at: meta.min_expires_at,
             sst_base: sst_base as u32,
             block_cache: RefCell::new(vec![None; num_blocks]),
             data,

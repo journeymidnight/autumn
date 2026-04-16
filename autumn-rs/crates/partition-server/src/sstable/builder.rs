@@ -46,6 +46,8 @@ pub struct SstBuilder {
     total_raw_bytes: u64,
     /// Discard stats to embed in MetaBlock (set via set_discards before finish()).
     discards: HashMap<u64, i64>,
+    /// Earliest non-zero expires_at seen across all entries.
+    min_expires_at: u64,
 }
 
 impl SstBuilder {
@@ -66,6 +68,7 @@ impl SstBuilder {
             biggest_key: Vec::new(),
             total_raw_bytes: 0,
             discards: HashMap::new(),
+            min_expires_at: 0,
         }
     }
 
@@ -95,6 +98,12 @@ impl SstBuilder {
         let ts = parse_seq(internal_key);
         if ts > self.seq_num {
             self.seq_num = ts;
+        }
+
+        if expires_at > 0 {
+            if self.min_expires_at == 0 || expires_at < self.min_expires_at {
+                self.min_expires_at = expires_at;
+            }
         }
 
         if self.smallest_key.is_empty() {
@@ -168,6 +177,7 @@ impl SstBuilder {
             vp_extent_id: self.vp_extent_id,
             vp_offset: self.vp_offset,
             discards: self.discards,
+            min_expires_at: self.min_expires_at,
         };
         let meta_bytes = meta.encode();
         let meta_len = meta_bytes.len() as u32;
@@ -308,5 +318,37 @@ mod tests {
         assert_eq!(reader.discards.get(&10), Some(&500i64));
         assert_eq!(reader.discards.get(&20), Some(&1024i64));
         assert_eq!(reader.discards.len(), 2);
+    }
+
+    #[test]
+    fn min_expires_at_no_expiry() {
+        let mut b = SstBuilder::new(0, 0);
+        b.add(&ikey(b"a", 1), 1, b"v1", 0);
+        b.add(&ikey(b"b", 2), 1, b"v2", 0);
+        let data = b.finish();
+        let reader = SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader");
+        assert_eq!(reader.min_expires_at, 0);
+    }
+
+    #[test]
+    fn min_expires_at_with_expiry() {
+        let mut b = SstBuilder::new(0, 0);
+        b.add(&ikey(b"a", 1), 1, b"v1", 1000);
+        b.add(&ikey(b"b", 2), 1, b"v2", 500);
+        b.add(&ikey(b"c", 3), 1, b"v3", 0); // no expiry
+        b.add(&ikey(b"d", 4), 1, b"v4", 800);
+        let data = b.finish();
+        let reader = SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader");
+        assert_eq!(reader.min_expires_at, 500);
+    }
+
+    #[test]
+    fn min_expires_at_single_expiry() {
+        let mut b = SstBuilder::new(0, 0);
+        b.add(&ikey(b"a", 1), 1, b"v1", 0);
+        b.add(&ikey(b"b", 2), 1, b"v2", 42);
+        let data = b.finish();
+        let reader = SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader");
+        assert_eq!(reader.min_expires_at, 42);
     }
 }

@@ -2,11 +2,19 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::*;
+use autumn_rpc::partition_rpc::{self, *};
 use bytes::Bytes;
+
+// ── Re-exports for SDK consumers ────────────────────────────────────────────
+
+pub use autumn_rpc::partition_rpc::RangeEntry;
+
+// ── Public helpers ──────────────────────────────────────────────────────────
 
 pub fn parse_addr(addr: &str) -> Result<SocketAddr> {
     addr.parse()
@@ -16,6 +24,58 @@ pub fn parse_addr(addr: &str) -> Result<SocketAddr> {
 pub fn decode_err(e: String) -> anyhow::Error {
     anyhow!("rkyv decode: {e}")
 }
+
+// ── Error type ──────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub enum AutumnError {
+    NotFound,
+    InvalidArgument(String),
+    PreconditionFailed(String),
+    ServerError(String),
+    RoutingError(String),
+    ConnectionError(String),
+}
+
+impl std::fmt::Display for AutumnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AutumnError::NotFound => write!(f, "key not found"),
+            AutumnError::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
+            AutumnError::PreconditionFailed(msg) => write!(f, "precondition failed: {msg}"),
+            AutumnError::ServerError(msg) => write!(f, "server error: {msg}"),
+            AutumnError::RoutingError(msg) => write!(f, "routing error: {msg}"),
+            AutumnError::ConnectionError(msg) => write!(f, "connection error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for AutumnError {}
+
+fn code_to_error(code: u8, message: String) -> AutumnError {
+    match code {
+        partition_rpc::CODE_NOT_FOUND => AutumnError::NotFound,
+        partition_rpc::CODE_INVALID_ARGUMENT => AutumnError::InvalidArgument(message),
+        partition_rpc::CODE_PRECONDITION => AutumnError::PreconditionFailed(message),
+        _ => AutumnError::ServerError(message),
+    }
+}
+
+// ── Range scan result ───────────────────────────────────────────────────────
+
+pub struct RangeResult {
+    pub entries: Vec<RangeEntry>,
+    pub has_more: bool,
+}
+
+// ── Key metadata ────────────────────────────────────────────────────────────
+
+pub struct KeyMeta {
+    pub found: bool,
+    pub value_length: u64,
+}
+
+// ── ClusterClient ───────────────────────────────────────────────────────────
 
 /// Client for interacting with an autumn-rs cluster.
 ///
@@ -67,7 +127,7 @@ impl ClusterClient {
     }
 
     /// Call the current manager. On error, drop connection (auto-reconnect next time).
-    async fn mgr_call(&self, msg_type: u8, payload: Bytes) -> Result<Bytes> {
+    pub async fn mgr_call(&self, msg_type: u8, payload: Bytes) -> Result<Bytes> {
         let client = self.mgr_client().await?;
         match client.call(msg_type, payload).await {
             Ok(resp) => Ok(resp),
@@ -80,7 +140,7 @@ impl ClusterClient {
     }
 
     /// Call manager with retry and round-robin on NotLeader/connection error.
-    async fn mgr_call_retry(&self, msg_type: u8, payload: Bytes, max_retries: u32) -> Result<Bytes> {
+    pub async fn mgr_call_retry(&self, msg_type: u8, payload: Bytes, max_retries: u32) -> Result<Bytes> {
         let mut attempt = 0u32;
         loop {
             match self.mgr_call(msg_type, payload.clone()).await {
@@ -91,7 +151,7 @@ impl ClusterClient {
                         return Err(e.context(format!("failed after {max_retries} retries")));
                     }
                     self.rotate_manager();
-                    compio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    compio::time::sleep(Duration::from_millis(500)).await;
                 }
             }
         }
@@ -283,5 +343,255 @@ impl ClusterClient {
             .collect();
         result.sort_by_key(|(pid, _)| *pid);
         Ok(result)
+    }
+
+    // ── High-level SDK API ──────────────────────────────────────────────────
+
+    /// Put a key-value pair. Retries once on routing miss.
+    pub async fn put(&mut self, key: &[u8], value: &[u8], must_sync: bool) -> std::result::Result<(), AutumnError> {
+        self.put_opts(key, value, must_sync, 0).await
+    }
+
+    /// Put a key-value pair with TTL (seconds from now). 0 = no expiry.
+    pub async fn put_with_ttl(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        must_sync: bool,
+        ttl_secs: u64,
+    ) -> std::result::Result<(), AutumnError> {
+        let expires_at = if ttl_secs > 0 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + ttl_secs
+        } else {
+            0
+        };
+        self.put_opts(key, value, must_sync, expires_at).await
+    }
+
+    async fn put_opts(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        must_sync: bool,
+        expires_at: u64,
+    ) -> std::result::Result<(), AutumnError> {
+        let (part_id, ps_addr) = self.resolve_key(key).await
+            .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
+        let resp_bytes = self
+            .ps_call(
+                &ps_addr,
+                MSG_PUT,
+                rkyv_encode(&PutReq {
+                    part_id,
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                    must_sync,
+                    expires_at,
+                }),
+            )
+            .await
+            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
+        let resp: PutResp = rkyv_decode(&resp_bytes)
+            .map_err(|e| AutumnError::ServerError(e))?;
+        if resp.code != partition_rpc::CODE_OK {
+            return Err(code_to_error(resp.code, resp.message));
+        }
+        Ok(())
+    }
+
+    /// Get a value by key. Returns None if not found.
+    pub async fn get(&mut self, key: &[u8]) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
+        let (part_id, ps_addr) = self.resolve_key(key).await
+            .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
+        let resp_bytes = self
+            .ps_call(
+                &ps_addr,
+                MSG_GET,
+                rkyv_encode(&GetReq {
+                    part_id,
+                    key: key.to_vec(),
+                    offset: 0,
+                    length: 0,
+                }),
+            )
+            .await
+            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
+        let resp: GetResp = rkyv_decode(&resp_bytes)
+            .map_err(|e| AutumnError::ServerError(e))?;
+        if resp.code == partition_rpc::CODE_NOT_FOUND {
+            return Ok(None);
+        }
+        if resp.code != partition_rpc::CODE_OK {
+            return Err(code_to_error(resp.code, resp.message));
+        }
+        Ok(Some(resp.value))
+    }
+
+    /// Delete a key. Returns Ok(()) even if key didn't exist.
+    pub async fn delete(&mut self, key: &[u8]) -> std::result::Result<(), AutumnError> {
+        let (part_id, ps_addr) = self.resolve_key(key).await
+            .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
+        let resp_bytes = self
+            .ps_call(
+                &ps_addr,
+                MSG_DELETE,
+                rkyv_encode(&DeleteReq {
+                    part_id,
+                    key: key.to_vec(),
+                }),
+            )
+            .await
+            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
+        let resp: DeleteResp = rkyv_decode(&resp_bytes)
+            .map_err(|e| AutumnError::ServerError(e))?;
+        if resp.code != partition_rpc::CODE_OK && resp.code != partition_rpc::CODE_NOT_FOUND {
+            return Err(code_to_error(resp.code, resp.message));
+        }
+        Ok(())
+    }
+
+    /// Get key metadata (existence and value length).
+    pub async fn head(&mut self, key: &[u8]) -> std::result::Result<KeyMeta, AutumnError> {
+        let (part_id, ps_addr) = self.resolve_key(key).await
+            .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
+        let resp_bytes = self
+            .ps_call(
+                &ps_addr,
+                MSG_HEAD,
+                rkyv_encode(&HeadReq {
+                    part_id,
+                    key: key.to_vec(),
+                }),
+            )
+            .await
+            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
+        let resp: HeadResp = rkyv_decode(&resp_bytes)
+            .map_err(|e| AutumnError::ServerError(e))?;
+        Ok(KeyMeta {
+            found: resp.found,
+            value_length: resp.value_length,
+        })
+    }
+
+    /// Range scan with prefix filter.
+    pub async fn range(
+        &mut self,
+        prefix: &[u8],
+        start: &[u8],
+        limit: u32,
+    ) -> std::result::Result<RangeResult, AutumnError> {
+        let search_key = if start.is_empty() { prefix } else { start };
+        let (part_id, ps_addr) = self.resolve_key(search_key).await
+            .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
+        let resp_bytes = self
+            .ps_call(
+                &ps_addr,
+                MSG_RANGE,
+                rkyv_encode(&RangeReq {
+                    part_id,
+                    prefix: prefix.to_vec(),
+                    start: start.to_vec(),
+                    limit,
+                }),
+            )
+            .await
+            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
+        let resp: RangeResp = rkyv_decode(&resp_bytes)
+            .map_err(|e| AutumnError::ServerError(e))?;
+        if resp.code != partition_rpc::CODE_OK {
+            return Err(code_to_error(resp.code, resp.message));
+        }
+        Ok(RangeResult {
+            entries: resp.entries,
+            has_more: resp.has_more,
+        })
+    }
+
+    /// Stream put (for large values, single RPC).
+    pub async fn stream_put(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        must_sync: bool,
+    ) -> std::result::Result<(), AutumnError> {
+        let (part_id, ps_addr) = self.resolve_key(key).await
+            .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
+        let resp_bytes = self
+            .ps_call(
+                &ps_addr,
+                MSG_STREAM_PUT,
+                rkyv_encode(&StreamPutReq {
+                    part_id,
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                    must_sync,
+                    expires_at: 0,
+                }),
+            )
+            .await
+            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
+        let resp: PutResp = rkyv_decode(&resp_bytes)
+            .map_err(|e| AutumnError::ServerError(e))?;
+        if resp.code != partition_rpc::CODE_OK {
+            return Err(code_to_error(resp.code, resp.message));
+        }
+        Ok(())
+    }
+
+    /// Trigger partition split.
+    pub async fn split(&mut self, part_id: u64) -> std::result::Result<(), AutumnError> {
+        let ps_addr = self.resolve_part_id(part_id).await
+            .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
+        self.ps_call(&ps_addr, MSG_SPLIT_PART, rkyv_encode(&SplitPartReq { part_id }))
+            .await
+            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Trigger compaction on a partition.
+    pub async fn compact(&mut self, part_id: u64) -> std::result::Result<(), AutumnError> {
+        self.maintenance(part_id, MAINTENANCE_COMPACT, vec![]).await
+    }
+
+    /// Trigger automatic GC on a partition.
+    pub async fn gc(&mut self, part_id: u64) -> std::result::Result<(), AutumnError> {
+        self.maintenance(part_id, MAINTENANCE_AUTO_GC, vec![]).await
+    }
+
+    /// Force GC of specific extents on a partition.
+    pub async fn force_gc(&mut self, part_id: u64, extent_ids: Vec<u64>) -> std::result::Result<(), AutumnError> {
+        self.maintenance(part_id, MAINTENANCE_FORCE_GC, extent_ids).await
+    }
+
+    /// Trigger flush on a partition.
+    pub async fn flush(&mut self, part_id: u64) -> std::result::Result<(), AutumnError> {
+        self.maintenance(part_id, MAINTENANCE_FLUSH, vec![]).await
+    }
+
+    async fn maintenance(&mut self, part_id: u64, op: u8, extent_ids: Vec<u64>) -> std::result::Result<(), AutumnError> {
+        let ps_addr = self.resolve_part_id(part_id).await
+            .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
+        let resp_bytes = self
+            .ps_call(
+                &ps_addr,
+                MSG_MAINTENANCE,
+                rkyv_encode(&MaintenanceReq {
+                    part_id,
+                    op,
+                    extent_ids,
+                }),
+            )
+            .await
+            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
+        let resp: MaintenanceResp = rkyv_decode(&resp_bytes)
+            .map_err(|e| AutumnError::ServerError(e))?;
+        if resp.code != partition_rpc::CODE_OK {
+            return Err(code_to_error(resp.code, resp.message));
+        }
+        Ok(())
     }
 }

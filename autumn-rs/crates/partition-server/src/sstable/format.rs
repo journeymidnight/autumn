@@ -74,6 +74,9 @@ pub struct MetaBlock {
     /// Per-logStream-extent discard stats: extentID -> reclaimable bytes.
     /// Persisted in rowStream as part of the SSTable MetaBlock.
     pub discards: HashMap<u64, i64>,
+    /// Earliest non-zero expires_at across all entries in this SSTable.
+    /// 0 means no entries have expiry set.
+    pub min_expires_at: u64,
 }
 
 impl MetaBlock {
@@ -106,6 +109,8 @@ impl MetaBlock {
             buf.extend_from_slice(&eid.to_le_bytes());
             buf.extend_from_slice(&sz.to_le_bytes());
         }
+        // min_expires_at: earliest non-zero expiry timestamp (0 = none)
+        buf.extend_from_slice(&self.min_expires_at.to_le_bytes());
         // CRC32C covers everything above
         let crc = crc32c::crc32c(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
@@ -173,6 +178,13 @@ impl MetaBlock {
             }
         }
 
+        // min_expires_at (optional — old SSTs without this field get 0)
+        let min_expires_at = if c + 8 <= payload.len() {
+            read_u64(payload, &mut c)?
+        } else {
+            0
+        };
+
         Ok(MetaBlock {
             block_offsets,
             bloom_data,
@@ -183,6 +195,7 @@ impl MetaBlock {
             vp_extent_id,
             vp_offset,
             discards,
+            min_expires_at,
         })
     }
 }

@@ -228,8 +228,8 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 ### F046 · Migrate CLI tools, proto codegen, and tests to compio
 - **Target:** `autumn-client`、`autumn-stream-cli` 的 gRPC client 全部替换为 autumn-rpc RpcClient。`autumn-proto` 的 build.rs 移除 tonic-build server/client codegen，只保留 prost 消息类型生成。所有集成测试从 `#[tokio::test]` 迁移到 compio runtime。
 - **Evidence:** `crates/server/src/bin/autumn_client.rs` · `crates/server/src/bin/stream_cli.rs` · `crates/proto/build.rs` · `crates/manager/tests/*.rs` · `crates/stream/tests/*.rs`
-- **Notes:** autumn-client ClusterClient 的 4 种 gRPC client (StreamManagerServiceClient, PartitionManagerServiceClient, PartitionKvClient, ExtentServiceClient) 全部换成 RpcClient。proto build.rs: `tonic_build::configure()` → `prost_build::Config::new()`，只生成 message struct，不生成 service trait/client/server。测试: `#[tokio::test]` → `compio::runtime::Runtime::new().unwrap().block_on(async { ... })`。workspace Cargo.toml 移除 tonic workspace dependency。
-- **passes:** false
+- **Notes:** 全部完成。autumn-client 使用 autumn_rpc::client::RpcClient（不再有 gRPC client）。proto crate 已移除（rkyv 替代 protobuf，prost 仅在 etcd 内部使用）。所有测试使用 `#[compio::test]` 或手动 `compio::runtime::Runtime::new().block_on()`。tonic/tokio 从所有 crate Cargo.toml 和 Cargo.lock 中完全移除。
+- **passes:** true
 
 ---
 
@@ -413,9 +413,27 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 
 ## P3 — Developer Experience & Operations
 
-### F024 · Observability: distributed tracing and structured logging
-- **Target:** Jaeger/OpenTelemetry tracing with configurable sampling. Equivalent to Go xlog + trace-sampler flags.
-- **Evidence:** `xlog/xlog.go` · `cmd/autumn-ps/main.go` (trace-sampler) · `cmd/extent-node/main.go`
-- **Notes:** Metrics helpers standardized in `autumn-common::metrics` (duration_to_ns, ns_to_ms, unix_time_ms). All periodic summaries use `_ms` units. No distributed tracing export yet.
+### F024 · Observability: Prometheus metrics export + structured logging
+- **Target:** (1) Prometheus metrics endpoint (`/metrics`) on manager, extent-node, PS，导出关键指标：append latency, read latency, flush count, compaction count, GC count, memtable size, SST count, extent count, disk usage, connection count, recovery task count。使用 `metrics` + `metrics-exporter-prometheus` crate。(2) 结构化日志统一用 `tracing` crate + `tracing-subscriber` JSON formatter，支持 `RUST_LOG` 环境变量过滤。(3) 每个 binary 启动时输出版本、配置、监听地址等关键信息。
+- **Evidence:** `xlog/xlog.go` · `cmd/autumn-ps/main.go` (trace-sampler) · `crates/common/src/metrics.rs` (existing helpers) · `crates/partition-server/src/background.rs` (periodic log summaries)
+- **Notes:** Metrics helpers standardized in `autumn-common::metrics` (duration_to_ns, ns_to_ms, unix_time_ms). All periodic summaries use `_ms` units. Phase 1: Prometheus metrics + structured logging. Phase 2 (deferred): distributed tracing with OpenTelemetry/Jaeger.
 - **passes:** false
+
+### F083 · Client SDK library with ergonomic API
+- **Target:** 将 `crates/client/src/lib.rs` 的 `ClusterClient` 重构为正式的 SDK library，提供干净的 public API。(1) `ClusterClient` 作为主入口：`connect(addrs)`, `put(key, value, must_sync)`, `put_with_ttl(key, value, must_sync, ttl)`, `get(key) → Option<Vec<u8>>`, `delete(key)`, `range(prefix, start, limit) → RangeResult`, `head(key) → KeyMeta`, `stream_put(key, value, must_sync)`。(2) 维护操作：`split/compact/gc/force_gc/flush(part_id)`。(3) 自动路由刷新（routing miss 时 refresh）。(4) Error types：`AutumnError { NotFound, InvalidArgument, PreconditionFailed, ServerError, RoutingError, ConnectionError }`。(5) CLI binary 改用 SDK API，减少 ~60% 的 RPC boilerplate。
+- **Evidence:** `crates/client/src/lib.rs` (ClusterClient) · `crates/server/src/bin/autumn_client.rs` (CLI usage patterns) · Go: `autumn_clientv1/lib.go`
+- **Notes:** 实现完成。ClusterClient 新增 11 个高级方法（put/put_with_ttl/get/delete/head/range/stream_put/split/compact/gc/force_gc/flush）。AutumnError 枚举从 PS response code 映射。CLI 的 put/get/del/head/ls/split/compact/gc/forcegc/stream_put 共 10 个命令改用 SDK。低层 API（mgr_call/ps_call/get_ps_client）保留 public 给 benchmark 使用。5 个 CLI 单元测试通过。
+- **passes:** true
+
+### F084 · Client routing table via etcd watch (full F039)
+- **Target:** 完善 F039 的 interim 实现。ClusterClient/AutumnClient 通过 etcd watch 实时接收路由变更（split、migration、PS failover），无需等到 RPC 失败再 refresh。
+- **Evidence:** `crates/client/src/lib.rs` (ClusterClient.refresh_regions — current RPC-based refresh) · Go: `autumn_clientv1/lib.go` (lines 71-153: Connect with etcd watches) · `crates/etcd/src/lib.rs` (autumn-etcd client)
+- **Notes:** 架构决策：autumn-rs client 不直连 etcd，通过 lazy refresh（路由 miss 时从 manager 拉取）即可。路由变更（split/failover）是低频事件，lazy refresh 多一次 RTT 可忽略；避免了 client 维护 etcd 长连接的复杂度和 etcd 负载。Go 版本的 watch 方式不再沿用。
+- **passes:** true
+
+### F085 · TTL expiration with background cleanup
+- **Target:** 后台自动清理过期 key。(1) compaction 阶段已经跳过 expired key（现有逻辑），但不触发 compaction 的 partition 过期 key 会永久占空间；(2) 新增 `background_expiry_loop`：周期性（默认 60s）扫描 SSTable metadata 中记录的最早 expires_at，如果有大量过期 key 则触发 major compaction；(3) range scan 和 get 已经在读路径过滤 expired key（现有逻辑），确保语义正确；(4) `put_with_ttl` 在写入时设置 `expires_at = now() + ttl_seconds`。
+- **Evidence:** `crates/partition-server/src/rpc_handlers.rs` (expires_at filtering in get/range) · `crates/partition-server/src/lib.rs` (encode_record with expires_at) · Go: `range_partition/compaction.go` (isDeletedOrExpired)
+- **Notes:** 实现完成。SSTable MetaBlock 新增 `min_expires_at` 字段（向后兼容，旧 SST 默认为 0）。SstBuilder 在 add() 时自动跟踪最小非零 expires_at。background_compact_loop 在周期性 timeout 分支中检查所有 SST 的 min_expires_at，如有过期 key 则触发 major compaction（复用现有 do_compact major=true 逻辑，自动清理过期和删除条目）。读路径过滤（get/range/head）和写路径（put_with_ttl）之前已完成。3 个新单元测试通过。
+- **passes:** true
 

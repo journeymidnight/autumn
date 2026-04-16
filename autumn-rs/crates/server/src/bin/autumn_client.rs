@@ -4,7 +4,6 @@ extern crate libc;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -12,11 +11,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use autumn_client::{ClusterClient, parse_addr, decode_err};
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::*;
-use autumn_rpc::partition_rpc::{self, PutReq, PutResp, GetReq, GetResp, DeleteReq, DeleteResp,
-    HeadReq, HeadResp, RangeReq, RangeResp, SplitPartReq, StreamPutReq,
-    MaintenanceReq, MaintenanceResp, MSG_PUT, MSG_GET, MSG_DELETE, MSG_HEAD,
-    MSG_RANGE, MSG_SPLIT_PART, MSG_STREAM_PUT, MSG_MAINTENANCE,
-    MAINTENANCE_COMPACT, MAINTENANCE_AUTO_GC, MAINTENANCE_FORCE_GC};
+use autumn_rpc::partition_rpc::{self, PutReq, GetReq, MSG_PUT, MSG_GET};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
@@ -974,120 +969,44 @@ async fn main() -> Result<()> {
 
         Command::Put { key, file, nosync } => {
             let value = std::fs::read(&file).with_context(|| format!("read file {file}"))?;
-            let (part_id, ps_addr) = client.resolve_key(key.as_bytes()).await?;
-            let ps = client.get_ps_client(&ps_addr).await?;
-            let resp_bytes = ps
-                .call(
-                    MSG_PUT,
-                    rkyv_encode(&PutReq {
-                        part_id,
-                        key: key.into_bytes(),
-                        value,
-                        must_sync: !nosync,
-                        expires_at: 0,
-                    }),
-                )
-                .await
-                .context("put")?;
-            let resp: PutResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-            if resp.code != partition_rpc::CODE_OK {
-                bail!("put: {}", resp.message);
-            }
+            client.put(key.as_bytes(), &value, !nosync).await
+                .map_err(|e| anyhow!("put: {e}"))?;
             println!("ok");
         }
 
         Command::StreamPut { key, file, nosync } => {
             let value = std::fs::read(&file).with_context(|| format!("read file {file}"))?;
             let file_size = value.len();
-            let (part_id, ps_addr) = client.resolve_key(key.as_bytes()).await?;
-            let ps = client.get_ps_client(&ps_addr).await?;
-            let resp_bytes = ps
-                .call(
-                    MSG_STREAM_PUT,
-                    rkyv_encode(&StreamPutReq {
-                        part_id,
-                        key: key.into_bytes(),
-                        value,
-                        must_sync: !nosync,
-                        expires_at: 0,
-                    }),
-                )
-                .await
-                .context("stream put")?;
-            let resp: PutResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-            if resp.code != partition_rpc::CODE_OK {
-                bail!("stream put: {}", resp.message);
-            }
+            client.stream_put(key.as_bytes(), &value, !nosync).await
+                .map_err(|e| anyhow!("stream put: {e}"))?;
             println!("ok ({file_size} bytes)");
         }
 
         Command::Get { key } => {
-            let (part_id, ps_addr) = client.resolve_key(key.as_bytes()).await?;
-            let ps = client.get_ps_client(&ps_addr).await?;
-            let resp_bytes = ps
-                .call(
-                    MSG_GET,
-                    rkyv_encode(&GetReq {
-                        part_id,
-                        key: key.into_bytes(),
-                        offset: 0,
-                        length: 0,
-                    }),
-                )
-                .await
-                .context("get")?;
-            let resp: GetResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-            if resp.code == partition_rpc::CODE_NOT_FOUND {
-                eprintln!("key not found");
-                std::process::exit(2);
+            match client.get(key.as_bytes()).await {
+                Ok(Some(value)) => {
+                    use std::io::Write;
+                    std::io::stdout().write_all(&value)?;
+                }
+                Ok(None) => {
+                    eprintln!("key not found");
+                    std::process::exit(2);
+                }
+                Err(e) => bail!("get: {e}"),
             }
-            if resp.code != partition_rpc::CODE_OK {
-                bail!("get: {}", resp.message);
-            }
-            use std::io::Write;
-            std::io::stdout().write_all(&resp.value)?;
         }
 
-        Command::Del { key, nosync } => {
-            let (part_id, ps_addr) = client.resolve_key(key.as_bytes()).await?;
-            let ps = client.get_ps_client(&ps_addr).await?;
-            let resp_bytes = ps
-                .call(
-                    MSG_DELETE,
-                    rkyv_encode(&DeleteReq {
-                        part_id,
-                        key: key.into_bytes(),
-                    }),
-                )
-                .await
-                .context("delete")?;
-            let resp: DeleteResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-            if resp.code == partition_rpc::CODE_NOT_FOUND {
-                eprintln!("key not found");
-                std::process::exit(2);
-            }
-            if resp.code != partition_rpc::CODE_OK {
-                bail!("delete: {}", resp.message);
-            }
+        Command::Del { key, nosync: _nosync } => {
+            client.delete(key.as_bytes()).await
+                .map_err(|e| anyhow!("delete: {e}"))?;
             println!("ok");
         }
 
         Command::Head { key } => {
-            let (part_id, ps_addr) = client.resolve_key(key.as_bytes()).await?;
-            let ps = client.get_ps_client(&ps_addr).await?;
-            let resp_bytes = ps
-                .call(
-                    MSG_HEAD,
-                    rkyv_encode(&HeadReq {
-                        part_id,
-                        key: key.clone().into_bytes(),
-                    }),
-                )
-                .await
-                .context("head")?;
-            let resp: HeadResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-            if resp.found {
-                println!("key: {}, length: {}", key, resp.value_length);
+            let meta = client.head(key.as_bytes()).await
+                .map_err(|e| anyhow!("head: {e}"))?;
+            if meta.found {
+                println!("key: {}, length: {}", key, meta.value_length);
             } else {
                 println!("key not found");
             }
@@ -1098,72 +1017,31 @@ async fn main() -> Result<()> {
             start,
             limit,
         } => {
-            let search_key = if start.is_empty() {
-                prefix.as_bytes()
-            } else {
-                start.as_bytes()
-            };
-            let (part_id, ps_addr) = client.resolve_key(search_key).await?;
-            let ps = client.get_ps_client(&ps_addr).await?;
-            let resp_bytes = ps
-                .call(
-                    MSG_RANGE,
-                    rkyv_encode(&RangeReq {
-                        part_id,
-                        prefix: prefix.into_bytes(),
-                        start: start.into_bytes(),
-                        limit,
-                    }),
-                )
-                .await
-                .context("range")?;
-            let resp: RangeResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-            for e in &resp.entries {
+            let result = client.range(prefix.as_bytes(), start.as_bytes(), limit).await
+                .map_err(|e| anyhow!("range: {e}"))?;
+            for e in &result.entries {
                 println!("{}", String::from_utf8_lossy(&e.key));
             }
-            if resp.has_more {
+            if result.has_more {
                 eprintln!("(truncated, more results available)");
             }
         }
 
         Command::Split { part_id } => {
-            let ps_addr = client.resolve_part_id(part_id).await?;
-            let ps = client.get_ps_client(&ps_addr).await?;
-            ps.call(MSG_SPLIT_PART, rkyv_encode(&SplitPartReq { part_id }))
-                .await
-                .context("split")?;
+            client.split(part_id).await
+                .map_err(|e| anyhow!("split: {e}"))?;
             println!("split ok");
         }
 
         Command::Compact { part_id } => {
-            let ps_addr = client.resolve_part_id(part_id).await?;
-            let ps = client.get_ps_client(&ps_addr).await?;
-            ps.call(
-                MSG_MAINTENANCE,
-                rkyv_encode(&MaintenanceReq {
-                    part_id,
-                    op: MAINTENANCE_COMPACT,
-                    extent_ids: vec![],
-                }),
-            )
-            .await
-            .context("compact")?;
+            client.compact(part_id).await
+                .map_err(|e| anyhow!("compact: {e}"))?;
             println!("compact triggered for partition {part_id}");
         }
 
         Command::Gc { part_id } => {
-            let ps_addr = client.resolve_part_id(part_id).await?;
-            let ps = client.get_ps_client(&ps_addr).await?;
-            ps.call(
-                MSG_MAINTENANCE,
-                rkyv_encode(&MaintenanceReq {
-                    part_id,
-                    op: MAINTENANCE_AUTO_GC,
-                    extent_ids: vec![],
-                }),
-            )
-            .await
-            .context("gc")?;
+            client.gc(part_id).await
+                .map_err(|e| anyhow!("gc: {e}"))?;
             println!("gc triggered for partition {part_id}");
         }
 
@@ -1171,18 +1049,8 @@ async fn main() -> Result<()> {
             part_id,
             extent_ids,
         } => {
-            let ps_addr = client.resolve_part_id(part_id).await?;
-            let ps = client.get_ps_client(&ps_addr).await?;
-            ps.call(
-                MSG_MAINTENANCE,
-                rkyv_encode(&MaintenanceReq {
-                    part_id,
-                    op: MAINTENANCE_FORCE_GC,
-                    extent_ids: extent_ids.clone(),
-                }),
-            )
-            .await
-            .context("forcegc")?;
+            client.force_gc(part_id, extent_ids.clone()).await
+                .map_err(|e| anyhow!("forcegc: {e}"))?;
             println!("forcegc triggered for partition {part_id}, extents={extent_ids:?}");
         }
 

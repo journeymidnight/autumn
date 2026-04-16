@@ -81,6 +81,37 @@ pub(crate) async fn background_compact_loop(
             }
             CompactSelected::Timeout => {
                 next_minor_delay = random_delay();
+
+                // Check if any SSTable has expired keys — trigger major compaction
+                let has_expired = {
+                    let p = part.borrow();
+                    let now = crate::now_secs();
+                    p.sst_readers.iter().any(|r| {
+                        r.min_expires_at > 0 && r.min_expires_at <= now
+                    })
+                };
+                if has_expired {
+                    let tbls = part.borrow().tables.clone();
+                    if tbls.len() >= 1 {
+                        let last_extent = tbls.last().map(|t| t.extent_id).unwrap_or(0);
+                        match do_compact(&part, tbls, true).await {
+                            Ok(_) => {
+                                if last_extent != 0 {
+                                    let (row_stream_id, part_sc) = {
+                                        let p = part.borrow();
+                                        (p.row_stream_id, p.stream_client.clone())
+                                    };
+                                    if let Err(e) = part_sc.truncate(row_stream_id, last_extent).await {
+                                        tracing::warn!("expiry major compaction truncate: {e}");
+                                    }
+                                }
+                            }
+                            Err(e) => tracing::error!("expiry major compaction: {e}"),
+                        }
+                        continue;
+                    }
+                }
+
                 let tbls = part.borrow().tables.clone();
                 let (compact_tbls, truncate_id) = pickup_tables(&tbls, 2 * MAX_SKIP_LIST);
                 if compact_tbls.len() < 2 {

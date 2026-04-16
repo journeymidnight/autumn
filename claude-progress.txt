@@ -1,20 +1,19 @@
 Date: 2026-04-15
 TaskStatus: completed
-Task scope: F082 — ClusterClient auto-reconnect and multi-manager
+Task scope: F084 (skip) + F085 — TTL expiration with background cleanup
 
 Current summary:
-  F082 (completed): ClusterClient auto-reconnect + multi-manager support.
-    - Manager connections: auto-reconnect on error + round-robin failover
-    - PS connections: auto-reconnect on error (drop + reconnect on next call)
-    - connect() accepts comma-separated manager addresses
-    - CLI autumn_client.rs updated for new mgr() -> Result API
+  F084 (skipped): Client routing via etcd watch 不需要实现。
+    - 架构决策：autumn-rs client 不直连 etcd，lazy refresh on routing miss 足够
+    - 路由变更（split/failover）是低频事件，多一次 RTT 可忽略
 
-  Previously completed this session:
-    F077: Etcd-first mutation pattern
-    F078: Per-disk health check
-    F079: Multi-manager for StreamClient + PartitionServer
-    F062-F076: 16 system tests
-    F082: ClusterClient auto-reconnect
+  F085 (completed): TTL expiration with background cleanup.
+    - SSTable MetaBlock 新增 min_expires_at 字段（向后兼容）
+    - SstBuilder 在 add() 时自动跟踪最小非零 expires_at
+    - background_compact_loop 周期性检查 SST 的 min_expires_at，有过期 key 时触发 major compaction
+    - 读路径过滤（get/range/head）和写路径（put_with_ttl）之前已完成
+    - 3 个新单元测试通过，workspace 57 tests all pass
 
 Next steps:
-  - Multi-manager system test with embedded etcd
+  - F024: Prometheus metrics + 结构化日志
+  - F086: FUSE filesystem layer

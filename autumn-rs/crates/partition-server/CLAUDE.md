@@ -127,6 +127,9 @@ After flush, `save_table_locs_raw` writes `TableLocations` to `meta_stream` and 
 
 Two modes, run in `background_compact_loop`. Public method: `trigger_major_compact(part_id) -> Result<(), &'static str>` — enqueues via `compact_tx` channel (capacity 1), non-blocking.
 
+### Expiry-Triggered Major Compaction (automatic)
+During each periodic timeout tick, the compact loop checks all SST readers for `min_expires_at > 0 && min_expires_at <= now`. If any SSTable contains expired keys, a major compaction is triggered on all tables (which drops expired entries and tombstones). This ensures partitions with TTL keys eventually clean up even without explicit compaction triggers.
+
 ### Minor Compaction (periodic, 10–20s jitter)
 `pickup_tables` selects tables via one of two strategies:
 
@@ -260,6 +263,7 @@ vp_extent_id (8B) | vp_offset (4B)
 compression_type (1B, always 0)
 discard_count (4B)
   per entry: [extent_id:8B][size:i64 8B]
+min_expires_at (8B, 0 = no expiring keys)
 crc32c (4B)
 ```
 
