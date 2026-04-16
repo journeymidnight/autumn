@@ -636,8 +636,8 @@ impl AutumnManager {
     // ── Background loops ───────────────────────────────────────────────
 
     async fn ps_liveness_check_loop(&self) {
-        const CHECK_INTERVAL: Duration = Duration::from_secs(10);
-        const PS_DEAD_TIMEOUT: Duration = Duration::from_secs(30);
+        const CHECK_INTERVAL: Duration = Duration::from_secs(2);
+        const PS_DEAD_TIMEOUT: Duration = Duration::from_secs(10);
 
         loop {
             compio::time::sleep(CHECK_INTERVAL).await;

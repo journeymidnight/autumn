@@ -507,9 +507,10 @@ impl PartitionServer {
     }
 
     async fn heartbeat_loop(&self) {
-        const MAX_CONSECUTIVE_FAILURES: u32 = 6; // 6 × 5s = 30s
+        const HEARTBEAT_INTERVAL_SECS: u64 = 2;
+        const MAX_CONSECUTIVE_FAILURES: u32 = 5; // 5 × 2s = 10s
         let mut consecutive_failures: u32 = 0;
-        let mut ticker = compio::time::interval(Duration::from_secs(5));
+        let mut ticker = compio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
         ticker.tick().await; // first tick is immediate
         loop {
             ticker.tick().await;
@@ -530,7 +531,7 @@ impl PartitionServer {
                         tracing::error!(
                             "PS {} heartbeat lost for {}s, exiting to prevent stale serving",
                             self.ps_id,
-                            consecutive_failures * 5,
+                            consecutive_failures as u64 * HEARTBEAT_INTERVAL_SECS,
                         );
                         std::process::exit(1);
                     }
@@ -540,7 +541,7 @@ impl PartitionServer {
     }
 
     async fn region_sync_loop(&self) {
-        let mut ticker = compio::time::interval(Duration::from_secs(5));
+        let mut ticker = compio::time::interval(Duration::from_secs(2));
         ticker.tick().await; // first tick is immediate
         loop {
             ticker.tick().await;

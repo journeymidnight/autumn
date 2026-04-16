@@ -381,6 +381,12 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 - **Notes:** Fixed. Two tests: (1) extent_recovery_replaces_dead_node — seal, verify health, data readable; (2) recovery_dispatch_skips_healthy_sealed_extents — no spurious recovery after 6s.
 - **passes:** true
 
+### F069 · System test: PS crash → heartbeat timeout → partition reassigned
+- **Target:** 2 PS 注册，只有 PS2 发送 heartbeat。10s 后 manager 检测到 PS1 超时，partition 重分配给 PS2。
+- **Evidence:** `crates/manager/tests/system_ps_failover.rs`
+- **Notes:** Fixed. 同时将 PS heartbeat 从 5s 缩短到 2s，manager liveness check 从 10s/30s 缩短到 2s/10s，region_sync 从 5s 缩短到 2s。测试 ~25s（等 heartbeat 超时）。
+- **passes:** true
+
 ### F073 · System test: split with large values — VP resolution across shared extents
 - **Target:** 写入 8KB value (VP)，flush，split。两个 child partition 都能 resolve 指向共享 logStream extent 的 VP。
 - **Evidence:** `crates/manager/tests/system_split_large_values.rs`
