@@ -1,19 +1,27 @@
-Date: 2026-04-15
+Date: 2026-04-16
 TaskStatus: completed
-Task scope: F084 (skip) + F085 — TTL expiration with background cleanup
+Task scope: F086 — Perf instrumentation (VP resolve timing + ExtentNode write timing)
 
 Current summary:
-  F084 (skipped): Client routing via etcd watch 不需要实现。
-    - 架构决策：autumn-rs client 不直连 etcd，lazy refresh on routing miss 足够
-    - 路由变更（split/failover）是低频事件，多一次 RTT 可忽略
+  F086 (completed): Perf instrumentation
+    - ReadMetrics 新增 vp_resolve_ns/vp_resolve_count，handle_get 对 VP 命中计时
+    - ExtentAppendMetrics (thread_local) 在 handle_append_batch vectored write 后记录
+      req_count/bytes/total_ns，每秒 tracing::info! "extent append summary"
+    - WriteLoopMetrics (phase1/2/3) 和 StreamAppendMetrics (lock_wait/fanout) 已实现
+    - 编译通过，无新 error
 
-  F085 (completed): TTL expiration with background cleanup.
-    - SSTable MetaBlock 新增 min_expires_at 字段（向后兼容）
-    - SstBuilder 在 add() 时自动跟踪最小非零 expires_at
-    - background_compact_loop 周期性检查 SST 的 min_expires_at，有过期 key 时触发 major compaction
-    - 读路径过滤（get/range/head）和写路径（put_with_ttl）之前已完成
-    - 3 个新单元测试通过，workspace 57 tests all pass
+  已有埋点输出 (每秒一行):
+    [PS] partition write summary: part_id, ops, avg_phase1_ms, avg_phase2_ms, avg_phase3_ms
+    [PS] stream append summary: lock_wait, extent_lookup, fanout, total (avg)
+    [PS] partition read summary: lookup_ms, vp_resolve_count, avg_vp_resolve_ms, mem/imm/sst/miss
+    [EN] extent append summary: req_count, mb_per_sec, avg_write_ms
+
+  瓶颈假设待验证 (跑 perf_check.sh 后 grep 日志):
+    - phase2_ms >> phase1/3_ms → log_stream Mutex + replica fan-out 是写瓶颈
+    - avg_vp_resolve_ms ≈ p50_read → 读主要耗时在 VP loopback RPC
+    - 3 ExtentNode avg_write_ms 离散 → max-of-N tail 驱动 p95/p99
 
 Next steps:
+  - 跑 perf_check.sh, grep 日志验证假设, 写入 autumn-rs/perf_analysis.md
   - F024: Prometheus metrics + 结构化日志
-  - F086: FUSE filesystem layer
+  - F087: FUSE filesystem layer (原 F086)

@@ -431,6 +431,12 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 - **Notes:** 架构决策：autumn-rs client 不直连 etcd，通过 lazy refresh（路由 miss 时从 manager 拉取）即可。路由变更（split/failover）是低频事件，lazy refresh 多一次 RTT 可忽略；避免了 client 维护 etcd 长连接的复杂度和 etcd 负载。Go 版本的 watch 方式不再沿用。
 - **passes:** true
 
+### F086 · Perf instrumentation — VP resolve & ExtentNode write timing
+- **Target:** 在读路径添加 VP resolve 延迟埋点；在 ExtentNode handle_append_batch 添加服务端 write 延迟埋点，用于性能瓶颈验证。
+- **Evidence:** `crates/partition-server/src/rpc_handlers.rs` (ReadMetrics) · `crates/stream/src/extent_node.rs` (ExtentAppendMetrics)
+- **Notes:** 实现完成。ReadMetrics 新增 `vp_resolve_ns/vp_resolve_count`，在 handle_get 中对 OP_VALUE_POINTER 命中计时。ExtentAppendMetrics 为 thread_local，在 handle_append_batch 的 vectored write + 可选 sync_all 后累积 req_count/bytes/total_ns，每秒打印 "extent append summary"。WriteLoopMetrics(phase1/2/3) 和 StreamAppendMetrics(lock_wait/extent_lookup/fanout) 已在此前实现，无需修改。
+- **passes:** true
+
 ### F085 · TTL expiration with background cleanup
 - **Target:** 后台自动清理过期 key。(1) compaction 阶段已经跳过 expired key（现有逻辑），但不触发 compaction 的 partition 过期 key 会永久占空间；(2) 新增 `background_expiry_loop`：周期性（默认 60s）扫描 SSTable metadata 中记录的最早 expires_at，如果有大量过期 key 则触发 major compaction；(3) range scan 和 get 已经在读路径过滤 expired key（现有逻辑），确保语义正确；(4) `put_with_ttl` 在写入时设置 `expires_at = now() + ttl_seconds`。
 - **Evidence:** `crates/partition-server/src/rpc_handlers.rs` (expires_at filtering in get/range) · `crates/partition-server/src/lib.rs` (encode_record with expires_at) · Go: `range_partition/compaction.go` (isDeletedOrExpired)

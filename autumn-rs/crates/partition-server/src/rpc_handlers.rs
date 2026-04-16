@@ -24,6 +24,8 @@ struct ReadMetrics {
     ops: u64,
     lookup_ns: u64,
     encode_ns: u64,
+    vp_resolve_ns: u64,
+    vp_resolve_count: u64,
     found_in_mem: u64,
     found_in_imm: u64,
     found_in_sst: u64,
@@ -37,6 +39,8 @@ impl ReadMetrics {
             ops: 0,
             lookup_ns: 0,
             encode_ns: 0,
+            vp_resolve_ns: 0,
+            vp_resolve_count: 0,
             found_in_mem: 0,
             found_in_imm: 0,
             found_in_sst: 0,
@@ -47,11 +51,14 @@ impl ReadMetrics {
         if self.started_at.elapsed() >= Duration::from_secs(1) && self.ops > 0 {
             let elapsed = self.started_at.elapsed();
             let ops = self.ops.max(1);
+            let vp = self.vp_resolve_count.max(1);
             tracing::info!(
                 ops = self.ops,
                 ops_per_sec = self.ops as f64 / elapsed.as_secs_f64(),
                 avg_lookup_ms = ns_to_ms(self.lookup_ns, ops),
                 avg_encode_ms = ns_to_ms(self.encode_ns, ops),
+                vp_resolve_count = self.vp_resolve_count,
+                avg_vp_resolve_ms = ns_to_ms(self.vp_resolve_ns, vp),
                 mem = self.found_in_mem,
                 imm = self.found_in_imm,
                 sst = self.found_in_sst,
@@ -158,9 +165,13 @@ pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>
     }
 
     let sc = p.stream_client.clone();
+    let is_vp = (op & crate::OP_VALUE_POINTER) != 0;
     drop(p);
 
+    let vp_t0 = Instant::now();
     let value = resolve_value(op, raw_value, &sc, req.offset, req.length).await.map_err(|e| (StatusCode::Internal, e.to_string()))?;
+    let vp_resolve_ns = if is_vp { vp_t0.elapsed().as_nanos() as u64 } else { 0 };
+
     let encode_t0 = Instant::now();
     let resp = partition_rpc::rkyv_encode(&GetResp { code: CODE_OK, message: String::new(), value });
     let encode_ns = encode_t0.elapsed().as_nanos() as u64;
@@ -170,6 +181,10 @@ pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>
         m.ops += 1;
         m.lookup_ns += lookup_ns;
         m.encode_ns += encode_ns;
+        if is_vp {
+            m.vp_resolve_ns += vp_resolve_ns;
+            m.vp_resolve_count += 1;
+        }
         match source {
             1 => m.found_in_mem += 1,
             2 => m.found_in_imm += 1,

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use autumn_rpc::manager_rpc::{self, MgrExtentInfo};
 use crate::conn_pool::parse_addr;
 use crate::extent_rpc::*;
@@ -36,6 +37,45 @@ use dashmap::DashMap;
 use libc;
 use std::cell::RefCell;
 use std::rc::Rc;
+
+// ─── Per-node append metrics ─────────────────────────────────────────────────
+
+struct ExtentAppendMetrics {
+    started_at: Instant,
+    req_count: u64,
+    bytes: u64,
+    total_ns: u64,
+}
+
+impl ExtentAppendMetrics {
+    fn new() -> Self {
+        Self { started_at: Instant::now(), req_count: 0, bytes: 0, total_ns: 0 }
+    }
+    fn record(&mut self, reqs: u64, bytes: u64, elapsed_ns: u64) {
+        self.req_count += reqs;
+        self.bytes += bytes;
+        self.total_ns += elapsed_ns;
+        self.maybe_report();
+    }
+    fn maybe_report(&mut self) {
+        if self.started_at.elapsed() >= Duration::from_secs(1) && self.req_count > 0 {
+            let elapsed = self.started_at.elapsed();
+            let batches = self.req_count.max(1);
+            tracing::info!(
+                req_count = self.req_count,
+                mb_per_sec = self.bytes as f64 / elapsed.as_secs_f64() / 1_048_576.0,
+                avg_write_ms = autumn_common::metrics::ns_to_ms(self.total_ns, batches),
+                "extent append summary",
+            );
+            *self = Self::new();
+        }
+    }
+}
+
+thread_local! {
+    static EXTENT_APPEND_METRICS: RefCell<ExtentAppendMetrics> =
+        RefCell::new(ExtentAppendMetrics::new());
+}
 
 // ─── DiskFS ──────────────────────────────────────────────────────────────────
 
@@ -1325,6 +1365,7 @@ impl ExtentNode {
             }
 
             // Single vectored write — one pwritev syscall, zero extra copies.
+            let write_t0 = Instant::now();
             let f = unsafe { &mut *extent.file.get() };
             let BufResult(wr, _) = f.write_vectored_at(bufs, file_start).await;
             if let Err(e) = wr {
@@ -1351,6 +1392,10 @@ impl ExtentNode {
                     continue;
                 }
             }
+            let write_elapsed_ns = write_t0.elapsed().as_nanos() as u64;
+            EXTENT_APPEND_METRICS.with(|m| {
+                m.borrow_mut().record(valid_count as u64, total_payload as u64, write_elapsed_ns);
+            });
 
             extent.len.store(total_end, Ordering::SeqCst);
 
