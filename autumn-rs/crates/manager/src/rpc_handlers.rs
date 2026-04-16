@@ -1066,21 +1066,31 @@ impl AutumnManager {
         let req: UpsertPartitionReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
-        {
+        let assigned_part_id = {
             let mut s = self.store.inner.borrow_mut();
-            s.partitions.insert(req.meta.part_id, req.meta);
+            let mut meta = req.meta;
+            // Auto-assign part_id via alloc_ids when client sends 0
+            if meta.part_id == 0 {
+                let (id, _) = s.alloc_ids(1);
+                meta.part_id = id;
+            }
+            let pid = meta.part_id;
+            s.partitions.insert(pid, meta);
             Self::rebalance_regions(&mut s);
-        }
+            pid
+        };
         if let Err(err) = self.mirror_partition_snapshot().await {
-            return Ok(rkyv_encode(&CodeResp {
+            return Ok(rkyv_encode(&UpsertPartitionResp {
                 code: Self::err_to_code(&err),
                 message: err.to_string(),
+                part_id: 0,
             }));
         }
 
-        Ok(rkyv_encode(&CodeResp {
+        Ok(rkyv_encode(&UpsertPartitionResp {
             code: CODE_OK,
             message: String::new(),
+            part_id: assigned_part_id,
         }))
     }
 

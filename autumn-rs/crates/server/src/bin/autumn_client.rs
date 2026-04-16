@@ -918,17 +918,11 @@ async fn main() -> Result<()> {
                 };
                 let meta_stream_id = create_stream.await.context("create meta stream")?;
 
-                let part_id = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64
-                    + idx as u64;
-
                 let meta = MgrPartitionMeta {
                     log_stream: log_stream_id,
                     row_stream: row_stream_id,
                     meta_stream: meta_stream_id,
-                    part_id,
+                    part_id: 0, // auto-assigned by manager via alloc_ids
                     rg: Some(MgrRange {
                         start_key: start_key.clone(),
                         end_key: end_key.clone(),
@@ -943,7 +937,7 @@ async fn main() -> Result<()> {
                     )
                     .await
                     .context("upsert partition")?;
-                let resp: CodeResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+                let resp: UpsertPartitionResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
 
                 if resp.code != partition_rpc::CODE_OK {
                     bail!("bootstrap partition {} failed: {}", idx, resp.message);
@@ -961,7 +955,7 @@ async fn main() -> Result<()> {
                 };
                 println!(
                     "partition {} created: id={} log={} row={} meta={} range=[{}..{})",
-                    idx, part_id, log_stream_id, row_stream_id, meta_stream_id, start_s, end_s
+                    idx, resp.part_id, log_stream_id, row_stream_id, meta_stream_id, start_s, end_s
                 );
             }
             println!("bootstrap succeeded: {} partition(s)", ranges.len());

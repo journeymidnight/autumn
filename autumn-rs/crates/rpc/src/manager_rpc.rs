@@ -352,7 +352,13 @@ pub struct RegisterPsReq {
 pub struct UpsertPartitionReq {
     pub meta: MgrPartitionMeta,
 }
-// Response: CodeResp
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct UpsertPartitionResp {
+    pub code: u8,
+    pub message: String,
+    pub part_id: u64,
+}
 
 // --- GetRegions ---
 // Request: empty payload (0 bytes)
