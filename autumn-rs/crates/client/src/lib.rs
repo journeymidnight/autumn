@@ -345,6 +345,46 @@ impl ClusterClient {
         Ok(result)
     }
 
+    // ── Internal: PS call with routing retry ─────────────────────────────────
+
+    /// Resolve key to (part_id, ps_addr), call PS, retry once on failure with refresh.
+    async fn call_ps_for_key(
+        &mut self,
+        key: &[u8],
+        msg_type: u8,
+        build_payload: impl Fn(u64) -> Bytes,
+    ) -> std::result::Result<Bytes, AutumnError> {
+        for attempt in 0..2 {
+            let (part_id, ps_addr) = self.resolve_key(key).await
+                .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
+            match self.ps_call(&ps_addr, msg_type, build_payload(part_id)).await {
+                Ok(b) => return Ok(b),
+                Err(_) if attempt == 0 => { let _ = self.refresh_regions().await; }
+                Err(e) => return Err(AutumnError::ConnectionError(e.to_string())),
+            }
+        }
+        unreachable!()
+    }
+
+    /// Resolve part_id to ps_addr, call PS, retry once on failure with refresh.
+    async fn call_ps_for_part(
+        &mut self,
+        part_id: u64,
+        msg_type: u8,
+        payload: Bytes,
+    ) -> std::result::Result<Bytes, AutumnError> {
+        for attempt in 0..2 {
+            let ps_addr = self.resolve_part_id(part_id).await
+                .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
+            match self.ps_call(&ps_addr, msg_type, payload.clone()).await {
+                Ok(b) => return Ok(b),
+                Err(_) if attempt == 0 => { let _ = self.refresh_regions().await; }
+                Err(e) => return Err(AutumnError::ConnectionError(e.to_string())),
+            }
+        }
+        unreachable!()
+    }
+
     // ── High-level SDK API ──────────────────────────────────────────────────
 
     /// Put a key-value pair. Retries once on routing miss.
@@ -379,24 +419,12 @@ impl ClusterClient {
         must_sync: bool,
         expires_at: u64,
     ) -> std::result::Result<(), AutumnError> {
-        let (part_id, ps_addr) = self.resolve_key(key).await
-            .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
-        let resp_bytes = self
-            .ps_call(
-                &ps_addr,
-                MSG_PUT,
-                rkyv_encode(&PutReq {
-                    part_id,
-                    key: key.to_vec(),
-                    value: value.to_vec(),
-                    must_sync,
-                    expires_at,
-                }),
-            )
-            .await
-            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
-        let resp: PutResp = rkyv_decode(&resp_bytes)
-            .map_err(|e| AutumnError::ServerError(e))?;
+        let key = key.to_vec();
+        let value = value.to_vec();
+        let resp_bytes = self.call_ps_for_key(&key, MSG_PUT, |part_id| {
+            rkyv_encode(&PutReq { part_id, key: key.clone(), value: value.clone(), must_sync, expires_at })
+        }).await?;
+        let resp: PutResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
         if resp.code != partition_rpc::CODE_OK {
             return Err(code_to_error(resp.code, resp.message));
         }
@@ -405,23 +433,11 @@ impl ClusterClient {
 
     /// Get a value by key. Returns None if not found.
     pub async fn get(&mut self, key: &[u8]) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
-        let (part_id, ps_addr) = self.resolve_key(key).await
-            .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
-        let resp_bytes = self
-            .ps_call(
-                &ps_addr,
-                MSG_GET,
-                rkyv_encode(&GetReq {
-                    part_id,
-                    key: key.to_vec(),
-                    offset: 0,
-                    length: 0,
-                }),
-            )
-            .await
-            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
-        let resp: GetResp = rkyv_decode(&resp_bytes)
-            .map_err(|e| AutumnError::ServerError(e))?;
+        let key = key.to_vec();
+        let resp_bytes = self.call_ps_for_key(&key, MSG_GET, |part_id| {
+            rkyv_encode(&GetReq { part_id, key: key.clone(), offset: 0, length: 0 })
+        }).await?;
+        let resp: GetResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
         if resp.code == partition_rpc::CODE_NOT_FOUND {
             return Ok(None);
         }
@@ -433,21 +449,11 @@ impl ClusterClient {
 
     /// Delete a key. Returns Ok(()) even if key didn't exist.
     pub async fn delete(&mut self, key: &[u8]) -> std::result::Result<(), AutumnError> {
-        let (part_id, ps_addr) = self.resolve_key(key).await
-            .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
-        let resp_bytes = self
-            .ps_call(
-                &ps_addr,
-                MSG_DELETE,
-                rkyv_encode(&DeleteReq {
-                    part_id,
-                    key: key.to_vec(),
-                }),
-            )
-            .await
-            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
-        let resp: DeleteResp = rkyv_decode(&resp_bytes)
-            .map_err(|e| AutumnError::ServerError(e))?;
+        let key = key.to_vec();
+        let resp_bytes = self.call_ps_for_key(&key, MSG_DELETE, |part_id| {
+            rkyv_encode(&DeleteReq { part_id, key: key.clone() })
+        }).await?;
+        let resp: DeleteResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
         if resp.code != partition_rpc::CODE_OK && resp.code != partition_rpc::CODE_NOT_FOUND {
             return Err(code_to_error(resp.code, resp.message));
         }
@@ -456,25 +462,12 @@ impl ClusterClient {
 
     /// Get key metadata (existence and value length).
     pub async fn head(&mut self, key: &[u8]) -> std::result::Result<KeyMeta, AutumnError> {
-        let (part_id, ps_addr) = self.resolve_key(key).await
-            .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
-        let resp_bytes = self
-            .ps_call(
-                &ps_addr,
-                MSG_HEAD,
-                rkyv_encode(&HeadReq {
-                    part_id,
-                    key: key.to_vec(),
-                }),
-            )
-            .await
-            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
-        let resp: HeadResp = rkyv_decode(&resp_bytes)
-            .map_err(|e| AutumnError::ServerError(e))?;
-        Ok(KeyMeta {
-            found: resp.found,
-            value_length: resp.value_length,
-        })
+        let key = key.to_vec();
+        let resp_bytes = self.call_ps_for_key(&key, MSG_HEAD, |part_id| {
+            rkyv_encode(&HeadReq { part_id, key: key.clone() })
+        }).await?;
+        let resp: HeadResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
+        Ok(KeyMeta { found: resp.found, value_length: resp.value_length })
     }
 
     /// Range scan with prefix filter. Scans across partitions like Go's Range().
@@ -526,7 +519,7 @@ impl ClusterClient {
             };
             let part_id = region.part_id;
 
-            let resp_bytes = self
+            let resp_bytes = match self
                 .ps_call(
                     &ps_addr,
                     MSG_RANGE,
@@ -538,7 +531,13 @@ impl ClusterClient {
                     }),
                 )
                 .await
-                .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
+            {
+                Ok(b) => b,
+                Err(_) => {
+                    let _ = self.refresh_regions().await;
+                    continue;
+                }
+            };
             let resp: RangeResp = rkyv_decode(&resp_bytes)
                 .map_err(|e| AutumnError::ServerError(e))?;
             if resp.code != partition_rpc::CODE_OK {
@@ -574,24 +573,12 @@ impl ClusterClient {
         value: &[u8],
         must_sync: bool,
     ) -> std::result::Result<(), AutumnError> {
-        let (part_id, ps_addr) = self.resolve_key(key).await
-            .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
-        let resp_bytes = self
-            .ps_call(
-                &ps_addr,
-                MSG_STREAM_PUT,
-                rkyv_encode(&StreamPutReq {
-                    part_id,
-                    key: key.to_vec(),
-                    value: value.to_vec(),
-                    must_sync,
-                    expires_at: 0,
-                }),
-            )
-            .await
-            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
-        let resp: PutResp = rkyv_decode(&resp_bytes)
-            .map_err(|e| AutumnError::ServerError(e))?;
+        let key = key.to_vec();
+        let value = value.to_vec();
+        let resp_bytes = self.call_ps_for_key(&key, MSG_STREAM_PUT, |part_id| {
+            rkyv_encode(&StreamPutReq { part_id, key: key.clone(), value: value.clone(), must_sync, expires_at: 0 })
+        }).await?;
+        let resp: PutResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
         if resp.code != partition_rpc::CODE_OK {
             return Err(code_to_error(resp.code, resp.message));
         }
@@ -600,11 +587,7 @@ impl ClusterClient {
 
     /// Trigger partition split.
     pub async fn split(&mut self, part_id: u64) -> std::result::Result<(), AutumnError> {
-        let ps_addr = self.resolve_part_id(part_id).await
-            .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
-        self.ps_call(&ps_addr, MSG_SPLIT_PART, rkyv_encode(&SplitPartReq { part_id }))
-            .await
-            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
+        self.call_ps_for_part(part_id, MSG_SPLIT_PART, rkyv_encode(&SplitPartReq { part_id })).await?;
         Ok(())
     }
 
@@ -629,22 +612,11 @@ impl ClusterClient {
     }
 
     async fn maintenance(&mut self, part_id: u64, op: u8, extent_ids: Vec<u64>) -> std::result::Result<(), AutumnError> {
-        let ps_addr = self.resolve_part_id(part_id).await
-            .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
-        let resp_bytes = self
-            .ps_call(
-                &ps_addr,
-                MSG_MAINTENANCE,
-                rkyv_encode(&MaintenanceReq {
-                    part_id,
-                    op,
-                    extent_ids,
-                }),
-            )
-            .await
-            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
-        let resp: MaintenanceResp = rkyv_decode(&resp_bytes)
-            .map_err(|e| AutumnError::ServerError(e))?;
+        let resp_bytes = self.call_ps_for_part(
+            part_id, MSG_MAINTENANCE,
+            rkyv_encode(&MaintenanceReq { part_id, op, extent_ids }),
+        ).await?;
+        let resp: MaintenanceResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
         if resp.code != partition_rpc::CODE_OK {
             return Err(code_to_error(resp.code, resp.message));
         }
