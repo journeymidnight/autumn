@@ -1,0 +1,14 @@
+[package]
+name = "autumn-python"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "autumn"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.24", features = ["extension-module"] }
+autumn-client = { path = "../crates/client" }
+autumn-rpc = { path = "../crates/rpc" }
+compio = { version = "0.18", features = ["runtime", "time"] }

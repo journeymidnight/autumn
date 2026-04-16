@@ -11,6 +11,7 @@ members = [
   "crates/fuse",
   "examples/gallery",
 ]
+exclude = ["python"]
 resolver = "2"
 
 [workspace.package]
