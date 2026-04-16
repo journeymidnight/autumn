@@ -863,6 +863,14 @@ async fn partition_thread_main(
         .context("create per-partition StreamClient")?,
     );
 
+    // Pin row_stream and meta_stream to the Bulk mux connection. These streams
+    // do infrequent but very large appends (256MB SSTable flush, TableLocations
+    // checkpoint) which hold the MuxConn writer mutex for hundreds of ms. Left
+    // on the default Hot pool they would head-of-line-block tiny log_stream WAL
+    // frames that share the same TCP connection.
+    part_sc.set_stream_kind(row_stream_id, autumn_stream::PoolKind::Bulk);
+    part_sc.set_stream_kind(meta_stream_id, autumn_stream::PoolKind::Bulk);
+
     // Check commit length on all streams before recovery (Go: checkCommitLength).
     // This ensures the last extent of each stream has consistent commit length
     // across all replicas before we start reading from it.

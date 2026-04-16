@@ -245,6 +245,8 @@ All caches use `DashMap` for lock-free concurrent access.
 
 10. **Extent allocation is capped per append** — `append_payload` allows at most 3 new extent allocations per single append call (`MAX_ALLOC_PER_APPEND`). This prevents runaway empty extent creation if appends persistently fail.
 
+11. **PoolKind stream affinity (Hot vs Bulk)** — `MuxPool` keys by `(SocketAddr, PoolKind)`. Each (addr, kind) pair owns a distinct TCP connection with its own `MuxConn.writer` mutex. Callers register per-stream affinity via `StreamClient::set_stream_kind(stream_id, PoolKind::Bulk)`; unregistered streams default to `Hot`. The PartitionServer assigns `log_stream` = Hot (small frequent WAL frames) and `row_stream`/`meta_stream` = Bulk (256MB SSTable / checkpoint uploads). Without this split, a single large `write_vectored_all` on the shared MuxConn holds the writer mutex for hundreds of ms and head-of-line-blocks every small WAL batch, causing sawtoothed throughput synchronized to flush cycles.
+
 ---
 
 ## RPC Wire Protocol (extent_rpc.rs)

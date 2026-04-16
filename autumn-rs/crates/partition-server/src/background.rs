@@ -13,6 +13,7 @@ use autumn_stream::StreamClient;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::{FutureExt, SinkExt, StreamExt};
 use futures::channel::{mpsc, oneshot};
+use futures::stream::FuturesOrdered;
 
 use crate::*;
 use crate::sstable::{IterItem, MemtableIterator, MergeIterator, SstBuilder, SstReader, TableIterator};
@@ -281,132 +282,137 @@ pub(crate) async fn background_gc_loop(
 }
 
 
+type CombinedFut = std::pin::Pin<
+    Box<dyn std::future::Future<Output = (BatchData, Result<autumn_stream::AppendResult>)>>,
+>;
+
+fn launch_batch(
+    part: &Rc<RefCell<PartitionData>>,
+    in_flight: &mut FuturesOrdered<CombinedFut>,
+    batch: Vec<WriteRequest>,
+) {
+    match start_write_batch(part, batch) {
+        Ok(Some(InFlightBatch { data, phase2_fut })) => {
+            let fut: CombinedFut = Box::pin(async move {
+                let r = phase2_fut.await;
+                (data, r)
+            });
+            in_flight.push_back(fut);
+        }
+        Ok(None) => {} // empty batch (all out-of-range)
+        Err(e) => tracing::error!("write batch start error: {e}"),
+    }
+}
+
 pub(crate) async fn background_write_loop(
     part_id: u64,
     part: Rc<RefCell<PartitionData>>,
     mut write_rx: mpsc::Receiver<WriteRequest>,
     locked_by_other: Rc<Cell<bool>>,
 ) {
+    // Ring-buffer pipeline: up to `max_inflight` Phase2 futures in flight concurrently.
+    // Phase3 is driven FIFO by polling `FuturesOrdered::next()`, so `vp_offset` stays
+    // monotonic (recovery high-water) and client ack visibility is preserved.
+    // `AUTUMN_PS_WRITE_INFLIGHT=1` restores the old double-buffer behaviour.
+    let max_inflight: usize = std::env::var("AUTUMN_PS_WRITE_INFLIGHT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| (1..=16).contains(&n))
+        .unwrap_or(4);
+    // AUTUMN_PS_WRITE_BATCH_MAX caps per-batch size (default: MAX_WRITE_BATCH = 3072).
+    // Smaller batches reduce per-RPC Phase2 latency → Phase3 head unblocks faster → p99
+    // improves, at the cost of higher per-op RPC overhead.
+    let max_batch: usize = std::env::var("AUTUMN_PS_WRITE_BATCH_MAX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| (1..=MAX_WRITE_BATCH).contains(&n))
+        .unwrap_or(MAX_WRITE_BATCH);
+
     let mut metrics = WriteLoopMetrics::new();
     let mut pending: Vec<WriteRequest> = Vec::new();
-
-    // Double-buffer pipeline (Go doWrites pattern):
-    // While Phase2 (append I/O) is in-flight, collect the next batch from
-    // write_rx. Only block when the next batch is full but Phase2 hasn't
-    // finished yet.
-    //
-    // pending_batch: None = no in-flight Phase2.
-    //                Some = Phase2 running, holds the future + validated entries.
-    let mut in_flight: Option<InFlightBatch> = None;
+    let mut in_flight: FuturesOrdered<CombinedFut> = FuturesOrdered::new();
 
     loop {
-        // ── Collect requests into `pending` ──
-        if pending.is_empty() {
-            if in_flight.is_none() {
-                // Nothing in-flight, nothing pending — block for first request.
-                match write_rx.next().await {
-                    Some(req) => pending.push(req),
-                    None => break,
+        // ── Launch as many batches as we can (respect max_inflight + pending) ──
+        while in_flight.len() < max_inflight && !pending.is_empty() {
+            let take_n = pending.len().min(max_batch);
+            let batch: Vec<WriteRequest> = pending.drain(..take_n).collect();
+            launch_batch(&part, &mut in_flight, batch);
+        }
+
+        // ── Nothing in flight and nothing pending — block for first request ──
+        if in_flight.is_empty() && pending.is_empty() {
+            match write_rx.next().await {
+                Some(req) => {
+                    pending.push(req);
+                    continue;
                 }
-            } else {
-                // Phase2 in-flight — select: new request OR Phase2 done.
-                let flight = in_flight.as_mut().unwrap();
-                enum Sel {
-                    Req(WriteRequest),
-                    Done(Result<autumn_stream::AppendResult>),
-                    Closed,
+                None => break,
+            }
+        }
+
+        // ── Select: new request OR FIFO-head Phase2 completion ──
+        enum Sel {
+            Req(Option<WriteRequest>),
+            Done((BatchData, Result<autumn_stream::AppendResult>)),
+        }
+        let sel = {
+            let mut rx_fut = std::pin::pin!(write_rx.next());
+            let mut flight_fut = std::pin::pin!(in_flight.next());
+            std::future::poll_fn(|cx| {
+                use std::future::Future;
+                use std::pin::Pin;
+                use std::task::Poll;
+                if let Poll::Ready(v) = Pin::new(&mut rx_fut).poll(cx) {
+                    return Poll::Ready(Sel::Req(v));
                 }
-                let sel = {
-                    let mut rx_fut = std::pin::pin!(write_rx.next());
-                    let mut p2_fut = std::pin::pin!(&mut flight.phase2_fut);
-                    std::future::poll_fn(|cx| {
-                        use std::future::Future;
-                        use std::pin::Pin;
-                        use std::task::Poll;
-                        if let Poll::Ready(v) = Pin::new(&mut rx_fut).poll(cx) {
-                            return match v {
-                                Some(r) => Poll::Ready(Sel::Req(r)),
-                                None => Poll::Ready(Sel::Closed),
-                            };
-                        }
-                        if let Poll::Ready(r) = Pin::new(&mut p2_fut).poll(cx) {
-                            return Poll::Ready(Sel::Done(r));
-                        }
-                        Poll::Pending
-                    })
-                    .await
-                };
-                match sel {
-                    Sel::Req(r) => pending.push(r),
-                    Sel::Done(r) => {
-                        // Phase2 finished — complete the batch (Phase3 + reply).
-                        let flight = in_flight.take().unwrap();
-                        match finish_write_batch(&part, flight.data, r).await {
-                            Ok(stats) => metrics.record(stats),
-                            Err(e) => {
-                                if is_locked_by_other(&e) {
-                                    tracing::error!(part_id, "LockedByOther detected, poisoning partition");
-                                    locked_by_other.set(true);
-                                    return;
-                                }
-                                tracing::error!("write batch error: {e}");
-                            }
-                        }
-                        metrics.maybe_report(part_id);
-                        continue;
+                if let Poll::Ready(Some(r)) = Pin::new(&mut flight_fut).poll(cx) {
+                    return Poll::Ready(Sel::Done(r));
+                }
+                Poll::Pending
+            })
+            .await
+        };
+
+        match sel {
+            Sel::Req(Some(r)) => {
+                pending.push(r);
+                // Drain more without blocking.
+                while pending.len() < max_batch {
+                    match write_rx.next().now_or_never() {
+                        Some(Some(req)) => pending.push(req),
+                        _ => break,
                     }
-                    Sel::Closed => break,
                 }
             }
-        }
-
-        // Drain more without blocking.
-        while pending.len() < MAX_WRITE_BATCH {
-            match write_rx.next().now_or_never() {
-                Some(Some(req)) => pending.push(req),
-                _ => break,
-            }
-        }
-
-        // ── If Phase2 still in-flight, wait for it before starting next batch ──
-        if let Some(mut flight) = in_flight.take() {
-            let r = flight.phase2_fut.await;
-            match finish_write_batch(&part, flight.data, r).await {
-                Ok(stats) => metrics.record(stats),
-                Err(e) => {
-                    if is_locked_by_other(&e) {
-                        tracing::error!(part_id, "LockedByOther detected, poisoning partition");
-                        locked_by_other.set(true);
-                        return;
+            Sel::Req(None) => break,
+            Sel::Done((bd, r)) => {
+                match finish_write_batch(&part, bd, r).await {
+                    Ok(stats) => metrics.record(stats),
+                    Err(e) => {
+                        if is_locked_by_other(&e) {
+                            tracing::error!(part_id, "LockedByOther detected, poisoning partition");
+                            locked_by_other.set(true);
+                            return;
+                        }
+                        tracing::error!("write batch error: {e}");
                     }
-                    tracing::error!("write batch error: {e}");
                 }
+                metrics.maybe_report(part_id);
             }
-            metrics.maybe_report(part_id);
-        }
-
-        // ── Start new batch: Phase1 + launch Phase2 ──
-        let batch = std::mem::take(&mut pending);
-        match start_write_batch(&part, batch) {
-            Ok(Some(flight)) => {
-                in_flight = Some(flight);
-                // Loop back to collect next batch while Phase2 runs.
-            }
-            Ok(None) => {} // empty batch (all out-of-range)
-            Err(e) => tracing::error!("write batch start error: {e}"),
         }
     }
 
-    // Drain remaining.
-    if let Some(mut flight) = in_flight.take() {
-        let r = flight.phase2_fut.await;
-        let _ = finish_write_batch(&part, flight.data, r).await;
+    // Drain remaining in-flight batches (Phase3 FIFO).
+    while let Some((bd, r)) = in_flight.next().await {
+        let _ = finish_write_batch(&part, bd, r).await;
     }
+    // Drain any residual pending (single batch, no pipelining).
     if !pending.is_empty() {
         let batch = std::mem::take(&mut pending);
-        if let Ok(Some(mut flight)) = start_write_batch(&part, batch) {
-            let r = flight.phase2_fut.await;
-            let _ = finish_write_batch(&part, flight.data, r).await;
+        if let Ok(Some(InFlightBatch { data, phase2_fut })) = start_write_batch(&part, batch) {
+            let r = phase2_fut.await;
+            let _ = finish_write_batch(&part, data, r).await;
         }
     }
     metrics.flush(part_id);

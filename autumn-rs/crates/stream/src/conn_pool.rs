@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -10,6 +10,8 @@ use bytes::Bytes;
 use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::net::TcpStream;
 use compio::BufResult;
+use futures::channel::oneshot;
+use futures::lock::Mutex as FMutex;
 
 /// A single sequential RPC connection for single-threaded compio runtime.
 struct RpcConn {
@@ -222,4 +224,162 @@ pub fn normalize_endpoint(addr: &str) -> String {
     addr.trim_start_matches("http://")
         .trim_start_matches("https://")
         .to_string()
+}
+
+// ── Multiplexed RPC connection (for pipelined/fast-path stream append) ───────
+
+/// A single multiplexed RPC connection:
+/// - writer is serialized by a futures::Mutex (FIFO lock order ⇒ TCP frame order)
+/// - a spawned reader loop routes responses to pending oneshot receivers by req_id
+///
+/// Multiple tasks can call `send_frame_vectored` concurrently; they get a unique
+/// req_id and a Receiver<Frame> they can await independently. This is the piece
+/// that enables in-flight pipelining of stream appends without holding a lock
+/// across the ack wait.
+pub struct MuxConn {
+    writer: FMutex<compio::net::OwnedWriteHalf<TcpStream>>,
+    pending: RefCell<HashMap<u32, oneshot::Sender<Frame>>>,
+    next_id: Cell<u32>,
+    closed: Cell<bool>,
+}
+
+impl MuxConn {
+    async fn connect(addr: SocketAddr) -> Result<Rc<Self>> {
+        let stream = TcpStream::connect(addr).await?;
+        stream.set_nodelay(true)?;
+        set_tcp_buffer_sizes(&stream, 512 * 1024);
+        let (reader, writer) = stream.into_split();
+        let conn = Rc::new(Self {
+            writer: FMutex::new(writer),
+            pending: RefCell::new(HashMap::new()),
+            next_id: Cell::new(1),
+            closed: Cell::new(false),
+        });
+
+        let conn_for_reader = conn.clone();
+        compio::runtime::spawn(async move {
+            reader_loop(reader, conn_for_reader).await;
+        })
+        .detach();
+
+        Ok(conn)
+    }
+
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.closed.get()
+    }
+
+    /// Submit a request frame and return a Receiver that resolves when the
+    /// response Frame arrives. The caller awaits the Receiver *without* any
+    /// lock held, allowing multiple requests to overlap in the ack phase.
+    pub async fn send_frame_vectored(
+        &self,
+        msg_type: u8,
+        parts: Vec<Bytes>,
+    ) -> Result<oneshot::Receiver<Frame>> {
+        if self.closed.get() {
+            return Err(anyhow!("mux connection closed"));
+        }
+        let req_id = {
+            let id = self.next_id.get();
+            let next = id.wrapping_add(1).max(1);
+            self.next_id.set(next);
+            id
+        };
+
+        let (tx, rx) = oneshot::channel();
+        self.pending.borrow_mut().insert(req_id, tx);
+
+        let payload_len: u32 = parts.iter().map(|p| p.len() as u32).sum();
+        let hdr = Frame::encode_request_header(req_id, msg_type, payload_len);
+        let mut bufs = Vec::with_capacity(1 + parts.len());
+        bufs.push(Bytes::copy_from_slice(&hdr));
+        bufs.extend(parts);
+
+        let mut writer = self.writer.lock().await;
+        let BufResult(result, _) = writer.write_vectored_all(bufs).await;
+        drop(writer);
+
+        if let Err(e) = result {
+            self.pending.borrow_mut().remove(&req_id);
+            self.closed.set(true);
+            return Err(anyhow!("mux write error: {e}"));
+        }
+        Ok(rx)
+    }
+}
+
+async fn reader_loop(mut reader: compio::net::OwnedReadHalf<TcpStream>, conn: Rc<MuxConn>) {
+    let mut decoder = FrameDecoder::new();
+    let mut buf = vec![0u8; 512 * 1024];
+    'outer: loop {
+        loop {
+            match decoder.try_decode() {
+                Ok(Some(frame)) => {
+                    let tx = conn.pending.borrow_mut().remove(&frame.req_id);
+                    if let Some(tx) = tx {
+                        let _ = tx.send(frame);
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    break 'outer;
+                }
+            }
+        }
+        let BufResult(result, buf_back) = reader.read(std::mem::take(&mut buf)).await;
+        buf = buf_back;
+        match result {
+            Ok(0) | Err(_) => break,
+            Ok(n) => decoder.feed(&buf[..n]),
+        }
+    }
+    conn.closed.set(true);
+    // Drop all pending senders → receivers resolve to Canceled (treated as error).
+    conn.pending.borrow_mut().clear();
+}
+
+/// Pool classification for MuxPool. Separates latency-sensitive hot-path
+/// writes (log_stream) from bulk writes (row_stream SSTable flush,
+/// meta_stream checkpoint) so a 256MB flush cannot monopolize the writer
+/// mutex of the connection a 4KB WAL batch needs.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum PoolKind {
+    Hot,
+    Bulk,
+}
+
+/// Multiplexed RPC connection pool keyed by (address, kind). Each
+/// (address, kind) pair gets one `MuxConn`. Reconnects lazily when a
+/// connection is observed closed.
+pub struct MuxPool {
+    conns: RefCell<HashMap<(SocketAddr, PoolKind), Rc<MuxConn>>>,
+}
+
+impl MuxPool {
+    pub fn new() -> Self {
+        Self {
+            conns: RefCell::new(HashMap::new()),
+        }
+    }
+
+    pub async fn get(&self, addr: &str, kind: PoolKind) -> Result<Rc<MuxConn>> {
+        let sock = parse_addr(addr)?;
+        let key = (sock, kind);
+        if let Some(c) = self.conns.borrow().get(&key).cloned() {
+            if !c.is_closed() {
+                return Ok(c);
+            }
+        }
+        let new_conn = MuxConn::connect(sock).await?;
+        self.conns.borrow_mut().insert(key, new_conn.clone());
+        Ok(new_conn)
+    }
+}
+
+impl Default for MuxPool {
+    fn default() -> Self {
+        Self::new()
+    }
 }

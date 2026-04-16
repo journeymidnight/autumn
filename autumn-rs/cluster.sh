@@ -15,7 +15,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$SCRIPT_DIR/target/release"
 LOG_DIR="/tmp/autumn-rs-logs"
-DATA_ROOT="/tmp/autumn-rs"
+DATA_ROOT="${AUTUMN_DATA_ROOT:-/tmp/autumn-rs}"
 MANAGER_ADDR="127.0.0.1:9001"
 ETCD_DIR="$DATA_ROOT/etcd"
 
@@ -150,7 +150,7 @@ do_start() {
         --advertise 127.0.0.1:9201
     wait_port 9201 ps 60  # longer timeout: PS waits for manager leader election
 
-    # bootstrap (create 3 streams + 1 partition) — only on a fresh data dir
+    # bootstrap (create streams + partitions) — only on a fresh data dir
     if [[ -f "$bootstrap_marker" ]]; then
         echo "[cluster] skipping bootstrap (already done — use 'restart' for a fresh cluster)"
     else
@@ -158,7 +158,12 @@ do_start() {
         local repl
         if (( replicas >= 3 )); then repl="3+0"; else repl="${replicas}+0"; fi
         sleep 2  # give PS a moment to register with manager
-        "$AC" --manager "$MANAGER_ADDR" bootstrap --replication "$repl"
+        # AUTUMN_BOOTSTRAP_PRESPLIT: e.g. "4:3fffffff,7ffffffe,bffffffd"
+        if [[ -n "${AUTUMN_BOOTSTRAP_PRESPLIT:-}" ]]; then
+            "$AC" --manager "$MANAGER_ADDR" bootstrap --replication "$repl" --presplit "$AUTUMN_BOOTSTRAP_PRESPLIT"
+        else
+            "$AC" --manager "$MANAGER_ADDR" bootstrap --replication "$repl"
+        fi
         touch "$bootstrap_marker"
         sleep 1    # wait for PS to pick up the new partition
     fi

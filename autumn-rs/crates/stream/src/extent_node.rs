@@ -1129,19 +1129,28 @@ impl ExtentNode {
         }
 
         let mut start = extent.len.load(Ordering::SeqCst);
-        if start < req.commit as u64 {
+        if req.is_reconcile() {
+            if start < req.commit as u64 {
+                return Ok(AppendResp {
+                    code: CODE_PRECONDITION,
+                    offset: 0,
+                    end: 0,
+                }
+                .encode());
+            }
+            if start > req.commit as u64 {
+                Self::truncate_to_commit(&extent, req.commit)
+                    .await
+                    .map_err(|e| (StatusCode::Internal, e))?;
+                start = extent.len.load(Ordering::SeqCst);
+            }
+        } else if start != req.expected_offset {
             return Ok(AppendResp {
-                code: CODE_PRECONDITION,
+                code: CODE_STALE_OFFSET,
                 offset: 0,
-                end: 0,
+                end: start as u32,
             }
             .encode());
-        }
-        if start > req.commit as u64 {
-            Self::truncate_to_commit(&extent, req.commit)
-                .await
-                .map_err(|e| (StatusCode::Internal, e))?;
-            start = extent.len.load(Ordering::SeqCst);
         }
 
         let data_payload = req.payload;
@@ -1304,26 +1313,44 @@ impl ExtentNode {
                 extent.last_revision.store(first.revision, Ordering::SeqCst);
             }
 
-            // Commit reconciliation (only first request carries commit from client).
+            // Commit reconciliation OR fast-path expected_offset check.
             let mut file_start = extent.len.load(Ordering::SeqCst);
-            if file_start < first.commit as u64 {
-                let resp_payload = AppendResp { code: CODE_PRECONDITION, offset: 0, end: 0 }.encode();
-                for k in sub_start..sub_end {
-                    out.push(Frame::response(frames[k].req_id, MSG_APPEND, resp_payload.clone()));
-                }
-                i = sub_end;
-                continue;
-            }
-            if file_start > first.commit as u64 {
-                if let Err(e) = Self::truncate_to_commit(&extent, first.commit).await {
-                    let payload = autumn_rpc::RpcError::encode_status(StatusCode::Internal, &e);
+            if first.is_reconcile() {
+                // Legacy reconcile path: enforce commit-based truncation.
+                if file_start < first.commit as u64 {
+                    let resp_payload = AppendResp { code: CODE_PRECONDITION, offset: 0, end: 0 }.encode();
                     for k in sub_start..sub_end {
-                        out.push(Frame::error(frames[k].req_id, MSG_APPEND, payload.clone()));
+                        out.push(Frame::response(frames[k].req_id, MSG_APPEND, resp_payload.clone()));
                     }
                     i = sub_end;
                     continue;
                 }
-                file_start = extent.len.load(Ordering::SeqCst);
+                if file_start > first.commit as u64 {
+                    if let Err(e) = Self::truncate_to_commit(&extent, first.commit).await {
+                        let payload = autumn_rpc::RpcError::encode_status(StatusCode::Internal, &e);
+                        for k in sub_start..sub_end {
+                            out.push(Frame::error(frames[k].req_id, MSG_APPEND, payload.clone()));
+                        }
+                        i = sub_end;
+                        continue;
+                    }
+                    file_start = extent.len.load(Ordering::SeqCst);
+                }
+            } else {
+                // Fast path: strict optimistic concurrency check, no truncation.
+                if file_start != first.expected_offset {
+                    let resp_payload = AppendResp {
+                        code: CODE_STALE_OFFSET,
+                        offset: 0,
+                        end: file_start as u32,
+                    }
+                    .encode();
+                    for k in sub_start..sub_end {
+                        out.push(Frame::response(frames[k].req_id, MSG_APPEND, resp_payload.clone()));
+                    }
+                    i = sub_end;
+                    continue;
+                }
             }
 
             // Compute per-request offsets and collect payloads for vectored write.

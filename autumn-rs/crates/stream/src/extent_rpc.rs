@@ -25,12 +25,22 @@ pub const MSG_WRITE_SHARD: u8 = 10;
 
 // ── Append (hot path) ────────────────────────────────────────────────────────
 
-/// Fixed binary header for AppendRequest: 29 bytes + raw payload.
+/// Fixed binary header for AppendRequest: 38 bytes + raw payload.
 /// ```text
-/// [extent_id: u64 LE][eversion: u64 LE][commit: u32 LE][revision: i64 LE][must_sync: u8]
-/// [payload bytes...]
+/// [extent_id: u64 LE][eversion: u64 LE][commit: u32 LE][revision: i64 LE]
+/// [must_sync: u8][flags: u8][expected_offset: u64 LE][payload bytes...]
 /// ```
-pub const APPEND_HEADER_LEN: usize = 29;
+///
+/// When `flags & FLAG_RECONCILE != 0` (reconcile path): server uses `commit`
+/// for commit-based truncation (legacy semantics, required on cold start or
+/// after errors).
+///
+/// When `flags & FLAG_RECONCILE == 0` (steady-state fast path): server requires
+/// `local_length == expected_offset` strictly; no truncation is performed.
+pub const APPEND_HEADER_LEN: usize = 38;
+
+/// Flag bits for `AppendReq.flags`.
+pub const FLAG_RECONCILE: u8 = 1 << 0;
 
 pub struct AppendReq {
     pub extent_id: u64,
@@ -38,6 +48,8 @@ pub struct AppendReq {
     pub commit: u32,
     pub revision: i64,
     pub must_sync: bool,
+    pub flags: u8,
+    pub expected_offset: u64,
     pub payload: Bytes,
 }
 
@@ -49,17 +61,21 @@ impl AppendReq {
         buf.put_u32_le(self.commit);
         buf.put_i64_le(self.revision);
         buf.put_u8(if self.must_sync { 1 } else { 0 });
+        buf.put_u8(self.flags);
+        buf.put_u64_le(self.expected_offset);
         buf.extend_from_slice(&self.payload);
         buf.freeze()
     }
 
-    /// Encode only the 29-byte header (for vectored writes — payload sent separately).
+    /// Encode only the 38-byte header (for vectored writes — payload sent separately).
     pub fn encode_header(
         extent_id: u64,
         eversion: u64,
         commit: u32,
         revision: i64,
         must_sync: bool,
+        flags: u8,
+        expected_offset: u64,
     ) -> Bytes {
         let mut buf = BytesMut::with_capacity(APPEND_HEADER_LEN);
         buf.put_u64_le(extent_id);
@@ -67,6 +83,8 @@ impl AppendReq {
         buf.put_u32_le(commit);
         buf.put_i64_le(revision);
         buf.put_u8(if must_sync { 1 } else { 0 });
+        buf.put_u8(flags);
+        buf.put_u64_le(expected_offset);
         buf.freeze()
     }
 
@@ -79,6 +97,8 @@ impl AppendReq {
         let commit = data.get_u32_le();
         let revision = data.get_i64_le();
         let must_sync = data.get_u8() != 0;
+        let flags = data.get_u8();
+        let expected_offset = data.get_u64_le();
         let payload = data;
         Ok(Self {
             extent_id,
@@ -86,8 +106,16 @@ impl AppendReq {
             commit,
             revision,
             must_sync,
+            flags,
+            expected_offset,
             payload,
         })
+    }
+
+    /// Whether this request is a reconcile (commit-based truncation) request.
+    #[inline]
+    pub fn is_reconcile(&self) -> bool {
+        self.flags & FLAG_RECONCILE != 0
     }
 }
 
@@ -278,6 +306,9 @@ pub const CODE_PRECONDITION: u8 = 3;
 pub const CODE_ERROR: u8 = 4;
 /// Returned when `header.revision < last_revision` — a newer owner has taken the lock.
 pub const CODE_LOCKED_BY_OTHER: u8 = 5;
+/// Returned when fast-path append's `expected_offset` doesn't match the extent's `local_length`.
+/// Client should switch to reconcile path to re-align replicas.
+pub const CODE_STALE_OFFSET: u8 = 6;
 
 /// Convert a u8 code from binary wire format to autumn_rpc::StatusCode.
 pub fn code_to_status(code: u8) -> StatusCode {
@@ -295,6 +326,8 @@ pub fn code_description(code: u8) -> &'static str {
         CODE_OK => "ok",
         CODE_NOT_FOUND => "not found",
         CODE_PRECONDITION => "precondition failed",
+        CODE_LOCKED_BY_OTHER => "locked by other",
+        CODE_STALE_OFFSET => "stale offset (replicas diverged, reconcile required)",
         _ => "error",
     }
 }
