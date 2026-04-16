@@ -115,6 +115,13 @@ do_start() {
         --advertise-client-urls http://127.0.0.1:2379
     wait_port 2379 etcd
 
+    # Clean etcd data on fresh start (no bootstrap marker = fresh cluster)
+    local bootstrap_marker="$DATA_ROOT/bootstrapped"
+    if [[ ! -f "$bootstrap_marker" ]]; then
+        echo "[cluster] cleaning etcd (fresh start)"
+        etcdctl del "" --prefix >/dev/null 2>&1 || true
+    fi
+
     # manager
     start_proc manager \
         "$MANAGER" --port 9001 --etcd 127.0.0.1:2379
@@ -144,7 +151,6 @@ do_start() {
     wait_port 9201 ps 60  # longer timeout: PS waits for manager leader election
 
     # bootstrap (create 3 streams + 1 partition) — only on a fresh data dir
-    local bootstrap_marker="$DATA_ROOT/bootstrapped"
     if [[ -f "$bootstrap_marker" ]]; then
         echo "[cluster] skipping bootstrap (already done — use 'restart' for a fresh cluster)"
     else
