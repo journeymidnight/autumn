@@ -1,7 +1,7 @@
 #[cfg(unix)]
 extern crate libc;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1810,12 +1810,42 @@ async fn main() -> Result<()> {
                 rkyv_decode(&regions_resp_bytes).map_err(decode_err)?;
 
             // Build lookup maps
-            let extent_map: HashMap<u64, MgrExtentInfo> =
+            let mut extent_map: HashMap<u64, MgrExtentInfo> =
                 stream_resp.extents.into_iter().collect();
             let stream_map: HashMap<u64, MgrStreamInfo> =
                 stream_resp.streams.iter().cloned().collect();
             let disk_map: HashMap<u64, MgrDiskInfo> =
                 nodes_resp.disks_info.into_iter().collect();
+            let node_map: HashMap<u64, String> = nodes_resp
+                .nodes
+                .iter()
+                .map(|(id, n)| (*id, n.address.clone()))
+                .collect();
+
+            // Query actual size for open (unsealed) extents via commit_length
+            let mut open_extents: HashSet<u64> = HashSet::new();
+            for (eid, ext) in extent_map.iter_mut() {
+                if ext.sealed_length == 0 {
+                    open_extents.insert(*eid);
+                    if let Some(node_id) = ext.replicates.first() {
+                        if let Some(addr) = node_map.get(node_id) {
+                            if let Ok(en_client) = client.get_ps_client(addr).await {
+                                let req = ExtCommitLengthReq {
+                                    extent_id: *eid,
+                                    revision: 0,
+                                };
+                                if let Ok(resp_bytes) =
+                                    en_client.call(EXT_MSG_COMMIT_LENGTH, req.encode()).await
+                                {
+                                    if let Ok(resp) = ExtCommitLengthResp::decode(resp_bytes) {
+                                        ext.sealed_length = resp.length as u64;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             fn human_size(bytes: u64) -> String {
                 if bytes >= 1 << 30 {
@@ -1860,14 +1890,10 @@ async fn main() -> Result<()> {
             let mut extents: Vec<(&u64, &MgrExtentInfo)> = extent_map.iter().collect();
             extents.sort_by_key(|(id, _)| **id);
             for (eid, e) in &extents {
-                let sealed = if e.sealed_length > 0 {
-                    human_size(e.sealed_length)
-                } else {
-                    "open".to_string()
-                };
+                let tag = if open_extents.contains(eid) { " (open)" } else { "" };
                 println!(
-                    "  extent {}: size={}, replicas={:?}, refs={}, eversion={}",
-                    eid, sealed, e.replicates, e.refs, e.eversion
+                    "  extent {}: size={}{}, replicas={:?}, refs={}, eversion={}",
+                    eid, human_size(e.sealed_length), tag, e.replicates, e.refs, e.eversion
                 );
             }
 
