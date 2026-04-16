@@ -477,37 +477,93 @@ impl ClusterClient {
         })
     }
 
-    /// Range scan with prefix filter.
+    /// Range scan with prefix filter. Scans across partitions like Go's Range().
     pub async fn range(
         &mut self,
         prefix: &[u8],
         start: &[u8],
         limit: u32,
     ) -> std::result::Result<RangeResult, AutumnError> {
-        let search_key = if start.is_empty() { prefix } else { start };
-        let (part_id, ps_addr) = self.resolve_key(search_key).await
-            .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
-        let resp_bytes = self
-            .ps_call(
-                &ps_addr,
-                MSG_RANGE,
-                rkyv_encode(&RangeReq {
-                    part_id,
-                    prefix: prefix.to_vec(),
-                    start: start.to_vec(),
-                    limit,
-                }),
-            )
-            .await
-            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
-        let resp: RangeResp = rkyv_decode(&resp_bytes)
-            .map_err(|e| AutumnError::ServerError(e))?;
-        if resp.code != partition_rpc::CODE_OK {
-            return Err(code_to_error(resp.code, resp.message));
+        // Ensure regions are loaded
+        if self.regions.is_empty() {
+            self.refresh_regions().await
+                .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
         }
+
+        let search_key = if start.is_empty() { prefix } else { start };
+
+        // Find starting partition index (same binary search as lookup_key)
+        let start_idx = self.regions.partition_point(|(_, region)| match region.rg.as_ref() {
+            Some(rg) if !rg.end_key.is_empty() => rg.end_key.as_slice() <= search_key,
+            _ => false,
+        });
+
+        let mut remaining = limit;
+        let mut all_entries = Vec::new();
+        let mut has_more = false;
+
+        // Iterate from starting partition through subsequent ones
+        for i in start_idx..self.regions.len() {
+            if remaining == 0 {
+                has_more = true;
+                break;
+            }
+
+            let (_, region) = &self.regions[i];
+
+            // For partitions after the first, check if start_key still has the prefix
+            if i != start_idx && !prefix.is_empty() {
+                if let Some(rg) = &region.rg {
+                    if !rg.start_key.starts_with(prefix) {
+                        break;
+                    }
+                }
+            }
+
+            let ps_addr = match self.ps_details.get(&region.ps_id) {
+                Some(d) => d.address.clone(),
+                None => continue,
+            };
+            let part_id = region.part_id;
+
+            let resp_bytes = self
+                .ps_call(
+                    &ps_addr,
+                    MSG_RANGE,
+                    rkyv_encode(&RangeReq {
+                        part_id,
+                        prefix: prefix.to_vec(),
+                        start: start.to_vec(),
+                        limit: remaining,
+                    }),
+                )
+                .await
+                .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
+            let resp: RangeResp = rkyv_decode(&resp_bytes)
+                .map_err(|e| AutumnError::ServerError(e))?;
+            if resp.code != partition_rpc::CODE_OK {
+                continue;
+            }
+
+            let count = resp.entries.len() as u32;
+            all_entries.extend(resp.entries);
+            remaining = remaining.saturating_sub(count);
+            if resp.has_more {
+                has_more = true;
+            }
+        }
+
+        // Dedup by key — after split, overlapping SSTables may return
+        // the same key from multiple partitions before compaction cleans up.
+        // Keep the first occurrence (from the authoritative partition).
+        {
+            let mut seen = std::collections::HashSet::new();
+            all_entries.retain(|e| seen.insert(e.key.clone()));
+        }
+
         Ok(RangeResult {
-            entries: resp.entries,
-            has_more: resp.has_more,
+            entries: all_entries,
+            has_more,
         })
     }
 

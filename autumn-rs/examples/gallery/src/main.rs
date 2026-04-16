@@ -170,49 +170,20 @@ async fn delete_handler_inner(client: &Client, name: String) -> Response<Body> {
 }
 
 async fn list_handler_inner(client: &Client) -> Response<Body> {
-    // SDK range scans one partition; gallery needs all partitions
-    match list_all_keys(client).await {
-        Ok(keys) => Response::builder()
-            .header("content-type", "text/plain; charset=utf-8")
-            .body(Body::from(keys.join("\n")))
-            .unwrap(),
+    match client.borrow_mut().range(b"", b"", u32::MAX).await {
+        Ok(result) => {
+            let keys: Vec<String> = result
+                .entries
+                .iter()
+                .map(|e| String::from_utf8_lossy(&e.key).to_string())
+                .collect();
+            Response::builder()
+                .header("content-type", "text/plain; charset=utf-8")
+                .body(Body::from(keys.join("\n")))
+                .unwrap()
+        }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("list: {e}")),
     }
-}
-
-/// List all keys across all partitions using low-level API.
-async fn list_all_keys(client: &Client) -> Result<Vec<String>> {
-    use autumn_rpc::partition_rpc::*;
-    use autumn_client::decode_err;
-
-    let partitions = client.borrow_mut().all_partitions().await?;
-    let mut all_keys = Vec::new();
-    for (part_id, ps_addr) in partitions {
-        if ps_addr.is_empty() {
-            continue;
-        }
-        let ps = client.borrow().get_ps_client(&ps_addr).await?;
-        let resp_bytes = ps
-            .call(
-                MSG_RANGE,
-                rkyv_encode(&RangeReq {
-                    part_id,
-                    prefix: vec![],
-                    start: vec![],
-                    limit: u32::MAX,
-                }),
-            )
-            .await?;
-        let resp: RangeResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-        if resp.code != CODE_OK {
-            continue;
-        }
-        for entry in resp.entries {
-            all_keys.push(String::from_utf8_lossy(&entry.key).to_string());
-        }
-    }
-    all_keys.sort();
-    Ok(all_keys)
 }
 
 // ---------------------------------------------------------------------------

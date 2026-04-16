@@ -3,7 +3,6 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use autumn_client::{AutumnError, ClusterClient};
-use autumn_rpc::partition_rpc::*;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
@@ -89,53 +88,22 @@ async fn handle_op(client: &mut ClusterClient, op: Op) {
     }
 }
 
-/// Range scan across all partitions (same pattern as gallery list_all_keys).
+/// Range scan using SDK (cross-partition).
 async fn do_range(
     client: &mut ClusterClient,
     prefix: &[u8],
     start: &[u8],
     limit: u32,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
-    use autumn_client::decode_err;
-
-    let partitions = client
-        .all_partitions()
+    let result = client
+        .range(prefix, start, limit)
         .await
         .map_err(|e| e.to_string())?;
-    let mut results = Vec::new();
-    for (part_id, ps_addr) in partitions {
-        if ps_addr.is_empty() {
-            continue;
-        }
-        let ps = client
-            .get_ps_client(&ps_addr)
-            .await
-            .map_err(|e| e.to_string())?;
-        let resp_bytes = ps
-            .call(
-                MSG_RANGE,
-                rkyv_encode(&RangeReq {
-                    part_id,
-                    prefix: prefix.to_vec(),
-                    start: start.to_vec(),
-                    limit,
-                }),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-        let resp: RangeResp = rkyv_decode(&resp_bytes).map_err(|e| decode_err(e).to_string())?;
-        if resp.code != CODE_OK {
-            continue;
-        }
-        for entry in resp.entries {
-            results.push((entry.key, entry.value));
-        }
-        if results.len() as u32 >= limit {
-            results.truncate(limit as usize);
-            break;
-        }
-    }
-    Ok(results)
+    Ok(result
+        .entries
+        .into_iter()
+        .map(|e| (e.key, e.value))
+        .collect())
 }
 
 /// Batch delete: scan all keys with prefix, then delete each one.
