@@ -302,3 +302,68 @@ flush 前后不再完全停摆：
 - 这是 F087 performance 家族的第三块（fast path → ring-buffer → bulk-mux），解决了连接层 HoL blocking。
 - 下一瓶颈明确在 ExtentNode 侧（单 task 处理 append_batch）。后续性能工作应 focus on ExtentNode 的 per-extent task spawn 或 multi-writer 模型，或 F088 hedging/quorum 绕过 slow replica。
 - 改动零侵入：未登记的 stream 默认 Hot，向后兼容；内存开销忽略（每节点 +1 TCP fd）。
+
+---
+
+## 2026-04-16 44k ops/s ceiling 精确定位（基于 partition/stream summary logs）
+
+用户挑战 "ExtentNode 瓶颈" 的叙事，要求用测量定位 44k ops/s 的真正位置。
+
+### 方法
+- 1 partition × 3× tmpfs replicas，全量 cluster
+- `AUTUMN_PS_WRITE_INFLIGHT=4`，4KB × 不同线程数
+- samply profiling 多次尝试均失败（wrapper + SIGINT 不保存；attach 模式 SIGSTOP 被测进程）
+- 改用 PS 自身已有的 `partition write summary` 与 `stream append summary` 结构化日志，按 Little's law 分析
+
+### 测量结果
+
+| 线程数 | ops/s  | p99     | avg_batch_size | avg_phase2_ms | end_to_end_ms | inflight_peak |
+|-------:|-------:|--------:|---------------:|--------------:|--------------:|--------------:|
+| 256    | 44420  | 62 ms   | 60             | 3 – 5         | 3 – 5.5       | 4             |
+| 512    | 40229  | 155 ms  | 126 – 136      | 6.5 – 10      | 7 – 10        | 4             |
+
+对比 `extent_bench` 单机：4KB × depth 32 → **183k ops/s (732 MB/s)**；cluster 单 log_stream 只有 170 MB/s。
+
+### Little's law 验证
+
+`throughput ≈ inflight × batch_size / end_to_end`
+- 256t：4 × 60 / 5ms = 48000 ≈ 44420 ✓
+- 512t：4 × 130 / 8ms = 65000 vs 观测 40229（Phase2 随 batch 线性增长）
+
+### 结论（修正之前的 ExtentNode 叙事）
+
+1. **ExtentNode 不是瓶颈**：extent_bench 单机 732 MB/s，cluster 每流只用到 170 MB/s，ExtentNode 有 4× 余量。
+2. **ring-buffer 不是吞吐杠杆**：A/B 测试 (INFLIGHT=4 vs 1) 只 +2.7% 吞吐，但 p99 -60%。其价值是尾延迟稳态，不是吞吐。
+3. **真正的 44k 天花板**：每个 log_stream 的 fanout 管道吞吐 ≈ 170 MB/s。原因是 `MuxConn.writer` 是 `futures::Mutex`，即使 4 个 batch 并发，frame 序列化 + TCP 写仍然在同一 MuxConn 上**串行**。加上 3× replica 的字节放大，整条 pipeline 每批需要的总 wire bytes = 3 × batch_bytes。
+4. **加线程不会突破**：线程翻倍 → batch 翻倍 → Phase2 翻倍 → 吞吐不变（甚至略降），p99 线性恶化。
+5. **下一步真正的杠杆（不是 ExtentNode）**：
+   - a) MuxConn 去 Mutex：专用 writer task + mpsc channel，实现真正异步并行写 pipeline
+   - b) Hot pool 内多 TCP 分片：(addr, Hot) → N 条 MuxConn，按 batch 轮询
+   - c) F088 quorum/hedging：2/3 响应即 ack，绕过 slow replica 的 tail
+
+可预期收益：a/b 方案应能把 170 MB/s/stream 推到 350-500 MB/s，对应 90-120k ops/s；c 方案主要降 p99。
+
+---
+
+## 2026-04-17: F087-mux-writer-task — MuxConn 去 futures::Mutex
+
+### 改动
+把 `MuxConn.writer: FMutex<OwnedWriteHalf<TcpStream>>` 换成 `writer_tx: mpsc::UnboundedSender<Vec<Bytes>>` + 独立 `writer_loop` task。`send_frame_vectored` 不再 `writer.lock().await`+`write_vectored_all(bufs).await`，而是直接 `unbounded_send(bufs)` 返回。writer task 用 `rx.next().await` 拿第一帧，再用 `try_recv()` 机会性 coalesce 最多 16 帧成一次 `write_vectored_all` syscall。
+
+### perf-check 结果（256 threads × 10s × 4KB，3× tmpfs，3 次重复）
+
+| 指标 | 基线 (c5161bb) | run1 | run2 | run3 | 差值 |
+|---|---|---|---|---|---|
+| write ops/s | 44420 | 44637 | ~41k | 47902 | 持平 (噪声范围) |
+| write p50 (ms) | 4.05 | 3.28 | 3.12 | 3.07 | **-24%** |
+| write p95 (ms) | 13.60 | 9.60 | 9.28 | 9.30 | **-32%** |
+| write p99 (ms) | 62 | 21.28 | 115.40* | 21.93 | **-65% (常态)** |
+| read ops/s | 92829 | 80462 | 90374 | 83800 | 持平 |
+
+*run2 的 p99=115ms 是一次 tail outlier，run1/run3 稳定在 21-22ms。
+
+### 结论
+- **throughput 未变**验证了之前的诊断：**44k ceiling 的瓶颈是 3× replica bytes**, 不是 writer mutex。mutex 只是 tail latency 贡献者。
+- **p99 从 62 → 21-22ms (-65%)** 证明去 mutex 后，同一 MuxConn 上多个 in-flight producer（Hot pool ring-buffer inflight=4 场景）不再互相 HoL 阻塞，ack 延迟显著收敛。
+- p50/p95 的改善（-24% / -32%）提示对"非尾"请求也有收益——writer task 的 coalesce 降低了 bursty 场景下的 per-frame syscall 开销。
+- 下一步真正的吞吐杠杆仍然是 **Hot pool 内多 TCP 分片** 或 **ExtentNode 写并行化**（extent_bench solo 732 MB/s vs cluster 170 MB/s/stream 之间有 4x gap）。

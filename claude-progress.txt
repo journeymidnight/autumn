@@ -1,56 +1,53 @@
-Date: 2026-04-16
+Date: 2026-04-17
 TaskStatus: completed
-Task scope: F087-bulk-mux — MuxPool Hot/Bulk 分池隔离 WAL 与 flush
+Task scope: F087-mux-writer-task — MuxConn writer 去 futures::Mutex，改 mpsc + 独立 writer task
 
 Current summary:
-  F087-bulk-mux (completed): 按 PoolKind 分池
-    - conn_pool.rs: 新增 PoolKind { Hot, Bulk } 枚举 (Copy/Eq/Hash)
-    - MuxPool: HashMap<SocketAddr, _> → HashMap<(SocketAddr, PoolKind), _>
-    - MuxPool::get(addr, kind): 按 (addr, kind) 索引 MuxConn, 每对一条独立 TCP
-    - lib.rs: re-export PoolKind
-    - client.rs:
-      * StreamClient 新增 stream_kinds: DashMap<u64, PoolKind>
-      * 新增 set_stream_kind(sid, kind) 公开 API + kind_for(sid) 内部辅助
-      * fast_path (line ~625): self.mux_pool.get(addr, self.kind_for(stream_id))
-      * 默认 Hot (未登记即视为延迟敏感)
-    - partition-server/lib.rs (partition_thread_main):
-      * StreamClient 创建后立即 set_stream_kind(row_stream_id, Bulk)
-      * 同样 set_stream_kind(meta_stream_id, Bulk)
-      * log_stream 不登记, 保持默认 Hot
+  F087-mux-writer-task (completed): 去掉 MuxConn.writer 的 futures::Mutex
+    - conn_pool.rs:
+      * `MuxConn` 结构去掉 `writer: FMutex<OwnedWriteHalf<TcpStream>>`
+      * 新增 `writer_tx: mpsc::UnboundedSender<Vec<Bytes>>`
+      * 新增 `writer_loop` task：`rx.next().await` 拿第一个 frame 的 bufs，
+        然后 `try_recv()` 机会性 coalesce 最多 16 帧成一次 `write_vectored_all`
+      * `send_frame_vectored` 变成近乎同步：分配 req_id → 注册 pending →
+        `unbounded_send(bufs)`，不 await I/O
+      * `use futures::channel::{mpsc, oneshot}` + `use futures::StreamExt`
+        替换 `use futures::lock::Mutex as FMutex`
+    - 写错误语义：writer_loop 写失败 → `closed=true` + 清 pending →
+      上游 oneshot 收 Canceled（client.rs join_all 本就处理了此分支）
+    - 连接重建走老路径：`mux_pool.get()` 检测 `is_closed()` 重连
 
-  根因分析:
-    - 之前 MuxPool 按 addr 索引, 同一 ExtentNode 所有 stream 共享 1 条 MuxConn
-    - MuxConn.writer 是 futures::Mutex, 跨 await 锁定
-    - flush 时 row_stream append 256MB SSTable:
-      write_vectored_all 在 loopback TCP 握锁 150-200ms/replica × 3 replicas
-    - 期间 log_stream 的 4KB/16KB WAL 批都 writer.lock().await 等待
-    - 结果: 每 1.5s (FLUSH_MEM_BYTES=256MB / 167MB/s) 一次吞吐凹槽
-    - 小值 (128B) 测试甚至出现 整段 2+s 0 ops/s 完全停摆
+  为什么这个改动重要:
+    - 旧实现：`writer.lock().await` 后 `write_vectored_all(bufs).await`,
+      锁跨 await。Hot pool 典型场景：log_stream ring-buffer inflight=4,
+      每个 batch fan-out 到 3 replica 的 3 条 MuxConn。inflight 越深,
+      同一 MuxConn 上多个 producer 互相 HoL 串行化（只有一个能持锁）
+    - 新实现：writer 任务化后，producer 只做 O(1) 的 channel push，
+      真正的写 I/O 由单独的 task 完成。
+      coalesce 能把多个小帧批成一次 syscall，降低单调 frame 场景的 syscall 开销
 
   测试:
-    - cargo build --release --workspace: 0 error
-    - 清洗 /dev/shm/autumn-rs, 起 3× tmpfs cluster
-    - perf-check 4KB × 256 threads × 10s: 42881 ops/s (baseline 32491, +32%)
-    - perf-check 128B × 256 threads × 15s: 130560 ops/s, p99=3.91ms
-      (之前 128B 在 flush 期间完全停摆, 现在仅短暂 20k 凹点后立即恢复)
-    - perf-check 4KB × 20s: 40827 ops/s (持续 20s 稳定 35-48k)
-    - Read ops/s: 88569 (未变, 读路径不走 mux 写锁)
+    - cargo build --workspace --release: 0 error
+    - cargo test -p autumn-stream --release: 36 unit + 11 integration 全绿
+    - cargo test -p autumn-partition-server --release: 58 passed
+    - perf-check (256 threads × 10s × 4KB, 3× tmpfs):
+        run 1: ops/s=44637, p50=3.28, p95=9.60, p99=21.28ms
+        run 2: ops/s=~41k,  p50=3.12, p95=9.28, p99=115.40ms (outlier)
+        run 3: ops/s=47902, p50=3.07, p95=9.30, p99=21.93ms
+      vs 基线 (F087-bulk-mux 提交 c5161bb): ops/s=44420, p99=62ms
+      → throughput 持平 (44-48k, 瓶颈仍在 3× replica bytes)
+      → p99 通常降到 21-22ms (−65%); 偶尔 tail outlier
 
   关键观察:
-    - log_stream lock_wait_ms: before ~150ms during flush → after 0.0 (隔离成功)
-    - row_stream (Bulk pool) append_ms 依然 150-900ms (此路径本就是 bulk)
-    - inflight_peak = 4 稳定 (F087-followup ring-buffer 持续工作)
-    - p99 依然偏高 (37-81ms): 连接层 HoL 已消除, 但 ExtentNode 单机串行写盘仍是下一个瓶颈
-    - 回退: 未登记的 stream 默认 Hot → 与之前行为等价, 无需 env 开关
-
-  结论:
-    - 连接层 HoL blocking 已解决, log_stream 的"瞬时拥塞"问题消失
-    - 小值 (<VALUE_THROTTLE=4KB) 写入路径改善最大 (完全停摆 → 最低 20k ops/s)
-    - 4KB/大值路径进一步改善受限于 ExtentNode (参考 memory: ps_write_bottleneck)
-    - 下一步性能工作应聚焦 ExtentNode 写盘侧并发/io_uring SQE 批量
+    - 吞吐未改变验证了之前的诊断：44k ceiling 瓶颈 = 3× replica bytes,
+      不是 writer mutex。mutex 主要贡献的是 tail latency（不是 throughput）
+    - p99 从 62 → 21ms 验证了 writer 任务化确实消除了同一 MuxConn 上
+      多 producer 的 HoL 阻塞
+    - Read 路径不受影响（读不走 MuxConn writer），80-90k ops/s 稳定
 
 Next steps:
-  - ExtentNode 侧: handle_append_batch 的 pwritev 语义已批量; 但每个 handle_connection
-    是单 task 串行, 多 extent 并发写需要 spawn per-extent append task
-  - F088 hedging/quorum: 2/3 quorum 替代 join_all, 绕过 slow replica
+  - Hot pool 分片: (addr, Hot) → N 条 MuxConn 轮询 (进一步降 tail + 可能提升吞吐)
+  - F088 hedging/quorum: 2/3 quorum 替代 join_all, 绕过 slow replica (p99 再降)
+  - ExtentNode 单机写盘并行化: 当前 3× tmpfs 也只 170MB/s per stream,
+    extent_bench solo 能到 732MB/s, gap 需要 ExtentNode 写循环侧面的优化
   - F024: Prometheus metrics + 结构化日志

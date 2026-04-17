@@ -10,8 +10,8 @@ use bytes::Bytes;
 use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::net::TcpStream;
 use compio::BufResult;
-use futures::channel::oneshot;
-use futures::lock::Mutex as FMutex;
+use futures::channel::{mpsc, oneshot};
+use futures::StreamExt;
 
 /// A single sequential RPC connection for single-threaded compio runtime.
 struct RpcConn {
@@ -229,19 +229,29 @@ pub fn normalize_endpoint(addr: &str) -> String {
 // ── Multiplexed RPC connection (for pipelined/fast-path stream append) ───────
 
 /// A single multiplexed RPC connection:
-/// - writer is serialized by a futures::Mutex (FIFO lock order ⇒ TCP frame order)
+/// - a dedicated writer task owns the socket write half and drains an mpsc
+///   channel of encoded frame buffers; senders never await on writer I/O
 /// - a spawned reader loop routes responses to pending oneshot receivers by req_id
 ///
-/// Multiple tasks can call `send_frame_vectored` concurrently; they get a unique
-/// req_id and a Receiver<Frame> they can await independently. This is the piece
-/// that enables in-flight pipelining of stream appends without holding a lock
-/// across the ack wait.
+/// Multiple tasks can call `send_frame_vectored` concurrently. Each gets a
+/// unique req_id plus a `Receiver<Frame>` they can await independently.
+///
+/// Frame ordering on the wire matches the order of successful `unbounded_send`
+/// calls, which on a single-threaded compio runtime matches the order in which
+/// `send_frame_vectored` invocations reach their channel push. The writer task
+/// opportunistically coalesces back-to-back queued frames into a single
+/// `write_vectored_all` syscall.
 pub struct MuxConn {
-    writer: FMutex<compio::net::OwnedWriteHalf<TcpStream>>,
+    writer_tx: mpsc::UnboundedSender<Vec<Bytes>>,
     pending: RefCell<HashMap<u32, oneshot::Sender<Frame>>>,
     next_id: Cell<u32>,
     closed: Cell<bool>,
 }
+
+/// Upper bound on frames the writer task coalesces into a single syscall.
+/// Stops one "big" bulk frame from being delayed behind an unbounded queue of
+/// small hot-path frames, and keeps iovec count well under IOV_MAX.
+const WRITER_COALESCE_MAX: usize = 16;
 
 impl MuxConn {
     async fn connect(addr: SocketAddr) -> Result<Rc<Self>> {
@@ -249,8 +259,11 @@ impl MuxConn {
         stream.set_nodelay(true)?;
         set_tcp_buffer_sizes(&stream, 512 * 1024);
         let (reader, writer) = stream.into_split();
+
+        let (writer_tx, writer_rx) = mpsc::unbounded::<Vec<Bytes>>();
+
         let conn = Rc::new(Self {
-            writer: FMutex::new(writer),
+            writer_tx,
             pending: RefCell::new(HashMap::new()),
             next_id: Cell::new(1),
             closed: Cell::new(false),
@@ -259,6 +272,12 @@ impl MuxConn {
         let conn_for_reader = conn.clone();
         compio::runtime::spawn(async move {
             reader_loop(reader, conn_for_reader).await;
+        })
+        .detach();
+
+        let conn_for_writer = conn.clone();
+        compio::runtime::spawn(async move {
+            writer_loop(writer, writer_rx, conn_for_writer).await;
         })
         .detach();
 
@@ -271,8 +290,9 @@ impl MuxConn {
     }
 
     /// Submit a request frame and return a Receiver that resolves when the
-    /// response Frame arrives. The caller awaits the Receiver *without* any
-    /// lock held, allowing multiple requests to overlap in the ack phase.
+    /// response Frame arrives. This call is effectively synchronous: it
+    /// registers the pending entry and hands the encoded buffer to the writer
+    /// task's mpsc channel. No writer lock is held across I/O.
     pub async fn send_frame_vectored(
         &self,
         msg_type: u8,
@@ -297,17 +317,49 @@ impl MuxConn {
         bufs.push(Bytes::copy_from_slice(&hdr));
         bufs.extend(parts);
 
-        let mut writer = self.writer.lock().await;
-        let BufResult(result, _) = writer.write_vectored_all(bufs).await;
-        drop(writer);
-
-        if let Err(e) = result {
+        if self.writer_tx.unbounded_send(bufs).is_err() {
             self.pending.borrow_mut().remove(&req_id);
             self.closed.set(true);
-            return Err(anyhow!("mux write error: {e}"));
+            return Err(anyhow!("mux writer channel closed"));
         }
         Ok(rx)
     }
+}
+
+async fn writer_loop(
+    mut writer: compio::net::OwnedWriteHalf<TcpStream>,
+    mut rx: mpsc::UnboundedReceiver<Vec<Bytes>>,
+    conn: Rc<MuxConn>,
+) {
+    loop {
+        let first = match rx.next().await {
+            Some(b) => b,
+            None => break,
+        };
+        // Coalesce any already-queued frames: one syscall per ready burst
+        // instead of one per frame. Bounded to keep iovec count sane and to
+        // let the reactor schedule reads between writes.
+        let mut bufs = first;
+        for _ in 1..WRITER_COALESCE_MAX {
+            // `try_recv` returns Ok(T) if an item is immediately available,
+            // Err(_) if the channel is empty *or* closed. Either way, stop
+            // coalescing and flush; if the channel is closed the outer
+            // `rx.next().await` on the next iteration returns None and we exit.
+            match rx.try_recv() {
+                Ok(next_bufs) => bufs.extend(next_bufs),
+                Err(_) => break,
+            }
+        }
+        let BufResult(result, _) = writer.write_vectored_all(bufs).await;
+        if result.is_err() {
+            break;
+        }
+    }
+    conn.closed.set(true);
+    // Drop all pending senders → receivers resolve to Canceled. Reader loop
+    // will also clear pending when it notices the half-closed TCP, but doing
+    // it here avoids stranding pending requests if the channel closed first.
+    conn.pending.borrow_mut().clear();
 }
 
 async fn reader_loop(mut reader: compio::net::OwnedReadHalf<TcpStream>, conn: Rc<MuxConn>) {
