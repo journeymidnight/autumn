@@ -440,12 +440,60 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 ### F087-bulk-mux · ConnPool 按 PoolKind 分池（Hot/Bulk）隔离 WAL 与 flush
 - **Target:** 让 `log_stream`（WAL，小帧高频）与 `row_stream`/`meta_stream`（flush/checkpoint，单次 128MB+）走到**不同的 TCP 连接**。之前 ConnPool 按 `SocketAddr` 索引，同一 ExtentNode 的所有 stream 共享一条 RpcConn，flush 占用 socket 数百毫秒，期间 log_stream 的 4KB 批全部排队，每次 flush 出现吞吐凹槽。新增 `PoolKind { Hot, Bulk }`，ConnPool 改为 `HashMap<(SocketAddr, PoolKind), Rc<RefCell<Option<RpcConn>>>>`；StreamClient 新增 `stream_kinds: DashMap<u64, PoolKind>` 与 `set_stream_kind()` API，默认 Hot；fanout 调用处按 stream_id 查 kind 走 `call_vectored_kind`。PartitionServer 在 `partition_thread_main` 中登记 `row_stream_id`/`meta_stream_id` 为 Bulk。
 - **Evidence:** `crates/stream/src/conn_pool.rs` (`PoolKind` 枚举 + `ConnPool::call_kind/call_vectored_kind`) · `crates/stream/src/lib.rs` (re-export) · `crates/stream/src/client.rs` (`stream_kinds` 字段、`set_stream_kind`/`kind_for`、fanout 处 `call_vectored_kind`) · `crates/partition-server/src/lib.rs` (`partition_thread_main` 登记 row/meta 为 Bulk)
-- **Notes:** 基于 6376250 基础上实现。revert 了 F087 fast path (AppendReq flags/expected_offset/CODE_STALE_OFFSET)、F087-followup ring-buffer（PS 回到 double-buffer inflight=1）、F087-mux-writer-task（MuxConn mpsc writer）——这些在同实验结论下均为负优化（吞吐未提升，代码复杂度显著增加）。剩下的只有 PoolKind 分池。perf-check 2 次（256 threads × 10s × 4KB, 3× tmpfs）：write 41-42k ops/s / p99 29-33ms，read 84-96k ops/s。**44k ceiling 的瓶颈是 3× replica bytes per append 除以单节点 extent 极限（extent_bench solo 183k / 3 ≈ 61k, 观测 ~70% 利用率），不是连接层 HoL**——连接层优化无法突破。未登记的 stream 默认 Hot，向后兼容；ConnPool size 从 N=nodes 增到 2N。36 stream + 58 PS 测试全绿。
+- **Notes:** 基于 6376250 基础上实现。revert 了 F087 fast path (AppendReq flags/expected_offset/CODE_STALE_OFFSET)、F087-followup ring-buffer（PS 回到 double-buffer inflight=1）、F087-mux-writer-task（MuxConn mpsc writer）——这些在同实验结论下均为负优化（吞吐未提升，代码复杂度显著增加）。剩下的只有 PoolKind 分池。perf-check 2 次（256 threads × 10s × 4KB, 3× tmpfs）：write 41-42k ops/s / p99 29-33ms，read 84-96k ops/s。**44k ceiling 的瓶颈是 3× replica bytes per append 除以单节点 extent 极限（extent_bench solo 183k / 3 ≈ 61k, 观测 ~70% 利用率），不是连接层 HoL**——连接层优化无法突破。未登记的 stream 默认 Hot，向后兼容；ConnPool size 从 N=nodes 增到 2N。36 stream + 58 PS 测试全绿。**Obsoleted by F093**：F088 把 flush 迁到 P-bulk 独立 OS thread 后，P-log SC 只承载 log_stream（+ 低频 compact write），P-bulk SC 只承载 row/meta stream——两条物理不交集，共享 socket 的 HoL 场景消失，PoolKind 分池失去作用面被删除。
 - **passes:** true
 
 ### F085 · TTL expiration with background cleanup
 - **Target:** 后台自动清理过期 key。(1) compaction 阶段已经跳过 expired key（现有逻辑），但不触发 compaction 的 partition 过期 key 会永久占空间；(2) 新增 `background_expiry_loop`：周期性（默认 60s）扫描 SSTable metadata 中记录的最早 expires_at，如果有大量过期 key 则触发 major compaction；(3) range scan 和 get 已经在读路径过滤 expired key（现有逻辑），确保语义正确；(4) `put_with_ttl` 在写入时设置 `expires_at = now() + ttl_seconds`。
 - **Evidence:** `crates/partition-server/src/rpc_handlers.rs` (expires_at filtering in get/range) · `crates/partition-server/src/lib.rs` (encode_record with expires_at) · Go: `range_partition/compaction.go` (isDeletedOrExpired)
 - **Notes:** 实现完成。SSTable MetaBlock 新增 `min_expires_at` 字段（向后兼容，旧 SST 默认为 0）。SstBuilder 在 add() 时自动跟踪最小非零 expires_at。background_compact_loop 在周期性 timeout 分支中检查所有 SST 的 min_expires_at，如有过期 key 则触发 major compaction（复用现有 do_compact major=true 逻辑，自动清理过期和删除条目）。读路径过滤（get/range/head）和写路径（put_with_ttl）之前已完成。3 个新单元测试通过。
+- **passes:** true
+
+---
+
+## P4 — PS Thread Isolation (log vs flush on separate OS threads)
+
+**背景：** perf_check.sh --shm 实测 write 44k ops/s / p99 29ms，NOFLUSH 实验提升到 63k ops/s / p99 5ms，证明 flush 与 write 在同一 compio runtime thread 上共享 io_uring，flush 的 128MB row_stream append 占用 runtime 数百 ms，导致 log_stream 的 4KB hot batch 排队。F087-bulk-mux 只分开了 TCP 连接，没有分开 OS 线程——flush 的 vectored write submit + CQE wait 仍然和 log append 在同一个 compio worker 上竞争。本阶段把 PS 的 flush/compact 拆到独立 OS 线程，让 log_stream WAL 写入路径独占一个 compio runtime，不再被 bulk 长任务打断。
+
+### F088 · PS Step1 · Split flush_loop to dedicated bulk thread
+- **Target:** 在 PS 内部引入第二个 OS 线程 P-bulk，`background_flush_loop` 独占该线程上的 compio runtime；P-log 线程保留 `background_write_loop` / `dispatch_rpc` / `background_compact_loop` / `background_gc_loop`。P-log 在 imm 就绪时通过 `futures::channel::mpsc` 向 P-bulk 发 `FlushReq { imm: Arc<Memtable>, vp_eid, vp_off, row_sid, meta_sid, tables_snapshot }`，P-bulk 完成 SST build + `row_stream.append` + `meta_stream.append` 后通过回复 channel 返回 `FlushResp { new_table_meta, new_sst_reader, truncate_extent }`，P-log 收到后在自己的线程里 atomic swap `tables`/`sst_readers`。P-bulk 的 StreamClient 用 `StreamClient::new_with_revision` 复用 server 级 owner_lock revision，避免二次 acquire。row_stream_id / meta_stream_id 仍保留 PoolKind=Bulk，但走 P-bulk 自己的 ConnPool。
+- **Evidence:** `crates/partition-server/src/lib.rs` (`partition_thread_main` spawn 逻辑、`spawn_bulk_thread`、`flush_worker_loop`、`do_flush_on_bulk`；`FlushReq` + `flush_req_tx` 字段；重构后的 `flush_one_imm` dispatcher + `flush_one_imm_local` fallback) · `crates/partition-server/CLAUDE.md` 同步更新 (Thread Model + Flush Pipeline 章节)
+- **Notes:** 实现完成并通过 58 个 unit tests。实际 perf_check.sh --shm 三次实测（F088 前 vs F088 后）：吞吐 52k → 53k ops/s（+2%），p99 18.95ms → 10-22ms（中位 ~17ms，高方差）。p50 仍在 3.3ms 附近。Mechanism 验证：`bulk thread ready part_id=13` 日志确认 P-bulk compio runtime 成功启动；flush 期间 log append 不再被同 runtime 阻塞。**结论：F088 机制正确，但提升有限——证实 44k/~50k ceiling 的真正瓶颈在下游 ExtentNode 的 3× replica amplification（`extent_bench` solo ≈ 208k ops/s, /3 ≈ 69k 理论上限，当前 53k ≈ 77% 利用率），PS 侧线程隔离已经做完该做的；剩下的吞吐空间得在 ExtentNode 侧挖（F091）**。
+- **passes:** true
+
+### F089 · PS Step2 · Perf-verify Step1 and decide compact split
+- **Target:** 实测 F088 的效果，对比 baseline（`perf_baseline_shm.json`：44k ops/s, p99 29ms）。关注三个信号：(1) write throughput 提升幅度；(2) p99 尾延迟回落程度；(3) 每秒 extent append summary 中的 avg_write_ms 是否稳定。如果 write ≥50k ops/s & p99 ≤15ms，说明 flush HoL 已解除，F090（compact 拆线程）可标 `not_needed`；否则进入 F090。
+- **Evidence:** `autumn-rs/perf_check.sh` (三次 --shm 运行) · `autumn-rs/perf_baseline_shm.json` (post-F088 更新) · PS 日志 `bulk thread ready` 确认 P-bulk 启动
+- **Notes:** 三次 F088 后 perf_check --shm 结果：(1) 52785 ops/s p99=17.02ms；(2) 54195 ops/s p99=22.38ms；(3) 53612 ops/s p99=9.84ms。吞吐均 ≥52k 满足 ≥50k 目标，但 p99 只有 run#3 ≤15ms，方差极大。原因：仍有 flush 瞬时把 3× ExtentNode 打满 → log append 也受阻（因为下游 ExtentNode 的 `write_vectored_at` 在单 io_uring 上串行）。结论：F090（PS 内再拆 compact 线程）无法突破此瓶颈，标 `not_needed`；真正的下一步是 F091（ExtentNode 侧 spawn_blocking），但按用户的 4-step 计划这需要等 Step2 明确失败后才上。
+- **passes:** true
+
+### F090 · PS Step3 · (Conditional) Move compact_loop to bulk thread
+- **Target:** 若 F089 判定 flush 拆线程后仍未达标，把 `background_compact_loop` 也迁到 P-bulk：P-log 监测 SST 数量阈值后发 `CompactReq { tables_snapshot, major }` 到 P-bulk，P-bulk 跑 merge iterator + `row_stream.append`，返回 `CompactResp` 让 P-log 更新 tables/sst_readers。gc_loop 保留在 P-log（它只 punch 旧 extent，不在写 hot path 上）。
+- **Evidence:** N/A (not executed)
+- **Notes:** **Not needed**. F089 实测确认瓶颈已下沉到 ExtentNode 的单 io_uring 串行化，再拆 compact 到 P-bulk 只能让 compact 不阻塞 write_loop（已经不阻塞了——compact 频率比 flush 低 1 个数量级），无法提升写吞吐。跳过此 step，直接上 F091。
+- **passes:** not_needed
+
+### F091 · PS Step4 · (Conditional) ExtentNode spawn_blocking for bulk appends
+- **Target:** 若 F090 完成后仍低于 100k ops/s，则在 ExtentNode 侧动手：`handle_append_batch` 的 `write_vectored_at` 改为 `compio::runtime::spawn_blocking` 执行（避免阻塞 io_uring 的 CQE polling），单 ExtentNode 上多个并发 append 可真正并行走 pthread 池的 pwritev。需要处理 `&mut *extent.file.get()` 的 unsafe 访问在 spawn_blocking 里的 Send 安全性（用 Arc<File> + `pwritev` 系统调用 explicit）。
+- **Evidence:** `crates/stream/src/extent_node.rs:1370` (`f.write_vectored_at(bufs, file_start).await`) · extent_bench 结果：depth=1 218 MB/s, depth=64 834 MB/s（说明 ExtentNode 本身有 3.8× 并行上升空间未释放）
+- **Notes:** **Superseded**. 用户定案为"一 partition 2 个 OS thread：P-log+read 共享一个 StreamClient，P-bulk 独立 StreamClient"，放弃 3-thread / ExtentNode spawn_blocking 方向。44–53k ceiling 视为下游架构上限（3× replica × 单 io_uring ExtentNode ≈ 69k 理论顶），进一步提升需要 extent 分片或 extent 层单独重构——不在当前任务范围。
+- **passes:** not_needed
+
+### F092 · SstReader Rc→Arc + block_cache Sync 化
+- **Target:** 删除 `unsafe transmute::<Rc<SstReader>, Arc<SstReader>>` 的 soundness hole。`background.rs:750,1084` 和 `rpc_handlers.rs:261` 三处 transmute 发生在 `compio::runtime::spawn_blocking` 边界上；spawn_blocking 会把 closure 投到 pthread pool，`Rc` 不是 `Send`，transmute 绕过编译器绕不过运行时的原子 refcount 要求。正确做法：`SstReader.block_cache` 从 `RefCell<Vec<Option<Arc<DecodedBlock>>>>` 改成 `parking_lot::Mutex<...>`，让 `SstReader: Sync`，外层 `Rc<SstReader>` 改为 `Arc<SstReader>`，去掉所有 transmute。`read_block` 采用两段锁（先只读查缓存、miss 后无锁 decode、然后再短锁 install）保持并发 decode idempotent。
+- **Evidence:** `crates/partition-server/src/sstable/reader.rs` (`block_cache: parking_lot::Mutex<...>` + `read_block` 两段锁重写) · `crates/partition-server/src/lib.rs` (`PartitionData.sst_readers: Vec<Arc<SstReader>>`, 4 处 `Rc::new → Arc::new`) · `crates/partition-server/src/background.rs` (删除两处 transmute，合并 `get_discards_rc → get_discards`) · `crates/partition-server/src/rpc_handlers.rs` (删除 transmute) · `autumn-rs/Cargo.toml` + partition-server `Cargo.toml` (新增 `parking_lot = "0.12"`)
+- **Notes:** `cargo test -p autumn-partition-server --lib` 58 全绿，`cargo test -p autumn-stream --lib` 36 全绿，`grep transmute::<Rc` 返回空。2-thread 模型下 block_cache 实际只有 P-log 读，无争用，`parking_lot::Mutex` 代价接近 RefCell（一次 atomic CAS）。若后续 F094 perf 回退 >3%，可降级为 `parking_lot::RwLock` 做读写分离。
+- **passes:** true
+
+### F093 · PoolKind 移除（F087-bulk-mux cleanup after F088）
+- **Target:** 删除 `PoolKind::{Hot, Bulk}` 分池。F088 把 flush 迁到 P-bulk 独立 OS thread + 独立 StreamClient + 独立 ConnPool 之后，P-log SC 专服 log_stream（+ 低频 compact write）、P-bulk SC 专服 row/meta stream——两条物理不交集，共享 socket 的 HoL 场景消失，PoolKind 分池失去意义。改动：删 `PoolKind` 枚举、`call_kind` / `call_vectored_kind` 合并回 `call` / `call_vectored`；ConnPool key `(SocketAddr, PoolKind) → SocketAddr`；StreamClient 删 `stream_kinds: DashMap<u64, PoolKind>` 字段 + `set_stream_kind` / `kind_for` 方法；PartitionServer 删 4 处 `set_stream_kind` 调用 + `spawn_bulk_thread` 的 `row_stream_id` / `meta_stream_id` 未用参数。
+- **Evidence:** `crates/stream/src/conn_pool.rs` (`ConnPool { conns: HashMap<SocketAddr, Rc<RefCell<Option<RpcConn>>>> }`) · `crates/stream/src/client.rs` (删 stream_kinds/set_stream_kind/kind_for) · `crates/stream/src/lib.rs` (re-export 去 PoolKind) · `crates/partition-server/src/lib.rs` (删 set_stream_kind 调用 + 参数精简) · `crates/stream/CLAUDE.md` note #11 改为 post-F093 说明
+- **Notes:** 纯清理 commit；`cargo check --workspace` 干净，58+36 tests 全绿。对应 F087-bulk-mux Notes 已追加 "Obsoleted by F093"。
+- **passes:** true
+
+### F094 · Perf-verify F092+F093 + 文档/账本同步
+- **Target:** 验证 F092（Rc→Arc + Mutex）与 F093（PoolKind 删除）未造成 perf 回退。验收标准：write ≥ 52k ops/s（当前 53k ± 1%），read ≥ 73k ops/s（当前 75k ± 3%），p99 write ≤ 25ms。同步更新 autumn-rs/CLAUDE.md、partition-server/CLAUDE.md、stream/CLAUDE.md；更新 `perf_baseline_shm.json`、`claude-progress.txt`；提交 git commit。
+- **Evidence:** `perf_baseline_shm.json` (post-F092/F093 基线) · 3× `perf_check.sh --shm` 结果记录于 `claude-progress.txt` · 三个 CLAUDE.md 同步 PoolKind 删除 / P-bulk SC 单 kind 状态
+- **Notes:** 见 claude-progress.txt。
 - **passes:** true
 

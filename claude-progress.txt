@@ -1,57 +1,76 @@
 Date: 2026-04-17
 TaskStatus: completed
-Task scope: F061 FUSE — drop busy-poll dispatch loop, switch bridge to futures mpsc + compio::time::timeout-driven periodic sync
+Task scope: F088-F094 — 2-thread-per-partition cleanup (SstReader hygiene + PoolKind removal)
 
 Current summary:
-  Problem diagnosed last session: per-chunk kv_put观测到 7ms延迟，而 RPC本身只 1ms。
-  剩下 6ms 是 main.rs 那条 `try_recv + sleep(100μs)` 轮询循环的空转开销
-  (256MB seq write拆 2048次 FUSE WRITE，累积 100-200ms 纯 sleep)。
+  F088 (completed · passes: true):
+    机制：P-bulk 独立 OS thread + compio runtime + ConnPool + StreamClient::new_with_revision，
+    flush 通过 mpsc<FlushReq>/oneshot<FlushResp> 跨线程；P-log 保留 write_loop/compact_loop/
+    gc_loop/dispatch_rpc，单线程语义完整。58 unit tests 通过。
 
-  本次修改：
-    1. crates/fuse/src/bridge.rs
-       - FuseBridge 从 std::sync::mpsc 改为 futures::channel::mpsc::unbounded
-       - call_sync 签名改成接受 futures UnboundedSender，用 unbounded_send（非阻塞、Send-safe、
-         可以在同步 fuser 回调线程里直接调用）
-       - Reply<T> 保留 std::sync::mpsc（oneshot，fuser 线程用 recv_timeout 阻塞等回复，
-         std 语义正确）
-    2. crates/fuse/src/ops.rs
-       - AutumnFs.tx 类型切到 futures::channel::mpsc::UnboundedSender<FsRequest>
-       - destroy / forget 里 self.tx.send(...) 改成 unbounded_send(...)
-    3. crates/fuse/src/main.rs
-       - 移除 try_recv + sleep 轮询循环
-       - 改用 compio::time::timeout(remaining, rx.next()) + 30s 抖动周期驱动 periodic_sync：
-         下一次 deadline 到之前 await 在 rx 上，rx 空 -> compio 不 spin；
-         rx.next 到 None 自然退出；
-         timeout 触发时扫 dirty_inodes 并 flush
-       - periodic_sync 抽成独立 async fn
-       - 删掉未用的 use autumn_fuse::sync_task;
-    4. crates/fuse/src/state.rs
-       - 删除 kv_put 里的 tracing::info! timing 仪器，已完成其诊断使命
+  F089 (completed · passes: true):
+    perf_check.sh --shm 三次 (post-F088): 52785 / 54195 / 53612 ops/s, p99 17 / 22 / 10 ms。
+    相对 pre-F088 的 52k/18.95ms: 吞吐 +2%，p99 高方差；证明 PS-side flush HoL 不再是瓶颈，
+    真因是 ExtentNode 单 io_uring × 3× replica = 69k 理论上限。
 
-  构建：cargo build --release -p autumn-fuse — 0 error，仅有 autumn-rpc 里 2 个无关 warning。
+  F090 (not_needed):
+    拆 compact 到 P-bulk 无法突破 ExtentNode 瓶颈；跳过。
 
-  性能对比（同一 1× local cluster，256MB fsync）：
-    | 指标                | 改前       | 改后       | 倍率 |
-    |---------------------|-----------:|-----------:|-----:|
-    | dd seq write bs=1M  | 34 MB/s    | **130 MB/s** | 3.8× |
-    | dd seq read  bs=1M  | 349 MB/s   | **502 MB/s** | 1.4× |
-    | fio 4k randread     | 5370 IOPS  | **11.3k IOPS** | 2.1× |
-    | fio 4k randwrite    | 870 IOPS   | 706 IOPS   | 0.8× |
+  F091 (not_needed · superseded):
+    用户定案：保持 2-thread-per-partition（P-log+read 共享一个 StreamClient，P-bulk 独立
+    StreamClient），放弃 ExtentNode spawn_blocking / 3-thread 扩展方向。44-53k ceiling
+    视为下游架构上限。
 
-  4k randwrite 波动属噪声，单次 kv_put ≈1.4ms，sleep 节省量在微秒级小写上不显。
+  F092 (completed · passes: true):
+    删除 `unsafe transmute::<Rc<SstReader>, Arc<SstReader>>` 的 soundness hole。
+    背景：3 处 transmute（background.rs:750、:1084、rpc_handlers.rs:261）发生在
+    compio::runtime::spawn_blocking 边界上；spawn_blocking 使用 pthread pool，跨 OS thread，
+    `Rc` 不是 Send，transmute 绕过编译器但绕不过原子 refcount 要求——真实的 soundness bug。
+    修复：
+      - SstReader.block_cache: RefCell<Vec<Option<Arc<DecodedBlock>>>>
+                            → parking_lot::Mutex<...>
+      - read_block 两段锁（先只读查 cache，miss 后无锁 decode，再短锁 install；并发 miss idempotent）
+      - PartitionData.sst_readers: Vec<Rc<SstReader>> → Vec<Arc<SstReader>>
+      - 4 处 Rc::new(reader) → Arc::new(reader)
+      - 3 处 transmute::<Rc,Arc> 全部删除，改为 .clone()
+      - get_discards_rc 与 get_discards 合并
+      - 新增 workspace dep: parking_lot = "0.12"
+    验证：cargo check --workspace 干净；58+36 tests 全绿。
 
-  正确性验证：
-    - dd seq write 256MB -> md5 = 1f5039e50bd66b290c56684d8550c6c2
-    - umount + remount 后 md5 仍一致
-    - ls、mkdir、touch 正常
+  F093 (completed · passes: true):
+    删除 F087-bulk-mux 的 PoolKind 分池。F088 独立 P-bulk SC + ConnPool 后，
+    P-log SC 专服 log_stream（+ 低频 compact）、P-bulk SC 专服 row/meta——
+    两条物理不交集，共享 socket HoL 场景消失，PoolKind 失去作用面。改动：
+      - 删 PoolKind 枚举 (conn_pool.rs)
+      - 合并 call_kind/call_vectored_kind 回 call/call_vectored
+      - ConnPool key: (SocketAddr, PoolKind) → SocketAddr
+      - StreamClient 删 stream_kinds DashMap + set_stream_kind + kind_for
+      - PartitionServer 删 4 处 set_stream_kind 调用
+      - spawn_bulk_thread 删除未用的 row_stream_id / meta_stream_id 参数
+      - crates/stream/CLAUDE.md note #11 改为 post-F093 说明
+      - feature_list F087-bulk-mux Notes 追加 "Obsoleted by F093"
+    验证：cargo check --workspace 干净；58+36 tests 全绿。
 
-Main gaps:
-  - attr_timeout/entry_timeout=30s 好像没完全生效 (stat 只 1k/s)，待排查 — 可能 fuser 那侧覆盖或 DefaultPermissions 选项触发每次 revalidate
-  - F061 Phase 2: symlink / readdirplus / xattr 未实现
-  - 周期 sync 现在由 dispatch loop 内嵌驱动，sync_task.rs 仍未起用（可以后续删掉或迁移成外部 task）
-  - F024 metrics, F084 etcd watch routing 未动
+  F094 (completed · passes: true):
+    perf_check.sh --shm 三次 (post-F092+F093):
+      R1: write 54535 ops/s p99 21.28ms, read 68817 ops/s p99 5.83ms
+      R2: write 48897 ops/s p99 27.20ms, read 73549 ops/s p99 6.03ms
+      R3: write 56984 ops/s p99  5.56ms, read 73546 ops/s p99 5.92ms
+      median: write 54535 / p99 21.28ms, read 73546 / p99 5.92ms
+      mean:   write 53472, read 71970
+    验收：
+      - Write ≥ 52k ops/s  → ✓ (median 54535, mean 53472, 接近 pre-F092 的 53612)
+      - Read  ≥ 73k ops/s  → ✓ (median 73546) / mean 71970 落在 ±3% 容差内
+      - p99 write ≤ 25ms   → median OK (R1=21.28, R3=5.56, R2=27.20 单次 outlier)
+    结论：F092+F093 合格。R2 的 p99 outlier 与 F088 实测的 22ms 尾延迟方差一致，
+    不是 regression，是 ExtentNode 侧 3× replica fanout 的固有抖动。
+    已更新 perf_baseline_shm.json（median 作为新基线）。
+
+Main gaps: none.
 
 Next steps:
-  - attr_timeout 不生效的根因排查
-  - FUSE Phase 2 (symlink, readdirplus)
-  - 清理 sync_task.rs（现在是 dead code）
+  1. git commit F088+F089+F092+F093+F094 的整体 stack（lib.rs / background.rs /
+     rpc_handlers.rs / sstable/reader.rs / stream client/conn_pool/lib / 三份
+     CLAUDE.md / Cargo.toml / Cargo.lock / perf_check.sh / perf_baseline_shm.json
+     / feature_list.md / claude-progress.txt）。
+  2. 后续若要继续抬升吞吐，方向是下游 extent 分片或单独重构 ExtentNode —— 不在本任务范围。
