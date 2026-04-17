@@ -1,46 +1,47 @@
 Date: 2026-04-17
 TaskStatus: completed
-Task scope: F087 revert — 保留 Hot/Bulk 分池，回退 fast path / ring-buffer / writer-task
+Task scope: F061 FUSE filesystem — 修 readdir segfault + flush 丢 size 两个阻塞 bug，通过手工集成测试
 
 Current summary:
-  F087 revert (completed): 把从 6376250 之后加的 F087 优化全部回退，只保留 Hot/Bulk 分池。
-    - 回退的提交：
-      * c5161bb feat(stream): F087 performance arc — fast path + ring-buffer + Hot/Bulk MuxPool
-      * 7e252b3 feat(stream): MuxConn writer task + mpsc (F087-mux-writer-task)
-    - 回退的模块：
-      * AppendReq wire 协议：`flags:u8 + expected_offset:u64` 去掉，header 回到 29B
-      * `FLAG_RECONCILE` / `CODE_STALE_OFFSET` 去掉
-      * `ExtentNode::handle_append` 的 fast/reconcile 双分支合并回单分支
-      * `ConnPool` 回到简单 `RpcConn`（sequential RPC，write_vectored_all 一次 syscall header+payload）
-      * `MuxPool` / `MuxConn` 全部删除（mpsc writer task 跟随删除）
-      * PS `background_write_loop` 回到 `Option<InFlightBatch>` double-buffer（inflight=1）
-      * StreamClient 去掉 `try_append_fast` / `append_reconcile_internal` / `StreamAppendState.tail_offset/reconciled/inflight`
-    - 保留的部分（F087-bulk-mux 的核心价值）：
-      * `PoolKind { Hot, Bulk }` 枚举
-      * `ConnPool` 改用 `HashMap<(SocketAddr, PoolKind), Rc<RefCell<Option<RpcConn>>>>`
-      * `ConnPool::call_kind` / `call_vectored_kind` 显式传 kind 的 API
-      * StreamClient `stream_kinds: DashMap<u64, PoolKind>` + `set_stream_kind` + `kind_for`
-      * fanout 走 `pool.call_vectored_kind(&addr, self.kind_for(stream_id), MSG_APPEND, parts)`
-      * PartitionServer `partition_thread_main` 中登记 row/meta 为 Bulk
+  三处修改:
+    1. crates/fuse/src/state.rs: `kv_range` 重命名为 `kv_range_keys`，返回 `Vec<Vec<u8>>`
+       - 背景: PS `handle_range` 默认只回 key，`RangeEntry.value = vec![]`，这是有意的 wire contract
+       - 原来 FUSE 以为 range 返回 (key, value) 对，直接 decode 空 bytes 就走 rkyv `from_bytes_unchecked`
+         读未初始化内存 → segfault
+    2. crates/fuse/src/dir.rs: readdir 先 `kv_range_keys` 拿 dirent key 列表，再对每个 key `kv_get`
+       取 DirentValue；rmdir 只用 keys 判空不再解 value
+    3. crates/fuse/src/schema.rs: `decode_dirent` / `decode_inode_meta` 遇到空 bytes 提前返回 Err，
+       防止上游漏过空 value 时再次触发 rkyv unchecked segfault
+    4. crates/fuse/src/write.rs: `flush_inode` 重构
+       - 原来当写缓冲已空（chunks 已在 write() 路径增量刷写）时直接 return，不调用 put_inode
+       - 结果：cp 2MB 文件后 md5 正确，但 umount+remount 后 size=0、内容空
+       - 修复：buffer 为空也继续往下走，dirty 位已置则 put_inode 持久化 size/mtime
 
-  为什么回退:
-    - extent_bench solo 183k ops/s ÷ 3× replica = 单 PS 理论极限 ~61k，观测 41-44k = 67-72% 利用率
-    - 44k 吞吐天花板是 3× replica bytes + 单节点 extent 写能力，不是连接层 HoL
-    - 连接层优化（mux / inflight depth / 去 mutex）都不能突破这个天花板
-    - 只有 Hot/Bulk 分池有真实吞吐收益（+32%），因为它把 128MB SSTable flush 从 WAL 的 socket 上移走
-    - 其他改动都是负优化：复杂度大，throughput 不变，p99 变化在噪声范围内
+  手工集成验证（/tmp/autumn-fuse-mnt，对 1× local cluster）：
+    - mkdir / rmdir / rmdir-non-empty(ENOTEMPTY)
+    - create small (inline)、cat 读回一致
+    - cp 512KB + 2MB 随机文件，md5 对比源文件完全一致
+    - 嵌套目录 a/b/c、find tree 正确
+    - rename 文件 / 重命名目录
+    - rm -rf 递归删除
+    - umount + remount 后文件内容 md5 仍然一致（持久化闭环）
 
-  测试:
-    - cargo build --workspace --release: 0 error
-    - cargo test -p autumn-stream --release: 47 passed (36 unit + 11 integration)
-    - cargo test -p autumn-partition-server --release: 58 passed
-    - perf-check 2 次（256 threads × 10s × 4KB, 3× tmpfs）：
-        run 1: write=41246 ops/s p50=3.95 p95=9.52 p99=29.54ms, read=96485 ops/s
-        run 2: write=42466 ops/s p50=3.94 p95=9.23 p99=33.53ms, read=84065 ops/s
-      匹配 F087-bulk-mux 基线预期（~42k，未受 F087/writer-task 影响）
+  修改的 crate 构建: `cargo build --release -p autumn-partition-server -p autumn-fuse` 0 error
+
+  仍未覆盖（后续 item）：
+    - 大文件 non-contiguous write（gap detection 路径）
+    - 并发多客户端写同一文件
+    - symlink / link（F061 Phase 2）
+    - readdirplus / xattr（F061 Phase 2）
+    - 周期 sync loop 的 30s 抖动（sync_task.rs 存在但未串到 main.rs，main.rs 有 unused import warning）
+
+Main gaps:
+  - F061 Phase 2 功能（symlink、hardlink、readdirplus、xattr）未做
+  - 周期 sync task 未启动（当前只靠 close/fsync/destroy 触发 flush）
+  - FUSE 性能测试（fio/dd 吞吐、lookup 延迟）未做
 
 Next steps:
-  - Hot pool 分片: (addr, Hot) → N 条 RpcConn 轮询（拆 replica fanout bytes 到多 socket）
-  - F088 hedging/quorum: 2/3 quorum 替代 join_all, 绕过慢副本降 p99
-  - ExtentNode 写循环并行化: 单 stream 170MB/s vs solo 732MB/s 的 gap 在 ExtentNode 端
-  - F024: Prometheus metrics + 结构化日志
+  - F061 Phase 2: symlink + readdirplus（ls -la 可以一次 batch 返回所有子项 attr）
+  - 启动周期 sync task：main.rs 里 spawn sync_task.rs 的循环
+  - FUSE 性能基线：fio 4KB random read/write + dd seq throughput
+  - 其他未完成 feature：F024 (metrics), F084 (etcd watch routing)

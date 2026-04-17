@@ -105,24 +105,25 @@ pub async fn write(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) -> R
 
 /// Flush all buffered writes for an inode.
 pub async fn flush_inode(state: &mut FsState, ino: u64) -> Result<()> {
-    // Extract buffer data to avoid holding borrow during async KV ops
+    // Extract buffered chunk data (if any) to drain before persisting meta.
     let (buf_data, buf_offset, buf_len) = {
         let is = match state.inodes.get_mut(&ino) {
             Some(is) => is,
             None => return Ok(()),
         };
-        let wb = match is.write_buf.as_mut() {
-            Some(wb) if wb.len > 0 => wb,
-            _ => return Ok(()),
-        };
-        let data = wb.buf[..wb.len].to_vec();
-        let offset = wb.offset;
-        let len = wb.len;
-        wb.len = 0;
-        (data, offset, len)
+        match is.write_buf.as_mut() {
+            Some(wb) if wb.len > 0 => {
+                let data = wb.buf[..wb.len].to_vec();
+                let offset = wb.offset;
+                let len = wb.len;
+                wb.len = 0;
+                (data, offset, len)
+            }
+            _ => (Vec::new(), 0i64, 0usize),
+        }
     };
 
-    // Write buffered data as chunks
+    // Write buffered data as chunks (no-op when buf_len == 0)
     let mut pos = 0;
     let mut file_offset = buf_offset;
     while pos < buf_len {
@@ -132,12 +133,16 @@ pub async fn flush_inode(state: &mut FsState, ino: u64) -> Result<()> {
         file_offset += to_write as i64;
     }
 
-    // Sync inode metadata to KV
+    // Persist the current InodeMeta if dirty — captures size/mtime updates from
+    // writes whose chunk data was already flushed incrementally during write().
     let meta = {
         let is = match state.inodes.get_mut(&ino) {
             Some(is) => is,
             None => return Ok(()),
         };
+        if !is.dirty {
+            return Ok(());
+        }
         is.dirty = false;
         is.meta.clone()
     };

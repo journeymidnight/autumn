@@ -47,24 +47,29 @@ pub async fn readdir(state: &mut FsState, ino: u64, offset: i64) -> Result<Vec<R
     }
 
     let prefix = key::dirent_prefix(ino);
-    let kv_entries = state.kv_range(&prefix, &prefix, 4096).await?;
+    let keys = state.kv_range_keys(&prefix, &prefix, 4096).await?;
 
-    for (i, (k, v)) in kv_entries.into_iter().enumerate() {
+    for (i, k) in keys.into_iter().enumerate() {
         let entry_offset = (i as i64) + 3;
         if entry_offset <= offset {
             continue;
         }
 
         let (_, name_bytes) = match key::parse_dirent_key(&k) {
-            Some(parsed) => parsed,
+            Some(parsed) => (parsed.0, parsed.1.to_vec()),
             None => continue,
+        };
+
+        let v = match state.kv_get(&k).await {
+            Ok(v) => v,
+            Err(_) => continue,
         };
         let dirent: DirentValue = match schema::decode_dirent(&v) {
             Ok(d) => d,
             Err(_) => continue,
         };
         let kind = dt_to_filetype(dirent.file_type);
-        let name = unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(name_bytes.to_vec()) };
+        let name = unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(name_bytes) };
 
         entries.push(ReaddirEntry {
             ino: dirent.child_inode,
@@ -118,7 +123,7 @@ pub async fn rmdir(state: &mut FsState, parent: u64, name: &OsStr) -> Result<()>
     }
 
     let prefix = key::dirent_prefix(dirent.child_inode);
-    let children = state.kv_range(&prefix, &prefix, 1).await?;
+    let children = state.kv_range_keys(&prefix, &prefix, 1).await?;
     if !children.is_empty() {
         return Err(anyhow!("ENOTEMPTY"));
     }

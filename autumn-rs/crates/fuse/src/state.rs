@@ -131,7 +131,10 @@ impl FsState {
     }
 
     /// Range scan with prefix and optional start key.
-    pub async fn kv_range(&mut self, prefix: &[u8], start: &[u8], limit: u32) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    ///
+    /// Returns keys only — PS `handle_range` does not populate values on the wire.
+    /// Callers that need values must issue a separate `kv_get` per key.
+    pub async fn kv_range_keys(&mut self, prefix: &[u8], start: &[u8], limit: u32) -> Result<Vec<Vec<u8>>> {
         let (part_id, addr) = self.client.resolve_key(prefix).await?;
         let ps = self.client.get_ps_client(&addr).await?;
         let req = RangeReq {
@@ -148,7 +151,7 @@ impl FsState {
         if resp.code != CODE_OK {
             return Err(anyhow!("KV range error: {} {}", resp.code, resp.message));
         }
-        Ok(resp.entries.into_iter().map(|e| (e.key, e.value)).collect())
+        Ok(resp.entries.into_iter().map(|e| e.key).collect())
     }
 
     /// Check if a key exists (uses Head RPC).

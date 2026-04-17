@@ -4,6 +4,9 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 /// Decode InodeMeta from rkyv bytes.
 pub fn decode_inode_meta(bytes: &[u8]) -> Result<InodeMeta, String> {
+    if bytes.is_empty() {
+        return Err("empty InodeMeta bytes".to_string());
+    }
     autumn_rpc::partition_rpc::rkyv_decode(bytes).map_err(|e| format!("{:?}", e))
 }
 
@@ -14,6 +17,9 @@ pub fn encode_inode_meta(meta: &InodeMeta) -> Vec<u8> {
 
 /// Decode DirentValue from rkyv bytes.
 pub fn decode_dirent(bytes: &[u8]) -> Result<DirentValue, String> {
+    if bytes.is_empty() {
+        return Err("empty DirentValue bytes".to_string());
+    }
     autumn_rpc::partition_rpc::rkyv_decode(bytes).map_err(|e| format!("{:?}", e))
 }
 
