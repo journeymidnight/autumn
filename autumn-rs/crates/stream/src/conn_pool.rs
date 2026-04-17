@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -10,8 +10,6 @@ use bytes::Bytes;
 use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::net::TcpStream;
 use compio::BufResult;
-use futures::channel::{mpsc, oneshot};
-use futures::StreamExt;
 
 /// A single sequential RPC connection for single-threaded compio runtime.
 struct RpcConn {
@@ -96,13 +94,25 @@ impl RpcConn {
     }
 }
 
+/// Pool classification. Separates latency-sensitive hot-path writes
+/// (log_stream / small WAL frames) from bulk writes (row_stream SSTable
+/// flush, meta_stream checkpoint) so a 256MB flush on Bulk's TCP cannot
+/// head-of-line-block a 4KB WAL batch on Hot's TCP to the same node.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum PoolKind {
+    Hot,
+    Bulk,
+}
+
 /// Per-process connection pool for extent nodes (single-threaded compio).
 ///
-/// Uses take/put pattern on `RefCell<Option<RpcConn>>` to avoid holding
-/// borrow_mut across await points. If a conn is already taken (another task
-/// is using it), we create a second connection for that address.
+/// Keyed by `(SocketAddr, PoolKind)`: each (addr, kind) pair owns a distinct
+/// sequential `RpcConn`. Uses take/put pattern on `RefCell<Option<RpcConn>>`
+/// to avoid holding borrow_mut across await points. If a conn is already
+/// taken (another task is using it), we create a second connection for that
+/// address+kind.
 pub struct ConnPool {
-    conns: RefCell<HashMap<SocketAddr, Rc<RefCell<Option<RpcConn>>>>>,
+    conns: RefCell<HashMap<(SocketAddr, PoolKind), Rc<RefCell<Option<RpcConn>>>>>,
 }
 
 impl ConnPool {
@@ -116,11 +126,22 @@ impl ConnPool {
     /// On error, the connection is discarded (not returned to pool) so
     /// the next call creates a fresh connection.
     pub async fn call(&self, addr: &str, msg_type: u8, payload: Bytes) -> Result<Bytes> {
+        self.call_kind(addr, PoolKind::Hot, msg_type, payload).await
+    }
+
+    /// Send an RPC on a specific pool kind (Hot vs Bulk).
+    pub async fn call_kind(
+        &self,
+        addr: &str,
+        kind: PoolKind,
+        msg_type: u8,
+        payload: Bytes,
+    ) -> Result<Bytes> {
         let sock = parse_addr(addr)?;
-        let mut conn = self.take_conn(sock).await?;
+        let mut conn = self.take_conn(sock, kind).await?;
         let result = conn.call(msg_type, payload).await;
         if result.is_ok() {
-            self.put_conn(sock, conn);
+            self.put_conn(sock, kind, conn);
         }
         // On error: conn is dropped, pool entry stays None → next call reconnects.
         result
@@ -146,34 +167,49 @@ impl ConnPool {
 
     /// Send an RPC with payload split into parts (zero-copy vectored write).
     /// On error, the connection is discarded so next call reconnects.
-    pub async fn call_vectored(&self, addr: &str, msg_type: u8, payload_parts: Vec<Bytes>) -> Result<Bytes> {
+    pub async fn call_vectored(
+        &self,
+        addr: &str,
+        msg_type: u8,
+        payload_parts: Vec<Bytes>,
+    ) -> Result<Bytes> {
+        self.call_vectored_kind(addr, PoolKind::Hot, msg_type, payload_parts)
+            .await
+    }
+
+    /// Vectored version of `call_kind`.
+    pub async fn call_vectored_kind(
+        &self,
+        addr: &str,
+        kind: PoolKind,
+        msg_type: u8,
+        payload_parts: Vec<Bytes>,
+    ) -> Result<Bytes> {
         let sock = parse_addr(addr)?;
-        let mut conn = self.take_conn(sock).await?;
+        let mut conn = self.take_conn(sock, kind).await?;
         let result = conn.call_vectored(msg_type, payload_parts).await;
         if result.is_ok() {
-            self.put_conn(sock, conn);
+            self.put_conn(sock, kind, conn);
         }
         result
     }
 
-    /// Take an RpcConn for the given address. If the pooled one is in use
-    /// (taken by another task), create a fresh connection.
-    async fn take_conn(&self, addr: SocketAddr) -> Result<RpcConn> {
-        // Try to take the existing conn.
-        if let Some(cell) = self.conns.borrow().get(&addr).cloned() {
+    /// Take an RpcConn for the given (address, kind). If the pooled one is
+    /// in use (taken by another task), create a fresh connection.
+    async fn take_conn(&self, addr: SocketAddr, kind: PoolKind) -> Result<RpcConn> {
+        if let Some(cell) = self.conns.borrow().get(&(addr, kind)).cloned() {
             if let Some(conn) = cell.borrow_mut().take() {
                 return Ok(conn);
             }
         }
-        // No pooled conn or it's in use — connect fresh.
         RpcConn::connect(addr).await
     }
 
-    /// Return an RpcConn to the pool.
-    fn put_conn(&self, addr: SocketAddr, conn: RpcConn) {
+    /// Return an RpcConn to the pool under its (address, kind) slot.
+    fn put_conn(&self, addr: SocketAddr, kind: PoolKind, conn: RpcConn) {
         let mut conns = self.conns.borrow_mut();
         let cell = conns
-            .entry(addr)
+            .entry((addr, kind))
             .or_insert_with(|| Rc::new(RefCell::new(None)));
         *cell.borrow_mut() = Some(conn);
     }
@@ -182,7 +218,8 @@ impl ConnPool {
         let Ok(sock) = parse_addr(addr) else {
             return false;
         };
-        self.conns.borrow().contains_key(&sock)
+        let conns = self.conns.borrow();
+        conns.contains_key(&(sock, PoolKind::Hot)) || conns.contains_key(&(sock, PoolKind::Bulk))
     }
 }
 
@@ -224,214 +261,4 @@ pub fn normalize_endpoint(addr: &str) -> String {
     addr.trim_start_matches("http://")
         .trim_start_matches("https://")
         .to_string()
-}
-
-// ── Multiplexed RPC connection (for pipelined/fast-path stream append) ───────
-
-/// A single multiplexed RPC connection:
-/// - a dedicated writer task owns the socket write half and drains an mpsc
-///   channel of encoded frame buffers; senders never await on writer I/O
-/// - a spawned reader loop routes responses to pending oneshot receivers by req_id
-///
-/// Multiple tasks can call `send_frame_vectored` concurrently. Each gets a
-/// unique req_id plus a `Receiver<Frame>` they can await independently.
-///
-/// Frame ordering on the wire matches the order of successful `unbounded_send`
-/// calls, which on a single-threaded compio runtime matches the order in which
-/// `send_frame_vectored` invocations reach their channel push. The writer task
-/// opportunistically coalesces back-to-back queued frames into a single
-/// `write_vectored_all` syscall.
-pub struct MuxConn {
-    writer_tx: mpsc::UnboundedSender<Vec<Bytes>>,
-    pending: RefCell<HashMap<u32, oneshot::Sender<Frame>>>,
-    next_id: Cell<u32>,
-    closed: Cell<bool>,
-}
-
-/// Upper bound on frames the writer task coalesces into a single syscall.
-/// Stops one "big" bulk frame from being delayed behind an unbounded queue of
-/// small hot-path frames, and keeps iovec count well under IOV_MAX.
-const WRITER_COALESCE_MAX: usize = 16;
-
-impl MuxConn {
-    async fn connect(addr: SocketAddr) -> Result<Rc<Self>> {
-        let stream = TcpStream::connect(addr).await?;
-        stream.set_nodelay(true)?;
-        set_tcp_buffer_sizes(&stream, 512 * 1024);
-        let (reader, writer) = stream.into_split();
-
-        let (writer_tx, writer_rx) = mpsc::unbounded::<Vec<Bytes>>();
-
-        let conn = Rc::new(Self {
-            writer_tx,
-            pending: RefCell::new(HashMap::new()),
-            next_id: Cell::new(1),
-            closed: Cell::new(false),
-        });
-
-        let conn_for_reader = conn.clone();
-        compio::runtime::spawn(async move {
-            reader_loop(reader, conn_for_reader).await;
-        })
-        .detach();
-
-        let conn_for_writer = conn.clone();
-        compio::runtime::spawn(async move {
-            writer_loop(writer, writer_rx, conn_for_writer).await;
-        })
-        .detach();
-
-        Ok(conn)
-    }
-
-    #[inline]
-    pub fn is_closed(&self) -> bool {
-        self.closed.get()
-    }
-
-    /// Submit a request frame and return a Receiver that resolves when the
-    /// response Frame arrives. This call is effectively synchronous: it
-    /// registers the pending entry and hands the encoded buffer to the writer
-    /// task's mpsc channel. No writer lock is held across I/O.
-    pub async fn send_frame_vectored(
-        &self,
-        msg_type: u8,
-        parts: Vec<Bytes>,
-    ) -> Result<oneshot::Receiver<Frame>> {
-        if self.closed.get() {
-            return Err(anyhow!("mux connection closed"));
-        }
-        let req_id = {
-            let id = self.next_id.get();
-            let next = id.wrapping_add(1).max(1);
-            self.next_id.set(next);
-            id
-        };
-
-        let (tx, rx) = oneshot::channel();
-        self.pending.borrow_mut().insert(req_id, tx);
-
-        let payload_len: u32 = parts.iter().map(|p| p.len() as u32).sum();
-        let hdr = Frame::encode_request_header(req_id, msg_type, payload_len);
-        let mut bufs = Vec::with_capacity(1 + parts.len());
-        bufs.push(Bytes::copy_from_slice(&hdr));
-        bufs.extend(parts);
-
-        if self.writer_tx.unbounded_send(bufs).is_err() {
-            self.pending.borrow_mut().remove(&req_id);
-            self.closed.set(true);
-            return Err(anyhow!("mux writer channel closed"));
-        }
-        Ok(rx)
-    }
-}
-
-async fn writer_loop(
-    mut writer: compio::net::OwnedWriteHalf<TcpStream>,
-    mut rx: mpsc::UnboundedReceiver<Vec<Bytes>>,
-    conn: Rc<MuxConn>,
-) {
-    loop {
-        let first = match rx.next().await {
-            Some(b) => b,
-            None => break,
-        };
-        // Coalesce any already-queued frames: one syscall per ready burst
-        // instead of one per frame. Bounded to keep iovec count sane and to
-        // let the reactor schedule reads between writes.
-        let mut bufs = first;
-        for _ in 1..WRITER_COALESCE_MAX {
-            // `try_recv` returns Ok(T) if an item is immediately available,
-            // Err(_) if the channel is empty *or* closed. Either way, stop
-            // coalescing and flush; if the channel is closed the outer
-            // `rx.next().await` on the next iteration returns None and we exit.
-            match rx.try_recv() {
-                Ok(next_bufs) => bufs.extend(next_bufs),
-                Err(_) => break,
-            }
-        }
-        let BufResult(result, _) = writer.write_vectored_all(bufs).await;
-        if result.is_err() {
-            break;
-        }
-    }
-    conn.closed.set(true);
-    // Drop all pending senders → receivers resolve to Canceled. Reader loop
-    // will also clear pending when it notices the half-closed TCP, but doing
-    // it here avoids stranding pending requests if the channel closed first.
-    conn.pending.borrow_mut().clear();
-}
-
-async fn reader_loop(mut reader: compio::net::OwnedReadHalf<TcpStream>, conn: Rc<MuxConn>) {
-    let mut decoder = FrameDecoder::new();
-    let mut buf = vec![0u8; 512 * 1024];
-    'outer: loop {
-        loop {
-            match decoder.try_decode() {
-                Ok(Some(frame)) => {
-                    let tx = conn.pending.borrow_mut().remove(&frame.req_id);
-                    if let Some(tx) = tx {
-                        let _ = tx.send(frame);
-                    }
-                }
-                Ok(None) => break,
-                Err(_) => {
-                    break 'outer;
-                }
-            }
-        }
-        let BufResult(result, buf_back) = reader.read(std::mem::take(&mut buf)).await;
-        buf = buf_back;
-        match result {
-            Ok(0) | Err(_) => break,
-            Ok(n) => decoder.feed(&buf[..n]),
-        }
-    }
-    conn.closed.set(true);
-    // Drop all pending senders → receivers resolve to Canceled (treated as error).
-    conn.pending.borrow_mut().clear();
-}
-
-/// Pool classification for MuxPool. Separates latency-sensitive hot-path
-/// writes (log_stream) from bulk writes (row_stream SSTable flush,
-/// meta_stream checkpoint) so a 256MB flush cannot monopolize the writer
-/// mutex of the connection a 4KB WAL batch needs.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum PoolKind {
-    Hot,
-    Bulk,
-}
-
-/// Multiplexed RPC connection pool keyed by (address, kind). Each
-/// (address, kind) pair gets one `MuxConn`. Reconnects lazily when a
-/// connection is observed closed.
-pub struct MuxPool {
-    conns: RefCell<HashMap<(SocketAddr, PoolKind), Rc<MuxConn>>>,
-}
-
-impl MuxPool {
-    pub fn new() -> Self {
-        Self {
-            conns: RefCell::new(HashMap::new()),
-        }
-    }
-
-    pub async fn get(&self, addr: &str, kind: PoolKind) -> Result<Rc<MuxConn>> {
-        let sock = parse_addr(addr)?;
-        let key = (sock, kind);
-        if let Some(c) = self.conns.borrow().get(&key).cloned() {
-            if !c.is_closed() {
-                return Ok(c);
-            }
-        }
-        let new_conn = MuxConn::connect(sock).await?;
-        self.conns.borrow_mut().insert(key, new_conn.clone());
-        Ok(new_conn)
-    }
-}
-
-impl Default for MuxPool {
-    fn default() -> Self {
-        Self::new()
-    }
 }

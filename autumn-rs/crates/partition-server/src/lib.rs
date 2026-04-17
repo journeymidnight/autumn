@@ -19,7 +19,7 @@ use autumn_common::metrics::{duration_to_ns, ns_to_ms};
 use autumn_rpc::manager_rpc::{self, MgrRange as Range, rkyv_encode, rkyv_decode};
 use autumn_rpc::partition_rpc::{self, *, TableLocations, SstLocation};
 use autumn_rpc::{Frame, FrameDecoder, HandlerResult, StatusCode};
-use autumn_stream::{ConnPool, StreamClient};
+use autumn_stream::{ConnPool, PoolKind, StreamClient};
 use bytes::{BufMut, Bytes, BytesMut};
 use compio::dispatcher::Dispatcher;
 use compio::io::{AsyncRead, AsyncWriteExt};
@@ -863,13 +863,11 @@ async fn partition_thread_main(
         .context("create per-partition StreamClient")?,
     );
 
-    // Pin row_stream and meta_stream to the Bulk mux connection. These streams
-    // do infrequent but very large appends (256MB SSTable flush, TableLocations
-    // checkpoint) which hold the MuxConn writer mutex for hundreds of ms. Left
-    // on the default Hot pool they would head-of-line-block tiny log_stream WAL
-    // frames that share the same TCP connection.
-    part_sc.set_stream_kind(row_stream_id, autumn_stream::PoolKind::Bulk);
-    part_sc.set_stream_kind(meta_stream_id, autumn_stream::PoolKind::Bulk);
+    // Route row_stream (SSTable flush, up to 128MB) and meta_stream (checkpoint) over
+    // the Bulk pool so their large writes don't head-of-line-block the Hot-pool
+    // log_stream WAL batches on the same extent node.
+    part_sc.set_stream_kind(row_stream_id, PoolKind::Bulk);
+    part_sc.set_stream_kind(meta_stream_id, PoolKind::Bulk);
 
     // Check commit length on all streams before recovery (Go: checkCommitLength).
     // This ensures the last extent of each stream has consistent commit length

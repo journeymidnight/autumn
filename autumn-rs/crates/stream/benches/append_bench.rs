@@ -52,7 +52,6 @@ fn main() {
                 extent_id, eversion: 1,
                 commit: i * payload.len() as u32,
                 revision: 1, must_sync: false,
-                flags: FLAG_RECONCILE, expected_offset: 0,
                 payload: payload.clone(),
             };
             client.call(MSG_APPEND, req.encode()).await.unwrap();
@@ -66,7 +65,6 @@ fn main() {
             let req = AppendReq {
                 extent_id, eversion: 1,
                 commit, revision: 1, must_sync: false,
-                flags: FLAG_RECONCILE, expected_offset: 0,
                 payload: payload.clone(),
             };
             client.call(MSG_APPEND, req.encode()).await.unwrap();

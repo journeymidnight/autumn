@@ -94,8 +94,6 @@ impl TestConn {
             commit,
             revision,
             must_sync,
-            flags: FLAG_RECONCILE,
-            expected_offset: 0,
             payload: Bytes::from(payload),
         };
         let resp = self

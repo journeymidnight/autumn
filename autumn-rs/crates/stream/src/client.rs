@@ -6,37 +6,16 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use autumn_common::metrics::{duration_to_ns, ns_to_ms, unix_time_ms};
 use autumn_rpc::manager_rpc::{self, *};
-use crate::conn_pool::{MuxPool, PoolKind};
-use crate::ConnPool;
+use crate::{ConnPool, PoolKind};
 use crate::extent_rpc::{
     AppendReq, AppendResp, CommitLengthReq, CommitLengthResp, ExtentInfo, ReadBytesReq,
     ReadBytesResp, StreamInfo, CODE_LOCKED_BY_OTHER, CODE_NOT_FOUND, CODE_OK,
-    FLAG_RECONCILE, MSG_APPEND, MSG_COMMIT_LENGTH, MSG_READ_BYTES,
+    MSG_APPEND, MSG_COMMIT_LENGTH, MSG_READ_BYTES,
 };
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use futures::future::join_all;
 use futures::lock::Mutex;
-
-/// Maximum concurrent in-flight fast-path appends per stream.
-/// Tuned empirically — 4 matches the "bench depth=4" sweet spot (+57% vs depth=1).
-const MAX_INFLIGHT_PER_STREAM: u32 = 4;
-
-enum FastResult {
-    Ok(AppendResult),
-    Err(anyhow::Error),
-    Fallback,
-}
-
-/// Read once at construction. `AUTUMN_STREAM_PIPELINE=0` disables the fast path
-/// (rollback knob — forces every append through the reconcile path).
-fn pipeline_enabled() -> bool {
-    std::env::var("AUTUMN_STREAM_PIPELINE")
-        .ok()
-        .as_deref()
-        .map(|v| v != "0")
-        .unwrap_or(true)
-}
 
 #[derive(Debug, Clone)]
 pub struct AppendResult {
@@ -52,26 +31,14 @@ struct StreamTail {
 }
 
 /// Per-stream append state: tail info and commit cache.
-/// Protected by a Mutex. The reconcile path holds the lock across the whole
-/// fan-out (legacy). The fast path only holds the lock across frame submission
-/// — ack waits happen outside the critical section to allow multiple in-flight
-/// calls on the same stream.
+/// Protected by a Mutex so appends to the same stream are serialized,
+/// while appends to different streams are fully concurrent.
 struct StreamAppendState {
     tail: Option<StreamTail>,
-    /// High-watermark that is confirmed on all replicas (matches Go's `sc.end`).
-    /// Only advanced after a successful ack from every replica.
+    /// Locally-tracked commit offset (matches Go's `sc.end`).
+    /// Starts at 0 for a new extent; updated to `appended.end` after each
+    /// successful append.  Never queried from replicas in the hot path.
     commit: u32,
-    /// Optimistically-allocated tail offset: `commit` plus the total payload
-    /// of all in-flight fast-path calls. Each fast-path call reads this value
-    /// as its `expected_offset`, then bumps it by its payload length. Invariant
-    /// when `inflight == 0 && reconciled`: `tail_offset == commit`.
-    tail_offset: u32,
-    /// Protocol safety gate. `true` once a successful reconcile has aligned all
-    /// replicas to `commit`; `false` on cold start or after any error (since
-    /// replicas may have diverged). Only `true` unlocks the fast path.
-    reconciled: bool,
-    /// Number of fast-path calls currently awaiting ack.
-    inflight: u32,
 }
 
 #[derive(Default)]
@@ -82,9 +49,6 @@ struct StreamAppendMetrics {
     extent_lookup_ns: AtomicU64,
     fanout_ns: AtomicU64,
     total_ns: AtomicU64,
-    fast_path_ops: AtomicU64,
-    reconcile_ops: AtomicU64,
-    inflight_peak: AtomicU64,
     last_report_ms: AtomicU64,
 }
 
@@ -134,38 +98,16 @@ impl StreamAppendMetrics {
         let extent_lookup_ns = self.extent_lookup_ns.swap(0, Ordering::Relaxed);
         let fanout_ns = self.fanout_ns.swap(0, Ordering::Relaxed);
         let total_ns = self.total_ns.swap(0, Ordering::Relaxed);
-        let fast_path_ops = self.fast_path_ops.swap(0, Ordering::Relaxed);
-        let reconcile_ops = self.reconcile_ops.swap(0, Ordering::Relaxed);
-        let inflight_peak = self.inflight_peak.swap(0, Ordering::Relaxed);
         tracing::info!(
             owner_key,
             ops,
             retries,
-            fast_path_ops,
-            reconcile_ops,
-            inflight_peak,
             avg_lock_wait_ms = ns_to_ms(lock_wait_ns, ops),
             avg_extent_lookup_ms = ns_to_ms(extent_lookup_ns, ops),
             avg_fanout_ms = ns_to_ms(fanout_ns, ops),
             avg_total_ms = ns_to_ms(total_ns, ops),
             "stream append summary",
         );
-    }
-
-    fn bump_inflight_peak(&self, value: u32) {
-        let v = value as u64;
-        let mut cur = self.inflight_peak.load(Ordering::Relaxed);
-        while v > cur {
-            match self.inflight_peak.compare_exchange_weak(
-                cur,
-                v,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(prev) => cur = prev,
-            }
-        }
     }
 }
 
@@ -183,22 +125,15 @@ pub struct StreamClient {
     /// Shared connection pool — one RpcClient per remote address, with
     /// heartbeat health checks for extent nodes.
     pool: Rc<ConnPool>,
-    /// Multiplexed pool used by the fast-path append (allows concurrent
-    /// in-flight requests on the same extent node connection).
-    mux_pool: Rc<MuxPool>,
-    /// Whether the fast (pipelined) path is allowed. Controlled by
-    /// `AUTUMN_STREAM_PIPELINE=0` environment variable.
-    pipeline_enabled: bool,
     /// Node-id → address map (refreshed on miss).
     nodes_cache: DashMap<u64, String>,
     /// Cached ExtentInfo for read path.
     extent_info_cache: DashMap<u64, ExtentInfo>,
     /// Per-stream tail + commit state, each individually locked.
     stream_states: DashMap<u64, Arc<Mutex<StreamAppendState>>>,
-    /// Per-stream pool affinity. Unregistered streams default to `Hot` so the
-    /// WAL (log_stream) never shares a TCP connection with bulk flushes
-    /// (row_stream, meta_stream), which would otherwise hold the per-connection
-    /// writer mutex for hundreds of ms on 256MB SSTable uploads.
+    /// Per-stream pool classification (Hot vs Bulk). Default: Hot.
+    /// row_stream / meta_stream should be registered as Bulk by the caller so
+    /// their 256MB SSTable flushes don't head-of-line-block the log_stream WAL.
     stream_kinds: DashMap<u64, PoolKind>,
     append_metrics: StreamAppendMetrics,
 }
@@ -281,8 +216,6 @@ impl StreamClient {
                             revision: resp.revision,
                             max_extent_size,
                             pool,
-                            mux_pool: Rc::new(MuxPool::new()),
-                            pipeline_enabled: pipeline_enabled(),
                             nodes_cache: DashMap::new(),
                             extent_info_cache: DashMap::new(),
                             stream_states: DashMap::new(),
@@ -325,8 +258,6 @@ impl StreamClient {
             revision,
             max_extent_size,
             pool,
-            mux_pool: Rc::new(MuxPool::new()),
-            pipeline_enabled: pipeline_enabled(),
             nodes_cache: DashMap::new(),
             extent_info_cache: DashMap::new(),
             stream_states: DashMap::new(),
@@ -335,12 +266,17 @@ impl StreamClient {
         })
     }
 
-    /// Mark a stream's pool affinity. `Bulk` should be set for streams that
-    /// do infrequent but large appends (row_stream: SSTable flush, meta_stream:
-    /// TableLocations checkpoint). `Hot` (the default) is for latency-sensitive
-    /// streams like log_stream (the WAL). The `Hot` and `Bulk` MuxConns per
-    /// extent-node address are distinct TCP connections, so a multi-hundred-ms
-    /// 256MB upload on `Bulk` no longer blocks small WAL frames on `Hot`.
+    pub fn revision(&self) -> i64 {
+        self.revision
+    }
+    pub fn owner_key(&self) -> &str {
+        &self.owner_key
+    }
+
+    /// Classify a stream as Hot or Bulk for connection pool separation.
+    /// Hot: latency-sensitive small writes (log_stream / WAL).
+    /// Bulk: large bulk writes (row_stream SSTable flush, meta_stream checkpoint).
+    /// Default for unregistered streams is Hot.
     pub fn set_stream_kind(&self, stream_id: u64, kind: PoolKind) {
         self.stream_kinds.insert(stream_id, kind);
     }
@@ -348,15 +284,8 @@ impl StreamClient {
     fn kind_for(&self, stream_id: u64) -> PoolKind {
         self.stream_kinds
             .get(&stream_id)
-            .map(|k| *k)
+            .map(|v| *v)
             .unwrap_or(PoolKind::Hot)
-    }
-
-    pub fn revision(&self) -> i64 {
-        self.revision
-    }
-    pub fn owner_key(&self) -> &str {
-        &self.owner_key
     }
 
     // ── internal helpers ─────────────────────────────────────────────────────
@@ -418,9 +347,6 @@ impl StreamClient {
         let state = Arc::new(Mutex::new(StreamAppendState {
             tail: None,
             commit: 0,
-            tail_offset: 0,
-            reconciled: false,
-            inflight: 0,
         }));
         self.stream_states.insert(stream_id, state.clone());
         state
@@ -543,238 +469,24 @@ impl StreamClient {
             .await
     }
 
-    /// Dispatcher: try fast path (pipelined) first if the stream is reconciled;
-    /// fall back to the reconcile path on cold start, error, or at extent boundaries.
+    /// Core append implementation that sends payload segments to all replicas
+    /// via autumn-rpc binary protocol. Segments are concatenated into a single
+    /// AppendReq payload (no streaming).
     async fn append_payload_segments(
         &self,
         stream_id: u64,
         segments: Vec<Bytes>,
         must_sync: bool,
     ) -> Result<AppendResult> {
+        let payload_len: usize = segments.iter().map(|s| s.len()).sum();
+        let append_started_at = Instant::now();
         let state_arc = self.stream_state(stream_id);
-        let segments = Arc::new(segments);
-
-        if self.pipeline_enabled {
-            match self
-                .try_append_fast(stream_id, &state_arc, segments.clone(), must_sync)
-                .await
-            {
-                FastResult::Ok(r) => return Ok(r),
-                FastResult::Err(e) => return Err(e),
-                FastResult::Fallback => {}
-            }
-        }
-
-        self.append_reconcile_internal(stream_id, &state_arc, segments, must_sync)
-            .await
-    }
-
-    /// Fast path: optimistic concurrency via `expected_offset`. Holds the state
-    /// lock only across frame submission (3 × writer mutex + write_all), releases
-    /// it before awaiting acks. This allows up to `MAX_INFLIGHT_PER_STREAM` calls
-    /// to overlap their 1.5ms replica RTT.
-    ///
-    /// Returns `Fallback` when conditions aren't met (not reconciled, no tail,
-    /// too many in-flight, or about to cross extent boundary) — caller retries
-    /// via the reconcile path.
-    async fn try_append_fast(
-        &self,
-        stream_id: u64,
-        state_arc: &Arc<Mutex<StreamAppendState>>,
-        segments: Arc<Vec<Bytes>>,
-        must_sync: bool,
-    ) -> FastResult {
-        let payload_len: usize = segments.iter().map(|s| s.len()).sum();
-        let append_started_at = Instant::now();
-
-        // ── Critical section: check preconditions, allocate offset, submit 3 frames ──
-        let lock_started_at = Instant::now();
-        let (tail, expected, inflight_snapshot, receivers, lock_wait) = {
-            let mut st = state_arc.lock().await;
-            let lock_wait = lock_started_at.elapsed();
-            if !st.reconciled || st.tail.is_none() {
-                return FastResult::Fallback;
-            }
-            if st.inflight >= MAX_INFLIGHT_PER_STREAM {
-                return FastResult::Fallback;
-            }
-            let new_tail_offset = match st.tail_offset.checked_add(payload_len as u32) {
-                Some(v) if (v as u64) < (self.max_extent_size as u64) => v,
-                _ => return FastResult::Fallback,
-            };
-            let expected = st.tail_offset;
-            let tail = st.tail.as_ref().unwrap().clone();
-
-            // Build frame header with FLAG_RECONCILE=0 and real expected_offset.
-            let hdr = AppendReq::encode_header(
-                tail.extent.extent_id,
-                tail.extent.eversion,
-                0,
-                self.revision,
-                must_sync,
-                0,
-                expected as u64,
-            );
-
-            // Submit to all replicas. `send_frame_vectored` takes each replica's
-            // writer mutex in turn; since we hold `state_arc` lock, no other
-            // fast-path task can interleave submissions, preserving TCP order.
-            let mut recvs = Vec::with_capacity(tail.replica_addrs.len());
-            let pool_kind = self.kind_for(stream_id);
-            for addr in &tail.replica_addrs {
-                let conn = match self.mux_pool.get(addr, pool_kind).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        st.reconciled = false;
-                        return FastResult::Err(e.context(format!(
-                            "fast path mux connect failed for stream {stream_id} replica {addr}"
-                        )));
-                    }
-                };
-                let mut parts = Vec::with_capacity(1 + segments.len());
-                parts.push(hdr.clone());
-                for seg in segments.iter() {
-                    parts.push(seg.clone());
-                }
-                match conn.send_frame_vectored(MSG_APPEND, parts).await {
-                    Ok(rx) => recvs.push(rx),
-                    Err(e) => {
-                        st.reconciled = false;
-                        return FastResult::Err(
-                            e.context(format!("fast path submit failed on {addr}")),
-                        );
-                    }
-                }
-            }
-
-            // Commit the offset/inflight bookkeeping now that all 3 submissions succeeded.
-            st.tail_offset = new_tail_offset;
-            st.inflight += 1;
-            let inflight_now = st.inflight;
-            (tail, expected, inflight_now, recvs, lock_wait)
-        };
-        self.append_metrics
-            .bump_inflight_peak(inflight_snapshot);
-
-        // ── Outside critical section: await acks in parallel ──
-        let fanout_started_at = Instant::now();
-        let frames = join_all(receivers).await;
-        let fanout_elapsed = fanout_started_at.elapsed();
-
-        // ── Reacquire lock to finalize ──
-        let mut st = state_arc.lock().await;
-        st.inflight = st.inflight.saturating_sub(1);
-
-        // Parse responses — all must match on (code, offset, end).
-        let mut canonical: Option<AppendResp> = None;
-        let mut err: Option<String> = None;
-        for (i, recv_r) in frames.into_iter().enumerate() {
-            let frame = match recv_r {
-                Ok(f) => f,
-                Err(_) => {
-                    err = Some(format!("replica {i} canceled"));
-                    break;
-                }
-            };
-            if frame.is_error() {
-                let (_code, msg) = autumn_rpc::RpcError::decode_status(&frame.payload);
-                err = Some(format!("replica {i} rpc error: {msg}"));
-                break;
-            }
-            let resp = match AppendResp::decode(frame.payload) {
-                Ok(r) => r,
-                Err(e) => {
-                    err = Some(format!("replica {i} decode: {e}"));
-                    break;
-                }
-            };
-            if resp.code != CODE_OK {
-                err = Some(format!(
-                    "replica {i} code={}",
-                    crate::extent_rpc::code_description(resp.code)
-                ));
-                if resp.code == CODE_LOCKED_BY_OTHER {
-                    st.reconciled = false;
-                    return FastResult::Err(anyhow!(
-                        "LockedByOther: a newer owner holds extent {}",
-                        tail.extent.extent_id
-                    ));
-                }
-                break;
-            }
-            if resp.offset != expected {
-                err = Some(format!(
-                    "replica {i} offset mismatch: got {}, expected {expected}",
-                    resp.offset
-                ));
-                break;
-            }
-            match &canonical {
-                None => canonical = Some(resp),
-                Some(c) => {
-                    if c.offset != resp.offset || c.end != resp.end {
-                        err = Some(format!(
-                            "replica {i} diverged: {} vs {}",
-                            resp.end, c.end
-                        ));
-                        break;
-                    }
-                }
-            }
-        }
-
-        if let Some(e) = err {
-            st.reconciled = false;
-            return FastResult::Err(anyhow!(
-                "fast path append failed on extent {}: {e}",
-                tail.extent.extent_id
-            ));
-        }
-
-        let resp = canonical.expect("fast path had no canonical response but no error");
-        if resp.end > st.commit {
-            st.commit = resp.end;
-        }
-        self.append_metrics
-            .fast_path_ops
-            .fetch_add(1, Ordering::Relaxed);
-        drop(st);
-        self.append_metrics.record(
-            &self.owner_key,
-            lock_wait,
-            Duration::default(),
-            fanout_elapsed,
-            append_started_at.elapsed(),
-            0,
-        );
-
-        FastResult::Ok(AppendResult {
-            extent_id: tail.extent.extent_id,
-            offset: expected,
-            end: resp.end,
-        })
-    }
-
-    /// Reconcile path: legacy commit-based truncation. Holds the state lock for
-    /// the full fan-out; safe against replica divergence but serializes calls.
-    ///
-    /// On success, marks the stream `reconciled = true` so subsequent calls can
-    /// take the fast path.
-    async fn append_reconcile_internal(
-        &self,
-        stream_id: u64,
-        state_arc: &Arc<Mutex<StreamAppendState>>,
-        segments: Arc<Vec<Bytes>>,
-        must_sync: bool,
-    ) -> Result<AppendResult> {
-        let payload_len: usize = segments.iter().map(|s| s.len()).sum();
-        let append_started_at = Instant::now();
         let lock_started_at = Instant::now();
         let mut state = state_arc.lock().await;
         let lock_wait = lock_started_at.elapsed();
-        self.append_metrics
-            .reconcile_ops
-            .fetch_add(1, Ordering::Relaxed);
+
+        // Wrap segments in Arc so all replicas can share without copying.
+        let segments = Arc::new(segments);
 
         let mut retry = 0usize;
         let mut alloc_count = 0u32;
@@ -799,7 +511,6 @@ impl StreamClient {
             let commit = if state.commit == 0 && state.tail.is_some() {
                 let c = self.current_commit(&tail).await.unwrap_or(0);
                 state.commit = c;
-                state.tail_offset = c;
                 c
             } else {
                 state.commit
@@ -810,7 +521,7 @@ impl StreamClient {
             extent_lookup_elapsed += extent_lookup_started_at.elapsed();
 
             // Fan out identical append to all replicas in parallel.
-            // FLAG_RECONCILE=1 enables server's legacy commit-based truncation.
+            // Zero-copy: AppendReq header (29B) + segments sent via vectored write.
             let extent_id = tail.extent.extent_id;
             let append_hdr = AppendReq::encode_header(
                 extent_id,
@@ -818,11 +529,10 @@ impl StreamClient {
                 commit,
                 revision,
                 must_sync,
-                FLAG_RECONCILE,
-                0,
             );
 
             let fanout_started_at = Instant::now();
+            let kind = self.kind_for(stream_id);
             let futs: Vec<_> = tail
                 .replica_addrs
                 .iter()
@@ -839,7 +549,7 @@ impl StreamClient {
                             parts.push(seg.clone()); // Bytes::clone = refcount, not memcpy
                         }
                         let result = pool
-                            .call_vectored(&addr, MSG_APPEND, parts)
+                            .call_vectored_kind(&addr, kind, MSG_APPEND, parts)
                             .await;
                         (addr, result)
                     }
@@ -904,8 +614,6 @@ impl StreamClient {
                 let (_, new_tail_ext) = self.alloc_new_extent(stream_id, 0).await?;
                 let replica_addrs = self.replica_addrs_for_extent(&new_tail_ext).await?;
                 state.commit = 0;
-                state.tail_offset = 0;
-                state.reconciled = true;
                 state.tail = Some(StreamTail {
                     extent: new_tail_ext,
                     replica_addrs,
@@ -934,8 +642,6 @@ impl StreamClient {
                         let (_, new_tail_ext) = self.alloc_new_extent(stream_id, 0).await?;
                         let replica_addrs = self.replica_addrs_for_extent(&new_tail_ext).await?;
                         state.commit = 0;
-                        state.tail_offset = 0;
-                        state.reconciled = true;
                         state.tail = Some(StreamTail {
                             extent: new_tail_ext,
                             replica_addrs,
@@ -943,9 +649,7 @@ impl StreamClient {
                     } else {
                         if fresh.extent.extent_id != tail.extent.extent_id {
                             state.commit = 0;
-                            state.tail_offset = 0;
                         }
-                        state.reconciled = false;
                         state.tail = Some(fresh);
                     }
                     continue;
@@ -958,8 +662,6 @@ impl StreamClient {
                     Ok((_, new_tail_ext)) => {
                         let replica_addrs = self.replica_addrs_for_extent(&new_tail_ext).await?;
                         state.commit = 0;
-                        state.tail_offset = 0;
-                        state.reconciled = true;
                         state.tail = Some(StreamTail {
                             extent: new_tail_ext,
                             replica_addrs,
@@ -983,18 +685,13 @@ impl StreamClient {
             let appended =
                 first_resp.ok_or_else(|| anyhow!("append failed: no replica response"))?;
 
-            // Update cached commit / tail_offset for next append. Mark reconciled
-            // so subsequent calls can take the fast path.
+            // Update cached commit for next append.
             state.commit = appended.end;
-            state.tail_offset = appended.end;
-            state.reconciled = true;
 
             if appended.end >= self.max_extent_size {
                 let (_, new_tail_ext) = self.alloc_new_extent(stream_id, appended.end).await?;
                 let replica_addrs = self.replica_addrs_for_extent(&new_tail_ext).await?;
                 state.commit = 0;
-                state.tail_offset = 0;
-                state.reconciled = true;
                 state.tail = Some(StreamTail {
                     extent: new_tail_ext,
                     replica_addrs,

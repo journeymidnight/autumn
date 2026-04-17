@@ -159,6 +159,45 @@ Expected queuing latency (Little's Law) = 256 / 92,829 ≈ 2.76ms  ✓
 
 ---
 
+## 2026-04-17 Revert: Keep Only Hot/Bulk, Drop Rest of F087 Arc
+
+Rolled back three optimizations that did NOT move the 44k ops/s write ceiling:
+
+| Commit | Scope | Outcome |
+|---|---|---|
+| `c5161bb` (F087) | Fast path + `expected_offset` wire + MuxPool + ring-buffer | Throughput unchanged |
+| `c5161bb` (F087-followup) | PS `background_write_loop` ring-buffer (inflight=4) | +5% ops, p99 +170% regression |
+| `7e252b3` (F087-mux-writer-task) | MuxConn mpsc writer task | Throughput unchanged; p99 noisy (21–115ms) |
+
+### Why throughput stayed flat
+
+The **3× replica bytes per append** is fundamental. `extent_bench` shows a single ExtentNode on tmpfs does ~183k ops/s at depth=32. With 3-way replication, each client append costs ~3× backend bytes → ceiling = 183k / 3 ≈ 61k. Observed 41–44k client ops/s = 67–72% of that ceiling. Connection-layer optimizations (mux, inflight depth, mutex removal) cannot break this ceiling. Only the Hot/Bulk pool split gave a genuine throughput gain (+32%), because it removed head-of-line blocking from SSTable flushes (256MB writes) on the log_stream WAL socket.
+
+### What we kept (F087-bulk-mux only)
+
+`ConnPool` keyed by `(SocketAddr, PoolKind)` where `PoolKind ∈ {Hot, Bulk}`:
+- `log_stream` → Hot (small frames, latency-sensitive)
+- `row_stream`, `meta_stream` → Bulk (SSTable flush up to 128MB, checkpoint)
+
+Implemented on the simple pre-F087 `RpcConn` (sequential RPC with write_vectored_all header+payload), not on MuxConn. Take/put pattern on `Rc<RefCell<Option<RpcConn>>>`; if a conn is taken, a fresh connection is created on the fly. No multiplexing, no pipelining — simpler and matches observed bottleneck (backend bytes, not client pipeline depth).
+
+### Revert perf-check (2026-04-17, 256 threads × 10s × 4KB, 3× tmpfs)
+
+| Run | write ops/s | p50 | p95 | p99 | read ops/s |
+|---|---|---|---|---|---|
+| 1 | 41246 | 3.95 | 9.52 | 29.54 | 96485 |
+| 2 | 42466 | 3.94 | 9.23 | 33.53 | 84065 |
+
+Matches the F087-bulk-mux baseline (c5161bb pre-writer-task ≈ 44.4k, p99 62ms). Slightly lower p99 than that baseline (30ms vs 62ms), but still above the best writer-task run (21ms). The writer-task win on p99 was partly genuine tail reduction, partly noise — the simpler code path is preferred.
+
+### Real remaining levers (unchanged from prior analysis)
+
+- **Shard Hot pool within an ExtentNode** (multiple TCPs per (addr, Hot)) to split replica fanout bytes across sockets — may push past the single-TCP byte ceiling.
+- **Quorum / hedging (F088)**: 2/3 quorum instead of `join_all` so a slow replica doesn't pace fanout.
+- **ExtentNode write-loop parallelism**: cluster per-stream saturates at ~170 MB/s while extent_bench solo reaches 732 MB/s — gap is on the ExtentNode side.
+
+---
+
 ## Instrumentation Added (F086)
 
 All four metrics streams are now active in every `perf_check.sh` run:
