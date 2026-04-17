@@ -1698,7 +1698,7 @@ async fn main() -> Result<()> {
             let read_summary = print_bench_summary(
                 "Read",
                 threads,
-                0,
+                value_size,
                 read_elapsed,
                 read_ops,
                 &mut read_hist,
