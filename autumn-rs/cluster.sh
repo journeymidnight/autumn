@@ -197,6 +197,12 @@ do_stop() {
     done
     kill_proc manager
     kill_proc etcd
+    # Safety net: kill by binary name if pid files were missing (e.g. switching
+    # between --shm and disk mode changes DATA_ROOT, so the old pids dir is
+    # invisible to kill_proc).
+    pkill -9 -f "$BIN/autumn-manager-server" 2>/dev/null || true
+    pkill -9 -f "$BIN/autumn-extent-node" 2>/dev/null || true
+    pkill -9 -f "$BIN/autumn-ps " 2>/dev/null || true
     echo "[cluster] all processes stopped"
 }
 

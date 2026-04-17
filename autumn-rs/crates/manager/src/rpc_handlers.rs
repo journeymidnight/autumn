@@ -1057,9 +1057,10 @@ impl AutumnManager {
 
     async fn handle_upsert_partition(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
-            return Ok(rkyv_encode(&CodeResp {
+            return Ok(rkyv_encode(&UpsertPartitionResp {
                 code: Self::err_to_code(&err),
                 message: err.to_string(),
+                part_id: 0,
             }));
         }
 

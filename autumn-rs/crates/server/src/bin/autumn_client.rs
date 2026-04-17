@@ -11,7 +11,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use autumn_client::{ClusterClient, parse_addr, decode_err};
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::*;
-use autumn_rpc::partition_rpc::{self, PutReq, GetReq, MSG_PUT, MSG_GET};
+use autumn_rpc::partition_rpc::{PutReq, GetReq, MSG_PUT, MSG_GET};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
@@ -881,42 +881,41 @@ async fn main() -> Result<()> {
                 }
             };
 
+            let create_stream_once = |label: &'static str| {
+                let client = &client;
+                async move {
+                    let req_bytes = rkyv_encode(&CreateStreamReq {
+                        replicates,
+                        ec_data_shard: 0,
+                        ec_parity_shard: 0,
+                    });
+                    let mut attempt = 0u32;
+                    loop {
+                        let resp_bytes = client.mgr()?
+                            .call(MSG_CREATE_STREAM, req_bytes.clone())
+                            .await
+                            .with_context(|| format!("create {label} stream"))?;
+                        let resp: CreateStreamResp =
+                            rkyv_decode(&resp_bytes).map_err(decode_err)?;
+                        if resp.code == CODE_OK {
+                            return Ok::<u64, anyhow::Error>(
+                                resp.stream.map(|s| s.stream_id).unwrap_or(0),
+                            );
+                        }
+                        if resp.code == CODE_NOT_LEADER && attempt < 60 {
+                            attempt += 1;
+                            compio::time::sleep(Duration::from_millis(500)).await;
+                            continue;
+                        }
+                        bail!("create {label} stream failed: code={} {}", resp.code, resp.message);
+                    }
+                }
+            };
+
             for (idx, (start_key, end_key)) in ranges.iter().enumerate() {
-                let create_stream = async {
-                    let resp_bytes = client.mgr()?
-                        .call(
-                            MSG_CREATE_STREAM,
-                            rkyv_encode(&CreateStreamReq {
-                                replicates,
-                                ec_data_shard: 0,
-                                ec_parity_shard: 0,
-                            }),
-                        )
-                        .await
-                        .context("create stream")?;
-                    let resp: CreateStreamResp =
-                        rkyv_decode(&resp_bytes).map_err(decode_err)?;
-                    Ok::<u64, anyhow::Error>(resp.stream.map(|s| s.stream_id).unwrap_or(0))
-                };
-                let log_stream_id = create_stream.await.context("create log stream")?;
-
-                let create_stream = async {
-                    let resp_bytes = client.mgr()?
-                        .call(MSG_CREATE_STREAM, rkyv_encode(&CreateStreamReq { replicates, ec_data_shard: 0, ec_parity_shard: 0 }))
-                        .await.context("create stream")?;
-                    let resp: CreateStreamResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-                    Ok::<u64, anyhow::Error>(resp.stream.map(|s| s.stream_id).unwrap_or(0))
-                };
-                let row_stream_id = create_stream.await.context("create row stream")?;
-
-                let create_stream = async {
-                    let resp_bytes = client.mgr()?
-                        .call(MSG_CREATE_STREAM, rkyv_encode(&CreateStreamReq { replicates, ec_data_shard: 0, ec_parity_shard: 0 }))
-                        .await.context("create stream")?;
-                    let resp: CreateStreamResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-                    Ok::<u64, anyhow::Error>(resp.stream.map(|s| s.stream_id).unwrap_or(0))
-                };
-                let meta_stream_id = create_stream.await.context("create meta stream")?;
+                let log_stream_id = create_stream_once("log").await?;
+                let row_stream_id = create_stream_once("row").await?;
+                let meta_stream_id = create_stream_once("meta").await?;
 
                 let meta = MgrPartitionMeta {
                     log_stream: log_stream_id,
@@ -929,19 +928,25 @@ async fn main() -> Result<()> {
                     }),
                 };
 
-                let resp_bytes = client
-                    .mgr()?
-                    .call(
-                        MSG_UPSERT_PARTITION,
-                        rkyv_encode(&UpsertPartitionReq { meta }),
-                    )
-                    .await
-                    .context("upsert partition")?;
-                let resp: UpsertPartitionResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-
-                if resp.code != partition_rpc::CODE_OK {
-                    bail!("bootstrap partition {} failed: {}", idx, resp.message);
-                }
+                let req_bytes = rkyv_encode(&UpsertPartitionReq { meta });
+                let mut attempt = 0u32;
+                let resp = loop {
+                    let resp_bytes = client
+                        .mgr()?
+                        .call(MSG_UPSERT_PARTITION, req_bytes.clone())
+                        .await
+                        .context("upsert partition")?;
+                    let resp: UpsertPartitionResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+                    if resp.code == CODE_OK {
+                        break resp;
+                    }
+                    if resp.code == CODE_NOT_LEADER && attempt < 60 {
+                        attempt += 1;
+                        compio::time::sleep(Duration::from_millis(500)).await;
+                        continue;
+                    }
+                    bail!("bootstrap partition {} failed: code={} {}", idx, resp.code, resp.message);
+                };
 
                 let start_s = if start_key.is_empty() {
                     String::from("\"\"")
@@ -1049,18 +1054,30 @@ async fn main() -> Result<()> {
         }
 
         Command::RegisterNode { addr, disks } => {
-            let resp_bytes = client
-                .mgr()?
-                .call(
-                    MSG_REGISTER_NODE,
-                    rkyv_encode(&RegisterNodeReq {
-                        addr: addr.clone(),
-                        disk_uuids: disks,
-                    }),
-                )
-                .await
-                .context("register node")?;
-            let resp: RegisterNodeResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+            // Retry on CODE_NOT_LEADER: manager may still be completing etcd
+            // leader election when cluster.sh fires the first register-node.
+            let req_bytes = rkyv_encode(&RegisterNodeReq {
+                addr: addr.clone(),
+                disk_uuids: disks,
+            });
+            let mut attempt = 0u32;
+            let resp = loop {
+                let resp_bytes = client
+                    .mgr()?
+                    .call(MSG_REGISTER_NODE, req_bytes.clone())
+                    .await
+                    .context("register node")?;
+                let resp: RegisterNodeResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+                if resp.code == CODE_OK {
+                    break resp;
+                }
+                if resp.code == CODE_NOT_LEADER && attempt < 60 {
+                    attempt += 1;
+                    compio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+                bail!("register-node failed: code={} {}", resp.code, resp.message);
+            };
             println!("node registered: node_id={}, addr={}", resp.node_id, addr);
             for (uuid, disk_id) in &resp.disk_uuids {
                 println!("  disk {uuid} → disk_id={disk_id}");
