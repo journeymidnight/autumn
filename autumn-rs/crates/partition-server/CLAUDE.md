@@ -22,10 +22,26 @@ Dispatcher worker threads (N = CPU count, configurable via --conn-threads)
 ├─ worker-1: handle_ps_connection × K
 └─ worker-N: handle_ps_connection × K
 
-Partition threads (1 OS thread per partition, each with own compio runtime)
-├─ part-1: write_loop, flush_loop, compact_loop, gc_loop, dispatch_rpc
-└─ part-2: ...
+Partition threads — 2 OS threads per partition (F088, PoolKind removed in F093):
+├─ part-N-log (P-log): write_loop, flush_dispatcher, compact_loop, gc_loop, dispatch_rpc
+│     • owns PartitionData (Rc<RefCell>), dedicated StreamClient + ConnPool
+│     • serves log_stream WAL appends + (rare) compact row_stream writes
+│     • all WAL appends + atomic tables/sst_readers swap run here
+├─ part-N-bulk (P-bulk): flush_worker_loop
+│     • own compio runtime, own io_uring, own ConnPool, own StreamClient
+│     • uses StreamClient::new_with_revision to inherit owner-lock fencing
+│     • runs build_sst_bytes + row_stream.append + save_table_locs_raw
+│
+P-log → P-bulk: mpsc::Sender<FlushReq> (capacity 1 → sequential flushes)
+P-bulk → P-log: oneshot::Sender<Result<(TableMeta, SstReader)>>
 ```
+
+**Why two OS threads per partition?** A 128 MB row_stream flush holds the P-log
+compio runtime for hundreds of ms (syscall + 3-replica fanout CQE wait), head-
+of-line-blocking the log_stream 4 KB WAL batches sharing the same io_uring. The
+F087-bulk-mux pool split separated the TCP sockets, but the runtime was still
+single-threaded. F088 gives flush its own runtime so WAL appends make forward
+progress concurrently with SST uploads.
 
 Workers communicate with partition threads via `PartitionRouter` (DashMap<part_id, mpsc::Sender>).
 Each connection is sequential: decode → route → await response → write. No Mutex writer.
@@ -108,20 +124,45 @@ Get(key, part_id):
        else → return raw value
 ```
 
-## Flush Pipeline (3 Phases, minimizes lock duration)
+## Flush Pipeline (F088: cross-thread hand-off)
 
-Triggered when `active` exceeds `FLUSH_MEM_BYTES` (256KB) or `FLUSH_MEM_OPS` (512 entries).
+Triggered when `active` exceeds `FLUSH_MEM_BYTES` (256 MB).
 
 ```
-Phase 1 (read lock):  snapshot front imm memtable + stream IDs
-Phase 2 (no lock):    build SSTable bytes in memory (CPU-intensive, no lock held)
-Phase 3 (write lock): append SST to row_stream, save TableLocations to meta_stream,
-                       push new SstReader to sst_readers, pop flushed imm
+P-log: background_flush_loop
+  1. recv flush_rx signal
+  2. snapshot front imm + vp + tables → FlushReq
+  3. flush_req_tx.send(req)      ← cross-thread hand-off (capacity 1)
+  4. oneshot resp.await           ← ~1 ms–seconds depending on row_stream backlog
+
+P-bulk: flush_worker_loop
+  1. recv FlushReq
+  2. build_sst_bytes(imm, vp_eid, vp_off)         ← spawn_blocking (CPU)
+  3. bulk_sc.append(row_stream_id, sst_bytes)     ← 128 MB network upload
+  4. SstReader::from_bytes(Bytes::from(sst_bytes))
+  5. tables_after = tables_before + new_meta
+  6. save_table_locs_raw(bulk_sc, meta_stream_id, tables_after, vp_eid, vp_off)
+  7. resp_tx.send(Ok((new_meta, reader)))
+
+P-log: continuation
+  8. part.tables.push(new_meta)
+  9. part.sst_readers.push(Rc::new(reader))
+  10. part.imm.pop_front()
 ```
 
-The 3-phase design keeps the write lock held for only the final metadata swap, not during SSTable construction or network I/O.
+The in-thread legacy path (`flush_one_imm_local`) is retained as a fallback for
+when bulk-thread spawn fails.
 
-After flush, `save_table_locs_raw` writes `TableLocations` to `meta_stream` and **truncates meta_stream to 1 extent** — only the latest checkpoint is kept.
+After flush, `save_table_locs_raw` writes `TableLocations` to `meta_stream` and
+**truncates meta_stream to 1 extent** — only the latest checkpoint is kept.
+
+**vp snapshot semantics**: the meta_stream checkpoint records the vp
+(`vp_extent_id/vp_offset`) captured at FlushReq send time on P-log — NOT the
+current vp at P-bulk commit time. Correctness: during replay, logStream from
+the snapshot vp forward will include any records added after snapshot,
+re-inserting them into memtable (some may already be in the just-flushed SST,
+which is fine — duplicate entries with the same seq are idempotent). Trade-off:
+avoids a second round trip; slightly more logStream retained until next flush.
 
 ## Compaction
 
@@ -220,7 +261,9 @@ After split, both child partitions will detect `has_overlap = true` on next open
        - Large values (>4KB): VP points to record in logStream
        - Records with ts ≤ max_seq (already in SSTables) are skipped
   5. PartitionData.active = recovered memtable (preserves unflushed entries)
-  6. Spawn background loops: flush_loop, compact_loop, gc_loop, write_loop
+  6. Spawn P-bulk OS thread (flush_worker_loop on own compio runtime)
+  7. Spawn P-log background tasks on this thread: flush_loop (dispatcher),
+     compact_loop, gc_loop, write_loop, dispatch_rpc
 ```
 
 ## Fault Recovery: LockedByOther Self-Eviction

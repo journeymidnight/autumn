@@ -94,25 +94,20 @@ impl RpcConn {
     }
 }
 
-/// Pool classification. Separates latency-sensitive hot-path writes
-/// (log_stream / small WAL frames) from bulk writes (row_stream SSTable
-/// flush, meta_stream checkpoint) so a 256MB flush on Bulk's TCP cannot
-/// head-of-line-block a 4KB WAL batch on Hot's TCP to the same node.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum PoolKind {
-    Hot,
-    Bulk,
-}
-
 /// Per-process connection pool for extent nodes (single-threaded compio).
 ///
-/// Keyed by `(SocketAddr, PoolKind)`: each (addr, kind) pair owns a distinct
-/// sequential `RpcConn`. Uses take/put pattern on `RefCell<Option<RpcConn>>`
-/// to avoid holding borrow_mut across await points. If a conn is already
-/// taken (another task is using it), we create a second connection for that
-/// address+kind.
+/// Keyed by `SocketAddr`: each address owns one sequential `RpcConn`. Uses
+/// take/put pattern on `RefCell<Option<RpcConn>>` to avoid holding borrow_mut
+/// across await points. If the pooled conn is already taken (another task is
+/// using it), we create a second connection for the same address on the fly.
+///
+/// F087-bulk-mux previously keyed by `(SocketAddr, PoolKind)` to keep large
+/// SSTable flushes off the socket used by small log_stream WAL batches. F088
+/// moved flush to a dedicated P-bulk OS thread with its own ConnPool, so the
+/// P-log SC now only carries WAL (+ rare compact writes) and PoolKind
+/// separation became unnecessary (F093 removal).
 pub struct ConnPool {
-    conns: RefCell<HashMap<(SocketAddr, PoolKind), Rc<RefCell<Option<RpcConn>>>>>,
+    conns: RefCell<HashMap<SocketAddr, Rc<RefCell<Option<RpcConn>>>>>,
 }
 
 impl ConnPool {
@@ -126,22 +121,11 @@ impl ConnPool {
     /// On error, the connection is discarded (not returned to pool) so
     /// the next call creates a fresh connection.
     pub async fn call(&self, addr: &str, msg_type: u8, payload: Bytes) -> Result<Bytes> {
-        self.call_kind(addr, PoolKind::Hot, msg_type, payload).await
-    }
-
-    /// Send an RPC on a specific pool kind (Hot vs Bulk).
-    pub async fn call_kind(
-        &self,
-        addr: &str,
-        kind: PoolKind,
-        msg_type: u8,
-        payload: Bytes,
-    ) -> Result<Bytes> {
         let sock = parse_addr(addr)?;
-        let mut conn = self.take_conn(sock, kind).await?;
+        let mut conn = self.take_conn(sock).await?;
         let result = conn.call(msg_type, payload).await;
         if result.is_ok() {
-            self.put_conn(sock, kind, conn);
+            self.put_conn(sock, conn);
         }
         // On error: conn is dropped, pool entry stays None → next call reconnects.
         result
@@ -173,31 +157,19 @@ impl ConnPool {
         msg_type: u8,
         payload_parts: Vec<Bytes>,
     ) -> Result<Bytes> {
-        self.call_vectored_kind(addr, PoolKind::Hot, msg_type, payload_parts)
-            .await
-    }
-
-    /// Vectored version of `call_kind`.
-    pub async fn call_vectored_kind(
-        &self,
-        addr: &str,
-        kind: PoolKind,
-        msg_type: u8,
-        payload_parts: Vec<Bytes>,
-    ) -> Result<Bytes> {
         let sock = parse_addr(addr)?;
-        let mut conn = self.take_conn(sock, kind).await?;
+        let mut conn = self.take_conn(sock).await?;
         let result = conn.call_vectored(msg_type, payload_parts).await;
         if result.is_ok() {
-            self.put_conn(sock, kind, conn);
+            self.put_conn(sock, conn);
         }
         result
     }
 
-    /// Take an RpcConn for the given (address, kind). If the pooled one is
-    /// in use (taken by another task), create a fresh connection.
-    async fn take_conn(&self, addr: SocketAddr, kind: PoolKind) -> Result<RpcConn> {
-        if let Some(cell) = self.conns.borrow().get(&(addr, kind)).cloned() {
+    /// Take an RpcConn for the given address. If the pooled one is in use
+    /// (taken by another task), create a fresh connection.
+    async fn take_conn(&self, addr: SocketAddr) -> Result<RpcConn> {
+        if let Some(cell) = self.conns.borrow().get(&addr).cloned() {
             if let Some(conn) = cell.borrow_mut().take() {
                 return Ok(conn);
             }
@@ -205,11 +177,11 @@ impl ConnPool {
         RpcConn::connect(addr).await
     }
 
-    /// Return an RpcConn to the pool under its (address, kind) slot.
-    fn put_conn(&self, addr: SocketAddr, kind: PoolKind, conn: RpcConn) {
+    /// Return an RpcConn to the pool for the given address.
+    fn put_conn(&self, addr: SocketAddr, conn: RpcConn) {
         let mut conns = self.conns.borrow_mut();
         let cell = conns
-            .entry((addr, kind))
+            .entry(addr)
             .or_insert_with(|| Rc::new(RefCell::new(None)));
         *cell.borrow_mut() = Some(conn);
     }
@@ -219,7 +191,7 @@ impl ConnPool {
             return false;
         };
         let conns = self.conns.borrow();
-        conns.contains_key(&(sock, PoolKind::Hot)) || conns.contains_key(&(sock, PoolKind::Bulk))
+        conns.contains_key(&sock)
     }
 }
 

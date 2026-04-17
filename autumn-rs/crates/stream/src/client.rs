@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use autumn_common::metrics::{duration_to_ns, ns_to_ms, unix_time_ms};
 use autumn_rpc::manager_rpc::{self, *};
-use crate::{ConnPool, PoolKind};
+use crate::ConnPool;
 use crate::extent_rpc::{
     AppendReq, AppendResp, CommitLengthReq, CommitLengthResp, ExtentInfo, ReadBytesReq,
     ReadBytesResp, StreamInfo, CODE_LOCKED_BY_OTHER, CODE_NOT_FOUND, CODE_OK,
@@ -131,10 +131,6 @@ pub struct StreamClient {
     extent_info_cache: DashMap<u64, ExtentInfo>,
     /// Per-stream tail + commit state, each individually locked.
     stream_states: DashMap<u64, Arc<Mutex<StreamAppendState>>>,
-    /// Per-stream pool classification (Hot vs Bulk). Default: Hot.
-    /// row_stream / meta_stream should be registered as Bulk by the caller so
-    /// their 256MB SSTable flushes don't head-of-line-block the log_stream WAL.
-    stream_kinds: DashMap<u64, PoolKind>,
     append_metrics: StreamAppendMetrics,
 }
 
@@ -219,7 +215,6 @@ impl StreamClient {
                             nodes_cache: DashMap::new(),
                             extent_info_cache: DashMap::new(),
                             stream_states: DashMap::new(),
-                            stream_kinds: DashMap::new(),
                             append_metrics: StreamAppendMetrics::default(),
                         });
                     } else if resp.code == CODE_NOT_LEADER {
@@ -261,7 +256,6 @@ impl StreamClient {
             nodes_cache: DashMap::new(),
             extent_info_cache: DashMap::new(),
             stream_states: DashMap::new(),
-            stream_kinds: DashMap::new(),
             append_metrics: StreamAppendMetrics::default(),
         })
     }
@@ -271,21 +265,6 @@ impl StreamClient {
     }
     pub fn owner_key(&self) -> &str {
         &self.owner_key
-    }
-
-    /// Classify a stream as Hot or Bulk for connection pool separation.
-    /// Hot: latency-sensitive small writes (log_stream / WAL).
-    /// Bulk: large bulk writes (row_stream SSTable flush, meta_stream checkpoint).
-    /// Default for unregistered streams is Hot.
-    pub fn set_stream_kind(&self, stream_id: u64, kind: PoolKind) {
-        self.stream_kinds.insert(stream_id, kind);
-    }
-
-    fn kind_for(&self, stream_id: u64) -> PoolKind {
-        self.stream_kinds
-            .get(&stream_id)
-            .map(|v| *v)
-            .unwrap_or(PoolKind::Hot)
     }
 
     // ── internal helpers ─────────────────────────────────────────────────────
@@ -532,7 +511,6 @@ impl StreamClient {
             );
 
             let fanout_started_at = Instant::now();
-            let kind = self.kind_for(stream_id);
             let futs: Vec<_> = tail
                 .replica_addrs
                 .iter()
@@ -549,7 +527,7 @@ impl StreamClient {
                             parts.push(seg.clone()); // Bytes::clone = refcount, not memcpy
                         }
                         let result = pool
-                            .call_vectored_kind(&addr, kind, MSG_APPEND, parts)
+                            .call_vectored(&addr, MSG_APPEND, parts)
                             .await;
                         (addr, result)
                     }

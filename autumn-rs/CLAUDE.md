@@ -80,11 +80,18 @@ background_flush_loop (when signaled):
 
 No local WAL file. logStream is the sole WAL.
 
-Each partition uses its **own `Arc<StreamClient>`** (`PartitionData.stream_client`), created via
+Each partition uses its **own `Rc<StreamClient>`** (`PartitionData.stream_client`), created via
 `StreamClient::new_with_revision` which reuses the server-level owner-lock revision without
 calling `acquire_owner_lock` again. `StreamClient` is internally concurrent via per-stream
 locking (`DashMap<stream_id, Arc<Mutex<StreamAppendState>>>`), so no external Mutex is needed.
 The server-level `PartitionServer.stream_client` is reserved for split coordination RPCs only.
+
+**Two OS threads per partition (F088)**: each partition additionally owns a **P-bulk** thread
+running its own compio runtime + ConnPool + StreamClient (also via `new_with_revision` to
+inherit owner-lock fencing). `background_flush_loop` on P-log ships `FlushReq` over a
+bounded-1 channel to P-bulk, which runs the 128 MB `row_stream.append` + meta checkpoint
+without competing for P-log's io_uring. The response carries the `TableMeta` + `SstReader`
+back; P-log atomically pushes them and pops imm.
 
 ## Core Read Data Flow
 

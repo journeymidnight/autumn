@@ -232,7 +232,7 @@ pub(crate) async fn background_gc_loop(
                 extent_ids.iter().copied().filter(|e| idx.contains(e)).take(MAX_GC_ONCE).collect()
             }
             GcTask::Auto => {
-                let mut discards = get_discards_rc(&readers_snapshot);
+                let mut discards = get_discards(&readers_snapshot);
                 valid_discard(&mut discards, sealed_extents);
 
                 let mut candidates: Vec<u64> = discards.keys().copied().collect();
@@ -726,7 +726,7 @@ pub(crate) async fn do_compact(
 
     let (readers, row_stream_id, meta_stream_id, compact_vp_eid, compact_vp_off, rg, part_sc) = {
         let p = part.borrow();
-        let mut rds: Vec<Rc<SstReader>> = Vec::new();
+        let mut rds: Vec<Arc<SstReader>> = Vec::new();
         for t in &tbls {
             if let Some(idx) = p.tables.iter().position(|x| x.loc() == t.loc()) {
                 rds.push(p.sst_readers[idx].clone());
@@ -739,27 +739,18 @@ pub(crate) async fn do_compact(
         return Ok(CompactStats { input_tables, output_tables: 0, entries_kept: 0, entries_discarded: 0, output_bytes: 0 });
     }
 
-    let mut readers_with_meta: Vec<(Rc<SstReader>, u64)> = readers.iter().zip(tbls.iter()).map(|(r, t)| (r.clone(), t.last_seq)).collect();
+    let mut readers_with_meta: Vec<(Arc<SstReader>, u64)> = readers.iter().zip(tbls.iter()).map(|(r, t)| (r.clone(), t.last_seq)).collect();
     readers_with_meta.sort_by(|a, b| b.1.cmp(&a.1));
 
     let iters: Vec<TableIterator> = readers_with_meta.iter().map(|(r, _)| {
-        // SstReader needs Arc for TableIterator — convert Rc to Arc by cloning data.
-        // This is a limitation: TableIterator expects Arc<SstReader>.
-        // For now, we need to use Arc in sst_readers even in single-threaded mode.
-        // TODO: make TableIterator generic over Rc/Arc.
-        let arc_reader = unsafe {
-            // SAFETY: single-threaded, Rc and Arc have the same layout.
-            // We're transmuting Rc<SstReader> to Arc<SstReader>.
-            std::mem::transmute::<Rc<SstReader>, Arc<SstReader>>(r.clone())
-        };
-        let mut it = TableIterator::new(arc_reader);
+        let mut it = TableIterator::new(r.clone());
         it.rewind();
         it
     }).collect();
     let mut merge = MergeIterator::new(iters);
     merge.rewind();
 
-    let mut discards = get_discards_rc(&readers);
+    let mut discards = get_discards(&readers);
 
     let now = now_secs();
     let max_chunk = 2 * MAX_SKIP_LIST as usize;
@@ -858,7 +849,7 @@ pub(crate) async fn do_compact(
     let last_chunk_idx = chunks.len().saturating_sub(1);
     let output_tables = chunks.len();
     let mut output_bytes = 0u64;
-    let mut new_readers: Vec<(TableMeta, Rc<SstReader>)> = Vec::new();
+    let mut new_readers: Vec<(TableMeta, Arc<SstReader>)> = Vec::new();
     for (chunk_idx, (entries, chunk_last_seq)) in chunks.into_iter().enumerate() {
         let mut b = SstBuilder::new(compact_vp_eid, compact_vp_off);
         if chunk_idx == last_chunk_idx {
@@ -871,7 +862,7 @@ pub(crate) async fn do_compact(
         output_bytes += sst_bytes.len() as u64;
         let result = part_sc.append(row_stream_id, &sst_bytes, true).await?;
         let estimated_size = sst_bytes.len() as u64;
-        let reader = Rc::new(SstReader::from_bytes(Bytes::from(sst_bytes))?);
+        let reader = Arc::new(SstReader::from_bytes(Bytes::from(sst_bytes))?);
         new_readers.push((
             TableMeta {
                 extent_id: result.extent_id,
@@ -913,16 +904,6 @@ pub(crate) fn remove_compacted_tables(part: &mut PartitionData, compact_keys: &H
 }
 
 pub(crate) fn get_discards(readers: &[Arc<SstReader>]) -> HashMap<u64, i64> {
-    let mut out: HashMap<u64, i64> = HashMap::new();
-    for r in readers {
-        for (&eid, &sz) in &r.discards {
-            *out.entry(eid).or_insert(0) += sz;
-        }
-    }
-    out
-}
-
-pub(crate) fn get_discards_rc(readers: &[Rc<SstReader>]) -> HashMap<u64, i64> {
     let mut out: HashMap<u64, i64> = HashMap::new();
     for r in readers {
         for (&eid, &sz) in &r.discards {
@@ -1081,10 +1062,7 @@ pub(crate) fn unique_user_keys(part: &PartitionData) -> Vec<Vec<u8>> {
     }
 
     for reader in part.sst_readers.iter().rev() {
-        let arc_reader = unsafe {
-            std::mem::transmute::<Rc<SstReader>, Arc<SstReader>>(reader.clone())
-        };
-        let mut it = TableIterator::new(arc_reader);
+        let mut it = TableIterator::new(reader.clone());
         it.rewind();
         while it.valid() {
             let item = it.item().unwrap();

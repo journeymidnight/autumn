@@ -1,9 +1,9 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
+use parking_lot::Mutex;
 
 use super::bloom::BloomFilter;
 use super::format::{BlockOffset, DecodedBlock, MetaBlock};
@@ -28,7 +28,13 @@ pub struct SstReader {
     pub min_expires_at: u64,
     sst_base: u32,
     /// Decoded block cache — avoids re-decoding (CRC + memcpy) on repeated reads.
-    block_cache: RefCell<Vec<Option<Arc<DecodedBlock>>>>,
+    /// Mutex (not RefCell) so SstReader is Sync and can be shared across
+    /// P-log/P-bulk via Arc without the unsafe Rc→Arc transmute that the
+    /// codebase carried pre-F092. In practice only P-log reads blocks; P-bulk
+    /// only consumes freshly built SstReaders via oneshot move. Contention is
+    /// near-zero; the two-phase locking in read_block allows idempotent
+    /// concurrent misses.
+    block_cache: Mutex<Vec<Option<Arc<DecodedBlock>>>>,
 }
 
 impl SstReader {
@@ -92,7 +98,7 @@ impl SstReader {
             discards: meta.discards,
             min_expires_at: meta.min_expires_at,
             sst_base: sst_base as u32,
-            block_cache: RefCell::new(vec![None; num_blocks]),
+            block_cache: Mutex::new(vec![None; num_blocks]),
             data,
         })
     }
@@ -136,9 +142,11 @@ impl SstReader {
 
     /// Read and decode block at index `idx`. Cached after first decode.
     pub fn read_block(&self, idx: usize) -> Result<Arc<DecodedBlock>> {
-        // Check cache first.
-        if let Some(cached) = self.block_cache.borrow().get(idx).and_then(|c| c.clone()) {
-            return Ok(cached);
+        {
+            let guard = self.block_cache.lock();
+            if let Some(cached) = guard.get(idx).and_then(|c| c.clone()) {
+                return Ok(cached);
+            }
         }
         let bo = self.block_offsets.get(idx).ok_or_else(|| {
             anyhow!(
@@ -155,7 +163,12 @@ impl SstReader {
             ));
         }
         let block = Arc::new(DecodedBlock::decode(self.data.slice(start..end), &bo.key)?);
-        self.block_cache.borrow_mut()[idx] = Some(block.clone());
+        {
+            let mut guard = self.block_cache.lock();
+            if let Some(slot) = guard.get_mut(idx) {
+                *slot = Some(block.clone());
+            }
+        }
         Ok(block)
     }
 

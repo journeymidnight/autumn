@@ -258,8 +258,7 @@ pub(crate) async fn handle_range(payload: Bytes, part: &Rc<RefCell<PartitionData
     mem_it.seek(&seek_key);
 
     let sst_iters: Vec<TableIterator> = p.sst_readers.iter().rev().map(|r| {
-        let arc_reader = unsafe { std::mem::transmute::<Rc<SstReader>, Arc<SstReader>>(r.clone()) };
-        let mut it = TableIterator::new(arc_reader);
+        let mut it = TableIterator::new(r.clone());
         it.seek(&seek_key);
         it
     }).collect();

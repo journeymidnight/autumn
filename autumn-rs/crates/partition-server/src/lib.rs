@@ -19,7 +19,7 @@ use autumn_common::metrics::{duration_to_ns, ns_to_ms};
 use autumn_rpc::manager_rpc::{self, MgrRange as Range, rkyv_encode, rkyv_decode};
 use autumn_rpc::partition_rpc::{self, *, TableLocations, SstLocation};
 use autumn_rpc::{Frame, FrameDecoder, HandlerResult, StatusCode};
-use autumn_stream::{ConnPool, PoolKind, StreamClient};
+use autumn_stream::{ConnPool, StreamClient};
 use bytes::{BufMut, Bytes, BytesMut};
 use compio::dispatcher::Dispatcher;
 use compio::io::{AsyncRead, AsyncWriteExt};
@@ -208,12 +208,16 @@ pub(crate) struct PartitionData {
     row_stream_id: u64,
     meta_stream_id: u64,
     tables: Vec<TableMeta>,
-    sst_readers: Vec<Rc<SstReader>>,
+    sst_readers: Vec<Arc<SstReader>>,
     has_overlap: Cell<u32>,
     write_tx: mpsc::Sender<WriteRequest>,
     vp_extent_id: u64,
     vp_offset: u32,
     stream_client: Rc<StreamClient>,
+    /// F088: sender to the per-partition bulk thread. `None` if the bulk
+    /// thread failed to initialize — fall back to in-thread flush (legacy
+    /// path) so the partition remains usable.
+    flush_req_tx: Option<mpsc::Sender<FlushReq>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +227,31 @@ pub(crate) struct PartitionData {
 pub(crate) enum GcTask {
     Auto,
     Force { extent_ids: Vec<u64> },
+}
+
+// ---------------------------------------------------------------------------
+// Flush channel types (P-log → P-bulk)
+// ---------------------------------------------------------------------------
+//
+// F088: background_flush_loop on the P-log thread no longer runs
+// build_sst_bytes + row_stream.append + save_table_locs_raw itself. Instead it
+// ships a FlushReq over to a dedicated P-bulk OS thread (its own compio
+// runtime + io_uring + ConnPool), which does the heavy lifting and replies
+// with the new TableMeta + SstReader. P-log then atomically pushes the new
+// table/reader and pops imm — single-threaded semantics are preserved.
+//
+// imm: Arc<Memtable> — SkipMap + AtomicU64, Send+Sync. Safe to cross threads.
+// SstReader holds a RefCell block cache; RefCell<T: Send> is Send (not Sync),
+// so we can move it through the oneshot::Sender but not share across tasks.
+
+pub(crate) struct FlushReq {
+    pub(crate) imm: Arc<Memtable>,
+    pub(crate) vp_eid: u64,
+    pub(crate) vp_off: u32,
+    pub(crate) row_stream_id: u64,
+    pub(crate) meta_stream_id: u64,
+    pub(crate) tables_before: Vec<TableMeta>,
+    pub(crate) resp_tx: oneshot::Sender<Result<(TableMeta, SstReader)>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -863,12 +892,6 @@ async fn partition_thread_main(
         .context("create per-partition StreamClient")?,
     );
 
-    // Route row_stream (SSTable flush, up to 128MB) and meta_stream (checkpoint) over
-    // the Bulk pool so their large writes don't head-of-line-block the Hot-pool
-    // log_stream WAL batches on the same extent node.
-    part_sc.set_stream_kind(row_stream_id, PoolKind::Bulk);
-    part_sc.set_stream_kind(meta_stream_id, PoolKind::Bulk);
-
     // Check commit length on all streams before recovery (Go: checkCommitLength).
     // This ensures the last extent of each stream has consistent commit length
     // across all replicas before we start reading from it.
@@ -907,6 +930,26 @@ async fn partition_thread_main(
     let (gc_tx, gc_rx) = mpsc::channel::<GcTask>(1);
     let (write_tx, write_rx) = mpsc::channel::<WriteRequest>(WRITE_CHANNEL_CAP);
 
+    // F088: spawn a dedicated OS thread (P-bulk) that owns its own compio
+    // runtime + io_uring + ConnPool. Flush requests are forwarded to it via
+    // `flush_req_tx`. capacity=1 keeps flushes sequential (matches the old
+    // in-thread semantics) and provides back-pressure on the P-log flush_loop.
+    let (flush_req_tx, flush_req_rx) = mpsc::channel::<FlushReq>(1);
+    let bulk_thread_spawn = spawn_bulk_thread(
+        part_id,
+        manager_addr.clone(),
+        owner_key.clone(),
+        revision,
+        flush_req_rx,
+    );
+    let flush_req_tx_part = match &bulk_thread_spawn {
+        Ok(_) => Some(flush_req_tx.clone()),
+        Err(e) => {
+            tracing::error!(part_id, error = %e, "bulk thread spawn failed; flush will fall back to P-log");
+            None
+        }
+    };
+
     let part = Rc::new(RefCell::new(PartitionData {
         rg,
         active: recovered_active,
@@ -925,7 +968,14 @@ async fn partition_thread_main(
         vp_extent_id: vp_eid,
         vp_offset: vp_off,
         stream_client: part_sc.clone(),
+        flush_req_tx: flush_req_tx_part,
     }));
+
+    // Drop the extra `flush_req_tx` clone held locally: the one stored in
+    // PartitionData is the only reference. When PartitionData drops, the
+    // channel closes, the bulk thread sees flush_req_rx.next() = None,
+    // and exits cleanly.
+    drop(flush_req_tx);
 
     // Spawn background loops on this thread's compio runtime.
     {
@@ -1046,9 +1096,9 @@ async fn recover_partition(
     _row_stream_id: u64,
     meta_stream_id: u64,
     part_sc: &Rc<StreamClient>,
-) -> Result<(Vec<TableMeta>, Vec<Rc<SstReader>>, u64, u64, u32, bool, Memtable)> {
+) -> Result<(Vec<TableMeta>, Vec<Arc<SstReader>>, u64, u64, u32, bool, Memtable)> {
     let mut tables: Vec<TableMeta> = Vec::new();
-    let mut sst_readers: Vec<Rc<SstReader>> = Vec::new();
+    let mut sst_readers: Vec<Arc<SstReader>> = Vec::new();
     let mut max_seq: u64 = 0;
     let mut recovered_vp_eid: u64 = 0;
     let mut recovered_vp_off: u32 = 0;
@@ -1114,7 +1164,7 @@ async fn recover_partition(
                 estimated_size,
                 last_seq: tbl_last_seq,
             });
-            sst_readers.push(Rc::new(reader));
+            sst_readers.push(Arc::new(reader));
         }
     }
 
@@ -1380,7 +1430,8 @@ pub(crate) fn maybe_rotate(part: &mut PartitionData) {
 }
 
 pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<bool> {
-    let (imm_mem, row_stream_id, meta_stream_id, snap_vp_eid, snap_vp_off, part_sc) = {
+    // Snapshot of what P-bulk needs + whether a bulk worker is wired up.
+    let (imm_mem, row_stream_id, meta_stream_id, snap_vp_eid, snap_vp_off, tables_before, req_tx) = {
         let p = part.borrow();
         let Some(imm_mem) = p.imm.front().cloned() else {
             return Ok(false);
@@ -1391,13 +1442,56 @@ pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<b
             p.meta_stream_id,
             p.vp_extent_id,
             p.vp_offset,
-            p.stream_client.clone(),
+            p.tables.clone(),
+            p.flush_req_tx.clone(),
         )
     };
 
-    // Build SSTable on a blocking thread so the CPU-intensive work doesn't
-    // stall the partition thread's compio event loop (which needs to service
-    // write loop fanout I/O concurrently).
+    let Some(mut req_tx) = req_tx else {
+        // P-bulk thread failed to spawn — fall back to in-thread flush so
+        // the partition keeps working (degraded performance, legacy path).
+        return flush_one_imm_local(part, imm_mem, row_stream_id, meta_stream_id, snap_vp_eid, snap_vp_off).await;
+    };
+
+    let (resp_tx, resp_rx) = oneshot::channel();
+    let req = FlushReq {
+        imm: imm_mem,
+        vp_eid: snap_vp_eid,
+        vp_off: snap_vp_off,
+        row_stream_id,
+        meta_stream_id,
+        tables_before,
+        resp_tx,
+    };
+    if req_tx.send(req).await.is_err() {
+        return Err(anyhow!("bulk thread dropped flush channel"));
+    }
+    let (new_meta, reader) = match resp_rx.await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err(anyhow!("bulk thread dropped flush response")),
+    };
+
+    // Atomic swap on P-log: push new table/reader, pop drained imm.
+    let mut p = part.borrow_mut();
+    p.tables.push(new_meta);
+    p.sst_readers.push(Arc::new(reader));
+    p.imm.pop_front();
+    Ok(true)
+}
+
+/// Legacy in-thread flush. Only used when the P-bulk thread fails to spawn.
+/// Keeps the old flush_one_imm behavior so a partition remains functional in
+/// that degraded mode.
+async fn flush_one_imm_local(
+    part: &Rc<RefCell<PartitionData>>,
+    imm_mem: Arc<Memtable>,
+    row_stream_id: u64,
+    meta_stream_id: u64,
+    snap_vp_eid: u64,
+    snap_vp_off: u32,
+) -> Result<bool> {
+    let part_sc = part.borrow().stream_client.clone();
     let imm_clone = imm_mem.clone();
     let (sst_bytes, last_seq) = compio::runtime::spawn_blocking(move || {
         build_sst_bytes(&imm_clone, snap_vp_eid, snap_vp_off)
@@ -1407,7 +1501,7 @@ pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<b
     let result = part_sc.append(row_stream_id, &sst_bytes, true).await?;
 
     let estimated_size = sst_bytes.len() as u64;
-    let reader = Rc::new(SstReader::from_bytes(Bytes::from(sst_bytes))?);
+    let reader = Arc::new(SstReader::from_bytes(Bytes::from(sst_bytes))?);
 
     let (tables_snapshot, vp_eid, vp_off) = {
         let mut p = part.borrow_mut();
@@ -1470,6 +1564,126 @@ async fn background_flush_loop(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// F088: Per-partition bulk thread (P-bulk)
+//
+// The bulk thread owns its own compio runtime (separate io_uring), its own
+// ConnPool, and its own StreamClient. This prevents 128MB row_stream SSTable
+// uploads from head-of-line-blocking the 4KB log_stream WAL batches sharing
+// the P-log runtime.
+//
+// The StreamClient uses `new_with_revision` to inherit the server-level
+// owner-lock revision — no second `acquire_owner_lock` call, so both clients
+// use the same fencing token. Post-F093 the pool no longer uses Hot/Bulk
+// kinds; each thread's ConnPool is role-dedicated.
+// ---------------------------------------------------------------------------
+
+fn spawn_bulk_thread(
+    part_id: u64,
+    manager_addr: String,
+    owner_key: String,
+    revision: i64,
+    flush_req_rx: mpsc::Receiver<FlushReq>,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name(format!("part-{part_id}-bulk"))
+        .spawn(move || {
+            let rt = match compio::runtime::Runtime::new() {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(part_id, error = %e, "bulk thread runtime init failed");
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let pool = Rc::new(ConnPool::new());
+                let bulk_sc = match StreamClient::new_with_revision(
+                    &manager_addr,
+                    owner_key,
+                    revision,
+                    3 * 1024 * 1024 * 1024,
+                    pool,
+                )
+                .await
+                {
+                    Ok(sc) => Rc::new(sc),
+                    Err(e) => {
+                        tracing::error!(part_id, error = %e, "bulk StreamClient init failed");
+                        return;
+                    }
+                };
+                tracing::info!(part_id, "bulk thread ready");
+                flush_worker_loop(bulk_sc, flush_req_rx).await;
+                tracing::info!(part_id, "bulk thread exiting");
+            });
+        })
+}
+
+async fn flush_worker_loop(
+    bulk_sc: Rc<StreamClient>,
+    mut flush_req_rx: mpsc::Receiver<FlushReq>,
+) {
+    while let Some(req) = flush_req_rx.next().await {
+        let FlushReq {
+            imm,
+            vp_eid,
+            vp_off,
+            row_stream_id,
+            meta_stream_id,
+            tables_before,
+            resp_tx,
+        } = req;
+        let result = do_flush_on_bulk(
+            &bulk_sc,
+            imm,
+            vp_eid,
+            vp_off,
+            row_stream_id,
+            meta_stream_id,
+            tables_before,
+        )
+        .await;
+        let _ = resp_tx.send(result);
+    }
+}
+
+async fn do_flush_on_bulk(
+    bulk_sc: &Rc<StreamClient>,
+    imm: Arc<Memtable>,
+    vp_eid: u64,
+    vp_off: u32,
+    row_stream_id: u64,
+    meta_stream_id: u64,
+    tables_before: Vec<TableMeta>,
+) -> Result<(TableMeta, SstReader)> {
+    let imm_clone = imm.clone();
+    let (sst_bytes, last_seq) = compio::runtime::spawn_blocking(move || {
+        build_sst_bytes(&imm_clone, vp_eid, vp_off)
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("SSTable build task failed"))?;
+
+    let append_result = bulk_sc.append(row_stream_id, &sst_bytes, true).await?;
+    let estimated_size = sst_bytes.len() as u64;
+    let reader = SstReader::from_bytes(Bytes::from(sst_bytes))?;
+    let new_meta = TableMeta {
+        extent_id: append_result.extent_id,
+        offset: append_result.offset,
+        len: append_result.end - append_result.offset,
+        estimated_size,
+        last_seq,
+    };
+
+    // Persist the updated tables list + vp snapshot on meta_stream. Using the
+    // snapshot vp (captured at FlushReq time on P-log) instead of the possibly
+    // advanced current vp means logStream may retain slightly more data until
+    // the next flush — harmless, and avoids a second P-log ↔ P-bulk round trip.
+    let mut tables_after = tables_before;
+    tables_after.push(new_meta.clone());
+    save_table_locs_raw(bulk_sc, meta_stream_id, &tables_after, vp_eid, vp_off).await?;
+    Ok((new_meta, reader))
 }
 
 // ---------------------------------------------------------------------------

@@ -9,7 +9,6 @@ members = [
   "crates/server",
   "crates/client",
   "crates/fuse",
-  "examples/gallery",
 ]
 exclude = ["python"]
 resolver = "2"
@@ -29,6 +28,7 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 crc32c = "0.6"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+parking_lot = "0.12"
 
 
 [profile.release]
