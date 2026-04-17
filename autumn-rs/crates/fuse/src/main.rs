@@ -1,22 +1,22 @@
 //! autumn-fuse: Mount autumn-rs KV store as a POSIX filesystem.
 //!
 //! Architecture:
-//! - fuser threads handle FUSE callbacks and send FsRequests over a std::sync::mpsc channel
-//! - A single compio thread owns ClusterClient and processes all requests
-//! - The compio thread polls try_recv + yields to avoid blocking the event loop
+//! - fuser threads handle FUSE callbacks and unbounded_send FsRequests on a futures mpsc channel
+//! - A single compio thread owns ClusterClient and awaits rx.next() on the event loop
+//! - A 30s timeout on rx.next drives the periodic dirty-inode flush without busy-polling
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use futures::StreamExt;
 use tracing_subscriber::EnvFilter;
 
 use autumn_fuse::bridge::FuseBridge;
 use autumn_fuse::dispatch;
 use autumn_fuse::ops::AutumnFs;
 use autumn_fuse::state::FsState;
-use autumn_fuse::sync_task;
 use autumn_fuse::write;
 
 #[derive(Parser)]
@@ -54,7 +54,7 @@ fn main() -> Result<()> {
     // Create the bridge channel
     let bridge = FuseBridge::new();
     let tx = bridge.tx.clone();
-    let rx = bridge.rx;
+    let mut rx = bridge.rx;
 
     // Start the compio thread
     let manager_addr = args.manager.clone();
@@ -72,48 +72,32 @@ fn main() -> Result<()> {
                 };
                 tracing::info!("connected to cluster");
 
-                // Track time for periodic sync
-                let mut last_sync = std::time::Instant::now();
                 let sync_interval = Duration::from_secs(30);
+                let mut last_sync = std::time::Instant::now();
 
-                // Dispatch loop: poll try_recv + yield to not block compio event loop
                 loop {
-                    match rx.try_recv() {
-                        Ok(req) => {
+                    let remaining = (last_sync + sync_interval)
+                        .saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        periodic_sync(&mut state).await;
+                        last_sync = std::time::Instant::now();
+                        continue;
+                    }
+
+                    match compio::time::timeout(remaining, rx.next()).await {
+                        Ok(Some(req)) => {
                             if !dispatch::handle_request(&mut state, req).await {
                                 tracing::info!("received Destroy, shutting down");
                                 break;
                             }
                         }
-                        Err(std::sync::mpsc::TryRecvError::Empty) => {
-                            // No request pending — yield to compio event loop briefly
-                            compio::time::sleep(Duration::from_micros(100)).await;
-
-                            // Periodic sync check
-                            if last_sync.elapsed() >= sync_interval {
-                                let dirty: Vec<u64> =
-                                    state.dirty_inodes.iter().copied().collect();
-                                if !dirty.is_empty() {
-                                    tracing::debug!(
-                                        count = dirty.len(),
-                                        "periodic sync: flushing dirty inodes"
-                                    );
-                                    for ino in &dirty {
-                                        if let Err(e) = write::flush_inode(&mut state, *ino).await {
-                                            tracing::warn!(
-                                                ino,
-                                                error = %e,
-                                                "periodic sync: flush failed"
-                                            );
-                                        }
-                                    }
-                                }
-                                last_sync = std::time::Instant::now();
-                            }
-                        }
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        Ok(None) => {
                             tracing::info!("bridge channel closed, shutting down");
                             break;
+                        }
+                        Err(_) => {
+                            periodic_sync(&mut state).await;
+                            last_sync = std::time::Instant::now();
                         }
                     }
                 }
@@ -141,4 +125,17 @@ fn main() -> Result<()> {
     let _ = compio_handle.join();
 
     Ok(())
+}
+
+async fn periodic_sync(state: &mut FsState) {
+    let dirty: Vec<u64> = state.dirty_inodes.iter().copied().collect();
+    if dirty.is_empty() {
+        return;
+    }
+    tracing::debug!(count = dirty.len(), "periodic sync: flushing dirty inodes");
+    for ino in &dirty {
+        if let Err(e) = write::flush_inode(state, *ino).await {
+            tracing::warn!(ino, error = %e, "periodic sync: flush failed");
+        }
+    }
 }

@@ -19,11 +19,11 @@ const TTL: Duration = Duration::from_secs(30);
 /// The FUSE filesystem implementation. Lives on fuser threads.
 /// Sends all requests to the compio thread via the bridge channel.
 pub struct AutumnFs {
-    tx: std::sync::mpsc::Sender<FsRequest>,
+    tx: futures::channel::mpsc::UnboundedSender<FsRequest>,
 }
 
 impl AutumnFs {
-    pub fn new(tx: std::sync::mpsc::Sender<FsRequest>) -> Self {
+    pub fn new(tx: futures::channel::mpsc::UnboundedSender<FsRequest>) -> Self {
         Self { tx }
     }
 
@@ -50,7 +50,7 @@ impl Filesystem for AutumnFs {
     }
 
     fn destroy(&mut self) {
-        let _ = self.tx.send(FsRequest::Destroy);
+        let _ = self.tx.unbounded_send(FsRequest::Destroy);
     }
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
@@ -65,7 +65,7 @@ impl Filesystem for AutumnFs {
     }
 
     fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
-        let _ = self.tx.send(FsRequest::Forget { ino, nlookup });
+        let _ = self.tx.unbounded_send(FsRequest::Forget { ino, nlookup });
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {

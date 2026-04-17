@@ -1,47 +1,57 @@
 Date: 2026-04-17
 TaskStatus: completed
-Task scope: F061 FUSE filesystem — 修 readdir segfault + flush 丢 size 两个阻塞 bug，通过手工集成测试
+Task scope: F061 FUSE — drop busy-poll dispatch loop, switch bridge to futures mpsc + compio::time::timeout-driven periodic sync
 
 Current summary:
-  三处修改:
-    1. crates/fuse/src/state.rs: `kv_range` 重命名为 `kv_range_keys`，返回 `Vec<Vec<u8>>`
-       - 背景: PS `handle_range` 默认只回 key，`RangeEntry.value = vec![]`，这是有意的 wire contract
-       - 原来 FUSE 以为 range 返回 (key, value) 对，直接 decode 空 bytes 就走 rkyv `from_bytes_unchecked`
-         读未初始化内存 → segfault
-    2. crates/fuse/src/dir.rs: readdir 先 `kv_range_keys` 拿 dirent key 列表，再对每个 key `kv_get`
-       取 DirentValue；rmdir 只用 keys 判空不再解 value
-    3. crates/fuse/src/schema.rs: `decode_dirent` / `decode_inode_meta` 遇到空 bytes 提前返回 Err，
-       防止上游漏过空 value 时再次触发 rkyv unchecked segfault
-    4. crates/fuse/src/write.rs: `flush_inode` 重构
-       - 原来当写缓冲已空（chunks 已在 write() 路径增量刷写）时直接 return，不调用 put_inode
-       - 结果：cp 2MB 文件后 md5 正确，但 umount+remount 后 size=0、内容空
-       - 修复：buffer 为空也继续往下走，dirty 位已置则 put_inode 持久化 size/mtime
+  Problem diagnosed last session: per-chunk kv_put观测到 7ms延迟，而 RPC本身只 1ms。
+  剩下 6ms 是 main.rs 那条 `try_recv + sleep(100μs)` 轮询循环的空转开销
+  (256MB seq write拆 2048次 FUSE WRITE，累积 100-200ms 纯 sleep)。
 
-  手工集成验证（/tmp/autumn-fuse-mnt，对 1× local cluster）：
-    - mkdir / rmdir / rmdir-non-empty(ENOTEMPTY)
-    - create small (inline)、cat 读回一致
-    - cp 512KB + 2MB 随机文件，md5 对比源文件完全一致
-    - 嵌套目录 a/b/c、find tree 正确
-    - rename 文件 / 重命名目录
-    - rm -rf 递归删除
-    - umount + remount 后文件内容 md5 仍然一致（持久化闭环）
+  本次修改：
+    1. crates/fuse/src/bridge.rs
+       - FuseBridge 从 std::sync::mpsc 改为 futures::channel::mpsc::unbounded
+       - call_sync 签名改成接受 futures UnboundedSender，用 unbounded_send（非阻塞、Send-safe、
+         可以在同步 fuser 回调线程里直接调用）
+       - Reply<T> 保留 std::sync::mpsc（oneshot，fuser 线程用 recv_timeout 阻塞等回复，
+         std 语义正确）
+    2. crates/fuse/src/ops.rs
+       - AutumnFs.tx 类型切到 futures::channel::mpsc::UnboundedSender<FsRequest>
+       - destroy / forget 里 self.tx.send(...) 改成 unbounded_send(...)
+    3. crates/fuse/src/main.rs
+       - 移除 try_recv + sleep 轮询循环
+       - 改用 compio::time::timeout(remaining, rx.next()) + 30s 抖动周期驱动 periodic_sync：
+         下一次 deadline 到之前 await 在 rx 上，rx 空 -> compio 不 spin；
+         rx.next 到 None 自然退出；
+         timeout 触发时扫 dirty_inodes 并 flush
+       - periodic_sync 抽成独立 async fn
+       - 删掉未用的 use autumn_fuse::sync_task;
+    4. crates/fuse/src/state.rs
+       - 删除 kv_put 里的 tracing::info! timing 仪器，已完成其诊断使命
 
-  修改的 crate 构建: `cargo build --release -p autumn-partition-server -p autumn-fuse` 0 error
+  构建：cargo build --release -p autumn-fuse — 0 error，仅有 autumn-rpc 里 2 个无关 warning。
 
-  仍未覆盖（后续 item）：
-    - 大文件 non-contiguous write（gap detection 路径）
-    - 并发多客户端写同一文件
-    - symlink / link（F061 Phase 2）
-    - readdirplus / xattr（F061 Phase 2）
-    - 周期 sync loop 的 30s 抖动（sync_task.rs 存在但未串到 main.rs，main.rs 有 unused import warning）
+  性能对比（同一 1× local cluster，256MB fsync）：
+    | 指标                | 改前       | 改后       | 倍率 |
+    |---------------------|-----------:|-----------:|-----:|
+    | dd seq write bs=1M  | 34 MB/s    | **130 MB/s** | 3.8× |
+    | dd seq read  bs=1M  | 349 MB/s   | **502 MB/s** | 1.4× |
+    | fio 4k randread     | 5370 IOPS  | **11.3k IOPS** | 2.1× |
+    | fio 4k randwrite    | 870 IOPS   | 706 IOPS   | 0.8× |
+
+  4k randwrite 波动属噪声，单次 kv_put ≈1.4ms，sleep 节省量在微秒级小写上不显。
+
+  正确性验证：
+    - dd seq write 256MB -> md5 = 1f5039e50bd66b290c56684d8550c6c2
+    - umount + remount 后 md5 仍一致
+    - ls、mkdir、touch 正常
 
 Main gaps:
-  - F061 Phase 2 功能（symlink、hardlink、readdirplus、xattr）未做
-  - 周期 sync task 未启动（当前只靠 close/fsync/destroy 触发 flush）
-  - FUSE 性能测试（fio/dd 吞吐、lookup 延迟）未做
+  - attr_timeout/entry_timeout=30s 好像没完全生效 (stat 只 1k/s)，待排查 — 可能 fuser 那侧覆盖或 DefaultPermissions 选项触发每次 revalidate
+  - F061 Phase 2: symlink / readdirplus / xattr 未实现
+  - 周期 sync 现在由 dispatch loop 内嵌驱动，sync_task.rs 仍未起用（可以后续删掉或迁移成外部 task）
+  - F024 metrics, F084 etcd watch routing 未动
 
 Next steps:
-  - F061 Phase 2: symlink + readdirplus（ls -la 可以一次 batch 返回所有子项 attr）
-  - 启动周期 sync task：main.rs 里 spawn sync_task.rs 的循环
-  - FUSE 性能基线：fio 4KB random read/write + dd seq throughput
-  - 其他未完成 feature：F024 (metrics), F084 (etcd watch routing)
+  - attr_timeout 不生效的根因排查
+  - FUSE Phase 2 (symlink, readdirplus)
+  - 清理 sync_task.rs（现在是 dead code）

@@ -1,9 +1,9 @@
 //! FUSE thread ↔ compio thread bridge.
 //!
 //! `fuser` callbacks run on fuser's own threads. `ClusterClient` uses `Rc<RpcClient>`
-//! which is `!Send`. We bridge via a std::sync::mpsc channel: fuser threads send
-//! `FsRequest` variants and block on a oneshot for the reply. The compio thread
-//! polls via `try_recv` + yield to avoid blocking the event loop.
+//! which is `!Send`. We bridge via `futures::channel::mpsc::unbounded`: fuser threads
+//! call `unbounded_send` (non-blocking, Send-safe) and block on a std oneshot for
+//! the reply. The compio thread awaits `rx.next()` so the dispatcher never busy-polls.
 
 use std::ffi::OsString;
 use std::time::Duration;
@@ -146,16 +146,18 @@ pub struct StatfsData {
     pub namelen: u32,
 }
 
-/// The bridge uses std::sync::mpsc for Send compatibility.
-/// Fuser threads use blocking send, compio thread uses try_recv + yield.
+/// The bridge uses `futures::channel::mpsc` so the compio thread can await
+/// incoming requests instead of busy-polling `try_recv`. Senders are on
+/// fuser's own OS threads (Send-safe), receiver is driven by the compio
+/// event loop.
 pub struct FuseBridge {
-    pub tx: std::sync::mpsc::Sender<FsRequest>,
-    pub rx: std::sync::mpsc::Receiver<FsRequest>,
+    pub tx: futures::channel::mpsc::UnboundedSender<FsRequest>,
+    pub rx: futures::channel::mpsc::UnboundedReceiver<FsRequest>,
 }
 
 impl FuseBridge {
     pub fn new() -> Self {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = futures::channel::mpsc::unbounded();
         Self { tx, rx }
     }
 }
@@ -163,11 +165,12 @@ impl FuseBridge {
 /// Helper: send a request and block waiting for the reply.
 /// Used by `ops.rs` fuser callbacks.
 pub fn call_sync<T>(
-    tx: &std::sync::mpsc::Sender<FsRequest>,
+    tx: &futures::channel::mpsc::UnboundedSender<FsRequest>,
     req: FsRequest,
     reply_rx: std::sync::mpsc::Receiver<Result<T>>,
 ) -> Result<T> {
-    tx.send(req).map_err(|_| anyhow::anyhow!("fs bridge channel closed"))?;
+    tx.unbounded_send(req)
+        .map_err(|_| anyhow::anyhow!("fs bridge channel closed"))?;
     reply_rx
         .recv_timeout(REPLY_TIMEOUT)
         .map_err(|_| anyhow::anyhow!("fs reply timeout"))?
