@@ -59,11 +59,13 @@ kill_proc() {
         local pid; pid="$(cat "$pf")"
         if kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null || true
-            # Wait up to 5s for process to exit; SIGKILL if stuck
+            # Wait up to 5s for process to exit; SIGKILL if stuck.
+            # NOTE: use pre-increment `((++i))` — `((i++))` returns the OLD value,
+            # which is 0 on the first iteration and trips `set -e`.
             local i=0
             while kill -0 "$pid" 2>/dev/null && (( i < 50 )); do
                 sleep 0.1
-                (( i++ ))
+                (( ++i ))
             done
             if kill -0 "$pid" 2>/dev/null; then
                 kill -9 "$pid" 2>/dev/null || true
