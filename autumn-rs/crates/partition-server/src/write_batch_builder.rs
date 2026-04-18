@@ -110,26 +110,24 @@ impl Future for BatchCompletion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{WriteOp, WriteRequest};
 
-    // Minimal WriteRequest fixture — adjust to match actual fields.
-    // If WriteRequest has a complex constructor, use a lightweight test wrapper
-    // OR add a #[cfg(test)] fn make_test_request() alongside the real type.
     fn mk_req() -> WriteRequest {
-        // The real WriteRequest will be instantiated here in real tests. For now
-        // the compile test proves the types line up; the "leader_handoff_basic"
-        // test is a placeholder that verifies the sequence semantics without
-        // actually enqueuing a real request (we test push/drain/signal without
-        // inspecting request content).
-        unimplemented!("wire real WriteRequest ctor in sub-task 2")
+        WriteRequest::new_for_test(
+            WriteOp::Put {
+                user_key: bytes::Bytes::from_static(b"test"),
+                value: bytes::Bytes::from_static(b"val"),
+                expires_at: 0,
+            },
+            false,
+        )
     }
 
     #[compio::test]
     async fn leader_handoff_basic() {
-        // This test is intentionally FAILING in sub-task 1. Sub-task 2 will
-        // wire a real WriteRequest fixture and make it pass.
         let builder = Arc::new(WriteBatchBuilder::new());
         // Simulate 2 pushes + drain + signal_complete in sequence.
-        let req0 = mk_req(); // will panic with "unimplemented" — that's the red phase.
+        let req0 = mk_req();
         let c0 = builder.push(req0);
         let req1 = mk_req();
         let c1 = builder.push(req1);

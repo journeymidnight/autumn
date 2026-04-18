@@ -299,6 +299,14 @@ impl WriteRequest {
             WriteOp::Delete { user_key } => 17 + user_key.len(),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(op: WriteOp, must_sync: bool) -> Self {
+        let (resp_tx, _resp_rx) = oneshot::channel();
+        // _resp_rx is dropped immediately; resp_tx.send() would return Err but
+        // tests don't exercise the response path — only push/drain/signal semantics.
+        Self { op, must_sync, resp_tx }
+    }
 }
 
 #[derive(Debug, Default)]
