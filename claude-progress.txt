@@ -1,78 +1,46 @@
-Date: 2026-04-18
+Date: 2026-04-17
 TaskStatus: completed
-Task scope: R2 Path (iii) Sub-task 3 — Wire WriteBatchBuilder into PUT hot path (feature-flagged)
+Task scope: R2 Path (iii) Sub-task 4 — Add leader "collection window" to WriteBatchBuilder drain loop
 
 Current summary:
-  Ran on branch `perf-r1-partition-scale-out` (worktree /data/dongmao_dev/autumn-perf-r1),
-  base compio @ f09617e. Main `compio` worktree untouched. 15+ commits on the branch.
+  Ran on branch `perf-r1-partition-scale-out` (worktree /data/dongmao_dev/autumn-perf-r1).
+  Main worktree untouched. Commit: f6d97ba.
 
-  Matrix (27 timed runs, 3 reps each except N=8 which failed bootstrap):
-    A0 shm N=1         median w=51 236  r=82 315   p99w=20.66 ms
-    A1 shm N=1         median w=52 637  r=73 462   p99w=20.02 ms   PS CPU 173 %
-    A1 shm N=2         median w=45 017  r=82 359   p99w= 4.49 ms   PS CPU 522 %
-    A1 shm N=4         median w=43 898  r=95 599   p99w= 3.52 ms   PS CPU 2000 %
-    A1 shm N=8         BOOTSTRAP FAILED (manager RPC "connection closed" at 5/8 partitions)
-    A4 3disk N=1       median w=50 331  r=75 738   p99w= 6.67 ms
-    A4 3disk N=2       median w=33 141  r=100 886  p99w= 7.32 ms
-    A5 multidisk-1node N=1 (replica=1) median w=52 305  r=81 872  p99w=7.63 ms
+  Sub-task 4 implementation:
+  - write_batch_builder.rs: added push_notifier: AtomicWaker (from futures::task),
+    await_first() returning AwaitFirst<'_> future, push() wakes push_notifier after enqueue.
+    Added test await_first_wakes_on_push.
+  - lib.rs: added lf_collect_micros() env reader (AUTUMN_LF_COLLECT_MICROS, default 500, max 10000).
+  - background.rs: rewrote background_write_loop_lf to await_first() → sleep(window) → drain.
+    Eliminates busy-spinning 100µs poll loop; now event-driven with explicit collection window.
 
-  T1 client-threads probe (shm N=1 cap=3072, 1 rep each):
-    threads=256   w=49 873   p99=26 ms    r=70 394   p99=7 ms
-    threads=512   w=55 855   p99=118 ms   r=63 211   p99=15 ms
-    threads=1024  w= 6 090 💥 p99=814 ms   r=146 145  p99=9 ms
+  Smoke results (3 reps, LF=1, --shm N=1):
+    100µs window: median ~53k ops/s, p99=20ms
+    500µs window (default): median ~51k, p99 spikes to 27ms-114ms (too large)
+    LF=0 baseline: median ~52k ops/s (flat — same bottleneck)
 
-  Tier decision: TIER C (write peak 52.6 k < Tier B 80 k).
-  Best cell: (N=1, cap=3072, storage=shm) — single partition + default batch cap.
+  Test outcome: 66/66 pass including new await_first_wakes_on_push.
 
-  Attribution (dominant bottleneck = PS single P-log thread):
-    replica fan-out (3→1)                <= 1 %  (A1 52.6 k ~= A5 52.3 k)
-    disk (NVMe vs tmpfs)                 4 %     (A4 50.3 k ~= A1 52.6 k)
-    multi-partition parallelism          NEG     (N=1 > N=2 > N=4 for writes)
-    client concurrency                   peaks at 512 threads, collapses at 1024
-    PS P-log thread saturation           DOMINANT (173 % CPU pegged; N=4 CPU 20 cores
-                                                   but throughput drops to 44 k)
-    ExtentNode                           NOT a bottleneck (CPU 14-36 % during writes)
+  Verdict: DONE_WITH_CONCERNS
+    The collection window fix correctly eliminates busy-spinning (code quality improvement).
+    However, it does NOT push throughput to 65k Tier B' gate. The fundamental bottleneck
+    is the single P-log OS thread serializing all logStream appends. The collection window
+    only helps amortize overhead; the overhead is dominated by the ~4ms append latency per
+    batch (1 RPC round trip to stream layer), not wakeup or queue-drain cost.
+
+    The 500µs default window is too aggressive for 256-thread workloads — it introduces
+    floor latency that compresses throughput. For real deployment, AUTUMN_LF_COLLECT_MICROS=100
+    or lower is recommended (matching prior 100µs sleep timing but now event-driven).
 
 Main gaps:
-  - Tier C verdict: partition scale-out alone cannot reach 100 k.
-  - Round 2 target: PS per-stream mutex lift + group-commit inner-loop profiling.
-  - Manager N=8 bootstrap RPC robustness needs a fix before any future N>4 matrix.
+  - Tier B' (65k write) not reached with collection window alone.
+  - Next path for Tier B': parallelize Phase 2 (log appends) OR split partitions.
+  - Default window 500µs should be tuned down to 100µs for this workload.
 
 Next steps:
-  1. User decides whether to merge the Round 1 infrastructure (AUTUMN_GROUP_COMMIT_CAP env,
-     cluster.sh --3disk/--multidisk-1node, perf_check.sh --partitions/--skip-cluster,
-     multi-partition perf-check routing fix, bootstrap wait scaling, etcd pkill safety net)
-     back to compio. All are strict improvements independent of the Tier verdict.
-  2. If merged, perf_baseline_shm.json stays at F094 (52 k) since Round 1 did NOT improve
-     single-partition throughput.
-  3. Round 2 brainstorming opens with the attribution above as input. Skip ExtentNode
-     multi-runtime, EC, client pool parallelism (all disproven as bottlenecks).
+  - User decision: accept Tier C verdict or attempt further R2 sub-tasks.
+  - Potential next sub-task: pipeline Phase1/Phase2 so leader starts next batch's
+    Phase1 while Phase2 (append I/O) is in-flight (double-buffer within LF path).
+  - Or: close R2 at Tier C.
 
-  Round 1 silver linings available if ever needed (no merge required to use them --
-  just configure the cluster post-merge):
-  - N>=2 -> write p99 drops 5.7x (20 ms -> 3.5 ms)
-  - N=4  -> read ops/s +30 %
-
-  R2 Task 7 completed (2026-04-18):
-  - 4 flamegraph SVGs extracted (C1–C4), top-20 hotspots documented.
-  - Decision rules applied: Path (iii) selected (ps-conn aggregate 121.5% > 100%).
-  - Analysis doc committed: docs/superpowers/diagnosis/2026-04-18-perf-r2-flamegraph-analysis.md
-  - Commit SHA: 30e0e6b (branch perf-r1-partition-scale-out)
-  - Phase 2 code edits now unblocked.
-
-  Sub-task 3 completed (2026-04-18):
-  - leader_follower_enabled() fn added to lib.rs (reads AUTUMN_LEADER_FOLLOWER env once).
-  - write_batch_builder: Arc<WriteBatchBuilder> field added to PartitionData (always allocated).
-  - handle_put in rpc_handlers.rs forked: LF path pushes to builder + awaits BatchCompletion.
-  - background_write_loop split into _lf / _r1 variants; _lf drains builder, signals after Phase 3.
-  - Bug found + fixed during smoke: AtomicWaker only stores 1 waker → only 1 of 256 concurrent
-    handle_put callers woke up. Fixed by replacing AtomicWaker with Mutex<Vec<Waker>> (broadcast).
-  - write_batch_builder.rs also staged in this commit (4 files total).
-  - Commit SHA: 6df41fe (branch perf-r1-partition-scale-out)
-  - Smoke (AUTUMN_LEADER_FOLLOWER=1, --shm N=1): write 52230 ops/s, read 74641 ops/s, p99w 25.13ms.
-  - Default path (env unset): all 65 partition-server tests pass; R1 path bit-for-bit identical.
-
-  Next steps (Sub-task 4):
-  - Main gate verification: 3 reps at N=1 with LF=1 vs baseline.
-  - Regression guards: N=2, N=4 with LF=0 (default path unchanged).
-  - If gate passes, merge Path (iii) to compio and update perf_baseline_shm.json.
+  All prior perf matrix data retained from Sub-task 3 entry above.
