@@ -130,6 +130,7 @@ enum Command {
         baseline_file: String,
         threshold: f64,
         update_baseline: bool,
+        partitions: usize,
     },
     Info,
 }
@@ -161,7 +162,7 @@ fn usage() -> ! {
     eprintln!("                                    Write benchmark (--nosync skips fsync)");
     eprintln!("  rbench [--threads 40] [--duration 10] <RESULT_FILE>");
     eprintln!("                                    Read benchmark");
-    eprintln!("  perf-check [--threads 256] [--duration 10] [--size 4096] [--nosync] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline]");
+    eprintln!("  perf-check [--threads 256] [--duration 10] [--size 4096] [--nosync] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline] [--partitions N]");
     eprintln!("                                    Quick write+read bench; warns if >threshold regression vs baseline");
     eprintln!("  info                              Show cluster info");
     std::process::exit(1);
@@ -500,6 +501,7 @@ fn parse_args() -> Args {
             let mut baseline_file = "perf_baseline.json".to_string();
             let mut threshold = 0.8f64;
             let mut update_baseline = false;
+            let mut partitions_meta_from_flag: usize = 1;
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--threads" | "-t" => {
@@ -528,6 +530,14 @@ fn parse_args() -> Args {
                     "--update-baseline" => {
                         update_baseline = true;
                     }
+                    "--partitions" => {
+                        i += 1;
+                        partitions_meta_from_flag = raw[i].parse().expect("--partitions must be a positive integer");
+                        if partitions_meta_from_flag == 0 {
+                            eprintln!("--partitions must be >= 1");
+                            usage();
+                        }
+                    }
                     other => {
                         eprintln!("unknown perf-check flag: {other}");
                         usage();
@@ -543,6 +553,7 @@ fn parse_args() -> Args {
                 baseline_file,
                 threshold,
                 update_baseline,
+                partitions: partitions_meta_from_flag,
             }
         }
         "info" => Command::Info,
@@ -602,6 +613,10 @@ struct BenchConfig {
     report_interval_secs: u64,
     part_id: Option<u64>,
     reuse_value: bool,
+    #[serde(default)]
+    partition_count: usize,
+    #[serde(default)]
+    group_commit_cap: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -785,6 +800,8 @@ mod tests {
                 report_interval_secs: 1,
                 part_id: Some(7),
                 reuse_value: true,
+                partition_count: 1,
+                group_commit_cap: None,
             },
             summary: BenchSummaryRecord {
                 total_ops: 1,
@@ -1322,6 +1339,8 @@ async fn main() -> Result<()> {
                     report_interval_secs,
                     part_id,
                     reuse_value,
+                    partition_count: 1,
+                    group_commit_cap: None,
                 },
                 summary,
                 ops_samples: ops_samples.lock().unwrap().drain(..).collect(),
@@ -1486,6 +1505,7 @@ async fn main() -> Result<()> {
             baseline_file,
             threshold,
             update_baseline,
+            partitions: partitions_meta_from_flag,
         } => {
             // ---- Write phase ----
             println!("==> perf-check: write ({threads} threads, {duration_secs}s, {value_size}B)");
@@ -1493,6 +1513,12 @@ async fn main() -> Result<()> {
             let partitions = client.all_partitions().await?;
             if partitions.is_empty() {
                 bail!("no partitions found, run bootstrap first");
+            }
+            if partitions.len() != partitions_meta_from_flag {
+                eprintln!(
+                    "warning: --partitions={} but cluster has {} partitions; using cluster value",
+                    partitions_meta_from_flag, partitions.len()
+                );
             }
 
             let mut thread_targets: Vec<(u64, SocketAddr)> = Vec::with_capacity(threads);
@@ -1776,6 +1802,10 @@ async fn main() -> Result<()> {
                         report_interval_secs: 1,
                         part_id: None,
                         reuse_value: true,
+                        partition_count: partitions_meta_from_flag,
+                        group_commit_cap: std::env::var("AUTUMN_GROUP_COMMIT_CAP")
+                            .ok()
+                            .and_then(|s| s.parse::<usize>().ok()),
                     },
                     recorded_at: now_secs,
                 };
