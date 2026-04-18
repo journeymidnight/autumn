@@ -375,6 +375,41 @@ Ran at `--shm N=1 cap=3072` varying `--threads` to test whether the 52 k write c
 - EC for writes (replication tax ≤ 1 %)
 - Client connection-pool parallelism (PS, not client, is bound)
 
+### Appendix P · Per-thread PS CPU profile (post-checkpoint diagnostic, 2026-04-18)
+
+Added after Checkpoint 4 when the user challenged the "P-log is the bottleneck" conclusion with "could it be the dispatch layer?". Sampled `/proc/<ps_pid>/task/*/stat` over 2 s mid-write phase (20 s duration, 256 client threads, `--shm`).
+
+**N=1** (write 54 k ops/s, total PS CPU 173 %):
+
+| Thread | Count | Each | Aggregate |
+|--------|------:|-----:|----------:|
+| `part-13` (P-log) | 1 | **75.5 %** | 75.5 % |
+| `part-13-bulk` (P-bulk) | 2 | 39 % + 18.5 % | 57.5 % |
+| `ps-conn-*` (dispatch workers, compio Dispatcher) | ~90 active | 0.5-4.5 % each | ~50 % |
+| `ps-accept` | 1 | 0 % | 0 % |
+
+**N=4** (write 44 k ops/s, total PS CPU 4 570 %):
+
+| Thread | Count | Each | Aggregate |
+|--------|------:|-----:|----------:|
+| `part-{13,20,27,34}` (P-log per partition) | 4 | **~100 % each (saturated)** | ~400 % |
+| `part-*-bulk` (P-bulk per partition) | ~8 | ~40 % each (mixed) | ~300 % |
+| `ps-conn-*` (dispatch workers) | ~60 hot | **70-77 % each** | ~4 300 % |
+| `ps-accept` | 1 | 0 % | 0 % |
+
+**Efficiency**:
+- N=1: 52 637 ÷ 173 % = **304 ops/s per % CPU**
+- N=4: 43 898 ÷ 4 570 % = **9.6 ops/s per % CPU** (32× worse)
+
+**What this changes in the attribution**:
+1. **At N=1** P-log runs at 75 % — it has 25 % idle time blocked on ExtentNode RTT. Per-stream mutex pipelining would push it to 100 %.
+2. **At N>1** P-logs do saturate (100 %), BUT per-connection dispatch-worker cost explodes from 1-5 % to 70-77 % per worker. The additional PS CPU at N=4 is almost entirely dispatch-layer overhead, not partition work.
+3. **Round 2 gets two parallel attack options**:
+   - **(i) Raise N=1 efficiency**: pipeline P-log → drive from 75 % to 100 % → throughput lift without partition-count cost.
+   - **(ii) Lower N>1 dispatch cost**: profile what's burning 70-77 % per ps-conn worker at N=4 (mpsc channel contention? DashMap lookup? compio task scheduling?). If fixed, N=4 throughput could approach 4× N=1.
+
+The two paths are independent and could be combined. Flamegraph before picking which to do first.
+
 ### Round 1 net outputs (usable regardless of Tier)
 
 - **Write p99 5.7× improvement** at N≥2 (20 ms → 3.5 ms). Free tail-latency win from multi-partition.
