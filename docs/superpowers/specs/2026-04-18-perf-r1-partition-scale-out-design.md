@@ -36,7 +36,9 @@ The 125 k → 54.5 k gap (~2.3×) is **not** disk (tmpfs) and **not** ExtentNode
 
 > `perf_check.sh --shm` drives a single partition, and single-partition P-log throughput is the dominant bottleneck. Pre-splitting the keyspace into N partitions will scale write throughput near-linearly with N until another ceiling (network, ExtentNode runtime, per-NIC loopback) kicks in.
 
-Secondary hypothesis: group-commit cap (currently 256) may be under-batching; raising to 512 / 1024 amortizes per-batch overhead (RPC header, fan-out scheduling, WAL framing) further, yielding a multiplicative bonus on top of partition scale-out.
+Secondary hypothesis: group-commit cap (currently `MAX_WRITE_BATCH = WRITE_CHANNEL_CAP * 3 = 1024 * 3 = 3072` requests, or `MAX_WRITE_BATCH_BYTES = 30 MB`, whichever is smaller, both defined in `crates/partition-server/src/lib.rs:45-47`) may be mis-tuned. Cap too low under-batches (RPC/WAL framing amortization lost); cap too high pushes per-batch latency up (variance in group-commit tail). We sweep both sides to find the knee.
+
+**Note:** the CLAUDE.md prose `Drain up to 256 requests per batch` is stale — the compiled constant is 3072. The plan records this correction.
 
 ## 2. Target & Acceptance Tiers
 
@@ -101,7 +103,7 @@ All runs: 4 KB values, 64 client threads, 3 replicas, per-phase 30 s warmup + 60
 | Variable | Values | Reps | Runs |
 |----------|--------|------|------|
 | Partition count N | 1, 2, 4, 8 | 3 | 12 |
-| Group-commit cap | 256 (fixed) | — | — |
+| Group-commit cap | 3072 (compiled default) | — | — |
 
 Phase A1 decision: if write ops/s scales near-linearly from N=1 to N=8, main hypothesis confirmed, proceed to A2. If saturation appears at N=2 (i.e. N=2 and N=4 both within ±10 % of N=2), main hypothesis refuted — skip A2, go to A3 and then Round 2 handoff.
 
@@ -110,13 +112,16 @@ Phase A1 decision: if write ops/s scales near-linearly from N=1 to N=8, main hyp
 | Variable | Values | Reps | Runs |
 |----------|--------|------|------|
 | Partition count N | N* = best of A1 | 3 | 9 |
-| Group-commit cap | 256, 512, 1024 | — | — |
+| Group-commit cap | 1024, 3072, 8192 | — | — |
+
+Sweep brackets the compiled default (3072) both below and above to detect whether today's setting is under- or over-tuned.
 
 **Phase A3 — conditional extensions**
 
 - If A1 + A2 peak ≥ 100 k → skip A3, go to reporting.
 - If A1 was clearly linear up to N=8 but peak still < 100 k → add N=16 at best cap; 3 reps.
-- If A2 cap=1024 still showed gains → add cap=2048; 3 reps.
+- If A2 cap=8192 was still the best → add cap=16384; 3 reps.
+- If A2 cap=1024 was the best → add cap=512; 3 reps (cap is already over-tuned, narrow down).
 
 **Phase A4 — `--3disk` spot-checks** (real NVMe 3-node 3-replica, independent of A1–A3)
 
@@ -176,8 +181,8 @@ CPU snapshots: `ps -o pid,pcpu,comm -p <autumn-ps-pid>` and same for one extent-
    - Existing `--shm` and default disk modes untouched.
 
 3. **`autumn-partition-server` (library)**
-   - Read `AUTUMN_GROUP_COMMIT_CAP` env var at PS startup; parse as `usize`. Fall back to the current hard-coded default if absent/malformed. One read at init, stored in `PartitionServerConfig`.
-   - Exact constant location to be pinpointed via `grep` at implementation time; CLAUDE.md references `Drain up to 256 requests per batch` in the write flow — that is the target.
+   - Read `AUTUMN_GROUP_COMMIT_CAP` env var at PS startup; parse as `usize`. Fall back to the compiled default (`MAX_WRITE_BATCH = 3072`) if absent/malformed. The plan wires it by reading the env once at `lib.rs` top-level and using the resulting `usize` where `MAX_WRITE_BATCH` is referenced (currently `lib.rs:46`, `lib.rs:348`, `lib.rs:366`, `background.rs:364`).
+   - Constant location confirmed: `crates/partition-server/src/lib.rs:45-47` (`WRITE_CHANNEL_CAP=1024`, `MAX_WRITE_BATCH=WRITE_CHANNEL_CAP*3`, `MAX_WRITE_BATCH_BYTES=30*1024*1024`).
 
 4. **`cluster.sh`** PS launch passes through `AUTUMN_GROUP_COMMIT_CAP` env when set by caller.
 
@@ -187,7 +192,7 @@ CPU snapshots: `ps -o pid,pcpu,comm -p <autumn-ps-pid>` and same for one extent-
 
 6. **`autumn-rs/scripts/perf_r1_sweep.sh`** — matrix driver. Env-configurable:
    - `PARTITIONS="1 2 4 8"`
-   - `CAPS="256"` (A1) or `"256 512 1024"` (A2)
+   - `CAPS=""` (A1 uses compiled default 3072) or `"1024 3072 8192"` (A2)
    - `STORAGE_MODES="shm"` or `"shm 3disk multidisk-1node"`
    - `REPS=3`
    - Flow per combination: `./cluster.sh reset 3 [--3disk]` → `presplit.sh --count N` → `AUTUMN_GROUP_COMMIT_CAP=$CAP perf_check.sh [--shm] --partitions N` (without `--update-baseline`, so the JSON baseline on `compio` stays untouched until Round 1 reports Tier A) → append row to CSV.
