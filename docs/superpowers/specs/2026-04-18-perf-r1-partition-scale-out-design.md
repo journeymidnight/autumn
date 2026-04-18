@@ -1,7 +1,7 @@
 ---
 title: Perf R1 — Partition Scale-Out + Batch Parameter Sweep
 date: 2026-04-18
-status: draft
+status: approved
 branch: perf-r1-partition-scale-out
 base: compio @ f09617e
 author: deanraccoon / Claude Opus 4.7
@@ -220,7 +220,7 @@ CPU snapshots: `ps -o pid,pcpu,comm -p <autumn-ps-pid>` and same for one extent-
 | `feature_list.md` entry | repo root | update (add FXXX) | update (add FXXX with `passes: false` or `not_needed`) |
 | `claude-progress.txt` | repo root | update | update |
 
-FXXX id: to be assigned at plan phase by scanning highest existing Fnnn in `feature_list.md` (currently F094, so Round 1 is likely F095).
+Feature id: **F095** (confirmed).
 
 ## 6. Git & Commit Discipline
 
@@ -252,7 +252,7 @@ Rules:
 | Multi-partition exposes a latent correctness bug (e.g. region routing race) | Low | `perf_check` runs the read phase after write — a routing bug would show as read errors. Any non-zero error rate aborts and opens a bug. |
 | CPU saturation on loopback TCP path (kernel softirq) at high ops/s | Medium-High | Captured in CPU snapshots. If observed, documented as Round 2 handoff signal. Not in scope to fix in Round 1. |
 | Metric-only improvements (batch smoothing) that don't reflect user-visible latency | Low | Tier A requires read throughput not dropping > 5 %; p99 stays within F094 envelope (write p99 ≤ 25 ms median). |
-| Round 1 takes longer than 2 h due to cluster flakiness | Medium | Each phase checkpoints to CSV + commits. Can resume mid-matrix without redoing prior phases. |
+| Round 1 takes longer than 2.5 h due to cluster flakiness | Medium | Each phase checkpoints to CSV + commits. Can resume mid-matrix without redoing prior phases. **Reps stay at 3** — flakiness is absorbed by wall-clock, not by trimming statistical quality. |
 
 ## 8. Rollback
 
@@ -278,9 +278,9 @@ Expected Round 2 candidates (priority order, Round 2 brainstorming will pick):
 
 ## 10. Open Questions for User Review
 
-1. The 2-h wall-clock budget for the full matrix assumes the cluster comes up cleanly on each `reset`. If that is not reliable, do we stretch the budget or trim the matrix (e.g. drop reps from 3 to 2)?
+1. ~~The 2-h wall-clock budget for the full matrix assumes the cluster comes up cleanly on each `reset`. If that is not reliable, do we stretch the budget or trim the matrix (e.g. drop reps from 3 to 2)?~~ **Resolved 2026-04-18**: reps stay at 3 — no trimming. On cluster-setup flakiness we extend wall-clock time.
 2. ~~Should `--3disk` also exercise the existing 1-node multi-disk mode (F021) as a control (`--multidisk /data03,/data05,/data08` on one node, 1 replica) — or is that out of scope for Round 1?~~ **Resolved 2026-04-18**: include as Phase A5 (`--multidisk-1node`, see §3.3 / §3.4 A5).
-3. Is the FXXX id auto-assigned (F095) acceptable, or do you want a different bucket (e.g. a new P5 section for perf iterations)?
+3. ~~Is the FXXX id auto-assigned (F095) acceptable, or do you want a different bucket (e.g. a new P5 section for perf iterations)?~~ **Resolved 2026-04-18**: F095.
 
 ---
 
