@@ -85,6 +85,49 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // ---- pprof-rs profiling hook (R2 diagnosis) ----
+    #[cfg(feature = "profiling")]
+    {
+        if let Ok(secs_s) = std::env::var("AUTUMN_PPROF_SECS") {
+            if let Ok(secs) = secs_s.parse::<u64>() {
+                if secs > 0 {
+                    let out_path = std::env::var("AUTUMN_PPROF_OUT")
+                        .unwrap_or_else(|_| "/tmp/autumn_ps_pprof.svg".to_string());
+                    let thread_filter = std::env::var("AUTUMN_PPROF_THREADS").ok();
+                    std::thread::spawn(move || {
+                        let guard = pprof::ProfilerGuardBuilder::default()
+                            .frequency(99)
+                            .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+                            .build()
+                            .expect("pprof guard");
+                        std::thread::sleep(std::time::Duration::from_secs(secs));
+                        let report = guard.report().build().expect("pprof report");
+                        let mut file = std::fs::File::create(&out_path).expect("pprof outfile");
+                        report.flamegraph(&mut file).expect("flamegraph write");
+                        if let Some(prefix) = thread_filter {
+                            let txt_path = format!("{}.threads.txt", out_path);
+                            if let Ok(mut txt) = std::fs::File::create(&txt_path) {
+                                use std::io::Write;
+                                for (frames, count) in &report.data {
+                                    if frames.thread_name.starts_with(&prefix) {
+                                        writeln!(
+                                            txt,
+                                            "thread={} count={}",
+                                            frames.thread_name, count
+                                        )
+                                        .ok();
+                                    }
+                                }
+                            }
+                        }
+                        eprintln!("[R2] pprof flamegraph written: {}", out_path);
+                    });
+                }
+            }
+        }
+    }
+    // ---- end pprof hook ----
+
     let args = parse_args();
 
     #[cfg(unix)]

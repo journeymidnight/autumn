@@ -37,3 +37,8 @@ rand = "0.8"
 uuid.workspace = true
 libc = "0.2"
 compio = { version = "0.18.0", features = ["macros", "time", "net"] }
+pprof = { version = "0.14", features = ["flamegraph"], optional = true }
+
+[features]
+default = []
+profiling = ["dep:pprof"]
