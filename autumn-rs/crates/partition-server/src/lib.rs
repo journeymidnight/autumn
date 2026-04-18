@@ -1,6 +1,7 @@
 mod background;
 mod rpc_handlers;
 mod sstable;
+mod write_batch_builder;
 
 use background::*;
 use rpc_handlers::dispatch_partition_rpc;
