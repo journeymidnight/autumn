@@ -144,6 +144,10 @@ do_start() {
     done
     echo "[cluster] extent node(s) registered"
 
+    if [[ -n "${AUTUMN_GROUP_COMMIT_CAP:-}" ]]; then
+        echo "[cluster] AUTUMN_GROUP_COMMIT_CAP=$AUTUMN_GROUP_COMMIT_CAP (forwarding to PS)"
+    fi
+
     # partition server
     start_proc ps \
         "$PS" \
