@@ -1,71 +1,67 @@
 Date: 2026-04-18
-TaskStatus: not_completed
-Task scope: F097 — Perf R3 Task 5 — lease-cursor state machine + send_vectored pipeline
+TaskStatus: completed
+Task scope: Perf R4 Step 4.1 — RpcClient SQ/CQ writer task refactor (foundational for F098)
 
 Current summary:
   Branch: perf-r1-partition-scale-out (worktree /data/dongmao_dev/autumn-perf-r1)
-  Commit: 2a47b40 perf(R3): StreamClient append_payload_segments — lease-cursor state machine
+  Commit: (updated below after git commit completes)
 
-  Task 5 implemented all 3 subparts:
+  Replaced the single-file `writer: Mutex<WriteHalf>` bottleneck in
+  autumn-rs/crates/rpc/src/client.rs with an SQ/CQ pipeline:
 
-  Part A: RpcClient::send_vectored added to autumn-rpc/crates/rpc/src/client.rs
-    - Sends vectored frame and returns oneshot::Receiver<Frame> without awaiting
-    - Parallel to existing call_vectored; same write path, stops before rx.await
-    - 7 rpc tests pass
+    SQ (submit side):
+      - callers push SubmitMsg { Single | Vectored } onto a bounded
+        mpsc::channel (SUBMIT_CHANNEL_CAP = 1024)
+      - a single background writer_task owns WriteHalf, drains the rx,
+        performs write_all / write_vectored_all sequentially
+      - no caller ever holds a write-side mutex; back-pressure comes
+        naturally from the bounded channel
 
-  Part B: ConnPool::send_vectored added to autumn-rs/crates/stream/src/conn_pool.rs
-    - Thin wrapper over RpcClient::send_vectored
-    - Uses autumn_rpc::Frame (exported from rpc crate root)
+    CQ (completion side, unchanged):
+      - read_loop task owns ReadHalf, decodes frames, dispatches via
+        Rc<RefCell<HashMap<req_id, oneshot::Sender<Frame>>>>
 
-  Part C: append_payload_segments rewritten in autumn-rs/crates/stream/src/client.rs
-    - Phase 1 (short lock): lease offset range via state.lease(size), build AppendReq
-      with header.commit = offset (Option A: NOT state.commit — lease-time cursor)
-      Fire 3 pool.send_vectored() calls UNDER state lock (preserves TCP write order)
-    - Drop lock. Await all 3 receivers concurrently via join_all.
-    - Phase 3 (short lock): state.ack(offset, end) on success, state.rewind_or_poison
-      on failure.
-    - All existing retry semantics preserved: MAX_ALLOC_PER_APPEND=3, NotFound trigger
-      alloc_new_extent, 2 soft retries before forced alloc
-    - Bug fix during implementation: initial commit=0&&lease_cursor=0 check must fall
-      through (not continue) to avoid infinite loop when extent is genuinely empty.
+  Critical invariants preserved:
+    1. pending.insert(req_id, tx) happens BEFORE submit_tx.send() so the
+       CQ can't race in and find no entry.
+    2. Borrows of pending are scoped tight (insert/remove then drop guard),
+       never held across an await.
+    3. submit_tx is cloned from a RefCell borrow (scoped), never held
+       across the .send().await — avoids RefCell-across-await panics.
+    4. req_id=0 (fire-and-forget) still works: send_oneshot pushes a
+       SubmitMsg without inserting into pending.
+    5. next_req_id skips 0 on wraparound (reserved for fire-and-forget).
+
+  Public API preserved: connect, from_stream, call, call_vectored,
+  call_timeout, call_vectored_timeout, send_frame, send_vectored,
+  send_oneshot, peer_addr, pending_count — all signatures identical.
+
+  New tests in client.rs::tests:
+    - multiplex_concurrency: 32 concurrent `call` invocations, server
+      sleeps inversely to req_id so responses return out-of-order;
+      verifies CQ dispatches each response to the right caller.
+    - submit_backpressure: constructs a client with SUBMIT_CHANNEL_CAP=4
+      and fires 10 concurrent calls against a slow (50ms) server;
+      verifies all 10 complete and peak concurrency ≥ 2.
+    - send_oneshot_no_response: req_id=0 path, pending_count stays 0.
 
   Test results:
-    - 40/40 autumn-stream tests pass (36 existing + 4 pipeline_tests)
-    - 7/7 autumn-rpc tests pass
-    - Workspace clean (excluding pre-existing autumn-manager failures)
+    autumn-rpc:              10 unit + 7 round_trip = 17 passed (was 14; +3 new)
+    autumn-stream:           40 unit + 11 integration = 51 passed
+    autumn-partition-server: 66 unit = 66 passed
+    Pre-existing manager lib test compile errors (private method access,
+      unrelated to this change) — noted but out of scope per spec.
 
-  Performance (smoke @ N=1 shm, 1 partition):
-    R3 write: 47k ops/s   (R2 baseline on same machine this session: 51.7k)
-    R3 read:  77-80k ops/s
-    R3 p99w:  114ms (high due to extent rollover stalls)
-
-    Note: R3 shows ~9% regression vs R2 for single-caller PS use case.
-    Root cause: the R3 benefit (parallel in-flight appends from different callers
-    overlapping their await phases) requires the PS double-buffer loop to start
-    phase2 of batch N BEFORE awaiting phase2 of batch N-1. Current PS write loop
-    only has ONE concurrent in-flight stream append, so the state machine's pipeline
-    capacity is never used. The implementation is correct; the PS loop change is
-    needed in a later R3 task to unlock the performance.
-
-  Implementation correctness is verified:
-    - header.commit = offset (lease-time cursor), NOT state.commit ✓
-    - 3 sends under state lock (TCP order preserved) ✓
-    - Awaits outside lock (concurrent via join_all) ✓
-    - ack/rewind_or_poison under post-await lock ✓
-    - All retry/alloc semantics preserved ✓
+  Only file touched: autumn-rs/crates/rpc/src/client.rs (1 file, 498 lines).
 
 Main gaps:
-  - Write ops/s (47k) below R2 baseline (51.7k) by ~9%
-  - Performance gate NOT met (spec requires >52.6k for Task 5)
-  - Root cause: PS write loop has single in-flight, cannot use R3's pipeline depth
-  - Fix: PS background_write_loop must start next batch's phase2 BEFORE awaiting
-    current batch's phase2. This enables concurrent callers to the state machine.
+  - This step is foundational only; perf gate not re-measured yet.
+  - Next steps (4.2 ExtentNode ExtentWorker, 4.3 StreamClient worker,
+    4.4 PS P-log/P-bulk) depend on this change and are not in scope here.
 
 Next steps:
-  1. R3 Task 6: Add unit tests for concurrent_append_preserves_order and
-     header_commit_is_lease_time_cursor (spec §6.1 remaining tests)
-  2. R3 Task 7: Modify PS background_write_loop to support pipeline depth > 1
-     (start next batch while current await is in flight) — this is the key change
-     that will actually show performance improvement
-  3. After PS loop change, re-run smoke test expecting >60k write ops/s
-  4. R3 Tasks 8-11: 3-rep sweep, integration test, CSV append, feature_list update
+  1. R4 Step 4.2: ExtentNode ExtentWorker (per-extent SQ/CQ, spec §3.1)
+  2. R4 Step 4.3: StreamClient StreamSender/StreamReceiver (spec §3.2)
+  3. R4 Step 4.4: PS P-log + P-bulk SQ/CQ (spec §3.3)
+  4. R4 Step 4.5: perf main gate — 3-rep on shm N=1, target write ≥ 80k,
+     read ≥ 69.8k

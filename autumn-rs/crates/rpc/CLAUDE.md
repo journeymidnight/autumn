@@ -35,12 +35,27 @@ Error responses encode status as: `[status_code: u8][message bytes]`.
 
 ### `client.rs`
 - `RpcClient`: multiplexed client over one TCP connection
-  - `connect(addr)` → `Arc<RpcClient>`: connect + start background reader
+  - `connect(addr)` → `Rc<RpcClient>`: connect + start background reader + writer tasks
   - `call(msg_type, payload)` → `Bytes`: send request, await response
+  - `call_vectored(msg_type, parts)` → `Bytes`: vectored payload, zero-copy
   - `send_frame(frame)` → `oneshot::Receiver<Frame>`: low-level send
+  - `send_vectored(msg_type, parts)` → `oneshot::Receiver<Frame>`: pipelined submit
   - `send_oneshot(msg_type, payload)`: fire-and-forget (req_id=0)
-- Background reader task routes responses by req_id via `DashMap<u32, oneshot::Sender<Frame>>`
-- Writer serialized by `tokio::sync::Mutex` (runtime-agnostic)
+- **SQ/CQ architecture (R4 step 4.1, F098)**:
+  - **SQ**: callers push `SubmitMsg { Single | Vectored }` onto a bounded
+    `mpsc::channel(SUBMIT_CHANNEL_CAP=1024)`. A single `writer_task` owns
+    `WriteHalf` and drains the queue sequentially — no cross-caller mutex.
+    Back-pressure comes naturally from the bounded channel.
+  - **CQ**: `read_loop` task owns `ReadHalf`, decodes frames, dispatches to
+    the matching `oneshot::Sender<Frame>` in
+    `Rc<RefCell<HashMap<u32, oneshot::Sender<Frame>>>>`.
+- Invariants:
+  - pending-insert happens **before** submit_tx.send so the CQ can't race
+    in and find no entry.
+  - `pending.borrow_mut()` is always scoped tight — never held across await.
+  - `submit_tx` is cloned from a `RefCell` borrow (scoped), never borrowed
+    across `.send().await` — avoids RefCell-across-await panics.
+  - `next_req_id` skips `0` on wraparound (0 reserved for fire-and-forget).
 
 ### `server.rs`
 - `RpcServer::new(handler)`: create server with async handler `Fn(u8, Bytes) -> Result<Bytes, (StatusCode, String)>`
