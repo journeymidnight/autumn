@@ -298,6 +298,28 @@ Expected Round 2 candidates (priority order, Round 2 brainstorming will pick):
 - strace 2s under load: **SKIPPED** — strace binary not available; steps 2-4 sufficient evidence
 - Conclusion: **compio is using io_uring on PS and node1 (the throughput-critical processes).** All three processes confirm successful io_uring backend initialization. Experiment is clear to proceed to Task 1.
 
+### Appendix A0 · Smoke results (2026-04-18)
+
+Four pre-matrix smoke runs validated the Round 1 infrastructure end to end. Numbers are single-run indicative only — statistical significance comes from the A1–A5 matrix with 3 reps each.
+
+| Smoke | Mode | N | Nodes × Disks | Replica | Write ops/s | Read ops/s | Write p99 | Read p99 |
+|-------|------|---|---------------|---------|-------------|------------|-----------|----------|
+| #1 (median of 3) | `--shm`   | 1 | 3 × tmpfs         | 3 | 51 236 | 82 315 | 20.99 ms | 3.50 ms |
+| #2               | `--shm`   | 4 | 3 × tmpfs         | 3 | 44 089 | 84 816 |  3.67 ms | 4.75 ms |
+| #3               | `--3disk` | 1 | 3 × NVMe (1/disk) | 3 | 51 193 | 67 968 |  6.52 ms | 6.26 ms |
+| #4               | `--multidisk-1node` | 1 | 1 × 3 NVMe | 1 | 53 308 | 76 142 |  7.57 ms | 5.34 ms |
+
+**Infrastructure fixes discovered during smokes** (all committed on the branch):
+1. `cluster.sh` now kills stray `etcd --data-dir ...autumn-rs` from prior `--shm` runs that hold stale etcd state when `DATA_ROOT` changes between runs.
+2. `cluster.sh` post-bootstrap wait scales as `3 * N` seconds (min 3 s) instead of a fixed 1 s — PS stream-layer open() calls serialize on the server-level stream client and take ≈ 3 s per partition.
+3. `--multidisk-1node` runs `autumn-client format` before starting the extent node (F021 requires `disk_id` files in each data dir).
+4. `perf_check.sh` emits `AUTUMN_BOOTSTRAP_PRESPLIT="N:hexstring"` (literal) — bootstrap's built-in `hex_split_ranges(n)` handles uniform N-way splits directly; no comma-separated midpoint computation needed.
+
+**Early signals** (indicative, 1 rep each except #1):
+- `--shm` N=4 write p99 drops 5× vs N=1 (20 ms → 4 ms). Throughput is 15 % lower in this single rep — A1 matrix will say whether that's noise.
+- `--3disk` vs `--shm` at N=1: write parity (51 k ≈ 52 k), read −17 % (68 k vs 82 k). NVMe not write-bound; read delta may be kernel page-cache.
+- `--multidisk-1node` (replica=1) vs `--3disk` (replica=3) at N=1: write 53 k vs 51 k (+4 %), read 76 k vs 68 k (+12 %). Replication tax at most modest on this hardware at N=1.
+
 ---
 
 *End of spec.*
