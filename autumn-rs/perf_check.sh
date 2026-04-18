@@ -49,7 +49,7 @@ fi
 # Build release binaries
 echo "[perf-check] building release binaries..."
 cd "$SCRIPT_DIR"
-cargo build --workspace --release 2>&1 | grep -E "^(Compiling|Finished|error)" || true
+cargo build --workspace --release --exclude autumn-fuse 2>&1 | grep -E "^(Compiling|Finished|error)" || true
 
 # Fresh 3-replica cluster (data root => $AUTUMN_DATA_ROOT, picked up by cluster.sh)
 echo "[perf-check] clean + start 3-replica cluster on $STORAGE_LABEL..."
