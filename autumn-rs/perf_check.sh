@@ -21,20 +21,36 @@ AC="$SCRIPT_DIR/target/release/autumn-client"
 
 USE_SHM=0
 UPDATE_BASELINE=""
-for arg in "$@"; do
-    case "$arg" in
+PARTITIONS=1
+while (( $# > 0 )); do
+    case "$1" in
         --shm)              USE_SHM=1 ;;
         --update-baseline)  UPDATE_BASELINE="--update-baseline" ;;
+        --partitions)
+            shift
+            PARTITIONS="${1:-}"
+            [[ "$PARTITIONS" =~ ^[0-9]+$ ]] && (( PARTITIONS >= 1 )) \
+                || { echo "--partitions must be a positive integer" >&2; exit 1; }
+            ;;
         -h|--help)
             sed -n '2,11p' "$0"
             exit 0
             ;;
         *)
-            echo "unknown option: $arg" >&2
+            echo "unknown option: $1" >&2
             exit 1
             ;;
     esac
+    shift
 done
+
+# Compute presplit midpoints for N partitions when N > 1.
+# Matches hex_split_ranges() in autumn-client: 8-char lowercase hex, uniform step.
+if (( PARTITIONS > 1 )); then
+    AUTUMN_BOOTSTRAP_PRESPLIT=$(python3 -c "N=${PARTITIONS}; step=(0xFFFFFFFF)//N; print('{}:{}'.format(N, ','.join(f'{step*i:08x}' for i in range(1, N))))")
+    export AUTUMN_BOOTSTRAP_PRESPLIT
+    echo "[perf-check] presplit: $AUTUMN_BOOTSTRAP_PRESPLIT"
+fi
 
 if (( USE_SHM )); then
     export AUTUMN_DATA_ROOT="/dev/shm/autumn-rs"
@@ -65,5 +81,6 @@ echo "[perf-check] running perf-check on $STORAGE_LABEL (baseline: $BASELINE)...
     --threads 256 \
     --duration 10 \
     --size 4096 \
+    --partitions "$PARTITIONS" \
     --baseline "$BASELINE" \
     $UPDATE_BASELINE
