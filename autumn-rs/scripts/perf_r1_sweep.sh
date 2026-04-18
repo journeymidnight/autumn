@@ -71,8 +71,7 @@ run_one() {
     ./cluster.sh clean > /dev/null
     if [[ -n "${AUTUMN_BOOTSTRAP_PRESPLIT:-}" ]]; then unset AUTUMN_BOOTSTRAP_PRESPLIT; fi
     if (( n > 1 )); then
-        AUTUMN_BOOTSTRAP_PRESPLIT=$(python3 -c "N=${n}; step=(0xFFFFFFFF)//N; print('{}:{}'.format(N, ','.join(f'{step*i:08x}' for i in range(1, N))))")
-        export AUTUMN_BOOTSTRAP_PRESPLIT
+        export AUTUMN_BOOTSTRAP_PRESPLIT="${n}:hexstring"
     fi
     AUTUMN_GROUP_COMMIT_CAP="$cap" ./cluster.sh reset "$REPLICAS" $CLUSTER_FLAGS
     popd > /dev/null

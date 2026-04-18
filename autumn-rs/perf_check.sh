@@ -46,11 +46,11 @@ while (( $# > 0 )); do
     shift
 done
 
-# Compute presplit midpoints for N partitions when N > 1.
-# Matches hex_split_ranges() in autumn-client: 8-char lowercase hex, uniform step.
+# Emit AUTUMN_BOOTSTRAP_PRESPLIT=N:hexstring when N > 1.
+# The bootstrap handler expands "hexstring" into N uniform 8-char hex midpoints
+# via hex_split_ranges(); no need to compute midpoints explicitly here.
 if (( PARTITIONS > 1 )); then
-    AUTUMN_BOOTSTRAP_PRESPLIT=$(python3 -c "N=${PARTITIONS}; step=(0xFFFFFFFF)//N; print('{}:{}'.format(N, ','.join(f'{step*i:08x}' for i in range(1, N))))")
-    export AUTUMN_BOOTSTRAP_PRESPLIT
+    export AUTUMN_BOOTSTRAP_PRESPLIT="${PARTITIONS}:hexstring"
     echo "[perf-check] presplit: $AUTUMN_BOOTSTRAP_PRESPLIT"
 fi
 

@@ -231,7 +231,19 @@ do_start() {
             "$AC" --manager "$MANAGER_ADDR" bootstrap --replication "$repl"
         fi
         touch "$bootstrap_marker"
-        sleep 1    # wait for PS to pick up the new partition
+        # Wait for PS to pick up the new partition(s) and finish opening them.
+        # Each partition's open() runs stream commit_length calls serially against
+        # the server-level stream_client, so total time scales with partition count.
+        # Budget ~3s per partition (empirically sufficient at bootstrap time).
+        local n_parts=1
+        if [[ -n "${AUTUMN_BOOTSTRAP_PRESPLIT:-}" ]]; then
+            n_parts="${AUTUMN_BOOTSTRAP_PRESPLIT%%:*}"
+            [[ "$n_parts" =~ ^[0-9]+$ ]] || n_parts=1
+        fi
+        local wait_secs=$(( 3 * n_parts ))
+        (( wait_secs < 3 )) && wait_secs=3
+        echo "[cluster] waiting ${wait_secs}s for PS to open ${n_parts} partition(s)..."
+        sleep "$wait_secs"
     fi
 
     echo ""
