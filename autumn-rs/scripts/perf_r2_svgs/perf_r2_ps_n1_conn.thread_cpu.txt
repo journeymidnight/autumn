@@ -1,0 +1,46 @@
+thread_name             N   total %   max %
+---------------------------------------------
+part-13                 1      74.0    74.0
+part-13-bulk            2      74.0    44.5
+ps-conn-127             1       8.5     8.5
+ps-conn-46              1       7.0     7.0
+ps-conn-173             1       3.0     3.0
+ps-conn-134             1       2.5     2.5
+ps-conn-37              1       2.0     2.0
+ps-conn-52              1       2.0     2.0
+ps-conn-54              1       2.0     2.0
+ps-conn-66              1       2.0     2.0
+ps-conn-107             1       2.0     2.0
+ps-conn-142             1       2.0     2.0
+ps-conn-146             1       2.0     2.0
+ps-conn-176             1       2.0     2.0
+ps-conn-5               1       1.5     1.5
+ps-conn-24              1       1.5     1.5
+ps-conn-29              1       1.5     1.5
+ps-conn-38              1       1.5     1.5
+ps-conn-43              1       1.5     1.5
+ps-conn-50              1       1.5     1.5
+
+Top 20 busiest individual threads:
+  tid=534553   part-13                  74.0%
+  tid=534587   part-13-bulk             44.5%
+  tid=535565   part-13-bulk             29.5%
+  tid=534682   ps-conn-127               8.5%
+  tid=534601   ps-conn-46                7.0%
+  tid=534728   ps-conn-173               3.0%
+  tid=534689   ps-conn-134               2.5%
+  tid=534621   ps-conn-66                2.0%
+  tid=534609   ps-conn-54                2.0%
+  tid=534607   ps-conn-52                2.0%
+  tid=534592   ps-conn-37                2.0%
+  tid=534731   ps-conn-176               2.0%
+  tid=534701   ps-conn-146               2.0%
+  tid=534697   ps-conn-142               2.0%
+  tid=534662   ps-conn-107               2.0%
+  tid=534627   ps-conn-72                1.5%
+  tid=534624   ps-conn-69                1.5%
+  tid=534622   ps-conn-67                1.5%
+  tid=534605   ps-conn-50                1.5%
+  tid=534559   ps-conn-5                 1.5%
+
+Total process CPU (sum of thread %): 254.5%
