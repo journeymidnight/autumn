@@ -14,6 +14,8 @@
 //!   1. Queue order preserved (FIFO within a partition).
 //!   2. Waker only rises after leader's Phase 3 memtable insert + bookkeeping.
 //!   3. All waiting BatchCompletion futures are woken (not just the last one).
+//!   4. push_notifier wakes the leader's await_first() when a push arrives.
+//!      Only ONE leader waits at a time (single-leader per partition).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -21,6 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
+use futures::task::AtomicWaker;
 use parking_lot::Mutex;
 
 use crate::WriteRequest;
@@ -39,6 +42,9 @@ pub(crate) struct WriteBatchBuilder {
     /// Waker set — all pending BatchCompletion futures register here.
     /// signal_complete drains + wakes ALL of them (true broadcast).
     wakers: Mutex<Vec<Waker>>,
+    /// Single-slot waker: wakes the leader's await_first() when a push
+    /// arrives. Only one leader waits per partition so AtomicWaker is correct.
+    push_notifier: AtomicWaker,
 }
 
 impl WriteBatchBuilder {
@@ -48,6 +54,7 @@ impl WriteBatchBuilder {
             next_seq: AtomicU64::new(0),
             last_done: AtomicU64::new(0),
             wakers: Mutex::new(Vec::new()),
+            push_notifier: AtomicWaker::new(),
         }
     }
 
@@ -59,11 +66,20 @@ impl WriteBatchBuilder {
             let mut q = self.queue.lock();
             q.push(req);
         }
+        // Wake the leader's await_first() if it is parked waiting for work.
+        self.push_notifier.wake();
         BatchCompletion {
             seq: my_seq,
             builder: self.clone(),
             registered: false,
         }
+    }
+
+    /// Leader calls this to wait for at least one push. Returns immediately
+    /// if the queue is already non-empty (fast path). Blocks without polling
+    /// until the next push arrives.
+    pub(crate) fn await_first(&self) -> AwaitFirst<'_> {
+        AwaitFirst { builder: self }
     }
 
     /// Leader takes all queued requests. Called by P-log write loop each iteration.
@@ -126,6 +142,30 @@ impl Future for BatchCompletion {
     }
 }
 
+/// Future returned by `WriteBatchBuilder::await_first`. Resolves when the
+/// queue is non-empty. Uses `push_notifier` AtomicWaker — only one leader
+/// per partition should await this at a time.
+pub(crate) struct AwaitFirst<'a> {
+    builder: &'a WriteBatchBuilder,
+}
+
+impl<'a> Future for AwaitFirst<'a> {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // Fast path: queue already has items.
+        if !self.builder.queue.lock().is_empty() {
+            return Poll::Ready(());
+        }
+        // Register waker, then re-check to avoid the missed-wake race.
+        self.builder.push_notifier.register(cx.waker());
+        if !self.builder.queue.lock().is_empty() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,5 +196,32 @@ mod tests {
         builder.signal_complete(max_seq);
         c0.await;
         c1.await;
+    }
+
+    #[compio::test]
+    async fn await_first_wakes_on_push() {
+        let builder = Arc::new(WriteBatchBuilder::new());
+        // Spawn a task that pushes after a brief delay.
+        let b2 = builder.clone();
+        compio::runtime::spawn(async move {
+            compio::time::sleep(std::time::Duration::from_millis(10)).await;
+            b2.push(WriteRequest::new_for_test(
+                WriteOp::Put {
+                    user_key: bytes::Bytes::from_static(b"k"),
+                    value: bytes::Bytes::from_static(b"v"),
+                    expires_at: 0,
+                },
+                false,
+            ));
+        })
+        .detach();
+        // await_first should wake within ~10ms, well under 1s.
+        let start = std::time::Instant::now();
+        builder.await_first().await;
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "await_first hung for {:?}",
+            start.elapsed()
+        );
     }
 }

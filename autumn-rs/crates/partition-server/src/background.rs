@@ -294,8 +294,10 @@ pub(crate) async fn background_write_loop(
     }
 }
 
-/// R2 Path (iii) write loop: drains from WriteBatchBuilder, sleeps 100µs when
-/// the queue is empty, signals all waiting handle_put futures after each batch.
+/// R2 Path (iii) write loop: waits for first push via await_first(), then
+/// sleeps a configurable collection window (AUTUMN_LF_COLLECT_MICROS, default
+/// 500µs) to let more pushes accumulate before draining. Signals all waiting
+/// handle_put futures after each batch.
 async fn background_write_loop_lf(
     part_id: u64,
     part: Rc<RefCell<PartitionData>>,
@@ -305,11 +307,21 @@ async fn background_write_loop_lf(
     let builder = part.borrow().write_batch_builder.clone();
 
     loop {
-        // ── Drain the builder queue ──
+        // (1) Wait for the first push — no busy-spinning.
+        builder.await_first().await;
+
+        // (2) Collection window — sleep to let more pushes accumulate.
+        let collect_micros = crate::lf_collect_micros();
+        if collect_micros > 0 {
+            compio::time::sleep(std::time::Duration::from_micros(collect_micros)).await;
+        }
+
+        // (3) Drain the accumulated batch.
         let (batch, max_seq) = builder.drain();
         if batch.is_empty() {
-            // Queue empty — sleep briefly to avoid busy-spinning.
-            compio::time::sleep(std::time::Duration::from_micros(100)).await;
+            // Spurious wake (e.g. all pushed items were already stolen by a
+            // concurrent drain path — shouldn't happen with single leader, but
+            // be defensive). Loop back to await_first.
             continue;
         }
 
