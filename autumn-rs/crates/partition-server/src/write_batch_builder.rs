@@ -4,23 +4,23 @@
 //! `WriteRequest` into a shared queue under a short `parking_lot::Mutex`
 //! critical section; the P-log thread's write loop drains the queue
 //! each iteration and, after running Phase 1/2/3 for the batch, signals
-//! all followers via a shared `AtomicU64` seq + `AtomicWaker` broadcast.
+//! all followers via a shared `AtomicU64` seq + waker-set broadcast.
 //!
 //! This replaces the mpsc + per-request oneshot pattern with:
 //!   push (lock, insert, unlock)  →  drain (lock, take, unlock)
-//!   → leader runs work → single broadcast wake of all pending futures.
+//!   → leader runs work → broadcast wake ALL pending futures.
 //!
 //! Invariants:
 //!   1. Queue order preserved (FIFO within a partition).
 //!   2. Waker only rises after leader's Phase 3 memtable insert + bookkeeping.
+//!   3. All waiting BatchCompletion futures are woken (not just the last one).
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
-use futures::task::AtomicWaker;
 use parking_lot::Mutex;
 
 use crate::WriteRequest;
@@ -36,8 +36,9 @@ pub(crate) struct WriteBatchBuilder {
     next_seq: AtomicU64,
     /// Highest seq that the leader has signaled complete.
     last_done: AtomicU64,
-    /// Broadcast waker. Leader calls `.wake()` once after signal_complete.
-    waker: AtomicWaker,
+    /// Waker set — all pending BatchCompletion futures register here.
+    /// signal_complete drains + wakes ALL of them (true broadcast).
+    wakers: Mutex<Vec<Waker>>,
 }
 
 impl WriteBatchBuilder {
@@ -46,7 +47,7 @@ impl WriteBatchBuilder {
             queue: Mutex::new(Vec::new()),
             next_seq: AtomicU64::new(0),
             last_done: AtomicU64::new(0),
-            waker: AtomicWaker::new(),
+            wakers: Mutex::new(Vec::new()),
         }
     }
 
@@ -61,6 +62,7 @@ impl WriteBatchBuilder {
         BatchCompletion {
             seq: my_seq,
             builder: self.clone(),
+            registered: false,
         }
     }
 
@@ -75,11 +77,17 @@ impl WriteBatchBuilder {
     }
 
     /// Leader calls this after Phase 3 memtable insert finishes, passing
-    /// the `max_seq` returned by the drain call. Broadcasts to all waiting
-    /// followers.
+    /// the `max_seq` returned by the drain call. Wakes ALL pending followers.
     pub(crate) fn signal_complete(&self, up_to_seq: u64) {
         self.last_done.store(up_to_seq, Ordering::Release);
-        self.waker.wake();
+        // Drain ALL wakers and wake them — true broadcast.
+        let wakers: Vec<Waker> = {
+            let mut w = self.wakers.lock();
+            std::mem::take(&mut *w)
+        };
+        for waker in wakers {
+            waker.wake();
+        }
     }
 }
 
@@ -87,18 +95,29 @@ impl WriteBatchBuilder {
 pub(crate) struct BatchCompletion {
     seq: u64,
     builder: Arc<WriteBatchBuilder>,
+    /// Whether we have already registered in the waker set (avoid double-adding).
+    registered: bool,
 }
 
 impl Future for BatchCompletion {
     type Output = ();
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         // Fast path: already done.
         if self.builder.last_done.load(Ordering::Acquire) >= self.seq {
             return Poll::Ready(());
         }
-        // Register waker, then re-check (classic register-check-register pattern
-        // to avoid race between check and wake).
-        self.builder.waker.register(cx.waker());
+        // Register our waker in the waker set (once), then re-check to avoid
+        // the race between the check above and signal_complete.
+        if !self.registered {
+            self.builder.wakers.lock().push(cx.waker().clone());
+            self.registered = true;
+        } else {
+            // On re-poll (e.g. executor spuriously woke us), update the waker in-place
+            // if it has changed. We can't easily find our slot, so just push a new one.
+            // Duplicate wakes are harmless — the executor deduplicates.
+            self.builder.wakers.lock().push(cx.waker().clone());
+        }
+        // Re-check after registering.
         if self.builder.last_done.load(Ordering::Acquire) >= self.seq {
             Poll::Ready(())
         } else {

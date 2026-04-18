@@ -59,6 +59,20 @@ fn max_write_batch() -> usize {
             .unwrap_or(DEFAULT_MAX_WRITE_BATCH)
     })
 }
+/// Whether to route writes through WriteBatchBuilder (R2 Path iii leader-follower
+/// coalescing). Read once from env `AUTUMN_LEADER_FOLLOWER` at startup.
+/// Accepts "1", "true", "yes" (case-insensitive) as true; anything else = false.
+/// Default: false — preserves R1 behavior bit-for-bit.
+pub(crate) fn leader_follower_enabled() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        matches!(
+            std::env::var("AUTUMN_LEADER_FOLLOWER").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("TRUE") | Some("YES")
+        )
+    })
+}
+
 const MAX_WRITE_BATCH_BYTES: usize = 30 * 1024 * 1024;
 const COMPACT_RATIO: f64 = 0.5;
 const HEAD_RATIO: f64 = 0.3;
@@ -233,6 +247,10 @@ pub(crate) struct PartitionData {
     /// thread failed to initialize — fall back to in-thread flush (legacy
     /// path) so the partition remains usable.
     flush_req_tx: Option<mpsc::Sender<FlushReq>>,
+    // R2 Path (iii) — leader-follower write coalescing. Only USED when
+    // leader_follower_enabled() returns true; allocated unconditionally
+    // so the field shape is stable across feature flag states.
+    write_batch_builder: std::sync::Arc<crate::write_batch_builder::WriteBatchBuilder>,
 }
 
 // ---------------------------------------------------------------------------
@@ -992,6 +1010,7 @@ async fn partition_thread_main(
         vp_offset: vp_off,
         stream_client: part_sc.clone(),
         flush_req_tx: flush_req_tx_part,
+        write_batch_builder: std::sync::Arc::new(crate::write_batch_builder::WriteBatchBuilder::new()),
     }));
 
     // Drop the extra `flush_req_tx` clone held locally: the one stored in

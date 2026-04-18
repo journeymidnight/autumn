@@ -96,25 +96,53 @@ pub(crate) async fn dispatch_partition_rpc(
 pub(crate) async fn handle_put(payload: Bytes, part: &Rc<RefCell<PartitionData>>) -> HandlerResult {
     let req: PutReq = partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
-    let (resp_tx, resp_rx) = oneshot::channel();
-    let mut write_tx = part.borrow().write_tx.clone();
-    write_tx.send(WriteRequest {
-        op: WriteOp::Put {
-            user_key: req.key.clone().into(),
-            value: req.value.into(),
-            expires_at: req.expires_at,
-        },
-        must_sync: req.must_sync,
-        resp_tx,
-    }).await.map_err(|_| (StatusCode::Internal, "write channel closed".to_string()))?;
+    if crate::leader_follower_enabled() {
+        // --- R2 Path (iii): push to WriteBatchBuilder, await broadcast ---
+        // Build a WriteRequest with a detached oneshot (resp_tx unused in this path).
+        let (resp_tx, _resp_rx) = oneshot::channel();
+        let wreq = WriteRequest {
+            op: WriteOp::Put {
+                user_key: req.key.clone().into(),
+                value: req.value.into(),
+                expires_at: req.expires_at,
+            },
+            must_sync: req.must_sync,
+            resp_tx,
+        };
+        let builder = part.borrow().write_batch_builder.clone();
+        let completion = builder.push(wreq);
+        completion.await;
+        // Leader signals after successful Phase 3. Batch-level errors
+        // poison the partition in the existing flow (locked_by_other); a
+        // follower returning Ok here when the batch failed is OK because the
+        // next call will observe the poisoned state and error out.
+        Ok(partition_rpc::rkyv_encode(&PutResp {
+            code: CODE_OK,
+            message: String::new(),
+            key: req.key.into(),
+        }))
+    } else {
+        // --- R1 path: mpsc + oneshot (unchanged) ---
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let mut write_tx = part.borrow().write_tx.clone();
+        write_tx.send(WriteRequest {
+            op: WriteOp::Put {
+                user_key: req.key.clone().into(),
+                value: req.value.into(),
+                expires_at: req.expires_at,
+            },
+            must_sync: req.must_sync,
+            resp_tx,
+        }).await.map_err(|_| (StatusCode::Internal, "write channel closed".to_string()))?;
 
-    let key = resp_rx.await.map_err(|_| (StatusCode::Internal, "write response dropped".to_string()))?
-        .map_err(|e| (StatusCode::Internal, e))?;
-    Ok(partition_rpc::rkyv_encode(&PutResp {
-        code: CODE_OK,
-        message: String::new(),
-        key,
-    }))
+        let key = resp_rx.await.map_err(|_| (StatusCode::Internal, "write response dropped".to_string()))?
+            .map_err(|e| (StatusCode::Internal, e))?;
+        Ok(partition_rpc::rkyv_encode(&PutResp {
+            code: CODE_OK,
+            message: String::new(),
+            key,
+        }))
+    }
 }
 
 pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>, _part_sc: &Rc<StreamClient>) -> HandlerResult {

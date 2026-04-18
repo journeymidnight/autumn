@@ -287,6 +287,77 @@ pub(crate) async fn background_write_loop(
     mut write_rx: mpsc::Receiver<WriteRequest>,
     locked_by_other: Rc<Cell<bool>>,
 ) {
+    if crate::leader_follower_enabled() {
+        background_write_loop_lf(part_id, part, locked_by_other).await;
+    } else {
+        background_write_loop_r1(part_id, part, write_rx, locked_by_other).await;
+    }
+}
+
+/// R2 Path (iii) write loop: drains from WriteBatchBuilder, sleeps 100µs when
+/// the queue is empty, signals all waiting handle_put futures after each batch.
+async fn background_write_loop_lf(
+    part_id: u64,
+    part: Rc<RefCell<PartitionData>>,
+    locked_by_other: Rc<Cell<bool>>,
+) {
+    let mut metrics = WriteLoopMetrics::new();
+    let builder = part.borrow().write_batch_builder.clone();
+
+    loop {
+        // ── Drain the builder queue ──
+        let (batch, max_seq) = builder.drain();
+        if batch.is_empty() {
+            // Queue empty — sleep briefly to avoid busy-spinning.
+            compio::time::sleep(std::time::Duration::from_micros(100)).await;
+            continue;
+        }
+
+        // ── Start new batch: Phase1 + launch Phase2 ──
+        match start_write_batch(&part, batch) {
+            Ok(Some(flight)) => {
+                // Await Phase2 (append I/O).
+                let r = flight.phase2_fut.await;
+                match finish_write_batch(&part, flight.data, r).await {
+                    Ok(stats) => metrics.record(stats),
+                    Err(e) => {
+                        // Signal followers even on error so they don't hang.
+                        builder.signal_complete(max_seq);
+                        if is_locked_by_other(&e) {
+                            tracing::error!(part_id, "LockedByOther detected, poisoning partition");
+                            locked_by_other.set(true);
+                            metrics.flush(part_id);
+                            return;
+                        }
+                        tracing::error!("write batch error: {e}");
+                        metrics.maybe_report(part_id);
+                        continue;
+                    }
+                }
+                // Phase 3 complete — broadcast wake to all waiting followers.
+                builder.signal_complete(max_seq);
+                metrics.maybe_report(part_id);
+            }
+            Ok(None) => {
+                // Empty batch (all out-of-range) — signal anyway so futures resolve.
+                builder.signal_complete(max_seq);
+            }
+            Err(e) => {
+                tracing::error!("write batch start error: {e}");
+                // Signal so followers don't hang indefinitely.
+                builder.signal_complete(max_seq);
+            }
+        }
+    }
+}
+
+/// R1 write loop: original mpsc + double-buffer pipeline (unchanged).
+async fn background_write_loop_r1(
+    part_id: u64,
+    part: Rc<RefCell<PartitionData>>,
+    mut write_rx: mpsc::Receiver<WriteRequest>,
+    locked_by_other: Rc<Cell<bool>>,
+) {
     let mut metrics = WriteLoopMetrics::new();
     let mut pending: Vec<WriteRequest> = Vec::new();
 
