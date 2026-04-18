@@ -30,15 +30,99 @@ struct StreamTail {
     replica_addrs: Vec<String>,
 }
 
-/// Per-stream append state: tail info and commit cache.
-/// Protected by a Mutex so appends to the same stream are serialized,
-/// while appends to different streams are fully concurrent.
+/// Per-stream append state: tail info, commit cache, and R3 pipeline state.
+///
+/// R3 state machine fields (`lease_cursor`, `pending_acks`, `in_flight`,
+/// `poisoned`) track in-flight appends so the state Mutex can be held
+/// only for offset-lease + ack, not across the 3-replica fanout.
+///
+/// - `tail`: cached `StreamTail` (extent id + replica addrs + eversion).
+/// - `commit`: highest acked `end` that forms a contiguous prefix (matches
+///             Go's `sc.end`; also serves as `header.commit` for appends
+///             that are strictly serialized, i.e. R2 behavior).
+/// - `lease_cursor`: next offset to lease. Advances monotonically at lease
+///                   time; rewound only via `rewind_or_poison` on the
+///                   most-recent-lease fast path. Equals `commit` when
+///                   `in_flight == 0 && pending_acks.is_empty()`.
+/// - `pending_acks`: acked-but-not-yet-prefix batches (offset → end).
+/// - `in_flight`: count of leased-but-not-acked batches.
+/// - `poisoned`: set on mid-sequence error; causes the next caller to
+///               trigger `alloc_new_extent` via an NotFound-equivalent
+///               error path.
 struct StreamAppendState {
     tail: Option<StreamTail>,
     /// Locally-tracked commit offset (matches Go's `sc.end`).
     /// Starts at 0 for a new extent; updated to `appended.end` after each
     /// successful append.  Never queried from replicas in the hot path.
     commit: u32,
+    lease_cursor: u32,
+    pending_acks: std::collections::BTreeMap<u32, u32>,
+    in_flight: u32,
+    poisoned: bool,
+}
+
+impl StreamAppendState {
+    fn new() -> Self {
+        Self {
+            tail: None,
+            commit: 0,
+            lease_cursor: 0,
+            pending_acks: std::collections::BTreeMap::new(),
+            in_flight: 0,
+            poisoned: false,
+        }
+    }
+
+    /// Reset state for a newly-allocated extent. Called under the state
+    /// Mutex whenever `alloc_new_extent` returns a fresh extent. Preserves
+    /// `tail` (caller will overwrite it separately).
+    fn reset_for_new_extent(&mut self) {
+        self.commit = 0;
+        self.lease_cursor = 0;
+        self.pending_acks.clear();
+        self.in_flight = 0;
+        self.poisoned = false;
+    }
+
+    /// Lease an offset range for a new append. Caller must hold the state
+    /// Mutex. Always succeeds; the `in_flight` counter tracks outstanding
+    /// leases for `rewind_or_poison` and for R3 integration tests.
+    fn lease(&mut self, size: u32) -> (u32, u32) {
+        let offset = self.lease_cursor;
+        let end = offset + size;
+        self.lease_cursor = end;
+        self.in_flight += 1;
+        (offset, end)
+    }
+
+    /// Record a successful ack: insert into pending, then advance commit
+    /// through any contiguous prefix.
+    fn ack(&mut self, offset: u32, end: u32) {
+        self.pending_acks.insert(offset, end);
+        self.in_flight = self.in_flight.saturating_sub(1);
+        while let Some((&off, &end_of_slot)) = self.pending_acks.iter().next() {
+            if off == self.commit {
+                self.commit = end_of_slot;
+                self.pending_acks.remove(&off);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Record a failed ack. If this was the most-recently-leased batch
+    /// (no newer leases outstanding), rewind tail. Otherwise, poison the
+    /// stream so the next caller's append will force a new extent alloc.
+    fn rewind_or_poison(&mut self, offset: u32, size: u32) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        if offset + size == self.lease_cursor {
+            // Most-recent lease: it's safe to rewind.
+            self.lease_cursor = offset;
+        } else {
+            // Newer leases are in flight; we can't rewind without gaps.
+            self.poisoned = true;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -323,10 +407,7 @@ impl StreamClient {
         if let Some(s) = self.stream_states.get(&stream_id) {
             return s.clone();
         }
-        let state = Arc::new(Mutex::new(StreamAppendState {
-            tail: None,
-            commit: 0,
-        }));
+        let state = Arc::new(Mutex::new(StreamAppendState::new()));
         self.stream_states.insert(stream_id, state.clone());
         state
     }
