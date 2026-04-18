@@ -1,6 +1,6 @@
 Date: 2026-04-18
 TaskStatus: completed
-Task scope: F096 R2 Task 7 — Phase 1 flamegraph analysis + chosen path commit
+Task scope: R2 Path (iii) Sub-task 3 — Wire WriteBatchBuilder into PUT hot path (feature-flagged)
 
 Current summary:
   Ran on branch `perf-r1-partition-scale-out` (worktree /data/dongmao_dev/autumn-perf-r1),
@@ -60,8 +60,19 @@ Next steps:
   - Commit SHA: 30e0e6b (branch perf-r1-partition-scale-out)
   - Phase 2 code edits now unblocked.
 
-  Next steps (Phase 2 — Path iii implementation):
-  - lib.rs handle_ps_connection (794–893): eliminate per-request oneshot + req_tx.send overhead
-  - lib.rs spawn_write_request (1079–1100): reduce per-write compio::spawn cost
-  - rpc_handlers.rs handle_put (96–118): replace per-request oneshot with batch reply slot
-  - background.rs background_write_loop (284–412): reduce reply fanout overhead
+  Sub-task 3 completed (2026-04-18):
+  - leader_follower_enabled() fn added to lib.rs (reads AUTUMN_LEADER_FOLLOWER env once).
+  - write_batch_builder: Arc<WriteBatchBuilder> field added to PartitionData (always allocated).
+  - handle_put in rpc_handlers.rs forked: LF path pushes to builder + awaits BatchCompletion.
+  - background_write_loop split into _lf / _r1 variants; _lf drains builder, signals after Phase 3.
+  - Bug found + fixed during smoke: AtomicWaker only stores 1 waker → only 1 of 256 concurrent
+    handle_put callers woke up. Fixed by replacing AtomicWaker with Mutex<Vec<Waker>> (broadcast).
+  - write_batch_builder.rs also staged in this commit (4 files total).
+  - Commit SHA: 6df41fe (branch perf-r1-partition-scale-out)
+  - Smoke (AUTUMN_LEADER_FOLLOWER=1, --shm N=1): write 52230 ops/s, read 74641 ops/s, p99w 25.13ms.
+  - Default path (env unset): all 65 partition-server tests pass; R1 path bit-for-bit identical.
+
+  Next steps (Sub-task 4):
+  - Main gate verification: 3 reps at N=1 with LF=1 vs baseline.
+  - Regression guards: N=2, N=4 with LF=0 (default path unchanged).
+  - If gate passes, merge Path (iii) to compio and update perf_baseline_shm.json.
