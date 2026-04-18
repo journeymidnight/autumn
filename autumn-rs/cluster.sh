@@ -153,12 +153,34 @@ do_start() {
         "$MANAGER" --port 9001 --etcd 127.0.0.1:2379
     wait_port 9001 manager
 
-    # extent node(s): node1=9101, node2=9102, ...
+    # Extent node(s): node1=9101, node2=9102, ...
+    # Pre-create all data directories so both single-disk and multi-disk paths can rely on them.
+    for (( i=1; i<=replicas; i++ )); do
+        local disk_arg
+        disk_arg=$(disk_args_for_node "$i")
+        mkdir -p $(echo "$disk_arg" | tr ',' ' ')
+    done
+
+    # In --multidisk-1node mode, `autumn-client format` must run BEFORE the
+    # extent-node starts. Format registers the node with the manager and
+    # writes the `disk_id` file in every data directory — ExtentNodeConfig::
+    # new_multi requires those files on open. The format call also replaces
+    # register-node for this mode.
+    if [[ "${CLUSTER_MODE:-default}" == "multidisk-1node" ]]; then
+        local disk_arg
+        disk_arg=$(disk_args_for_node 1)
+        # shellcheck disable=SC2086  # intentional word splitting for positional args
+        "$AC" --manager "$MANAGER_ADDR" format \
+            --listen ":9101" \
+            --advertise "127.0.0.1:9101" \
+            $(echo "$disk_arg" | tr ',' ' ')
+    fi
+
+    # Launch extent-node processes.
     for (( i=1; i<=replicas; i++ )); do
         local port=$(( 9100 + i ))
         local disk_arg
         disk_arg=$(disk_args_for_node "$i")
-        mkdir -p $(echo "$disk_arg" | tr ',' ' ')
         # multidisk-1node sends multiple paths through --data and OMITS --disk-id
         # (extent-node switches to multi-disk mode when --data has commas AND --disk-id is absent).
         if [[ "$disk_arg" == *,* ]]; then
@@ -171,12 +193,16 @@ do_start() {
         wait_port "$port" "node$i"
     done
 
-    # register extent node(s)
-    for (( i=1; i<=replicas; i++ )); do
-        local port=$(( 9100 + i ))
-        "$AC" --manager "$MANAGER_ADDR" register-node --addr "127.0.0.1:$port" --disk "disk-$i"
-    done
-    echo "[cluster] extent node(s) registered"
+    # register extent node(s) — skip for multidisk-1node (format already registered).
+    if [[ "${CLUSTER_MODE:-default}" != "multidisk-1node" ]]; then
+        for (( i=1; i<=replicas; i++ )); do
+            local port=$(( 9100 + i ))
+            "$AC" --manager "$MANAGER_ADDR" register-node --addr "127.0.0.1:$port" --disk "disk-$i"
+        done
+        echo "[cluster] extent node(s) registered"
+    else
+        echo "[cluster] extent node registered via format (multidisk-1node)"
+    fi
 
     if [[ -n "${AUTUMN_GROUP_COMMIT_CAP:-}" ]]; then
         echo "[cluster] AUTUMN_GROUP_COMMIT_CAP=$AUTUMN_GROUP_COMMIT_CAP (forwarding to PS)"
@@ -241,6 +267,9 @@ do_stop() {
     pkill -9 -f "$BIN/autumn-manager-server" 2>/dev/null || true
     pkill -9 -f "$BIN/autumn-extent-node" 2>/dev/null || true
     pkill -9 -f "$BIN/autumn-ps " 2>/dev/null || true
+    # Match stray etcd only when its --data-dir is inside an autumn-rs tree.
+    # Avoids killing unrelated etcd instances on the host.
+    pkill -9 -f 'etcd --data-dir [^ ]*autumn-rs' 2>/dev/null || true
     echo "[cluster] all processes stopped"
 }
 
