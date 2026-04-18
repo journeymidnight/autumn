@@ -89,6 +89,32 @@ wait_port() {
 }
 
 # ---------------------------------------------------------------------------
+# disk helpers
+# ---------------------------------------------------------------------------
+
+# Return the --data argument for extent node $1 (1-indexed) given $CLUSTER_MODE.
+disk_args_for_node() {
+    local i="$1"
+    case "${CLUSTER_MODE:-default}" in
+        3disk)
+            case "$i" in
+                1) echo "/data03/autumn-rs/d1" ;;
+                2) echo "/data05/autumn-rs/d2" ;;
+                3) echo "/data08/autumn-rs/d3" ;;
+                *) die "--3disk supports exactly 3 nodes; got i=$i" ;;
+            esac
+            ;;
+        multidisk-1node)
+            [[ "$i" == "1" ]] || die "--multidisk-1node supports exactly 1 node"
+            echo "/data03/autumn-rs/d1,/data05/autumn-rs/d2,/data08/autumn-rs/d3"
+            ;;
+        *)
+            echo "$DATA_ROOT/d$i"
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # start
 # ---------------------------------------------------------------------------
 
@@ -104,10 +130,8 @@ do_start() {
     need_bin "$PS"
     need_bin "$AC"
 
-    # Create data dirs for all nodes (d1..dN)
-    local data_dirs=("$DATA_ROOT/etcd" "$DATA_ROOT/ps")
-    for (( i=1; i<=replicas; i++ )); do data_dirs+=("$DATA_ROOT/d$i"); done
-    mkdir -p "${data_dirs[@]}"
+    # Create data dirs for etcd and ps; node dirs are created per-node below.
+    mkdir -p "$DATA_ROOT/etcd" "$DATA_ROOT/ps"
 
     # etcd
     start_proc etcd \
@@ -132,8 +156,18 @@ do_start() {
     # extent node(s): node1=9101, node2=9102, ...
     for (( i=1; i<=replicas; i++ )); do
         local port=$(( 9100 + i ))
-        start_proc "node$i" \
-            "$NODE" --port "$port" --disk-id "$i" --data "$DATA_ROOT/d$i" --manager "$MANAGER_ADDR"
+        local disk_arg
+        disk_arg=$(disk_args_for_node "$i")
+        mkdir -p $(echo "$disk_arg" | tr ',' ' ')
+        # multidisk-1node sends multiple paths through --data and OMITS --disk-id
+        # (extent-node switches to multi-disk mode when --data has commas AND --disk-id is absent).
+        if [[ "$disk_arg" == *,* ]]; then
+            start_proc "node$i" \
+                "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR"
+        else
+            start_proc "node$i" \
+                "$NODE" --port "$port" --disk-id "$i" --data "$disk_arg" --manager "$MANAGER_ADDR"
+        fi
         wait_port "$port" "node$i"
     done
 
@@ -217,6 +251,8 @@ do_stop() {
 do_clean() {
     do_stop
     rm -rf "$DATA_ROOT" "$LOG_DIR"
+    # Also wipe alternate-disk data if this run used --3disk or --multidisk-1node.
+    rm -rf /data03/autumn-rs /data05/autumn-rs /data08/autumn-rs 2>/dev/null || true
     echo "[cluster] data dirs wiped"
 }
 
@@ -266,7 +302,30 @@ do_logs() {
 # ---------------------------------------------------------------------------
 
 CMD="${1:-help}"
-REPLICAS="${2:-1}"
+shift || true
+
+REPLICAS=1
+MODE="default"  # default | 3disk | multidisk-1node
+if [[ "${1:-}" =~ ^[0-9]+$ ]]; then
+    REPLICAS="$1"
+    shift
+fi
+while (( $# > 0 )); do
+    case "$1" in
+        --3disk)             MODE="3disk" ;;
+        --multidisk-1node)   MODE="multidisk-1node" ;;
+        *) die "unknown cluster.sh flag: $1" ;;
+    esac
+    shift
+done
+
+# Mode validation
+if [[ "$MODE" == "3disk" ]]; then
+    (( REPLICAS == 3 )) || die "--3disk requires replicas=3 (got $REPLICAS)"
+elif [[ "$MODE" == "multidisk-1node" ]]; then
+    (( REPLICAS == 1 )) || die "--multidisk-1node requires replicas=1 (got $REPLICAS)"
+fi
+export CLUSTER_MODE="$MODE"
 
 case "$CMD" in
     start)   do_start "$REPLICAS" ;;
@@ -278,6 +337,7 @@ case "$CMD" in
     logs)    do_logs ;;
     *)
         echo "Usage: $0 {start [N] | stop | restart [N] | clean | reset [N] | status | logs}"
+        echo "  Optional mode flag: --3disk (replicas=3, nodes on /data03,/data05,/data08) | --multidisk-1node (replicas=1, one node spans all three NVMes)"
         exit 1
         ;;
 esac
