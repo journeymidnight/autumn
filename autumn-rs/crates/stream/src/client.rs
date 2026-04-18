@@ -530,20 +530,26 @@ impl StreamClient {
     }
 
     /// Core append implementation that sends payload segments to all replicas
-    /// via autumn-rpc binary protocol. Segments are concatenated into a single
-    /// AppendReq payload (no streaming).
+    /// via autumn-rpc binary protocol. Uses R3 lease-cursor state machine:
+    ///
+    /// 1. Short lock: lease offset range, fire 3 send_vectored calls UNDER
+    ///    the lock (preserves TCP-write-order = lease-order at each replica).
+    /// 2. Drop lock. Await all receivers concurrently via join_all.
+    /// 3. Short lock: ack (advance commit) or rewind_or_poison on failure.
+    ///
+    /// Critical invariant (spec §5.2 Option A): header.commit = offset (the
+    /// lease-time cursor = end of previous batch), NOT state.commit which
+    /// trails and would cause ExtentNode to truncate committed data.
     async fn append_payload_segments(
         &self,
         stream_id: u64,
         segments: Vec<Bytes>,
         must_sync: bool,
     ) -> Result<AppendResult> {
-        let payload_len: usize = segments.iter().map(|s| s.len()).sum();
+        let payload_len_u32: u32 = segments.iter().map(|s| s.len() as u32).sum();
+        let payload_len: usize = payload_len_u32 as usize;
         let append_started_at = Instant::now();
         let state_arc = self.stream_state(stream_id);
-        let lock_started_at = Instant::now();
-        let mut state = state_arc.lock().await;
-        let lock_wait = lock_started_at.elapsed();
 
         // Wrap segments in Arc so all replicas can share without copying.
         let segments = Arc::new(segments);
@@ -553,86 +559,135 @@ impl StreamClient {
         const MAX_ALLOC_PER_APPEND: u32 = 3;
         let mut extent_lookup_elapsed = Duration::default();
         let mut fanout_elapsed = Duration::default();
+        let mut lock_wait_total = Duration::default();
+
         loop {
-            // Resolve stream tail (cached).
-            let tail = match &state.tail {
-                Some(t) => t.clone(),
+            // ── Phase 1: short lock — resolve tail, lease offset, fire sends ──
+            let lock_started_at = Instant::now();
+            let mut state = state_arc.lock().await;
+            lock_wait_total += lock_started_at.elapsed();
+
+            // If poisoned from a concurrent failed append, treat like NotFound:
+            // clear poison and force tail reload so we get a fresh extent.
+            if state.poisoned {
+                state.poisoned = false;
+                state.reset_for_new_extent();
+                state.tail = None;
+            }
+
+            // Load/resolve stream tail.
+            let tail = match state.tail.clone() {
+                Some(t) => t,
                 None => {
+                    // Must drop lock during the async manager call.
+                    drop(state);
                     let t = self.load_stream_tail(stream_id).await?;
+                    let mut state = state_arc.lock().await;
                     state.tail = Some(t.clone());
-                    t
+                    // lease_cursor / commit already zeroed (reset_for_new_extent was
+                    // called on the poisoned path or this is a fresh state).
+                    drop(state);
+                    continue;
                 }
             };
 
-            let revision = self.revision;
-            // On first append to an existing extent (commit==0 but tail cached),
-            // query actual commit_length from replicas to avoid truncating data
-            // that was written before this StreamClient was created (e.g. after restart).
-            let commit = if state.commit == 0 && state.tail.is_some() {
-                let c = self.current_commit(&tail).await.unwrap_or(0);
-                state.commit = c;
-                c
+            // On first append to an existing extent (both commit and lease_cursor are 0),
+            // query actual commit_length from replicas to avoid truncating pre-existing data.
+            // Drop the lock during the async query and re-acquire afterward, then fall through
+            // to the lease step. Using `continue` here would cause an infinite loop when the
+            // extent is genuinely empty (commit_val == 0).
+            let mut state = if state.commit == 0 && state.lease_cursor == 0 {
+                drop(state);
+                let commit_val = self.current_commit(&tail).await.unwrap_or(0);
+                let mut s = state_arc.lock().await;
+                // Guard: another concurrent caller might have set these while we queried.
+                if s.commit == 0 && s.lease_cursor == 0 {
+                    s.commit = commit_val;
+                    s.lease_cursor = commit_val;
+                }
+                s
             } else {
-                state.commit
+                state
             };
 
+            let revision = self.revision;
+            let extent_id = tail.extent.extent_id;
+
+            // Lease the offset range under lock.
+            let (offset, end) = state.lease(payload_len_u32);
+
+            // Option A invariant: header.commit = offset (the lease-time cursor,
+            // equal to the end of the previous batch's lease). NOT state.commit,
+            // which trails and could cause ExtentNode to truncate live data.
+            let header_commit = offset;
+
             let extent_lookup_started_at = Instant::now();
-            // No per-address client setup needed — ConnPool handles it.
             extent_lookup_elapsed += extent_lookup_started_at.elapsed();
 
-            // Fan out identical append to all replicas in parallel.
-            // Zero-copy: AppendReq header (29B) + segments sent via vectored write.
-            let extent_id = tail.extent.extent_id;
             let append_hdr = AppendReq::encode_header(
                 extent_id,
                 tail.extent.eversion,
-                commit,
+                header_commit,
                 revision,
                 must_sync,
             );
 
+            // Fire send_vectored to all replicas UNDER THE LOCK.
+            // Holding the lock during the socket writes ensures that bytes hit
+            // each replica's TCP socket in lease order, which is required for
+            // the commit-truncation protocol to be correct.
             let fanout_started_at = Instant::now();
-            let futs: Vec<_> = tail
-                .replica_addrs
-                .iter()
-                .map(|addr| {
-                    let pool = &self.pool;
-                    let addr = addr.clone();
-                    let append_hdr = append_hdr.clone();
-                    let segments = segments.clone();
-                    async move {
-                        // Build vectored parts: [append_header][seg0][seg1]...
-                        let mut parts = Vec::with_capacity(1 + segments.len());
-                        parts.push(append_hdr);
-                        for seg in segments.iter() {
-                            parts.push(seg.clone()); // Bytes::clone = refcount, not memcpy
-                        }
-                        let result = pool
-                            .call_vectored(&addr, MSG_APPEND, parts)
-                            .await;
-                        (addr, result)
+            let mut receivers: Vec<(String, Result<futures::channel::oneshot::Receiver<autumn_rpc::Frame>>)> =
+                Vec::with_capacity(tail.replica_addrs.len());
+            for addr in &tail.replica_addrs {
+                let mut parts = Vec::with_capacity(1 + segments.len());
+                parts.push(append_hdr.clone());
+                for seg in segments.iter() {
+                    parts.push(seg.clone()); // Bytes::clone = Arc refcount, not memcpy
+                }
+                let rx_res = self.pool.send_vectored(addr, MSG_APPEND, parts).await;
+                receivers.push((addr.clone(), rx_res));
+            }
+
+            // ── Drop the lock — the expensive network await happens outside. ──
+            drop(state);
+
+            // Await all replica responses concurrently.
+            let wait_futs = receivers.into_iter().map(|(addr, rx_res)| {
+                let extent_id = extent_id;
+                async move {
+                    match rx_res {
+                        Err(e) => (addr, Err(e)),
+                        Ok(rx) => match rx.await {
+                            Err(_) => (addr, Err(anyhow!("rpc connection closed"))),
+                            Ok(frame) => {
+                                let payload = frame.payload;
+                                match AppendResp::decode(payload) {
+                                    Ok(r) => (addr, Ok(r)),
+                                    Err(e) => {
+                                        let msg = format!("decode AppendResp from {addr}: {e}");
+                                        (addr, Err(anyhow!(msg)))
+                                    }
+                                }
+                            }
+                        },
                     }
-                })
-                .collect();
-            let results = join_all(futs).await;
+                }
+            });
+            let results = join_all(wait_futs).await;
             fanout_elapsed += fanout_started_at.elapsed();
 
+            // Parse results.
             let mut first_resp: Option<AppendResp> = None;
             let mut saw_not_found = false;
-            let mut append_error = None;
+            let mut append_error: Option<anyhow::Error> = None;
+            let mut locked_by_other = false;
 
             for (addr, result) in results {
-                let resp_bytes = match result {
-                    Ok(b) => b,
-                    Err(e) => {
-                        append_error = Some(anyhow!(e));
-                        break;
-                    }
-                };
-                let inner = match AppendResp::decode(resp_bytes) {
+                let inner = match result {
                     Ok(r) => r,
                     Err(e) => {
-                        append_error = Some(anyhow!("decode AppendResp from {addr}: {e}"));
+                        append_error = Some(e);
                         break;
                     }
                 };
@@ -641,7 +696,8 @@ impl StreamClient {
                     break;
                 }
                 if inner.code == CODE_LOCKED_BY_OTHER {
-                    return Err(anyhow!("LockedByOther: a newer owner holds extent {extent_id}"));
+                    locked_by_other = true;
+                    break;
                 }
                 if inner.code != CODE_OK {
                     append_error = Some(anyhow!(
@@ -650,7 +706,6 @@ impl StreamClient {
                     ));
                     break;
                 }
-
                 if let Some(first) = &first_resp {
                     if inner.offset != first.offset || inner.end != first.end {
                         append_error = Some(anyhow!(
@@ -663,34 +718,100 @@ impl StreamClient {
                 }
             }
 
+            // ── Phase 3: short lock — ack or rewind on outcome ──
+            let mut state = state_arc.lock().await;
+
+            // Immediate non-retried error: locked by a newer owner.
+            if locked_by_other {
+                state.rewind_or_poison(offset, payload_len_u32);
+                return Err(anyhow!("LockedByOther: a newer owner holds extent {extent_id}"));
+            }
+
+            if let Some(appended) = first_resp {
+                // Success path: advance commit.
+                state.ack(offset, end);
+                let total_elapsed = append_started_at.elapsed();
+                tracing::debug!(
+                    stream_id,
+                    payload_len,
+                    extent_lookup_ms = extent_lookup_elapsed.as_secs_f64() * 1000.0,
+                    fanout_ms = fanout_elapsed.as_secs_f64() * 1000.0,
+                    total_ms = total_elapsed.as_secs_f64() * 1000.0,
+                    retry,
+                    "append_payload"
+                );
+                self.append_metrics.record(
+                    &self.owner_key,
+                    lock_wait_total,
+                    extent_lookup_elapsed,
+                    fanout_elapsed,
+                    total_elapsed,
+                    retry as u64,
+                );
+
+                if appended.end >= self.max_extent_size {
+                    // Extent full — drop lock before the slow manager RPC, then re-acquire.
+                    // In the PS use case, only one append is in-flight at a time (group-commit
+                    // loop is sequential), so there's no concurrent-alloc race in practice.
+                    drop(state);
+                    let (_, new_tail_ext) = self.alloc_new_extent(stream_id, appended.end).await?;
+                    let replica_addrs = self.replica_addrs_for_extent(&new_tail_ext).await?;
+                    let mut state = state_arc.lock().await;
+                    if state.tail.is_none() || state.in_flight == 0 {
+                        state.reset_for_new_extent();
+                        state.tail = Some(StreamTail {
+                            extent: new_tail_ext,
+                            replica_addrs,
+                        });
+                    }
+                }
+
+                return Ok(AppendResult {
+                    extent_id,
+                    offset: appended.offset,
+                    end: appended.end,
+                });
+            }
+
+            // Failure path: rewind or poison the state.
+            state.rewind_or_poison(offset, payload_len_u32);
+
             if saw_not_found {
                 retry += 1;
                 alloc_count += 1;
                 if alloc_count > MAX_ALLOC_PER_APPEND {
                     return Err(anyhow!("too many extent allocations ({alloc_count}) for single append, giving up"));
                 }
+                state.reset_for_new_extent();
                 state.tail = None;
+                drop(state);
+                // alloc_new_extent is an async manager call; drop lock first.
                 let (_, new_tail_ext) = self.alloc_new_extent(stream_id, 0).await?;
                 let replica_addrs = self.replica_addrs_for_extent(&new_tail_ext).await?;
-                state.commit = 0;
+                let mut state = state_arc.lock().await;
+                state.reset_for_new_extent();
                 state.tail = Some(StreamTail {
                     extent: new_tail_ext,
                     replica_addrs,
                 });
+                drop(state);
                 continue;
             }
+
             if let Some(err) = append_error {
+                let commit_snap = state.commit;
                 tracing::warn!(
                     stream_id,
                     extent_id = tail.extent.extent_id,
                     retry,
-                    commit,
+                    commit = commit_snap,
                     error = %err,
                     "append failed, will retry"
                 );
                 state.tail = None;
                 retry += 1;
                 if retry <= 2 {
+                    drop(state);
                     compio::time::sleep(Duration::from_millis(100)).await;
                     let fresh = self.load_stream_tail(stream_id).await?;
                     if fresh.extent.sealed_length > 0 {
@@ -700,38 +821,44 @@ impl StreamClient {
                         }
                         let (_, new_tail_ext) = self.alloc_new_extent(stream_id, 0).await?;
                         let replica_addrs = self.replica_addrs_for_extent(&new_tail_ext).await?;
-                        state.commit = 0;
+                        let mut state = state_arc.lock().await;
+                        state.reset_for_new_extent();
                         state.tail = Some(StreamTail {
                             extent: new_tail_ext,
                             replica_addrs,
                         });
                     } else {
+                        let mut state = state_arc.lock().await;
                         if fresh.extent.extent_id != tail.extent.extent_id {
-                            state.commit = 0;
+                            state.reset_for_new_extent();
                         }
                         state.tail = Some(fresh);
                     }
                     continue;
                 }
+                // After 2 retries, force a new extent.
                 alloc_count += 1;
                 if alloc_count > MAX_ALLOC_PER_APPEND {
-                    return Err(anyhow!("too many extent allocations ({alloc_count}) for single append, giving up"));
+                    return Err(anyhow!("too many extent allocations ({alloc_count}) for single append, giving up: {err}"));
                 }
+                drop(state);
                 match self.alloc_new_extent(stream_id, 0).await {
                     Ok((_, new_tail_ext)) => {
                         let replica_addrs = self.replica_addrs_for_extent(&new_tail_ext).await?;
-                        state.commit = 0;
+                        let mut state = state_arc.lock().await;
+                        state.reset_for_new_extent();
                         state.tail = Some(StreamTail {
                             extent: new_tail_ext,
                             replica_addrs,
                         });
                         retry = 0;
+                        drop(state);
                         continue;
                     }
                     Err(alloc_err) => {
                         self.append_metrics.record(
                             &self.owner_key,
-                            lock_wait,
+                            lock_wait_total,
                             extent_lookup_elapsed,
                             fanout_elapsed,
                             append_started_at.elapsed(),
@@ -741,46 +868,8 @@ impl StreamClient {
                     }
                 }
             }
-            let appended =
-                first_resp.ok_or_else(|| anyhow!("append failed: no replica response"))?;
 
-            // Update cached commit for next append.
-            state.commit = appended.end;
-
-            if appended.end >= self.max_extent_size {
-                let (_, new_tail_ext) = self.alloc_new_extent(stream_id, appended.end).await?;
-                let replica_addrs = self.replica_addrs_for_extent(&new_tail_ext).await?;
-                state.commit = 0;
-                state.tail = Some(StreamTail {
-                    extent: new_tail_ext,
-                    replica_addrs,
-                });
-            }
-
-            let total_elapsed = append_started_at.elapsed();
-            tracing::debug!(
-                stream_id,
-                payload_len,
-                lock_wait_ms = lock_wait.as_secs_f64() * 1000.0,
-                extent_lookup_ms = extent_lookup_elapsed.as_secs_f64() * 1000.0,
-                fanout_ms = fanout_elapsed.as_secs_f64() * 1000.0,
-                total_ms = total_elapsed.as_secs_f64() * 1000.0,
-                retry,
-                "append_payload"
-            );
-            self.append_metrics.record(
-                &self.owner_key,
-                lock_wait,
-                extent_lookup_elapsed,
-                fanout_elapsed,
-                total_elapsed,
-                retry as u64,
-            );
-            return Ok(AppendResult {
-                extent_id: tail.extent.extent_id,
-                offset: appended.offset,
-                end: appended.end,
-            });
+            return Err(anyhow!("append: no response and no error"));
         }
     }
 

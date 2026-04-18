@@ -174,6 +174,45 @@ impl RpcClient {
         }
     }
 
+    /// Send a vectored request and return the receiver for the response,
+    /// without awaiting. Enables pipelined send + parallel await patterns
+    /// where multiple requests are fired under a mutex and their responses
+    /// awaited outside the mutex concurrently.
+    ///
+    /// The byte-level writer.lock().await is held only long enough to
+    /// write the frame (microseconds). The oneshot receiver is inserted
+    /// into `pending` before the write, so the background reader can
+    /// dispatch the response as soon as it arrives.
+    pub async fn send_vectored(
+        &self,
+        msg_type: u8,
+        payload_parts: Vec<Bytes>,
+    ) -> Result<oneshot::Receiver<Frame>, RpcError> {
+        let req_id = self.next_id.get();
+        self.next_id.set(req_id.wrapping_add(1));
+
+        let payload_len: usize = payload_parts.iter().map(|p| p.len()).sum();
+        let hdr = Frame::encode_request_header(req_id, msg_type, payload_len as u32);
+
+        let (tx, rx) = oneshot::channel();
+        self.pending.borrow_mut().insert(req_id, tx);
+
+        let mut bufs: Vec<Bytes> = Vec::with_capacity(1 + payload_parts.len());
+        bufs.push(Bytes::copy_from_slice(&hdr));
+        bufs.extend(payload_parts);
+
+        {
+            let mut writer = self.writer.lock().await;
+            let BufResult(result, _) = writer.write_vectored_all(bufs).await;
+            if let Err(e) = result {
+                self.pending.borrow_mut().remove(&req_id);
+                return Err(RpcError::Io(e));
+            }
+        }
+
+        Ok(rx)
+    }
+
     /// Send a vectored request with a timeout.
     pub async fn call_vectored_timeout(
         &self,

@@ -103,6 +103,24 @@ impl ConnPool {
         }
     }
 
+    /// Send a vectored request and return the oneshot receiver for the
+    /// response, without awaiting. Enables R3 pipelining: StreamClient
+    /// fires 3 `send_vectored` calls under a short mutex, then awaits
+    /// all 3 receivers concurrently outside the mutex.
+    pub async fn send_vectored(
+        &self,
+        addr: &str,
+        msg_type: u8,
+        payload_parts: Vec<Bytes>,
+    ) -> Result<futures::channel::oneshot::Receiver<autumn_rpc::Frame>> {
+        let sock = parse_addr(addr)?;
+        let client = self.get_client(sock).await?;
+        client
+            .send_vectored(msg_type, payload_parts)
+            .await
+            .map_err(|e| anyhow!("{}", e))
+    }
+
     pub fn is_healthy(&self, addr: &str) -> bool {
         let Ok(sock) = parse_addr(addr) else {
             return false;
