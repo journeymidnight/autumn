@@ -1287,3 +1287,84 @@ impl StreamClient {
         }
     }
 }
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+
+    #[test]
+    fn lease_no_collision() {
+        let mut state = StreamAppendState::new();
+        let (o0, e0) = state.lease(100);
+        let (o1, e1) = state.lease(200);
+        let (o2, e2) = state.lease(50);
+        assert_eq!(o0, 0);
+        assert_eq!(e0, 100);
+        assert_eq!(o1, 100);
+        assert_eq!(e1, 300);
+        assert_eq!(o2, 300);
+        assert_eq!(e2, 350);
+        assert_eq!(state.in_flight, 3);
+        assert_eq!(state.lease_cursor, 350);
+    }
+
+    #[test]
+    fn ack_advances_commit_on_prefix() {
+        let mut state = StreamAppendState::new();
+        let (o0, e0) = state.lease(100);    // 0..100
+        let (o1, e1) = state.lease(100);    // 100..200
+        let (o2, e2) = state.lease(100);    // 200..300
+
+        // Ack out of order: middle first, then tail, then head.
+        state.ack(o1, e1);                  // pending=[100..200], commit=0, in_flight=2
+        assert_eq!(state.commit, 0);
+        assert_eq!(state.in_flight, 2);
+        assert!(state.pending_acks.contains_key(&100));
+
+        state.ack(o2, e2);                  // pending=[100..200, 200..300], commit=0, in_flight=1
+        assert_eq!(state.commit, 0);
+        assert_eq!(state.in_flight, 1);
+
+        state.ack(o0, e0);                  // pending.drain: 0..100 matches, then 100..200, then 200..300. commit=300.
+        assert_eq!(state.commit, 300);
+        assert_eq!(state.in_flight, 0);
+        assert!(state.pending_acks.is_empty());
+    }
+
+    #[test]
+    fn rewind_on_error_most_recent() {
+        let mut state = StreamAppendState::new();
+        let (o0, _e0) = state.lease(100);   // 0..100
+        let (o1, _e1) = state.lease(200);   // 100..300, most recent
+        assert_eq!(state.lease_cursor, 300);
+        assert_eq!(state.in_flight, 2);
+
+        // Simulate error on the most-recently-leased batch (o1).
+        state.rewind_or_poison(o1, 200);
+        assert_eq!(state.lease_cursor, 100);
+        assert_eq!(state.in_flight, 1);
+        assert!(!state.poisoned);
+
+        // A subsequent lease starts at the rewound cursor.
+        let (o2, e2) = state.lease(50);
+        assert_eq!(o2, 100);
+        assert_eq!(e2, 150);
+
+        // Silence unused binding.
+        let _ = o0;
+    }
+
+    #[test]
+    fn poison_on_error_mid_sequence() {
+        let mut state = StreamAppendState::new();
+        let (o0, _) = state.lease(100);     // 0..100
+        let (_, _) = state.lease(200);      // 100..300 — most recent, still in-flight
+        assert_eq!(state.in_flight, 2);
+
+        // Simulate error on the OLDER batch (o0). lease_cursor is currently 300 != 0+100.
+        state.rewind_or_poison(o0, 100);
+        assert!(state.poisoned);
+        assert_eq!(state.lease_cursor, 300);  // not rewound
+        assert_eq!(state.in_flight, 1);
+    }
+}
