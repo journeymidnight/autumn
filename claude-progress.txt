@@ -1,6 +1,6 @@
 Date: 2026-04-18
-TaskStatus: not_completed
-Task scope: F095 — Perf R1 partition scale-out + batch cap sweep (Tier C, hypothesis refuted)
+TaskStatus: completed
+Task scope: F096 R2 Task 7 — Phase 1 flamegraph analysis + chosen path commit
 
 Current summary:
   Ran on branch `perf-r1-partition-scale-out` (worktree /data/dongmao_dev/autumn-perf-r1),
@@ -52,3 +52,16 @@ Next steps:
   just configure the cluster post-merge):
   - N>=2 -> write p99 drops 5.7x (20 ms -> 3.5 ms)
   - N=4  -> read ops/s +30 %
+
+  R2 Task 7 completed (2026-04-18):
+  - 4 flamegraph SVGs extracted (C1–C4), top-20 hotspots documented.
+  - Decision rules applied: Path (iii) selected (ps-conn aggregate 121.5% > 100%).
+  - Analysis doc committed: docs/superpowers/diagnosis/2026-04-18-perf-r2-flamegraph-analysis.md
+  - Commit SHA: 30e0e6b (branch perf-r1-partition-scale-out)
+  - Phase 2 code edits now unblocked.
+
+  Next steps (Phase 2 — Path iii implementation):
+  - lib.rs handle_ps_connection (794–893): eliminate per-request oneshot + req_tx.send overhead
+  - lib.rs spawn_write_request (1079–1100): reduce per-write compio::spawn cost
+  - rpc_handlers.rs handle_put (96–118): replace per-request oneshot with batch reply slot
+  - background.rs background_write_loop (284–412): reduce reply fanout overhead
