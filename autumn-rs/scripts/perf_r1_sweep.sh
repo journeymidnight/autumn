@@ -22,9 +22,12 @@ STORAGE_MODE="${STORAGE_MODE:-shm}"
 REPS="${REPS:-3}"
 
 case "$STORAGE_MODE" in
-    shm)                CLUSTER_FLAGS="";                  REPLICAS=3 ;;
-    3disk)              CLUSTER_FLAGS="--3disk";           REPLICAS=3 ;;
-    multidisk-1node)    CLUSTER_FLAGS="--multidisk-1node"; REPLICAS=1 ;;
+    shm)                CLUSTER_FLAGS="";                  REPLICAS=3
+                        export AUTUMN_DATA_ROOT="/dev/shm/autumn-rs" ;;
+    3disk)              CLUSTER_FLAGS="--3disk";           REPLICAS=3
+                        export AUTUMN_DATA_ROOT="/tmp/autumn-rs" ;;
+    multidisk-1node)    CLUSTER_FLAGS="--multidisk-1node"; REPLICAS=1
+                        export AUTUMN_DATA_ROOT="/tmp/autumn-rs" ;;
     *) echo "unknown STORAGE_MODE=$STORAGE_MODE" >&2; exit 1 ;;
 esac
 
