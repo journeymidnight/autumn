@@ -22,10 +22,12 @@ AC="$SCRIPT_DIR/target/release/autumn-client"
 USE_SHM=0
 UPDATE_BASELINE=""
 PARTITIONS=1
+SKIP_CLUSTER=0
 while (( $# > 0 )); do
     case "$1" in
         --shm)              USE_SHM=1 ;;
         --update-baseline)  UPDATE_BASELINE="--update-baseline" ;;
+        --skip-cluster)     SKIP_CLUSTER=1 ;;
         --partitions)
             shift
             PARTITIONS="${1:-}"
@@ -68,9 +70,13 @@ cd "$SCRIPT_DIR"
 cargo build --workspace --release --exclude autumn-fuse 2>&1 | grep -E "^(Compiling|Finished|error)" || true
 
 # Fresh 3-replica cluster (data root => $AUTUMN_DATA_ROOT, picked up by cluster.sh)
-echo "[perf-check] clean + start 3-replica cluster on $STORAGE_LABEL..."
-bash "$SCRIPT_DIR/cluster.sh" clean
-bash "$SCRIPT_DIR/cluster.sh" start 3
+if (( SKIP_CLUSTER == 0 )); then
+    echo "[perf-check] clean + start 3-replica cluster on $STORAGE_LABEL..."
+    bash "$SCRIPT_DIR/cluster.sh" clean
+    bash "$SCRIPT_DIR/cluster.sh" start 3
+else
+    echo "[perf-check] --skip-cluster: assuming cluster is already running"
+fi
 
 # Run perf-check (baseline file lives next to this script)
 # Parameters match production-style load: 256 threads, 4KB values, nosync (group-commit path)
