@@ -84,10 +84,13 @@ Any of these, if needed, is Round 2+ scope.
 
 ### 3.3 Storage Modes
 
-| Mode | Data root | WAL dir | Purpose |
-|------|-----------|---------|---------|
-| `--shm` (primary) | `/dev/shm/autumn-rs/d{i}` | same dir | CPU/protocol ceiling measurement; disk cost removed |
-| `--3disk` (secondary) | node1→`/data03/autumn-rs/d1`, node2→`/data05/autumn-rs/d2`, node3→`/data08/autumn-rs/d3` | same per-node dir | Production-like ceiling on NVMe |
+| Mode | Data root | WAL dir | Replicas | Nodes | Purpose |
+|------|-----------|---------|----------|-------|---------|
+| `--shm` (primary) | `/dev/shm/autumn-rs/d{i}` | same dir | 3 | 3 | CPU/protocol ceiling measurement; disk cost removed |
+| `--3disk` (secondary) | node1→`/data03/autumn-rs/d1`, node2→`/data05/autumn-rs/d2`, node3→`/data08/autumn-rs/d3` | same per-node dir | 3 | 3 | Production-like ceiling on NVMe; 1 node per disk |
+| `--multidisk-1node` (control) | single node with `--data /data03,/data05,/data08` | same dir | 1 | 1 | Isolate multi-disk ingest ceiling from replication overhead (F021 exercise) |
+
+The `--multidisk-1node` control answers the factor question: when `--3disk` (3 nodes × 1 disk × 3 replicas) and `--multidisk-1node` (1 node × 3 disks × 1 replica) both use the same three physical NVMes, does throughput come from disk parallelism (then the two should be comparable, mod replication tax) or from node parallelism (then `--3disk` wins regardless)? The answer shapes where Round 2 should attack.
 
 ### 3.4 Matrix
 
@@ -115,15 +118,24 @@ Phase A1 decision: if write ops/s scales near-linearly from N=1 to N=8, main hyp
 - If A1 was clearly linear up to N=8 but peak still < 100 k → add N=16 at best cap; 3 reps.
 - If A2 cap=1024 still showed gains → add cap=2048; 3 reps.
 
-**Phase A4 — 3-disk spot-checks** (real NVMe control points, independent of A1–A3)
+**Phase A4 — `--3disk` spot-checks** (real NVMe 3-node 3-replica, independent of A1–A3)
 
 | Point | (N, cap) | Reps |
 |-------|----------|------|
-| Baseline parity | (1, 256) — same as compio baseline | 3 |
+| Baseline parity | (1, 256) — same shape as compio baseline | 3 |
 | Peak parity | (N*, cap*) — best of A1+A2 | 3 |
 | Mid-point sanity | (2, 256) | 3 |
 
 Total: 9 runs.
+
+**Phase A5 — `--multidisk-1node` control** (1 node × 3 NVMes × 1 replica, F021 exercise)
+
+| Point | (N, cap) | Reps |
+|-------|----------|------|
+| Baseline parity | (1, 256) | 3 |
+| Peak parity | (N*, cap*) — best of A1+A2 | 3 |
+
+Total: 6 runs. Purpose is diagnostic (Round 2 input), not a target. Results published as-is in the spec appendix regardless of absolute ops/s.
 
 **Wall-clock budget**
 
@@ -131,8 +143,9 @@ Total: 9 runs.
 - A2: 9 × ~3 min ≈ 27 min
 - A3: 0–6 × ~3 min ≈ 0–18 min
 - A4: 9 × ~3 min ≈ 27 min
-- Setup + reset overhead: ~20 min
-- **Total**: ~2 hours
+- A5: 6 × ~3 min ≈ 18 min
+- Setup + reset overhead: ~25 min (extra reset between storage modes)
+- **Total**: ~2.5 hours
 
 ### 3.5 Data Captured Per Run
 
@@ -159,6 +172,7 @@ CPU snapshots: `ps -o pid,pcpu,comm -p <autumn-ps-pid>` and same for one extent-
 
 2. **`autumn-rs/cluster.sh`**
    - Add `--3disk` mode: when set, maps node1→`/data03/autumn-rs/d1`, node2→`/data05/autumn-rs/d2`, node3→`/data08/autumn-rs/d3`. Requires exactly 3 extent nodes (errors otherwise). WAL dir = same per-node dir.
+   - Add `--multidisk-1node` mode: when set, starts exactly 1 extent node with `--data /data03/autumn-rs/d1,/data05/autumn-rs/d2,/data08/autumn-rs/d3` (comma-separated list, ExtentNode's existing multi-disk support from F021). Replica factor forced to 1 (`./cluster.sh start 1 --multidisk-1node`). Incompatible with `--shm` and `--3disk`; combining them errors.
    - Existing `--shm` and default disk modes untouched.
 
 3. **`autumn-partition-server` (library)**
@@ -174,7 +188,7 @@ CPU snapshots: `ps -o pid,pcpu,comm -p <autumn-ps-pid>` and same for one extent-
 6. **`autumn-rs/scripts/perf_r1_sweep.sh`** — matrix driver. Env-configurable:
    - `PARTITIONS="1 2 4 8"`
    - `CAPS="256"` (A1) or `"256 512 1024"` (A2)
-   - `STORAGE_MODES="shm"` or `"shm 3disk"`
+   - `STORAGE_MODES="shm"` or `"shm 3disk multidisk-1node"`
    - `REPS=3`
    - Flow per combination: `./cluster.sh reset 3 [--3disk]` → `presplit.sh --count N` → `AUTUMN_GROUP_COMMIT_CAP=$CAP perf_check.sh [--shm] --partitions N` (without `--update-baseline`, so the JSON baseline on `compio` stays untouched until Round 1 reports Tier A) → append row to CSV.
    - At end: print median/mean table, tag rows crossing Tier A / B thresholds.
@@ -213,12 +227,13 @@ FXXX id: to be assigned at plan phase by scanning highest existing Fnnn in `feat
 All commits on `perf-r1-partition-scale-out`. Order:
 
 1. `perf(R1): --partitions + group-commit-cap env knob`
-2. `perf(R1): --3disk mode in cluster.sh`
+2. `perf(R1): --3disk + --multidisk-1node modes in cluster.sh`
 3. `perf(R1): presplit + sweep scripts (throwaway)`
 4. `perf(R1): A1 partition sweep results` (CSV + spec appendix, no code)
 5. `perf(R1): A2 batch cap sweep results`
 6. `perf(R1): A4 3-disk spot-check results`
-7. `perf(R1): conclusion + feature_list + progress` (+ baseline update if Tier A)
+7. `perf(R1): A5 multidisk-1node control results`
+8. `perf(R1): conclusion + feature_list + progress` (+ baseline update if Tier A)
 
 Rules:
 - Co-author line `Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>` on every commit.
@@ -264,7 +279,7 @@ Expected Round 2 candidates (priority order, Round 2 brainstorming will pick):
 ## 10. Open Questions for User Review
 
 1. The 2-h wall-clock budget for the full matrix assumes the cluster comes up cleanly on each `reset`. If that is not reliable, do we stretch the budget or trim the matrix (e.g. drop reps from 3 to 2)?
-2. Should `--3disk` also exercise the existing 1-node multi-disk mode (F021) as a control (`--multidisk /data03,/data05,/data08` on one node, 1 replica) — or is that out of scope for Round 1?
+2. ~~Should `--3disk` also exercise the existing 1-node multi-disk mode (F021) as a control (`--multidisk /data03,/data05,/data08` on one node, 1 replica) — or is that out of scope for Round 1?~~ **Resolved 2026-04-18**: include as Phase A5 (`--multidisk-1node`, see §3.3 / §3.4 A5).
 3. Is the FXXX id auto-assigned (F095) acceptable, or do you want a different bucket (e.g. a new P5 section for perf iterations)?
 
 ---
