@@ -287,6 +287,17 @@ Expected Round 2 candidates (priority order, Round 2 brainstorming will pick):
 2. ~~Should `--3disk` also exercise the existing 1-node multi-disk mode (F021) as a control (`--multidisk /data03,/data05,/data08` on one node, 1 replica) — or is that out of scope for Round 1?~~ **Resolved 2026-04-18**: include as Phase A5 (`--multidisk-1node`, see §3.3 / §3.4 A5).
 3. ~~Is the FXXX id auto-assigned (F095) acceptable, or do you want a different bucket (e.g. a new P5 section for perf iterations)?~~ **Resolved 2026-04-18**: F095.
 
+## Appendix T0 · Compio backend confirmation (2026-04-18)
+
+- Kernel: `6.1.0-31-amd64` (exceeds 5.1 requirement)
+- compio: `0.18.0`; compio-driver `0.11.4`; default feature inherited (no crate disables defaults)
+- All crates use compio 0.18.x without `default-features = false`; features used: `net`, `time`, `macros`, `dispatcher`, `fs`
+- manager (autumn-manager-server, pid 4008720) /proc/fd io_uring anon_inode present: **yes** (fd=4 → anon_inode:[io_uring])
+- PS (autumn-ps, pid 4013686) /proc/fd io_uring anon_inode present: **yes** (fd=11,12,129,130,131 → anon_inode:[io_uring])
+- node1 (autumn-extent-node, pid 4008740) /proc/fd io_uring anon_inode present: **yes** (fd=4 → anon_inode:[io_uring])
+- strace 2s under load: **SKIPPED** — strace binary not available; steps 2-4 sufficient evidence
+- Conclusion: **compio is using io_uring on PS and node1 (the throughput-critical processes).** All three processes confirm successful io_uring backend initialization. Experiment is clear to proceed to Task 1.
+
 ---
 
 *End of spec.*
