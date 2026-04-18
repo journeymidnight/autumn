@@ -497,6 +497,12 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 - **Notes:** 见 claude-progress.txt。
 - **passes:** true
 
+### F096 · Perf R2 — Flamegraph profile, then optimize single highest-leverage path (perf-r1-partition-scale-out branch)
+- **Target:** Write ≥ 65 000 ops/s on `perf_check.sh --shm --partitions 1` median of 3 (Tier B'). Two-phase plan: flamegraph diagnosis chooses one of three paths (pipeline-depth, hot-fn micro-opt, leader-follower); implement; verify. Full detail: `docs/superpowers/specs/2026-04-18-perf-r2-profile-then-optimize-design.md`.
+- **Evidence:** spec + plan in `docs/superpowers/{specs,plans}/` · 4 flamegraph SVGs in `autumn-rs/scripts/perf_r2_svgs/` · analysis doc `docs/superpowers/diagnosis/2026-04-18-perf-r2-flamegraph-analysis.md` (chosen path = iii) · `autumn-rs/scripts/perf_r1_results.csv` R2-iii-* rows · `AUTUMN_LEADER_FOLLOWER` + `AUTUMN_LF_COLLECT_MICROS` env knobs · pprof-rs integration behind `profiling` feature.
+- **Notes:** **Tier C · Path (iii) did not close the gap.** Chosen path = (iii) leader-follower coalescing. Best write cell: (shm, N=1, LF=1, window=100 µs) 3-rep median = **54 652 ops/s**, read = 69 248, p99w = 22.00 ms — +3.8 %/−5.7 % vs R1 N=1 (52 637/73 462/20.02 ms), within noise. Miss 65 k gate by ~10 k. Root cause: 256 client threads × 4 ms RPC = ~64 k theoretical ceiling; coalescing reduces per-request overhead but cannot break the serialization × RTT product. Batch size averaged 1.04 under contention. Round 3 direction: parallel P-log threads (revisit Path i at higher client thread counts), or reduce per-batch RPC cost (quorum-on-2), or client-side pipelining depth > 1, or multi-PS partition isolation. Path (i) / Path (ii) reserved for R3 evaluation.
+- **passes:** false
+
 ### F095 · Perf R1 — Partition scale-out + batch cap sweep (perf-r1-partition-scale-out branch)
 - **Target:** 目标 write ≥ 100k ops/s on `perf_check.sh --shm`（对比 F094 baseline 54.5k）。通过 partition pre-split + group-commit cap 扫描，不动 PS/Stream/RPC 热路径逻辑。验收分档 Tier A=100k / B=80k / C<80k。实验完整细节见 `docs/superpowers/specs/2026-04-18-perf-r1-partition-scale-out-design.md`（spec + plan + appendix 全部committed on branch).
 - **Evidence:** spec + plan 于 `docs/superpowers/specs/` & `docs/superpowers/plans/` · 27 计时运行原始数据于 `autumn-rs/scripts/perf_r1_results.csv` · A1–A5 median 表 & T1 client-threads 探针 在 spec Appendix R 小节。

@@ -301,6 +301,60 @@ Round 3 candidates (in priority order, as a starting menu — not prescriptive):
 
 None at spec-write time — all prior clarifying questions resolved during §1–§4 approvals. If user spots an issue during spec review, it will be recorded and addressed here.
 
+### Appendix R2-Final · Results + Tier Verdict (2026-04-18)
+
+**Chosen path**: (iii) Leader-follower WriteImpl analog.
+
+**Implementation**: `crates/partition-server/src/write_batch_builder.rs` (new module, 211 lines) + feature-flagged via `AUTUMN_LEADER_FOLLOWER` env. Collection window tunable via `AUTUMN_LF_COLLECT_MICROS` (default 100 µs).
+
+**Phase 2 sub-task progression**:
+1. `77cff64` — WriteBatchBuilder skeleton + failing test
+2. `e9ab495` — test passes (green phase)
+3. `6df41fe` — wired into `handle_put` + `background_write_loop` (feature-flagged); initial fix of AtomicWaker→Vec<Waker> single-waker bug discovered during integration
+4. `f6d97ba` — batching collection window (await_first + 500 µs window initially)
+5. `cbb9b2d` — tuned default window 500 µs → 100 µs (500 µs regressed to ~36 k)
+
+**Final 3-rep medians** (`perf_check.sh --shm --partitions 1`, `AUTUMN_LEADER_FOLLOWER=1`, 100 µs window):
+
+| Metric | rep 1 | rep 2 | rep 3 | median |
+|--------|------:|------:|------:|-------:|
+| write ops/s | 53 002 | 57 703 | 54 652 | **54 652** |
+| read  ops/s | 69 248 | 69 499 | 66 679 | **69 248** |
+| write p99 (ms) | 22.00 | 22.57 | 20.52 | **22.00** |
+
+**vs R1 N=1 median (52 637 / 73 462 / 20.02 ms)**:
+- write: +3.8 % (within noise)
+- read:  −5.7 % (within noise)
+- p99 w: comparable
+
+**vs Tier B' gate (65 000 ops/s write)**: **miss by 10 348 ops/s**.
+
+### Verdict: **Tier C — R2 `not_completed`**
+
+**Why Path (iii) did not clear the gate**: Under single-partition, all 256 client threads serialize through one P-log thread which itself is bounded by a ~4 ms round-trip to ExtentNode fanout. Theoretical ceiling at 256 threads: `256 / 0.004 s ≈ 64 000` ops/s. Observed 54.6 k is 85 % of this ceiling — Path (iii) reduced per-request overhead but cannot break the serialization x RTT product. Batch coalescing did not materialize (avg batch ~1.04 under contention: leader drain + short collection window still processes pushes faster than they can queue up).
+
+**What Path (iii) DID achieve**:
+- Removed the per-request `compio::spawn` in the PUT hot path (flamegraph attributed 12.9 % of samples to this at R1 time).
+- Established a cleaner request-batching scaffold (`WriteBatchBuilder`) that future rounds can extend with less friction.
+- Confirmed empirically that the 52 k → 65 k gap is not closeable via dispatch-side optimization alone.
+
+### Round 3 handoff
+
+**Architectural options to break the 256-thread × 4 ms ceiling**:
+1. **Parallel P-log threads** per partition — split the single P-log into multiple threads that interleave append_batch calls against ExtentNode with offset windowing. Requires lifting `StreamClient`'s per-stream mutex, which R2 Path (i) had planned but was passed over because flamegraph showed only 7.3 % I/O wait (Path (iii) won priority). Revisit at higher client thread counts where I/O wait would become dominant.
+2. **Reduce per-batch RPC cost** via quorum-on-2 or speculative writes (accept on 2-of-3 replicas, not all 3). Structural change to the stream commit protocol.
+3. **Increase client in-flight per thread** — today each client thread has exactly 1 in-flight request. A 2- or 4-deep client pipeline would lift the effective concurrency ceiling.
+4. **Multi-PS / partition-level network isolation** — decouple partitions so their P-log threads run on separate PS processes with separate listen sockets.
+
+### Round 2 net outputs (usable regardless of Tier C)
+
+- **`AUTUMN_LEADER_FOLLOWER` env** feature-flags the new path; default off preserves R1 behavior bit-for-bit.
+- **`AUTUMN_LF_COLLECT_MICROS` env** exposes the collection window for future tuning.
+- **pprof-rs profiling hook** (`AUTUMN_PPROF_SECS` / `AUTUMN_PPROF_OUT` / `AUTUMN_PPROF_THREADS`) behind `--features profiling` — reusable for Round 3 diagnosis.
+- **Per-thread CPU helper** `scripts/perf_r2_thread_cpu.py` — keeper.
+- **Full flamegraph capture pipeline** (`scripts/perf_r2_flamegraph.sh` + SVG outputs) — reference data for Round 3.
+- **`debug = 1` + `force-frame-pointers`** in release build — kept for future profiling rounds.
+
 ---
 
 *End of spec.*
