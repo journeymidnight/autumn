@@ -75,7 +75,8 @@ pub(crate) fn leader_follower_enabled() -> bool {
 
 /// Microseconds the leader waits after receiving the FIRST push to let more
 /// writes accumulate (collection window). Read once from env
-/// `AUTUMN_LF_COLLECT_MICROS`; default 500; range [0, 10000].
+/// `AUTUMN_LF_COLLECT_MICROS`; default 100; range [0, 10000].
+/// 100µs empirically tied R1's 52k baseline; 500µs regressed to ~36k.
 pub(crate) fn lf_collect_micros() -> u64 {
     static CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *CELL.get_or_init(|| {
@@ -83,7 +84,7 @@ pub(crate) fn lf_collect_micros() -> u64 {
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|&n| n <= 10_000)
-            .unwrap_or(500)
+            .unwrap_or(100)
     })
 }
 
