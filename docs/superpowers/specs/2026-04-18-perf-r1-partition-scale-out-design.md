@@ -320,6 +320,67 @@ Four pre-matrix smoke runs validated the Round 1 infrastructure end to end. Numb
 - `--3disk` vs `--shm` at N=1: write parity (51 k ≈ 52 k), read −17 % (68 k vs 82 k). NVMe not write-bound; read delta may be kernel page-cache.
 - `--multidisk-1node` (replica=1) vs `--3disk` (replica=3) at N=1: write 53 k vs 51 k (+4 %), read 76 k vs 68 k (+12 %). Replication tax at most modest on this hardware at N=1.
 
+### Appendix A1–A5 · Matrix results (2026-04-18)
+
+**27 timed runs** across 7 (phase, mode, N) cells, 3 reps each. Raw data in `autumn-rs/scripts/perf_r1_results.csv`.
+
+| Phase | Mode | N | w median | r median | p99 write | w mean | r mean |
+|-------|------|---|---------:|---------:|----------:|-------:|-------:|
+| A0 | `--shm` | 1 | 51 236 | 82 315 | 20.66 ms | 52 350 | 81 855 |
+| A1 | `--shm` | 1 | **52 637** | 73 462 | 20.02 ms | 52 581 | 75 639 |
+| A1 | `--shm` | 2 | 45 017 | 82 359 | 4.49 ms | 46 783 | 85 166 |
+| A1 | `--shm` | 4 | 43 898 | **95 599** | 3.52 ms | 43 945 | 95 458 |
+| A1 | `--shm` | 8 | *bootstrap failed* | | | | |
+| A4 | `--3disk` | 1 | 50 331 | 75 738 | 6.67 ms | 49 457 | 77 634 |
+| A4 | `--3disk` | 2 | 33 141 | **100 886** | 7.32 ms | 32 360 | 98 574 |
+| A5 | `--multidisk-1node` | 1 | **52 305** | 81 872 | 7.63 ms | 53 134 | 81 734 |
+
+**N=8 bootstrap failure** (A1): `create meta stream failed: code=4 internal error: connection closed` after 5/8 partitions created. Manager RPC instability under rapid stream-create; Round 2 candidate.
+
+### Appendix T1 · Client-threads probe (post-A1–A5 diagnostic)
+
+Ran at `--shm N=1 cap=3072` varying `--threads` to test whether the 52 k write ceiling was the client's in-flight-request cap rather than PS. Single rep per point — directional signal only.
+
+| threads | write ops/s | write p99 | read ops/s | read p99 |
+|--------:|------------:|----------:|-----------:|---------:|
+|     256 |      49 873 |   26.1 ms |     70 394 |   7.0 ms |
+|     512 |      **55 855** |  118.1 ms |     63 211 |  15.3 ms |
+|    1024 |       6 090 💥 |  814.2 ms |    **146 145** |   9.0 ms |
+
+**Conclusions**:
+1. Write peak at 256 → 512 threads (+12 %), then **queue collapse** at 1024 (write 6 k, p99 814 ms). The PS P-log thread is genuinely saturated near 55 k ops/s — not a client-pressure artifact.
+2. Read scales steeply with client threads: 146 k at 1024 threads, **well above** the 125 k microbench number we compared against at spec-writing time. Our Round 1 read targets in the tier ladder were underestimated.
+
+### Appendix R · Tier verdict + Round 2 handoff
+
+**Tier: C.** Best write = 52.6 k ops/s (`--shm` N=1). Below Tier B's 80 k and Tier A's 100 k. Partition scale-out alone cannot reach the target on this architecture.
+
+**Attribution** (A1 vs A4 vs A5 at N=1, plus T1 probe):
+
+| Cost | Evidence | Magnitude |
+|------|----------|-----------|
+| Replica fan-out (3→1) | A5 52.3 k ≈ A1 52.6 k | ≤ 1 % |
+| Disk (NVMe vs tmpfs) | A4 50.3 k ≈ A1 52.6 k | 4 % |
+| Multi-partition parallelism | A1 N=1 > N=2 > N=4 on write | negative |
+| Client concurrency | T1 256 → 512 → 1024: 49 k → 56 k → 6 k | peak at ~512, collapses beyond |
+| **PS single P-log thread** | PS CPU 173 % at N=1 saturates, N=4 goes to 2000 % CPU without throughput gain | **dominant** |
+
+**Round 2 direction** (evidence-guided):
+1. **PS per-stream mutex lift** — serialize by *offset window* not by *batch*; allow N in-flight batches per stream. Highest-probability unlock.
+2. **Group-commit inner loop profiling** — flamegraph the P-log thread at 49 k ops/s to see what's consuming 100 % of one core (WAL framing CRC? rkyv encode? channel plumbing?).
+3. **Manager stream-create RPC robustness** — N=8 bootstrap failure (Appendix A1) should be fixed before Round 2 matrix runs N>4.
+
+**Explicitly NOT Round 2 targets** (disproven):
+- ExtentNode multi-runtime (CPU idle at 14–36 % during writes)
+- EC for writes (replication tax ≤ 1 %)
+- Client connection-pool parallelism (PS, not client, is bound)
+
+### Round 1 net outputs (usable regardless of Tier)
+
+- **Write p99 5.7× improvement** at N≥2 (20 ms → 3.5 ms). Free tail-latency win from multi-partition.
+- **Read throughput +30 %** at N=4. Free on read-heavy workloads.
+- **Infrastructure**: `AUTUMN_GROUP_COMMIT_CAP` runtime knob, `cluster.sh --3disk / --multidisk-1node` modes, `perf_check.sh --partitions / --skip-cluster`, multi-partition perf-check read routing fix, bootstrap-wait scaling with N, stray-etcd pkill safety net.
+
 ---
 
 *End of spec.*

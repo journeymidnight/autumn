@@ -497,3 +497,9 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 - **Notes:** 见 claude-progress.txt。
 - **passes:** true
 
+### F095 · Perf R1 — Partition scale-out + batch cap sweep (perf-r1-partition-scale-out branch)
+- **Target:** 目标 write ≥ 100k ops/s on `perf_check.sh --shm`（对比 F094 baseline 54.5k）。通过 partition pre-split + group-commit cap 扫描，不动 PS/Stream/RPC 热路径逻辑。验收分档 Tier A=100k / B=80k / C<80k。实验完整细节见 `docs/superpowers/specs/2026-04-18-perf-r1-partition-scale-out-design.md`（spec + plan + appendix 全部committed on branch).
+- **Evidence:** spec + plan 于 `docs/superpowers/specs/` & `docs/superpowers/plans/` · 27 计时运行原始数据于 `autumn-rs/scripts/perf_r1_results.csv` · A1–A5 median 表 & T1 client-threads 探针 在 spec Appendix R 小节。
+- **Notes:** **Tier C · 主假设被证伪**。峰值 write = 52.6 k ops/s (`--shm` N=1)，未达 Tier B 的 80 k。归因（A4 vs A5 vs A1 + T1 探针）：replica 扇出税 ≤ 1 %、NVMe vs tmpfs 4 %、多 partition 并行甚至负贡献（write 随 N 下降），瓶颈明确落在**单 partition PS P-log 线程**（PS CPU 173 % 饱和一核；N=4 CPU 2000 % 但 throughput 反而跌至 44 k；T1 probe 显示 1024 clients 下 write 崩到 6 k 而 read 到 146 k）。副产出：N≥2 时 write p99 从 20 ms → 3.5 ms (5.7×)、read +30 % at N=4。Round 2 方向：PS per-stream mutex lift + group-commit 内循环 profiling + manager stream-create N=8 robustness。明确 **不** 是 Round 2 对象：ExtentNode 多 runtime、EC、client pool 并行。
+- **passes:** false
+

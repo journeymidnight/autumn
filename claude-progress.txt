@@ -1,76 +1,54 @@
-Date: 2026-04-17
-TaskStatus: completed
-Task scope: F088-F094 — 2-thread-per-partition cleanup (SstReader hygiene + PoolKind removal)
+Date: 2026-04-18
+TaskStatus: not_completed
+Task scope: F095 — Perf R1 partition scale-out + batch cap sweep (Tier C, hypothesis refuted)
 
 Current summary:
-  F088 (completed · passes: true):
-    机制：P-bulk 独立 OS thread + compio runtime + ConnPool + StreamClient::new_with_revision，
-    flush 通过 mpsc<FlushReq>/oneshot<FlushResp> 跨线程；P-log 保留 write_loop/compact_loop/
-    gc_loop/dispatch_rpc，单线程语义完整。58 unit tests 通过。
+  Ran on branch `perf-r1-partition-scale-out` (worktree /data/dongmao_dev/autumn-perf-r1),
+  base compio @ f09617e. Main `compio` worktree untouched. 15+ commits on the branch.
 
-  F089 (completed · passes: true):
-    perf_check.sh --shm 三次 (post-F088): 52785 / 54195 / 53612 ops/s, p99 17 / 22 / 10 ms。
-    相对 pre-F088 的 52k/18.95ms: 吞吐 +2%，p99 高方差；证明 PS-side flush HoL 不再是瓶颈，
-    真因是 ExtentNode 单 io_uring × 3× replica = 69k 理论上限。
+  Matrix (27 timed runs, 3 reps each except N=8 which failed bootstrap):
+    A0 shm N=1         median w=51 236  r=82 315   p99w=20.66 ms
+    A1 shm N=1         median w=52 637  r=73 462   p99w=20.02 ms   PS CPU 173 %
+    A1 shm N=2         median w=45 017  r=82 359   p99w= 4.49 ms   PS CPU 522 %
+    A1 shm N=4         median w=43 898  r=95 599   p99w= 3.52 ms   PS CPU 2000 %
+    A1 shm N=8         BOOTSTRAP FAILED (manager RPC "connection closed" at 5/8 partitions)
+    A4 3disk N=1       median w=50 331  r=75 738   p99w= 6.67 ms
+    A4 3disk N=2       median w=33 141  r=100 886  p99w= 7.32 ms
+    A5 multidisk-1node N=1 (replica=1) median w=52 305  r=81 872  p99w=7.63 ms
 
-  F090 (not_needed):
-    拆 compact 到 P-bulk 无法突破 ExtentNode 瓶颈；跳过。
+  T1 client-threads probe (shm N=1 cap=3072, 1 rep each):
+    threads=256   w=49 873   p99=26 ms    r=70 394   p99=7 ms
+    threads=512   w=55 855   p99=118 ms   r=63 211   p99=15 ms
+    threads=1024  w= 6 090 💥 p99=814 ms   r=146 145  p99=9 ms
 
-  F091 (not_needed · superseded):
-    用户定案：保持 2-thread-per-partition（P-log+read 共享一个 StreamClient，P-bulk 独立
-    StreamClient），放弃 ExtentNode spawn_blocking / 3-thread 扩展方向。44-53k ceiling
-    视为下游架构上限。
+  Tier decision: TIER C (write peak 52.6 k < Tier B 80 k).
+  Best cell: (N=1, cap=3072, storage=shm) — single partition + default batch cap.
 
-  F092 (completed · passes: true):
-    删除 `unsafe transmute::<Rc<SstReader>, Arc<SstReader>>` 的 soundness hole。
-    背景：3 处 transmute（background.rs:750、:1084、rpc_handlers.rs:261）发生在
-    compio::runtime::spawn_blocking 边界上；spawn_blocking 使用 pthread pool，跨 OS thread，
-    `Rc` 不是 Send，transmute 绕过编译器但绕不过原子 refcount 要求——真实的 soundness bug。
-    修复：
-      - SstReader.block_cache: RefCell<Vec<Option<Arc<DecodedBlock>>>>
-                            → parking_lot::Mutex<...>
-      - read_block 两段锁（先只读查 cache，miss 后无锁 decode，再短锁 install；并发 miss idempotent）
-      - PartitionData.sst_readers: Vec<Rc<SstReader>> → Vec<Arc<SstReader>>
-      - 4 处 Rc::new(reader) → Arc::new(reader)
-      - 3 处 transmute::<Rc,Arc> 全部删除，改为 .clone()
-      - get_discards_rc 与 get_discards 合并
-      - 新增 workspace dep: parking_lot = "0.12"
-    验证：cargo check --workspace 干净；58+36 tests 全绿。
+  Attribution (dominant bottleneck = PS single P-log thread):
+    replica fan-out (3→1)                <= 1 %  (A1 52.6 k ~= A5 52.3 k)
+    disk (NVMe vs tmpfs)                 4 %     (A4 50.3 k ~= A1 52.6 k)
+    multi-partition parallelism          NEG     (N=1 > N=2 > N=4 for writes)
+    client concurrency                   peaks at 512 threads, collapses at 1024
+    PS P-log thread saturation           DOMINANT (173 % CPU pegged; N=4 CPU 20 cores
+                                                   but throughput drops to 44 k)
+    ExtentNode                           NOT a bottleneck (CPU 14-36 % during writes)
 
-  F093 (completed · passes: true):
-    删除 F087-bulk-mux 的 PoolKind 分池。F088 独立 P-bulk SC + ConnPool 后，
-    P-log SC 专服 log_stream（+ 低频 compact）、P-bulk SC 专服 row/meta——
-    两条物理不交集，共享 socket HoL 场景消失，PoolKind 失去作用面。改动：
-      - 删 PoolKind 枚举 (conn_pool.rs)
-      - 合并 call_kind/call_vectored_kind 回 call/call_vectored
-      - ConnPool key: (SocketAddr, PoolKind) → SocketAddr
-      - StreamClient 删 stream_kinds DashMap + set_stream_kind + kind_for
-      - PartitionServer 删 4 处 set_stream_kind 调用
-      - spawn_bulk_thread 删除未用的 row_stream_id / meta_stream_id 参数
-      - crates/stream/CLAUDE.md note #11 改为 post-F093 说明
-      - feature_list F087-bulk-mux Notes 追加 "Obsoleted by F093"
-    验证：cargo check --workspace 干净；58+36 tests 全绿。
-
-  F094 (completed · passes: true):
-    perf_check.sh --shm 三次 (post-F092+F093):
-      R1: write 54535 ops/s p99 21.28ms, read 68817 ops/s p99 5.83ms
-      R2: write 48897 ops/s p99 27.20ms, read 73549 ops/s p99 6.03ms
-      R3: write 56984 ops/s p99  5.56ms, read 73546 ops/s p99 5.92ms
-      median: write 54535 / p99 21.28ms, read 73546 / p99 5.92ms
-      mean:   write 53472, read 71970
-    验收：
-      - Write ≥ 52k ops/s  → ✓ (median 54535, mean 53472, 接近 pre-F092 的 53612)
-      - Read  ≥ 73k ops/s  → ✓ (median 73546) / mean 71970 落在 ±3% 容差内
-      - p99 write ≤ 25ms   → median OK (R1=21.28, R3=5.56, R2=27.20 单次 outlier)
-    结论：F092+F093 合格。R2 的 p99 outlier 与 F088 实测的 22ms 尾延迟方差一致，
-    不是 regression，是 ExtentNode 侧 3× replica fanout 的固有抖动。
-    已更新 perf_baseline_shm.json（median 作为新基线）。
-
-Main gaps: none.
+Main gaps:
+  - Tier C verdict: partition scale-out alone cannot reach 100 k.
+  - Round 2 target: PS per-stream mutex lift + group-commit inner-loop profiling.
+  - Manager N=8 bootstrap RPC robustness needs a fix before any future N>4 matrix.
 
 Next steps:
-  1. git commit F088+F089+F092+F093+F094 的整体 stack（lib.rs / background.rs /
-     rpc_handlers.rs / sstable/reader.rs / stream client/conn_pool/lib / 三份
-     CLAUDE.md / Cargo.toml / Cargo.lock / perf_check.sh / perf_baseline_shm.json
-     / feature_list.md / claude-progress.txt）。
-  2. 后续若要继续抬升吞吐，方向是下游 extent 分片或单独重构 ExtentNode —— 不在本任务范围。
+  1. User decides whether to merge the Round 1 infrastructure (AUTUMN_GROUP_COMMIT_CAP env,
+     cluster.sh --3disk/--multidisk-1node, perf_check.sh --partitions/--skip-cluster,
+     multi-partition perf-check routing fix, bootstrap wait scaling, etcd pkill safety net)
+     back to compio. All are strict improvements independent of the Tier verdict.
+  2. If merged, perf_baseline_shm.json stays at F094 (52 k) since Round 1 did NOT improve
+     single-partition throughput.
+  3. Round 2 brainstorming opens with the attribution above as input. Skip ExtentNode
+     multi-runtime, EC, client pool parallelism (all disproven as bottlenecks).
+
+  Round 1 silver linings available if ever needed (no merge required to use them --
+  just configure the cluster post-merge):
+  - N>=2 -> write p99 drops 5.7x (20 ms -> 3.5 ms)
+  - N=4  -> read ops/s +30 %
