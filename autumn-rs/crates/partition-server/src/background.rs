@@ -361,7 +361,7 @@ pub(crate) async fn background_write_loop(
         }
 
         // Drain more without blocking.
-        while pending.len() < MAX_WRITE_BATCH {
+        while pending.len() < crate::max_write_batch() {
             match write_rx.next().now_or_never() {
                 Some(Some(req)) => pending.push(req),
                 _ => break,

@@ -43,7 +43,21 @@ use sstable::{IterItem, MemtableIterator, MergeIterator, SstBuilder, SstReader, 
 const FLUSH_MEM_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_SKIP_LIST: u64 = 256 * 1024 * 1024;
 const WRITE_CHANNEL_CAP: usize = 1024;
-const MAX_WRITE_BATCH: usize = WRITE_CHANNEL_CAP * 3;
+const DEFAULT_MAX_WRITE_BATCH: usize = WRITE_CHANNEL_CAP * 3;
+
+/// Group-commit request count cap. Read once from env `AUTUMN_GROUP_COMMIT_CAP`
+/// if set to a positive integer in [1, 1_000_000]; otherwise falls back to
+/// DEFAULT_MAX_WRITE_BATCH (3072). See docs/superpowers/specs/2026-04-18-*.md.
+fn max_write_batch() -> usize {
+    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("AUTUMN_GROUP_COMMIT_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0 && n <= 1_000_000)
+            .unwrap_or(DEFAULT_MAX_WRITE_BATCH)
+    })
+}
 const MAX_WRITE_BATCH_BYTES: usize = 30 * 1024 * 1024;
 const COMPACT_RATIO: f64 = 0.5;
 const HEAD_RATIO: f64 = 0.3;
@@ -345,7 +359,7 @@ impl WriteLoopMetrics {
             batches = self.batches,
             ops_per_sec = self.ops as f64 / elapsed.as_secs_f64().max(1e-9),
             avg_batch_size = self.batch_size_total as f64 / batches as f64,
-            fill_ratio = self.batch_size_total as f64 / (batches * MAX_WRITE_BATCH as u64) as f64,
+            fill_ratio = self.batch_size_total as f64 / (batches * max_write_batch() as u64) as f64,
             avg_phase1_ms = ns_to_ms(self.phase1_ns, batches),
             avg_phase2_ms = ns_to_ms(self.phase2_ns, batches),
             avg_phase3_ms = ns_to_ms(self.phase3_ns, batches),
@@ -363,7 +377,7 @@ fn write_batch_too_big(batch: &[WriteRequest]) -> bool {
         size += req.encoded_size();
         if size > MAX_WRITE_BATCH_BYTES { return true; }
     }
-    batch.len() > MAX_WRITE_BATCH
+    batch.len() > max_write_batch()
 }
 
 // ---------------------------------------------------------------------------
@@ -2158,5 +2172,47 @@ mod tests {
     #[test]
     fn resolve_value_inline_middle_slice() {
         assert_eq!(inline_subrange(b"0123456789", 3, 4), b"3456");
+    }
+}
+
+#[cfg(test)]
+mod env_knob_tests {
+    // `max_write_batch()` uses OnceLock and can only be initialized once per
+    // process. We test the underlying parsing logic by inlining the same
+    // expression, so the test does not depend on init order.
+    fn parse_env(raw: Option<&str>) -> usize {
+        raw.and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0 && n <= 1_000_000)
+            .unwrap_or(super::DEFAULT_MAX_WRITE_BATCH)
+    }
+
+    #[test]
+    fn default_when_unset() {
+        assert_eq!(parse_env(None), super::DEFAULT_MAX_WRITE_BATCH);
+    }
+
+    #[test]
+    fn parses_positive_in_range() {
+        assert_eq!(parse_env(Some("8192")), 8192);
+    }
+
+    #[test]
+    fn rejects_zero() {
+        assert_eq!(parse_env(Some("0")), super::DEFAULT_MAX_WRITE_BATCH);
+    }
+
+    #[test]
+    fn rejects_negative() {
+        assert_eq!(parse_env(Some("-1")), super::DEFAULT_MAX_WRITE_BATCH);
+    }
+
+    #[test]
+    fn rejects_too_large() {
+        assert_eq!(parse_env(Some("999999999999")), super::DEFAULT_MAX_WRITE_BATCH);
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert_eq!(parse_env(Some("abc")), super::DEFAULT_MAX_WRITE_BATCH);
     }
 }
