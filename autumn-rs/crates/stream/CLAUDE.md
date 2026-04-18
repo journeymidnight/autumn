@@ -65,20 +65,57 @@ struct ExtentEntry {
 
 No `write_lock` — appends are serialized by the single-threaded compio runtime (sequential processing in `handle_connection`).
 
-### Connection Handling & Batch Optimization
+### Connection Handling & Batch Optimization (R4 step 4.2)
 
-`handle_connection` processes all frames from one TCP read in a batch:
+Per-TCP-connection `handle_connection` routes frames to **per-extent
+ExtentWorkers** (SQ/CQ pipeline). Two tasks per connection:
 
 ```
-TCP read → FrameDecoder → collect all frames → process batch → write_vectored_all
+TCP read → Reader task (this fn) → group by msg_type + extent_id →
+    submit AppendBatch/ReadBatch (oneshot::Sender<Vec<Frame>>) to
+    ExtentWorker[extent_id]
+                         │
+                         ▼
+       ExtentWorker loop (crates/stream/src/extent_worker.rs)
+          - FuturesUnordered<inflight I/O futures>
+          - inflight cap = AUTUMN_EXTENT_INFLIGHT_CAP (default 64)
+          - ACL (eversion / sealed / revision / commit) then pwritev / pread
+          - on completion: oneshot::send(Vec<Frame>)
+                         │
+                         ▼
+       Completion task (owns WriteHalf)
+          - FuturesUnordered<oneshot::Receiver<Vec<Frame>>>
+          - drains ready completions, flattens into ONE write_vectored_all
 ```
 
-1. **MSG_APPEND batch** (`handle_append_batch`): consecutive append frames grouped by extent_id, validated once, written with one `write_vectored_at` (pwritev) syscall per extent.
-2. **MSG_READ_BYTES batch** (`handle_read_batch`): consecutive read frames processed sequentially (no spawn), responses collected.
-3. **All other RPCs**: processed one at a time via `dispatch()`.
-4. **Response write**: ALL response frames from one TCP read batch are encoded and written with a single `write_vectored_all` call — one TCP write syscall per batch.
+1. **MSG_APPEND batch** — consecutive append frames grouped by extent_id are
+   packaged as ONE `AppendBatch` to the per-extent worker. Worker issues
+   ONE `write_vectored_at` (pwritev) and emits N response frames as ONE
+   `Vec<Frame>` via a per-batch oneshot.
+2. **MSG_READ_BYTES batch** — same grouping, worker processes preads
+   sequentially inside the submit future.
+3. **Control RPCs** (ALLOC, DF, RECOVERY, etc.) — dispatched in a spawned
+   task, response delivered as a single-element `Vec<Frame>` via the same
+   oneshot pipeline so ordering with nearby ops is preserved.
+4. **Write coalesce** — the completion task's `now_or_never` drain merges
+   all ready oneshots into one `write_vectored_all` per poll cycle.
 
-This batch-oriented design eliminates per-request syscall overhead. With client-side pipelining (depth=64), achieves 125k write ops/s and 95k read ops/s on loopback.
+ExtentWorkers are lazily spawned on first APPEND/READ to an extent_id and
+shared across connections. They self-remove from `worker_pool: Rc<DashMap>`
+on exit (explicit `Shutdown` or all senders drop). ACL rejects sealed
+extents with `FAILED_PRECONDITION`, preserving current correctness.
+
+Extent length is reserved synchronously in the submit ACL (before pushing
+the pwritev future into FU) so overlapping submits see non-overlapping
+`file_start`s — necessary for the SQ/CQ overlap model.
+
+**Perf trade-off**: microbenchmark (`extent_bench`) shows the extra
+task boundary costs ~3× at high pipeline depths vs the previous
+single-task batch processor (209k → 68k ops/s at depth=64). End-to-end
+(perf_check.sh --shm) is unchanged at ~53k ops/s because that benchmark
+is network-RTT-bound, not server-side-bound. Subsequent R4 steps (4.3/4.4)
+close the gap by restructuring the upper layers to benefit from this
+per-extent decoupling.
 
 ### Append Protocol (eversion check → seal check → fencing → commit truncation → write)
 

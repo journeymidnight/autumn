@@ -29,7 +29,7 @@ use bytes::Bytes;
 use autumn_rpc::{Frame, FrameDecoder, HandlerResult, StatusCode};
 use compio::BufResult;
 use compio::fs::{File as CompioFile, OpenOptions};
-use compio::io::{AsyncReadAtExt, AsyncWriteAt, AsyncWriteAtExt};
+use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use compio::net::TcpListener;
 use compio::io::{AsyncRead, AsyncWriteExt};
 use dashmap::DashMap;
@@ -40,7 +40,7 @@ use std::rc::Rc;
 
 // ─── Per-node append metrics ─────────────────────────────────────────────────
 
-struct ExtentAppendMetrics {
+pub(crate) struct ExtentAppendMetrics {
     started_at: Instant,
     req_count: u64,
     bytes: u64,
@@ -51,7 +51,7 @@ impl ExtentAppendMetrics {
     fn new() -> Self {
         Self { started_at: Instant::now(), req_count: 0, bytes: 0, total_ns: 0 }
     }
-    fn record(&mut self, reqs: u64, bytes: u64, elapsed_ns: u64) {
+    pub(crate) fn record(&mut self, reqs: u64, bytes: u64, elapsed_ns: u64) {
         self.req_count += reqs;
         self.bytes += bytes;
         self.total_ns += elapsed_ns;
@@ -73,7 +73,7 @@ impl ExtentAppendMetrics {
 }
 
 thread_local! {
-    static EXTENT_APPEND_METRICS: RefCell<ExtentAppendMetrics> =
+    pub(crate) static EXTENT_APPEND_METRICS: RefCell<ExtentAppendMetrics> =
         RefCell::new(ExtentAppendMetrics::new());
 }
 
@@ -252,15 +252,15 @@ impl ExtentNodeConfig {
 
 // ─── ExtentEntry ─────────────────────────────────────────────────────────────
 
-struct ExtentEntry {
-    file: std::cell::UnsafeCell<CompioFile>,
-    len: AtomicU64,
-    eversion: AtomicU64,
-    sealed_length: AtomicU64,
-    avali: AtomicU32,
-    last_revision: AtomicI64,
+pub(crate) struct ExtentEntry {
+    pub(crate) file: std::cell::UnsafeCell<CompioFile>,
+    pub(crate) len: AtomicU64,
+    pub(crate) eversion: AtomicU64,
+    pub(crate) sealed_length: AtomicU64,
+    pub(crate) avali: AtomicU32,
+    pub(crate) last_revision: AtomicI64,
     /// Which disk this extent lives on. Used to resolve file paths.
-    disk_id: u64,
+    pub(crate) disk_id: u64,
 }
 
 // ─── ExtentNode ───────────────────────────────────────────────────────────────
@@ -276,7 +276,10 @@ pub struct ExtentNode {
     recovery_inflight: Rc<DashMap<u64, crate::extent_rpc::RecoveryTask>>,
     /// WAL for small must_sync writes. None if WAL is disabled.
     /// Wrapped in Rc<RefCell<>> for interior mutability on single-threaded compio.
-    wal: Option<Rc<RefCell<Wal>>>,
+    pub(crate) wal: Option<Rc<RefCell<Wal>>>,
+    /// Per-extent SQ/CQ worker senders (R4 step 4.2). Lazily populated on
+    /// first APPEND/READ touching that extent_id. See extent_worker.rs.
+    pub(crate) worker_pool: Rc<DashMap<u64, futures::channel::mpsc::Sender<crate::extent_worker::ExtentSubmitMsg>>>,
 }
 
 impl Clone for ExtentNode {
@@ -289,6 +292,7 @@ impl Clone for ExtentNode {
             recovery_done: self.recovery_done.clone(),
             recovery_inflight: self.recovery_inflight.clone(),
             wal: self.wal.clone(),
+            worker_pool: self.worker_pool.clone(),
         }
     }
 }
@@ -396,6 +400,7 @@ impl ExtentNode {
             recovery_done: Rc::new(std::cell::RefCell::new(Vec::new())),
             recovery_inflight: Rc::new(DashMap::new()),
             wal: None, // set after replay
+            worker_pool: Rc::new(DashMap::new()),
         };
 
         // Load existing extents from all disks.
@@ -424,7 +429,7 @@ impl ExtentNode {
     }
 
     /// Mark the disk hosting an extent as offline after an I/O error.
-    fn mark_disk_offline_for_extent(&self, extent_id: u64) {
+    pub(crate) fn mark_disk_offline_for_extent(&self, extent_id: u64) {
         if let Some(entry) = self.extents.get(&extent_id) {
             let disk_id = entry.disk_id;
             if let Some(disk) = self.disks.get(&disk_id) {
@@ -496,7 +501,7 @@ impl ExtentNode {
         }
     }
 
-    async fn save_meta(&self, extent_id: u64, entry: &ExtentEntry) -> Result<(), String> {
+    pub(crate) async fn save_meta(&self, extent_id: u64, entry: &ExtentEntry) -> Result<(), String> {
         let sealed_length = entry.sealed_length.load(Ordering::SeqCst);
         let eversion = entry.eversion.load(Ordering::SeqCst);
         let last_revision = entry.last_revision.load(Ordering::SeqCst);
@@ -612,31 +617,119 @@ impl ExtentNode {
         }
     }
 
+
     /// Handle one TCP connection.
     ///
-    /// Appends are processed sequentially to guarantee the `end` watermark:
-    /// returning end=N means all data in 0..N is written. Reads are spawned
-    /// for concurrent I/O (they don't affect the watermark).
+    /// R4 step 4.2 — SQ/CQ pipeline:
+    ///   * **Reader** (this task): decode frames; group consecutive
+    ///     APPEND/READ frames by extent_id; send ONE AppendBatch/ReadBatch
+    ///     submit message to the target extent's ExtentWorker, receiving
+    ///     ONE oneshot::Receiver<Vec<Frame>> back per submitted batch.
+    ///     Control RPCs are dispatched in a spawned task producing a
+    ///     single-element Vec<Frame>.
+    ///   * **Completion task** (spawned): owns WriteHalf. Drains a
+    ///     FuturesUnordered of per-batch `oneshot::Receiver<Vec<Frame>>`,
+    ///     coalescing all ready frames into a single `write_vectored_all`
+    ///     per poll cycle — preserves one-syscall-per-burst.
+    ///
+    /// Two-task split (not single-task with `select(read, completion)`)
+    /// avoids parking/resuming compio's io_uring read SQE mid-flight,
+    /// which triggered a deadlock in earlier attempts.
     pub async fn handle_connection(
         stream: compio::net::TcpStream,
         node: ExtentNode,
     ) -> Result<()> {
-        let (mut reader, mut writer) = stream.into_split();
+        use futures::channel::{mpsc, oneshot};
+        use futures::sink::SinkExt;
+        use futures::stream::{FuturesUnordered, StreamExt};
+        use crate::extent_worker::{
+            get_or_spawn, AppendSlot, ExtentSubmitMsg, ReadSlot,
+        };
+
+        let (mut reader, writer) = stream.into_split();
         let mut decoder = FrameDecoder::new();
         let mut buf = vec![0u8; 512 * 1024];
 
+        let (mut inflight_tx, inflight_rx) =
+            mpsc::channel::<oneshot::Receiver<Vec<Frame>>>(4096);
+
+        // Completion task.
+        compio::runtime::spawn(async move {
+            use futures::FutureExt;
+            let mut writer = writer;
+            let mut inflight_rx = inflight_rx;
+            let mut inflight: FuturesUnordered<oneshot::Receiver<Vec<Frame>>> =
+                FuturesUnordered::new();
+            loop {
+                if inflight.is_empty() {
+                    match inflight_rx.next().await {
+                        Some(rx) => inflight.push(rx),
+                        None => return,
+                    }
+                    while let Some(Some(rx)) = inflight_rx.next().now_or_never() {
+                        inflight.push(rx);
+                    }
+                    continue;
+                }
+                let new_rx_fut = inflight_rx.next();
+                let completion_fut = inflight.next();
+                futures::pin_mut!(new_rx_fut, completion_fut);
+                use futures::future::{select, Either};
+                match select(new_rx_fut, completion_fut).await {
+                    Either::Left((Some(rx), _)) => {
+                        inflight.push(rx);
+                        while let Some(Some(rx)) = inflight_rx.next().now_or_never() {
+                            inflight.push(rx);
+                        }
+                    }
+                    Either::Left((None, _)) => {
+                        while let Some(res) = inflight.next().await {
+                            if let Ok(frames) = res {
+                                let bufs: Vec<Bytes> =
+                                    frames.into_iter().map(|f| f.encode()).collect();
+                                if !bufs.is_empty() {
+                                    let _ = writer.write_vectored_all(bufs).await.0;
+                                }
+                            }
+                        }
+                        return;
+                    }
+                    Either::Right((maybe_done, _)) => {
+                        let mut ready: Vec<Bytes> = Vec::new();
+                        if let Some(Ok(frames)) = maybe_done {
+                            for f in frames { ready.push(f.encode()); }
+                        }
+                        while let Some(Some(res)) = inflight.next().now_or_never() {
+                            if let Ok(frames) = res {
+                                for f in frames { ready.push(f.encode()); }
+                            }
+                        }
+                        if !ready.is_empty() {
+                            let BufResult(r, _) = writer.write_vectored_all(ready).await;
+                            if let Err(e) = r {
+                                tracing::debug!(error = %e, "conn writer exited on write error");
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .detach();
+
+        // Reader task (this function).
         loop {
             let BufResult(result, buf_back) = reader.read(buf).await;
             buf = buf_back;
             let n = result?;
             if n == 0 {
+                drop(inflight_tx);
                 return Ok(());
             }
 
             decoder.feed(&buf[..n]);
 
-            // Decode all frames from this TCP read.
-            let mut frames = Vec::new();
+            let mut frames: Vec<Frame> = Vec::new();
             loop {
                 match decoder.try_decode().map_err(|e| anyhow::anyhow!(e))? {
                     Some(frame) if frame.req_id != 0 => frames.push(frame),
@@ -645,54 +738,147 @@ impl ExtentNode {
                 }
             }
 
-            // Process all frames, collect ALL responses into one buffer.
-            // Then write everything with one write_vectored_all — one syscall per TCP read.
-            let mut all_responses: Vec<Bytes> = Vec::with_capacity(frames.len());
+            // Helper macro: push an already-resolved batch onto the
+            // completion task's inflight queue. Avoids closure-async issues.
+            macro_rules! push_resolved {
+                ($frames:expr) => {{
+                    let (tx, rx) = oneshot::channel::<Vec<Frame>>();
+                    let _ = tx.send($frames);
+                    if inflight_tx.send(rx).await.is_err() {
+                        return Ok(());
+                    }
+                }};
+            }
 
             let mut i = 0;
             while i < frames.len() {
                 let msg_type = frames[i].msg_type;
 
-                if msg_type == MSG_READ_BYTES {
-                    // Batch consecutive reads.
-                    let batch_start = i;
-                    while i < frames.len() && frames[i].msg_type == MSG_READ_BYTES {
-                        i += 1;
-                    }
-                    let responses = node.handle_read_batch(&frames[batch_start..i]).await;
-                    for f in responses {
-                        all_responses.push(f.encode());
-                    }
-                } else if msg_type == MSG_APPEND {
-                    // Batch consecutive appends → one vectored pwritev per extent.
-                    let batch_start = i;
-                    while i < frames.len() && frames[i].msg_type == MSG_APPEND {
-                        i += 1;
-                    }
-                    let responses = node.handle_append_batch(&frames[batch_start..i]).await;
-                    for f in responses {
-                        all_responses.push(f.encode());
-                    }
-                } else {
-                    // Control RPCs: one at a time.
-                    let req_id = frames[i].req_id;
-                    let payload = frames[i].payload.clone();
-                    let resp_frame = match node.dispatch(msg_type, payload).await {
-                        Ok(p) => Frame::response(req_id, msg_type, p),
-                        Err((code, message)) => {
-                            let p = autumn_rpc::RpcError::encode_status(code, &message);
-                            Frame::error(req_id, msg_type, p)
+                if msg_type == MSG_APPEND {
+                    let first_req = match AppendReq::decode(frames[i].payload.clone()) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            push_resolved!(vec![Frame::error(
+                                frames[i].req_id, MSG_APPEND,
+                                autumn_rpc::RpcError::encode_status(
+                                    StatusCode::InvalidArgument, &e.to_string()))]);
+                            i += 1;
+                            continue;
                         }
                     };
-                    all_responses.push(resp_frame.encode());
+                    let anchor_extent = first_req.extent_id;
+                    let mut slots: Vec<AppendSlot> = Vec::new();
+                    slots.push(AppendSlot { req: first_req, req_id: frames[i].req_id });
+                    i += 1;
+                    while i < frames.len() && frames[i].msg_type == MSG_APPEND {
+                        match AppendReq::decode(frames[i].payload.clone()) {
+                            Ok(r) if r.extent_id == anchor_extent => {
+                                slots.push(AppendSlot { req: r, req_id: frames[i].req_id });
+                                i += 1;
+                            }
+                            Ok(_) => break,
+                            Err(e) => {
+                                push_resolved!(vec![Frame::error(
+                                    frames[i].req_id, MSG_APPEND,
+                                    autumn_rpc::RpcError::encode_status(
+                                        StatusCode::InvalidArgument, &e.to_string()))]);
+                                i += 1;
+                            }
+                        }
+                    }
+
+                    let extent = match node.get_extent(anchor_extent).await {
+                        Ok(e) => e,
+                        Err((code, msg)) => {
+                            let payload = autumn_rpc::RpcError::encode_status(code, &msg);
+                            let frames_vec: Vec<Frame> = slots.iter()
+                                .map(|s| Frame::error(s.req_id, MSG_APPEND, payload.clone()))
+                                .collect();
+                            push_resolved!(frames_vec);
+                            continue;
+                        }
+                    };
+                    let (tx, rx) = oneshot::channel::<Vec<Frame>>();
+                    if inflight_tx.send(rx).await.is_err() { return Ok(()); }
+                    let mut worker_tx = get_or_spawn(&node, anchor_extent, extent);
+                    if worker_tx.send(
+                        ExtentSubmitMsg::AppendBatch { slots, resp_tx: tx }).await.is_err()
+                    {
+                        tracing::warn!(extent_id = anchor_extent, "submit append to worker failed");
+                    }
+                } else if msg_type == MSG_READ_BYTES {
+                    let first_req = match ReadBytesReq::decode(frames[i].payload.clone()) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            push_resolved!(vec![Frame::error(
+                                frames[i].req_id, MSG_READ_BYTES,
+                                autumn_rpc::RpcError::encode_status(
+                                    StatusCode::InvalidArgument, &e.to_string()))]);
+                            i += 1;
+                            continue;
+                        }
+                    };
+                    let anchor_extent = first_req.extent_id;
+                    let mut slots: Vec<ReadSlot> = Vec::new();
+                    slots.push(ReadSlot { req: first_req, req_id: frames[i].req_id });
+                    i += 1;
+                    while i < frames.len() && frames[i].msg_type == MSG_READ_BYTES {
+                        match ReadBytesReq::decode(frames[i].payload.clone()) {
+                            Ok(r) if r.extent_id == anchor_extent => {
+                                slots.push(ReadSlot { req: r, req_id: frames[i].req_id });
+                                i += 1;
+                            }
+                            Ok(_) => break,
+                            Err(e) => {
+                                push_resolved!(vec![Frame::error(
+                                    frames[i].req_id, MSG_READ_BYTES,
+                                    autumn_rpc::RpcError::encode_status(
+                                        StatusCode::InvalidArgument, &e.to_string()))]);
+                                i += 1;
+                            }
+                        }
+                    }
+
+                    let extent = match node.get_extent(anchor_extent).await {
+                        Ok(e) => e,
+                        Err((code, msg)) => {
+                            let payload = autumn_rpc::RpcError::encode_status(code, &msg);
+                            let frames_vec: Vec<Frame> = slots.iter()
+                                .map(|s| Frame::error(s.req_id, MSG_READ_BYTES, payload.clone()))
+                                .collect();
+                            push_resolved!(frames_vec);
+                            continue;
+                        }
+                    };
+                    let (tx, rx) = oneshot::channel::<Vec<Frame>>();
+                    if inflight_tx.send(rx).await.is_err() { return Ok(()); }
+                    let mut worker_tx = get_or_spawn(&node, anchor_extent, extent);
+                    if worker_tx.send(
+                        ExtentSubmitMsg::ReadBatch { slots, resp_tx: tx }).await.is_err()
+                    {
+                        tracing::warn!(extent_id = anchor_extent, "submit read to worker failed");
+                    }
+                } else {
+                    // Control RPC: spawn dispatch; response delivered as a
+                    // single-element Vec<Frame>.
+                    let req_id = frames[i].req_id;
+                    let payload = frames[i].payload.clone();
+                    let node2 = node.clone();
+                    let (tx, rx) = oneshot::channel::<Vec<Frame>>();
+                    if inflight_tx.send(rx).await.is_err() { return Ok(()); }
+                    compio::runtime::spawn(async move {
+                        let resp_frame = match node2.dispatch(msg_type, payload).await {
+                            Ok(p) => Frame::response(req_id, msg_type, p),
+                            Err((code, message)) => {
+                                let p = autumn_rpc::RpcError::encode_status(code, &message);
+                                Frame::error(req_id, msg_type, p)
+                            }
+                        };
+                        let _ = tx.send(vec![resp_frame]);
+                    })
+                    .detach();
                     i += 1;
                 }
-            }
-
-            // ONE write_vectored_all for all responses from this TCP read batch.
-            if !all_responses.is_empty() {
-                let BufResult(result, _) = writer.write_vectored_all(all_responses).await;
-                result?;
             }
         }
     }
@@ -774,6 +960,11 @@ impl ExtentNode {
         old_sealed == 0 && ex.sealed_length > 0
     }
 
+    /// Crate-visible wrapper for `apply_extent_meta` used from extent_worker.rs.
+    pub(crate) fn apply_extent_meta_ref(extent: &ExtentEntry, ex: &ExtentInfo) -> bool {
+        Self::apply_extent_meta(extent, ex)
+    }
+
     async fn truncate_to_commit(extent: &Rc<ExtentEntry>, commit: u32) -> Result<(), String> {
         file_ref(&extent.file)
             .set_len(commit as u64)
@@ -781,6 +972,15 @@ impl ExtentNode {
             .map_err(|e| e.to_string())?;
         extent.len.store(commit as u64, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Crate-visible wrapper for `truncate_to_commit` used from extent_worker.rs.
+    pub(crate) async fn truncate_to_commit_ref(
+        &self,
+        extent: &Rc<ExtentEntry>,
+        commit: u32,
+    ) -> Result<(), String> {
+        Self::truncate_to_commit(extent, commit).await
     }
 
     /// Copy the full extent data from a remote source node using autumn-rpc.
@@ -838,7 +1038,7 @@ impl ExtentNode {
         Err("no source replica available for copy".to_string())
     }
 
-    async fn extent_info_from_manager(&self, extent_id: u64) -> Result<Option<ExtentInfo>, String> {
+    pub(crate) async fn extent_info_from_manager(&self, extent_id: u64) -> Result<Option<ExtentInfo>, String> {
         let mgr = match &self.manager_endpoint {
             Some(ep) => crate::conn_pool::normalize_endpoint(ep),
             None => return Ok(None),
@@ -1190,242 +1390,6 @@ impl ExtentNode {
         .encode())
     }
 
-    /// Process a batch of MSG_APPEND frames in one vectored write per extent.
-    ///
-    /// Within the batch, requests are grouped by extent_id and validated in order.
-    /// Payloads for the same extent are written with a single `write_vectored_at`
-    /// call (pwritev) — zero extra copy, one syscall per extent.
-    ///
-    /// Returns one `Frame` per input frame, in order.
-    async fn handle_append_batch(&self, frames: &[autumn_rpc::Frame]) -> Vec<Frame> {
-        // Group consecutive frames by extent_id to maximize coalescing.
-        // We process them extent-by-extent while preserving per-frame order.
-        let mut out: Vec<Frame> = Vec::with_capacity(frames.len());
-
-        let mut i = 0;
-        while i < frames.len() {
-            // Decode the first request to get the extent_id for this sub-batch.
-            let first_req = match AppendReq::decode(frames[i].payload.clone()) {
-                Ok(r) => r,
-                Err(e) => {
-                    out.push(Frame::error(
-                        frames[i].req_id, MSG_APPEND,
-                        autumn_rpc::RpcError::encode_status(StatusCode::InvalidArgument, &e.to_string()),
-                    ));
-                    i += 1;
-                    continue;
-                }
-            };
-            let extent_id = first_req.extent_id;
-
-            // Find contiguous frames for the same extent_id.
-            let sub_start = i;
-            let mut sub_end = i + 1;
-            while sub_end < frames.len() {
-                // Peek at next req's extent_id without full decode.
-                match AppendReq::decode(frames[sub_end].payload.clone()) {
-                    Ok(r) if r.extent_id == extent_id => sub_end += 1,
-                    _ => break,
-                }
-            }
-
-            // Decode all requests in this sub-batch.
-            let mut reqs: Vec<AppendReq> = Vec::with_capacity(sub_end - sub_start);
-            let mut decode_err: Option<(usize, String)> = None;
-            reqs.push(first_req);
-            for k in (sub_start + 1)..sub_end {
-                match AppendReq::decode(frames[k].payload.clone()) {
-                    Ok(r) => reqs.push(r),
-                    Err(e) => {
-                        decode_err = Some((k - sub_start, e.to_string()));
-                        break;
-                    }
-                }
-            }
-            let valid_count = if let Some((idx, _)) = &decode_err { *idx } else { reqs.len() };
-
-            // Get extent (shared for all reqs in this sub-batch).
-            let extent = match self.get_extent(extent_id).await {
-                Ok(e) => e,
-                Err((code, msg)) => {
-                    let payload = autumn_rpc::RpcError::encode_status(code, &msg);
-                    for k in sub_start..sub_end {
-                        out.push(Frame::error(frames[k].req_id, MSG_APPEND, payload.clone()));
-                    }
-                    i = sub_end;
-                    continue;
-                }
-            };
-
-            // Validate eversion / sealed / revision for the first request.
-            // All requests in the batch share the same extent so these checks
-            // apply once (eversion and sealed are stable within a batch).
-            let first = &reqs[0];
-            let local_eversion = extent.eversion.load(Ordering::SeqCst);
-            if first.eversion > local_eversion {
-                // Eversion mismatch — fall back to per-request path for the whole sub-batch.
-                for k in 0..valid_count {
-                    let req_id = frames[sub_start + k].req_id;
-                    let resp = self.handle_append(frames[sub_start + k].payload.clone()).await;
-                    let frame = match resp {
-                        Ok(p) => Frame::response(req_id, MSG_APPEND, p),
-                        Err((code, msg)) => Frame::error(req_id, MSG_APPEND,
-                            autumn_rpc::RpcError::encode_status(code, &msg)),
-                    };
-                    out.push(frame);
-                }
-                i = sub_end;
-                continue;
-            }
-            if local_eversion > first.eversion
-                || extent.sealed_length.load(Ordering::SeqCst) > 0
-                || extent.avali.load(Ordering::SeqCst) > 0
-            {
-                let resp_payload = AppendResp { code: CODE_PRECONDITION, offset: 0, end: 0 }.encode();
-                for k in sub_start..sub_end {
-                    out.push(Frame::response(frames[k].req_id, MSG_APPEND, resp_payload.clone()));
-                }
-                i = sub_end;
-                continue;
-            }
-
-            // Revision fencing (first request sets the tone for the whole batch).
-            let last_revision = extent.last_revision.load(Ordering::SeqCst);
-            if first.revision < last_revision {
-                let resp_payload = AppendResp { code: CODE_LOCKED_BY_OTHER, offset: 0, end: 0 }.encode();
-                for k in sub_start..sub_end {
-                    out.push(Frame::response(frames[k].req_id, MSG_APPEND, resp_payload.clone()));
-                }
-                i = sub_end;
-                continue;
-            }
-            let revision_changed = first.revision > last_revision;
-            if revision_changed {
-                extent.last_revision.store(first.revision, Ordering::SeqCst);
-            }
-
-            // Commit reconciliation (only first request carries commit from client).
-            let mut file_start = extent.len.load(Ordering::SeqCst);
-            if file_start < first.commit as u64 {
-                let resp_payload = AppendResp { code: CODE_PRECONDITION, offset: 0, end: 0 }.encode();
-                for k in sub_start..sub_end {
-                    out.push(Frame::response(frames[k].req_id, MSG_APPEND, resp_payload.clone()));
-                }
-                i = sub_end;
-                continue;
-            }
-            if file_start > first.commit as u64 {
-                if let Err(e) = Self::truncate_to_commit(&extent, first.commit).await {
-                    let payload = autumn_rpc::RpcError::encode_status(StatusCode::Internal, &e);
-                    for k in sub_start..sub_end {
-                        out.push(Frame::error(frames[k].req_id, MSG_APPEND, payload.clone()));
-                    }
-                    i = sub_end;
-                    continue;
-                }
-                file_start = extent.len.load(Ordering::SeqCst);
-            }
-
-            // Compute per-request offsets and collect payloads for vectored write.
-            let mut offsets: Vec<u32> = Vec::with_capacity(valid_count);
-            let mut bufs: Vec<Bytes> = Vec::with_capacity(valid_count);
-            let mut cursor = file_start;
-            let must_sync = reqs[..valid_count].iter().any(|r| r.must_sync);
-
-            for req in &reqs[..valid_count] {
-                offsets.push(cursor as u32);
-                cursor += req.payload.len() as u64;
-                bufs.push(req.payload.clone());
-            }
-            let total_end = cursor;
-
-            // WAL batch: write all records in one batch + one fsync, skip extent sync.
-            let total_payload: usize = reqs[..valid_count].iter().map(|r| r.payload.len()).sum();
-            let use_wal = must_sync && self.wal.is_some()
-                && should_use_wal(true, total_payload);
-            if use_wal {
-                let wal_records: Vec<WalRecord> = reqs[..valid_count].iter().enumerate().map(|(k, req)| {
-                    WalRecord {
-                        extent_id,
-                        start: offsets[k],
-                        revision: req.revision,
-                        payload: req.payload.to_vec(),
-                    }
-                }).collect();
-                if let Err(e) = self.wal.as_ref().unwrap().borrow_mut().write_batch(&wal_records) {
-                    let payload = autumn_rpc::RpcError::encode_status(
-                        StatusCode::Internal, &e.to_string(),
-                    );
-                    for k in sub_start..sub_end {
-                        out.push(Frame::error(frames[k].req_id, MSG_APPEND, payload.clone()));
-                    }
-                    i = sub_end;
-                    continue;
-                }
-            }
-
-            // Single vectored write — one pwritev syscall, zero extra copies.
-            let write_t0 = Instant::now();
-            let f = unsafe { &mut *extent.file.get() };
-            let BufResult(wr, _) = f.write_vectored_at(bufs, file_start).await;
-            if let Err(e) = wr {
-                let payload = autumn_rpc::RpcError::encode_status(
-                    StatusCode::Internal, &e.to_string(),
-                );
-                for k in sub_start..sub_end {
-                    out.push(Frame::error(frames[k].req_id, MSG_APPEND, payload.clone()));
-                }
-                i = sub_end;
-                continue;
-            }
-
-            // If WAL was used, skip extent sync (WAL provides durability).
-            if must_sync && !use_wal {
-                if let Err(e) = file_ref(&extent.file).sync_all().await {
-                    let payload = autumn_rpc::RpcError::encode_status(
-                        StatusCode::Internal, &e.to_string(),
-                    );
-                    for k in sub_start..sub_end {
-                        out.push(Frame::error(frames[k].req_id, MSG_APPEND, payload.clone()));
-                    }
-                    i = sub_end;
-                    continue;
-                }
-            }
-            let write_elapsed_ns = write_t0.elapsed().as_nanos() as u64;
-            EXTENT_APPEND_METRICS.with(|m| {
-                m.borrow_mut().record(valid_count as u64, total_payload as u64, write_elapsed_ns);
-            });
-
-            extent.len.store(total_end, Ordering::SeqCst);
-
-            if revision_changed {
-                let _ = self.save_meta(extent_id, &extent).await;
-            }
-
-            // Emit per-request responses.
-            for k in 0..valid_count {
-                let end = if k + 1 < valid_count {
-                    offsets[k + 1]
-                } else {
-                    total_end as u32
-                };
-                let resp = AppendResp { code: CODE_OK, offset: offsets[k], end };
-                out.push(Frame::response(frames[sub_start + k].req_id, MSG_APPEND, resp.encode()));
-            }
-            // If there was a decode error partway through, emit error for that frame.
-            if let Some((idx, msg)) = decode_err {
-                let payload = autumn_rpc::RpcError::encode_status(
-                    StatusCode::InvalidArgument, &msg,
-                );
-                out.push(Frame::error(frames[sub_start + idx].req_id, MSG_APPEND, payload));
-            }
-
-            i = sub_end;
-        }
-
-        out
-    }
 
     async fn handle_read_bytes(&self, payload: Bytes) -> HandlerResult {
         let req = ReadBytesReq::decode(payload)
@@ -1471,22 +1435,6 @@ impl ExtentNode {
     /// Sequential preads are faster than N spawned tasks for page-cache hits:
     /// each pread completes in ~1µs, and responses are written back together,
     /// saving per-request TCP write overhead.
-    async fn handle_read_batch(&self, frames: &[autumn_rpc::Frame]) -> Vec<Frame> {
-        let mut out = Vec::with_capacity(frames.len());
-        for frame in frames {
-            let req_id = frame.req_id;
-            let resp_frame = match self.handle_read_bytes(frame.payload.clone()).await {
-                Ok(p) => Frame::response(req_id, MSG_READ_BYTES, p),
-                Err((code, msg)) => Frame::error(
-                    req_id, MSG_READ_BYTES,
-                    autumn_rpc::RpcError::encode_status(code, &msg),
-                ),
-            };
-            out.push(resp_frame);
-        }
-        out
-    }
-
     async fn handle_commit_length(&self, payload: Bytes) -> HandlerResult {
         let req = CommitLengthReq::decode(payload)
             .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
