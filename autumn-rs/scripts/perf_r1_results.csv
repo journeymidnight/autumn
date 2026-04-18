@@ -1,0 +1,4 @@
+phase,storage_mode,partitions,group_commit_cap,rep,write_ops,read_ops,write_p50_ms,write_p99_ms,read_p50_ms,read_p99_ms,ps_cpu_pct,ext_cpu_pct,notes
+A0,shm,1,3072,1,48828.21,77898.59,3.83,20.66,3.15,5.49,,,A0 baseline (mean-based gate)
+A0,shm,1,3072,2,56984.90,82315.05,3.29,18.18,2.98,3.86,,,A0 baseline (mean-based gate)
+A0,shm,1,3072,3,51235.63,85352.11,3.60,20.99,2.95,3.50,,,A0 baseline (mean-based gate)
