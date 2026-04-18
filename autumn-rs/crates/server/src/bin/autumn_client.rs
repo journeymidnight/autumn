@@ -3,6 +3,7 @@ extern crate libc;
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1523,7 +1524,7 @@ async fn main() -> Result<()> {
                         };
                         let mut seq: u64 = 0;
                         let mut local_latencies: Vec<f64> = Vec::new();
-                        let mut local_keys: Vec<String> = Vec::new();
+                        let mut local_keyinfo: Vec<(String, u64, SocketAddr)> = Vec::new();
                         loop {
                             if std::time::SystemTime::now() >= *deadline {
                                 break;
@@ -1547,10 +1548,10 @@ async fn main() -> Result<()> {
                             if res.is_ok() {
                                 total_ops.fetch_add(1, Ordering::Relaxed);
                                 local_latencies.push(elapsed.as_secs_f64() * 1000.0);
-                                local_keys.push(key);
+                                local_keyinfo.push((key, part_id, ps_addr));
                             }
                         }
-                        (local_latencies, local_keys)
+                        (local_latencies, local_keyinfo)
                     })
                 });
                 write_handles.push(handle);
@@ -1568,11 +1569,11 @@ async fn main() -> Result<()> {
             });
 
             let mut all_write_latencies: Vec<f64> = Vec::new();
-            let mut all_write_keys: Vec<String> = Vec::new();
+            let mut all_write_keyinfo: Vec<(String, u64, SocketAddr)> = Vec::new();
             for h in write_handles {
-                if let Ok((lats, keys)) = h.join() {
+                if let Ok((lats, keyinfo)) = h.join() {
                     all_write_latencies.extend(lats);
-                    all_write_keys.extend(keys);
+                    all_write_keyinfo.extend(keyinfo);
                 }
             }
             drop(progress_w);
@@ -1592,43 +1593,39 @@ async fn main() -> Result<()> {
                 &mut write_hist,
             );
 
-            if all_write_keys.is_empty() {
+            if all_write_keyinfo.is_empty() {
                 bail!("write phase produced no keys — is the cluster running?");
             }
 
             // ---- Read phase ----
             println!("\n==> perf-check: read ({threads} threads, {duration_secs}s)");
 
-            let pc_keys = Arc::new(all_write_keys);
+            let pc_keyinfo = Arc::new(all_write_keyinfo);
             let manager_addr = Arc::new(args.manager.clone());
             let deadline =
                 Arc::new(std::time::SystemTime::now() + Duration::from_secs(duration_secs));
             let total_ops = Arc::new(AtomicU64::new(0));
             let bench_start = Instant::now();
-            let keys_per_thread = (pc_keys.len() + threads - 1) / threads;
+            let keys_per_thread = (pc_keyinfo.len() + threads - 1) / threads;
 
             let mut read_handles = Vec::new();
             for tid in 0..threads {
-                let pc_keys = Arc::clone(&pc_keys);
-                let manager_addr = Arc::clone(&manager_addr);
+                let pc_keyinfo = Arc::clone(&pc_keyinfo);
+                let _manager_addr = Arc::clone(&manager_addr); // kept for parity, unused now
                 let deadline = Arc::clone(&deadline);
                 let total_ops = Arc::clone(&total_ops);
 
                 let handle = std::thread::spawn(move || {
                     compio::runtime::Runtime::new().unwrap().block_on(async {
-                        let mut cc = match ClusterClient::connect(&manager_addr).await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                eprintln!("thread {tid} connect error: {e}");
-                                return Vec::new();
-                            }
-                        };
+                        // Per-thread RpcClient connection cache keyed by ps_addr.
+                        let mut conns: std::collections::HashMap<SocketAddr, Rc<RpcClient>> =
+                            std::collections::HashMap::new();
                         let start_idx = tid * keys_per_thread;
-                        let end_idx = (start_idx + keys_per_thread).min(pc_keys.len());
+                        let end_idx = (start_idx + keys_per_thread).min(pc_keyinfo.len());
                         if start_idx >= end_idx {
                             return Vec::new();
                         }
-                        let my_keys = &pc_keys[start_idx..end_idx];
+                        let my_slice = &pc_keyinfo[start_idx..end_idx];
                         let mut ki = 0usize;
                         let mut local_latencies: Vec<f64> = Vec::new();
 
@@ -1636,22 +1633,24 @@ async fn main() -> Result<()> {
                             if std::time::SystemTime::now() >= *deadline {
                                 break;
                             }
-                            let key = &my_keys[ki % my_keys.len()];
+                            let (key, part_id, ps_addr) = &my_slice[ki % my_slice.len()];
                             ki += 1;
-                            let Ok((part_id, ps_addr)) =
-                                cc.resolve_key(key.as_bytes()).await
-                            else {
-                                continue;
-                            };
-                            let Ok(ps) = cc.get_ps_client(&ps_addr).await else {
-                                continue;
+                            let ps = match conns.get(ps_addr) {
+                                Some(c) => c.clone(),
+                                None => match RpcClient::connect(*ps_addr).await {
+                                    Ok(c) => {
+                                        conns.insert(*ps_addr, c.clone());
+                                        c
+                                    }
+                                    Err(_) => continue,
+                                },
                             };
                             let t0 = Instant::now();
                             let res = ps
                                 .call(
                                     MSG_GET,
                                     rkyv_encode(&GetReq {
-                                        part_id,
+                                        part_id: *part_id,
                                         key: key.as_bytes().to_vec(),
                                         offset: 0,
                                         length: 0,
