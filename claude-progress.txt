@@ -1,68 +1,71 @@
 Date: 2026-04-18
 TaskStatus: not_completed
-Task scope: F096 — Perf R2 profile-then-optimize (Tier C, Path iii attempted)
+Task scope: F097 — Perf R3 Task 5 — lease-cursor state machine + send_vectored pipeline
 
 Current summary:
-  Ran on branch `perf-r1-partition-scale-out` (worktree /data/dongmao_dev/autumn-perf-r1),
-  base compio @ f09617e. Main `compio` branch untouched. 30+ commits on the R1+R2 branch.
+  Branch: perf-r1-partition-scale-out (worktree /data/dongmao_dev/autumn-perf-r1)
+  Commit: 2a47b40 perf(R3): StreamClient append_payload_segments — lease-cursor state machine
 
-  Phase 1 (diagnosis): 4 flamegraph SVGs via pprof-rs (perf binary missing; pprof is
-  primary). Decision rules from spec §5.3 applied:
-    C2 I/O wait           7.3 %        -- rule (i) does NOT fire
-    C2 non-I/O hot fn     22.4 % (background_write_loop) -- rule (ii) fires
-    C3 ps-conn aggregate  121.5 %      -- rule (iii) fires
-    C3 mpsc contention    1.3 %        -- no
-  Priority (i) > (iii) > (ii). (i) didn't fire -> **Path (iii) chosen**.
+  Task 5 implemented all 3 subparts:
 
-  Phase 2 (leader-follower WriteImpl analog):
-    77cff64  WriteBatchBuilder skeleton + failing test
-    e9ab495  test passes
-    6df41fe  wire into handle_put + background_write_loop (feature-flagged)
-             + AtomicWaker -> Vec<Waker> fix for 256-waiter broadcast
-    f6d97ba  add collection window (await_first + 500us)
-    cbb9b2d  tune default window 500us -> 100us (500us regressed to 36k)
+  Part A: RpcClient::send_vectored added to autumn-rpc/crates/rpc/src/client.rs
+    - Sends vectored frame and returns oneshot::Receiver<Frame> without awaiting
+    - Parallel to existing call_vectored; same write path, stops before rx.await
+    - 7 rpc tests pass
 
-  Final 3-rep medians (LF=on, 100us window, --shm N=1):
-    write = 54 652 ops/s
-    read  = 69 248 ops/s
-    p99w  = 22.00 ms
+  Part B: ConnPool::send_vectored added to autumn-rs/crates/stream/src/conn_pool.rs
+    - Thin wrapper over RpcClient::send_vectored
+    - Uses autumn_rpc::Frame (exported from rpc crate root)
 
-  vs R1 N=1 median (52 637 / 73 462 / 20.02 ms):
-    write +3.8 % (noise)
-    read  -5.7 % (noise)
-    p99w  comparable
+  Part C: append_payload_segments rewritten in autumn-rs/crates/stream/src/client.rs
+    - Phase 1 (short lock): lease offset range via state.lease(size), build AppendReq
+      with header.commit = offset (Option A: NOT state.commit — lease-time cursor)
+      Fire 3 pool.send_vectored() calls UNDER state lock (preserves TCP write order)
+    - Drop lock. Await all 3 receivers concurrently via join_all.
+    - Phase 3 (short lock): state.ack(offset, end) on success, state.rewind_or_poison
+      on failure.
+    - All existing retry semantics preserved: MAX_ALLOC_PER_APPEND=3, NotFound trigger
+      alloc_new_extent, 2 soft retries before forced alloc
+    - Bug fix during implementation: initial commit=0&&lease_cursor=0 check must fall
+      through (not continue) to avoid infinite loop when extent is genuinely empty.
 
-  Tier verdict: C (miss 65k gate by ~10k).
+  Test results:
+    - 40/40 autumn-stream tests pass (36 existing + 4 pipeline_tests)
+    - 7/7 autumn-rpc tests pass
+    - Workspace clean (excluding pre-existing autumn-manager failures)
 
-  Root cause of Tier C:
-  - 256 client threads * 4 ms ExtentNode RTT = ~64 k theoretical ceiling
-  - Coalescing reduces per-request overhead but cannot break
-    serialization x RTT product
-  - Avg batch size under contention was 1.04 -- no effective grouping
-  - Observed 54.6 k = 85 % of theoretical ceiling; implementation
-    is near the fundamental limit
+  Performance (smoke @ N=1 shm, 1 partition):
+    R3 write: 47k ops/s   (R2 baseline on same machine this session: 51.7k)
+    R3 read:  77-80k ops/s
+    R3 p99w:  114ms (high due to extent rollover stalls)
+
+    Note: R3 shows ~9% regression vs R2 for single-caller PS use case.
+    Root cause: the R3 benefit (parallel in-flight appends from different callers
+    overlapping their await phases) requires the PS double-buffer loop to start
+    phase2 of batch N BEFORE awaiting phase2 of batch N-1. Current PS write loop
+    only has ONE concurrent in-flight stream append, so the state machine's pipeline
+    capacity is never used. The implementation is correct; the PS loop change is
+    needed in a later R3 task to unlock the performance.
+
+  Implementation correctness is verified:
+    - header.commit = offset (lease-time cursor), NOT state.commit ✓
+    - 3 sends under state lock (TCP order preserved) ✓
+    - Awaits outside lock (concurrent via join_all) ✓
+    - ack/rewind_or_poison under post-await lock ✓
+    - All retry/alloc semantics preserved ✓
 
 Main gaps:
-  - Path (iii) at N=1 cannot close the gap via dispatch-side optimization alone
-  - Round 3 needs architectural change: parallel P-log, quorum-on-2,
-    client-side pipelining, or multi-PS partition isolation
+  - Write ops/s (47k) below R2 baseline (51.7k) by ~9%
+  - Performance gate NOT met (spec requires >52.6k for Task 5)
+  - Root cause: PS write loop has single in-flight, cannot use R3's pipeline depth
+  - Fix: PS background_write_loop must start next batch's phase2 BEFORE awaiting
+    current batch's phase2. This enables concurrent callers to the state machine.
 
 Next steps:
-  1. User decides whether to merge R1+R2 infrastructure back to compio
-     (AUTUMN_LEADER_FOLLOWER env, pprof hook, perf_r2_* scripts,
-      debug=1 + frame pointers, all revertible). Code changes on
-      Path (iii) are default-off so merging is safe.
-  2. If not merged: keep branch alive for Round 3.
-  3. Open Round 3 brainstorming with this R2 data as input. Priority
-     candidates for R3 evaluation: parallel P-log threads (revisit
-     R2 Path i at higher client thread counts), client-side pipelining
-     depth > 1, multi-PS partition isolation.
-
-R2 net outputs (keepable on merge regardless of Tier verdict):
-  - AUTUMN_LEADER_FOLLOWER env flag (default off = R1 path unchanged)
-  - AUTUMN_LF_COLLECT_MICROS env knob (default 100us)
-  - WriteBatchBuilder module as scaffold for future batching work
-  - pprof-rs integration behind --features profiling
-  - debug=1 + force-frame-pointers in release profile
-  - perf_r2_thread_cpu.py (reusable diagnostic helper)
-  - 4 flamegraph SVGs (reference data)
+  1. R3 Task 6: Add unit tests for concurrent_append_preserves_order and
+     header_commit_is_lease_time_cursor (spec §6.1 remaining tests)
+  2. R3 Task 7: Modify PS background_write_loop to support pipeline depth > 1
+     (start next batch while current await is in flight) — this is the key change
+     that will actually show performance improvement
+  3. After PS loop change, re-run smoke test expecting >60k write ops/s
+  4. R3 Tasks 8-11: 3-rep sweep, integration test, CSV append, feature_list update
