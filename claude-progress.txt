@@ -1,130 +1,79 @@
 Date: 2026-04-18
 TaskStatus: completed
-Task scope: Perf R4 Task B — `ps_bench` PartitionServer pipeline-depth matrix
-  benchmark (F098-R4-B)
+Task scope: Perf R4 Task A — `autumn-client perf-check --pipeline-depth K`
+  (sliding-window client pipeline to expose R4 server capacity)
 
 Current summary:
   Branch: perf-r1-partition-scale-out (worktree /data/dongmao_dev/autumn-perf-r1)
 
-  New `crates/partition-server/benches/ps_bench.rs` + Cargo.toml `[[bench]]`
-  stanza. Mirrors the `extent_bench` pattern at the PS layer — sweeps
-  `(tasks × depth)` combinations, one RpcClient per task on its own OS
-  thread + compio runtime, `FuturesUnordered`-driven sliding window of
-  `depth` in-flight 4 KB `PutReq` / `GetReq` calls against the PS.
+  Extended `autumn-client perf-check` with a per-thread pipeline depth
+  knob so the benchmark can fire up to K concurrent in-flight Put/Get
+  requests per worker thread instead of the previous sync loop
+  (one-in-flight-per-thread). This is the client-side counterpart to
+  R4 steps 4.1-4.4 (SQ/CQ everywhere): now the benchmark can actually
+  stress-test the pipelined server.
 
-  Unlike `extent_bench`, the PS benchmark connects to an **already-running**
-  cluster (manager + 3 extent nodes + PS launched via `cluster.sh start 3`)
-  rather than spinning one in-process, because PartitionKv requires a full
-  manager + extent-node stack and bootstrap.
+  Changes:
+    crates/server/src/bin/autumn_client.rs
+      • PerfCheck variant gains `pipeline_depth: usize` field.
+      • CLI parser adds `--pipeline-depth K`, validated [1, 256], default 1.
+      • usage() help text updated.
+      • Write-phase worker rewritten: FuturesUnordered sliding window
+        of up to `max_depth` in-flight ps.call(MSG_PUT, …) futures.
+        Refill while inflight.len() < max_depth && SystemTime::now()
+        < deadline; drain one completion per outer iteration; when
+        deadline passes and inflight is empty, next().await → None →
+        break.
+      • Read-phase worker rewritten with the same pattern, using
+        MSG_GET. Per-thread RpcClient conn cache preserved.
+      • Summary header prints `depth=K` only when K > 1
+        (== diff-stable vs baseline output for K=1).
 
-  Structure (matches spec):
-    - Config parsed from args: --manager <addr>, --duration <s>, --value-size
-      (defaults: 127.0.0.1:9001, 10, 4096).
-    - resolve_target(): RpcClient::connect on manager (20 × 100 ms retries),
-      then MSG_GET_REGIONS → pick first region → decode MgrPsDetail to find
-      PS address.
-    - connect_ps_with_retry(): 20 × 100 ms before panicking.
-    - warmup(500 puts) before first measurement.
-    - run_scenario() for writes: each task spawns its own OS thread +
-      compio runtime, connects its own RpcClient to the PS, runs a
-      FuturesUnordered pipeline up to `depth`; exits when deadline hit
-      AND inflight drained. AtomicU64 aggregates total_ops across tasks.
-      Per-op latency captured inside the future and summed per-thread so
-      avg latency = sum(lat) / count.
-    - run_read_scenario(): a seeded read variant — pre-writes 20 000
-      `psb_read_*` keys with a separate 64-depth warmup loop, then each
-      reader task cycles through those keys (staggered by task id * 997)
-      so readers genuinely hit data rather than all missing on the same
-      hot memtable entry.
-    - Output format matches extent_bench: `=== 4KB Write, N tasks, depth=D ===`
-      block with Total ops / Elapsed / Ops/sec / Throughput / Avg latency.
+    crates/server/Cargo.toml
+      • Adds `futures = "0.3"` (needed for FuturesUnordered / StreamExt).
 
-  Scenarios (written and measured):
-    Writes (12 cells):
-      (1,1), (1,4), (1,16), (1,64),
-      (8,1), (8,8),
-      (32,1), (32,8),
-      (64,16),
-      (256,1), (256,4), (256,8).
-    Reads (4 cells, after 20 000-key seed):
-      (1,1), (1,16), (1,64), (32,16).
+    perf_check.sh
+      • Parses `--pipeline-depth K` (validates [1, 256]), forwards to
+        `autumn-client perf-check --pipeline-depth K`. Default 1.
 
-  No new runtime deps — uses only what's already in the crate (+ bytes via
-  workspace + futures + compio).
-  No `pub` visibility change needed: `PutReq`, `GetReq`, `MSG_PUT`, `MSG_GET`,
-  `rkyv_encode/rkyv_decode` are already public in `autumn-rpc::partition_rpc`.
+  Key correctness points (verified by behaviour):
+    - At `--pipeline-depth 1`, observable output (ops/s) matches the
+      pre-change baseline (~57k write / 76k read on 3-rep shm, N=1).
+    - Deadline semantics preserved: refill stops once deadline hits,
+      but already-submitted in-flight requests drain (same as before).
+    - Error handling: only ok results count toward total_ops; errors
+      are silently dropped exactly like before.
+    - `RpcClient::connect` returns `Rc<Self>`, which is cheap to clone
+      into each inflight future — no Arc/spawn overhead per request.
 
-  Files touched:
-    NEW: crates/partition-server/benches/ps_bench.rs (~430 LOC)
-    EDIT: crates/partition-server/Cargo.toml (add `[[bench]]` stanza)
-    EDIT: feature_list.md (add F098-R4-B ledger entry)
-    EDIT: claude-progress.txt (this file)
+Verification / smoke runs (3-rep shm cluster, N=1 partition,
+4 KB values, nosync, 10s, 256 threads):
 
-  Build:
-    cargo build --release --bench ps_bench -p autumn-partition-server  OK
-    (0 bench warnings after cleanup; 19 pre-existing lib warnings unchanged)
+  --pipeline-depth 1   → write=57 316 ops/s  read=76 053 ops/s
+  --pipeline-depth 4   → write=55 168 ops/s  read=88 212 ops/s
+  --pipeline-depth 8   → write=50 639 ops/s  read=68 870 ops/s
+                         (first run at d=8 tipped over on connection
+                          back-pressure — pre-existing RpcClient
+                          submit-channel hang when writer_task exits
+                          on broken-pipe; second run clean. Out of
+                          scope for Task A, not changing library
+                          crates per spec.)
 
-Verification / smoke run:
-  bash cluster.sh clean
-  AUTUMN_DATA_ROOT=/dev/shm/autumn-rs bash cluster.sh start 3
-  cargo bench --bench ps_bench -p autumn-partition-server
-
-  Cluster: 3-node shm cluster, 3+0 replication, N=1 partition.
-
-  Write scaling (4 KB, must_sync=false):
-    1 task  d=1   → 11 689 ops/s  ( 45.7 MB/s,  85.0 µs)
-    1 task  d=4   → 14 788 ops/s  ( 57.8 MB/s, 269.8 µs)     [+27 %]
-    1 task  d=16  → 14 838 ops/s  ( 58.0 MB/s,   1.08 ms)
-    1 task  d=64  → 14 316 ops/s  ( 55.9 MB/s,   4.47 ms)    [saturated]
-    8 tasks d=1   → 41 183 ops/s  (160.9 MB/s, 193.6 µs)
-    8 tasks d=8   → 47 260 ops/s  (184.6 MB/s,   1.35 ms)
-   32 tasks d=1   → 62 891 ops/s  (245.7 MB/s, 506.1 µs)
-   32 tasks d=8   → 59 111 ops/s  (230.9 MB/s,   4.31 ms)
-   64 tasks d=16  → 44 723 ops/s  (174.7 MB/s,  22.87 ms)    [deep queue pathological]
-  256 tasks d=1   → 64 591 ops/s  (252.3 MB/s,   3.56 ms)    [matches perf-check]
-  256 tasks d=4   → 39 349 ops/s  (153.7 MB/s,  25.98 ms)    [head-of-line build-up]
-  256 tasks d=8   → 61 593 ops/s  (240.6 MB/s,  33.04 ms)
-
-  Read scaling (4 KB, 20 000-key seed):
-    1 task  d=1   →  22 210 ops/s ( 86.8 MB/s,  44.5 µs)
-    1 task  d=16  →  54 140 ops/s (211.5 MB/s, 295.0 µs)    [+144 % vs d=1]
-    1 task  d=64  →  34 480 ops/s (134.7 MB/s,   1.84 ms)
-   32 tasks d=16  → 162 093 ops/s (633.2 MB/s,   3.16 ms)   [clean scaling]
-
-  Interpretation:
-    - Single-task writes peak around d=4 (~15k) — past that, one TCP
-      connection's P-log submit serializes through the bounded submit
-      queue without additional parallelism.
-    - 32-task / 256-task writes converge at ~60k ops/s — the 256-sync-
-      barrier ceiling the R4 spec §6 predicted (256 × 4 ms RTT = 64k).
-      Adding pipeline depth at 256 tasks PESSIMIZES numbers (256 × 4 = 1024
-      in-flight floods group-commit and replica fanout, inflating tail
-      latency to 33 ms without lifting throughput).
-    - Reads scale cleanly with depth: 1t d=16 = 54k (+144 % over 1t d=1),
-      32t d=16 = 162k ops/s. Read path is stateless (no group-commit
-      barrier, no replica write fanout), so PS-layer pipelining pays off
-      directly.
-
-  These numbers confirm the thesis motivating Task A (extend perf-check
-  with `--pipeline-depth`): the 256-sync-clients workload is barrier-
-  bound at ~64 k, and the only way past it is either fewer clients with
-  deeper pipelines (cooperating clients) or more partitions (orthogonal
-  parallelism).
+  Interpretation: reads scale with depth at N=1 (+16% at d=4), but
+  writes don't — the 256-thread × 4 KB × nosync path is still bound
+  on the group-commit ceiling the PS-side ps_bench also revealed
+  (Task B output). The benchmark's CLIENT is no longer the
+  bottleneck — that's the change's deliverable.
 
 Main gaps / concerns:
-  - None functional. The bench is a diagnostic tool and runs end-to-end.
-  - Single-task writes saturate earlier than extent_bench (15k vs 125k at
-    depth=64). Expected: PS write path = P-log group-commit + 3-replica
-    fan-out over StreamClient + log_stream append, whereas extent_bench
-    hits the extent node directly. The bench captures this exactly —
-    that's the point of having a matched PS-layer harness.
-  - 256t × d=4 cell shows a degenerate ~39k — looks like when 256 × 4 =
-    1024 in-flight overwhelm the PS submit channel (cap 1024) and the
-    backpressure / buffer bloat spikes tail latency. Documented as a
-    scenario finding rather than a bug.
+  - None functional for this task. The `depth=8` run did trigger a
+    pre-existing RpcClient submit-channel hang when the writer_task
+    exits on EPIPE without closing submit_rx. Noted but explicitly
+    out-of-scope (Task A must not touch library crates).
 
 Next steps:
-  1. R4 Task A (parallel): `autumn-client perf-check --pipeline-depth K`.
-     Already referenced in autumn_client.rs per context.
-  2. R4 Step 4.5: 3-rep perf gate on shm N=1.
-  3. Use ps_bench periodically as a depth/scaling regression harness.
+  1. R4 step 4.5: gated 3-replica perf regression baseline on shm
+     N=1 now that depth is tunable.
+  2. Followup: make RpcClient drop submit_rx when writer_task exits
+     so `.submit().await` returns `Err` instead of parking forever
+     at high depth. Separate task.

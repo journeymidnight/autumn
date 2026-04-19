@@ -22,6 +22,7 @@ AC="$SCRIPT_DIR/target/release/autumn-client"
 USE_SHM=0
 UPDATE_BASELINE=""
 PARTITIONS=1
+PIPELINE_DEPTH=1
 SKIP_CLUSTER=0
 while (( $# > 0 )); do
     case "$1" in
@@ -33,6 +34,12 @@ while (( $# > 0 )); do
             PARTITIONS="${1:-}"
             [[ "$PARTITIONS" =~ ^[0-9]+$ ]] && (( PARTITIONS >= 1 )) \
                 || { echo "--partitions must be a positive integer" >&2; exit 1; }
+            ;;
+        --pipeline-depth)
+            shift
+            PIPELINE_DEPTH="${1:-}"
+            [[ "$PIPELINE_DEPTH" =~ ^[0-9]+$ ]] && (( PIPELINE_DEPTH >= 1 && PIPELINE_DEPTH <= 256 )) \
+                || { echo "--pipeline-depth must be an integer in [1, 256]" >&2; exit 1; }
             ;;
         -h|--help)
             sed -n '2,11p' "$0"
@@ -88,5 +95,6 @@ echo "[perf-check] running perf-check on $STORAGE_LABEL (baseline: $BASELINE)...
     --duration 10 \
     --size 4096 \
     --partitions "$PARTITIONS" \
+    --pipeline-depth "$PIPELINE_DEPTH" \
     --baseline "$BASELINE" \
     $UPDATE_BASELINE

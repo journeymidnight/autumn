@@ -131,6 +131,7 @@ enum Command {
         threshold: f64,
         update_baseline: bool,
         partitions: usize,
+        pipeline_depth: usize,
     },
     Info,
 }
@@ -162,7 +163,7 @@ fn usage() -> ! {
     eprintln!("                                    Write benchmark (--nosync skips fsync)");
     eprintln!("  rbench [--threads 40] [--duration 10] <RESULT_FILE>");
     eprintln!("                                    Read benchmark");
-    eprintln!("  perf-check [--threads 256] [--duration 10] [--size 4096] [--nosync] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline] [--partitions N]");
+    eprintln!("  perf-check [--threads 256] [--duration 10] [--size 4096] [--nosync] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline] [--partitions N] [--pipeline-depth K]");
     eprintln!("                                    Quick write+read bench; warns if >threshold regression vs baseline");
     eprintln!("  info                              Show cluster info");
     std::process::exit(1);
@@ -502,6 +503,7 @@ fn parse_args() -> Args {
             let mut threshold = 0.8f64;
             let mut update_baseline = false;
             let mut partitions_meta_from_flag: usize = 1;
+            let mut pipeline_depth: usize = 1;
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--threads" | "-t" => {
@@ -538,6 +540,16 @@ fn parse_args() -> Args {
                             usage();
                         }
                     }
+                    "--pipeline-depth" => {
+                        i += 1;
+                        pipeline_depth = raw[i]
+                            .parse()
+                            .expect("--pipeline-depth must be a positive integer");
+                        if pipeline_depth == 0 || pipeline_depth > 256 {
+                            eprintln!("--pipeline-depth must be in [1, 256]");
+                            usage();
+                        }
+                    }
                     other => {
                         eprintln!("unknown perf-check flag: {other}");
                         usage();
@@ -554,6 +566,7 @@ fn parse_args() -> Args {
                 threshold,
                 update_baseline,
                 partitions: partitions_meta_from_flag,
+                pipeline_depth,
             }
         }
         "info" => Command::Info,
@@ -1506,9 +1519,19 @@ async fn main() -> Result<()> {
             threshold,
             update_baseline,
             partitions: partitions_meta_from_flag,
+            pipeline_depth,
         } => {
+            let pipeline_depth = pipeline_depth.max(1);
             // ---- Write phase ----
-            println!("==> perf-check: write ({threads} threads, {duration_secs}s, {value_size}B)");
+            if pipeline_depth > 1 {
+                println!(
+                    "==> perf-check: write ({threads} threads, {duration_secs}s, {value_size}B, depth={pipeline_depth})"
+                );
+            } else {
+                println!(
+                    "==> perf-check: write ({threads} threads, {duration_secs}s, {value_size}B)"
+                );
+            }
 
             let partitions = client.all_partitions().await?;
             if partitions.is_empty() {
@@ -1539,8 +1562,10 @@ async fn main() -> Result<()> {
                 let value_bytes =
                     (0..value_size).map(|i| (i % 256) as u8).collect::<Vec<u8>>();
 
+                let max_depth = pipeline_depth;
                 let handle = std::thread::spawn(move || {
                     compio::runtime::Runtime::new().unwrap().block_on(async {
+                        use futures::stream::{FuturesUnordered, StreamExt};
                         let ps = match RpcClient::connect(ps_addr).await {
                             Ok(c) => c,
                             Err(e) => {
@@ -1551,30 +1576,39 @@ async fn main() -> Result<()> {
                         let mut seq: u64 = 0;
                         let mut local_latencies: Vec<f64> = Vec::new();
                         let mut local_keyinfo: Vec<(String, u64, SocketAddr)> = Vec::new();
+                        let mut inflight = FuturesUnordered::new();
                         loop {
-                            if std::time::SystemTime::now() >= *deadline {
-                                break;
+                            // Refill pipeline up to max_depth while deadline not expired.
+                            while inflight.len() < max_depth
+                                && std::time::SystemTime::now() < *deadline
+                            {
+                                let key = format!("pc_{tid}_{seq}");
+                                seq += 1;
+                                let req_bytes = rkyv_encode(&PutReq {
+                                    part_id,
+                                    key: key.as_bytes().to_vec(),
+                                    value: value_bytes.clone(),
+                                    must_sync: !nosync,
+                                    expires_at: 0,
+                                });
+                                let ps_clone = ps.clone();
+                                let t0 = Instant::now();
+                                inflight.push(async move {
+                                    let res = ps_clone.call(MSG_PUT, req_bytes).await;
+                                    (res, key, t0.elapsed())
+                                });
                             }
-                            let key = format!("pc_{tid}_{seq}");
-                            seq += 1;
-                            let t0 = Instant::now();
-                            let res = ps
-                                .call(
-                                    MSG_PUT,
-                                    rkyv_encode(&PutReq {
-                                        part_id,
-                                        key: key.as_bytes().to_vec(),
-                                        value: value_bytes.clone(),
-                                        must_sync: !nosync,
-                                        expires_at: 0,
-                                    }),
-                                )
-                                .await;
-                            let elapsed = t0.elapsed();
-                            if res.is_ok() {
-                                total_ops.fetch_add(1, Ordering::Relaxed);
-                                local_latencies.push(elapsed.as_secs_f64() * 1000.0);
-                                local_keyinfo.push((key, part_id, ps_addr));
+                            // Drain one completion. When deadline passes AND inflight is
+                            // empty, next() returns None and we exit.
+                            match inflight.next().await {
+                                Some((res, key, elapsed)) => {
+                                    if res.is_ok() {
+                                        total_ops.fetch_add(1, Ordering::Relaxed);
+                                        local_latencies.push(elapsed.as_secs_f64() * 1000.0);
+                                        local_keyinfo.push((key, part_id, ps_addr));
+                                    }
+                                }
+                                None => break,
                             }
                         }
                         (local_latencies, local_keyinfo)
@@ -1624,7 +1658,13 @@ async fn main() -> Result<()> {
             }
 
             // ---- Read phase ----
-            println!("\n==> perf-check: read ({threads} threads, {duration_secs}s)");
+            if pipeline_depth > 1 {
+                println!(
+                    "\n==> perf-check: read ({threads} threads, {duration_secs}s, depth={pipeline_depth})"
+                );
+            } else {
+                println!("\n==> perf-check: read ({threads} threads, {duration_secs}s)");
+            }
 
             let pc_keyinfo = Arc::new(all_write_keyinfo);
             let manager_addr = Arc::new(args.manager.clone());
@@ -1641,8 +1681,10 @@ async fn main() -> Result<()> {
                 let deadline = Arc::clone(&deadline);
                 let total_ops = Arc::clone(&total_ops);
 
+                let max_depth = pipeline_depth;
                 let handle = std::thread::spawn(move || {
                     compio::runtime::Runtime::new().unwrap().block_on(async {
+                        use futures::stream::{FuturesUnordered, StreamExt};
                         // Per-thread RpcClient connection cache keyed by ps_addr.
                         let mut conns: std::collections::HashMap<SocketAddr, Rc<RpcClient>> =
                             std::collections::HashMap::new();
@@ -1654,39 +1696,47 @@ async fn main() -> Result<()> {
                         let my_slice = &pc_keyinfo[start_idx..end_idx];
                         let mut ki = 0usize;
                         let mut local_latencies: Vec<f64> = Vec::new();
+                        let mut inflight = FuturesUnordered::new();
 
                         loop {
-                            if std::time::SystemTime::now() >= *deadline {
-                                break;
+                            // Refill pipeline up to max_depth while deadline not expired.
+                            while inflight.len() < max_depth
+                                && std::time::SystemTime::now() < *deadline
+                            {
+                                let (key, part_id, ps_addr) = &my_slice[ki % my_slice.len()];
+                                ki += 1;
+                                let ps = match conns.get(ps_addr) {
+                                    Some(c) => c.clone(),
+                                    None => match RpcClient::connect(*ps_addr).await {
+                                        Ok(c) => {
+                                            conns.insert(*ps_addr, c.clone());
+                                            c
+                                        }
+                                        Err(_) => continue,
+                                    },
+                                };
+                                let req_bytes = rkyv_encode(&GetReq {
+                                    part_id: *part_id,
+                                    key: key.as_bytes().to_vec(),
+                                    offset: 0,
+                                    length: 0,
+                                });
+                                let t0 = Instant::now();
+                                inflight.push(async move {
+                                    let res = ps.call(MSG_GET, req_bytes).await;
+                                    (res, t0.elapsed())
+                                });
                             }
-                            let (key, part_id, ps_addr) = &my_slice[ki % my_slice.len()];
-                            ki += 1;
-                            let ps = match conns.get(ps_addr) {
-                                Some(c) => c.clone(),
-                                None => match RpcClient::connect(*ps_addr).await {
-                                    Ok(c) => {
-                                        conns.insert(*ps_addr, c.clone());
-                                        c
+                            // Drain one completion. When deadline passes AND inflight is
+                            // empty, next() returns None and we exit.
+                            match inflight.next().await {
+                                Some((res, elapsed)) => {
+                                    if res.is_ok() {
+                                        total_ops.fetch_add(1, Ordering::Relaxed);
+                                        local_latencies.push(elapsed.as_secs_f64() * 1000.0);
                                     }
-                                    Err(_) => continue,
-                                },
-                            };
-                            let t0 = Instant::now();
-                            let res = ps
-                                .call(
-                                    MSG_GET,
-                                    rkyv_encode(&GetReq {
-                                        part_id: *part_id,
-                                        key: key.as_bytes().to_vec(),
-                                        offset: 0,
-                                        length: 0,
-                                    }),
-                                )
-                                .await;
-                            let elapsed = t0.elapsed();
-                            if res.is_ok() {
-                                total_ops.fetch_add(1, Ordering::Relaxed);
-                                local_latencies.push(elapsed.as_secs_f64() * 1000.0);
+                                }
+                                None => break,
                             }
                         }
                         local_latencies
