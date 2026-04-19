@@ -1,3 +1,75 @@
+Date: 2026-04-20
+TaskStatus: completed
+Task scope: F099-A — Perf R4 ceiling diagnosis (flame-graph measurement only,
+  no code change in crates/rpc, crates/stream, crates/partition-server/src)
+
+Current summary (F099-A):
+  Branch: perf-r1-partition-scale-out (worktree /data/dongmao_dev/autumn-perf-r1)
+
+  Captured 3 flame graphs of autumn-ps under the three scenarios listed
+  in the F099-A spec. Root cause identified: the 60-65 k write ceiling
+  at N=1 x 256 synchronous x 4 KB is a CPU ceiling on the single
+  `part-13` (P-log) OS thread, not an I/O ceiling.
+
+  Breakdown of P-log CPU at the ceiling (scenario a, 256 x d=1 write):
+    - 28 %  crossbeam-skiplist atomic ops during Memtable::insert
+            (SkipList::search_position + refcount cascades)
+    - 30 %  per-request RPC ceremony (spawn_write_request task +
+            handle_put's inner oneshot + waker cascade drops)
+    - 16 %  background_write_loop_r1 Phase 1 + Phase 3
+    -  4 %  StreamClient::append* (I/O is NOT the bottleneck)
+    -  4 %  flush dispatcher
+    -  18 %  compio scheduler, io_uring CQE drain, misc allocs
+
+  fsync and 3-replica fanout are both ruled out as the bottleneck.
+  Reads escape the ceiling because handle_get runs inline on ps-conn
+  threads (parallel), doesn't touch the skiplist except for search,
+  and has only one oneshot per request.
+
+  Candidate fixes for F099-B+ (priority order):
+    1. Replace SkipMap with single-writer BTreeMap for the active
+       memtable. Est. +25-40 %.
+    2. Collapse spawn_write_request task + handle_put inner oneshot
+       into direct enqueue. Est. +10-15 %.
+    3. Coalesce Bytes cloning during WAL encode. Est. +3-6 %.
+
+  Fixes A+B combined are expected to move median write throughput
+  from ~55 k to ~70-75 k, clearing the Tier B' 65 k gate.
+
+Files:
+  docs/superpowers/specs/2026-04-20-perf-r4-ceiling-diagnosis.md
+    (the findings document — 200+ lines, covers methodology, 3 flame
+    graphs, top-10 hot-spot table, root-cause hypothesis, candidate
+    fixes, and the read-vs-write divergence analysis)
+  /tmp/autumn_ps_pprof_*.svg + .collapsed.txt + .filtered.svg
+    (raw flame graph artifacts — NOT committed per the F099-A spec)
+
+Diagnostic-only code changes:
+  NONE committed. During capture, the pprof-rs hook in
+  crates/server/src/bin/partition_server.rs was temporarily
+  extended locally to emit inferno-format collapsed-stack text
+  (thread;frame;... count) so leaf functions could be scripted.
+  That change was REVERTED before commit — findings doc appendix
+  describes how to re-apply it in future captures.
+
+Main gaps / concerns:
+  - pprof-rs is user-space only. No kernel-side attribution. `perf`
+    is not installed on this host; if the bottleneck were in
+    pwritev/futex/io_uring_enter it would show as a fat leaf in the
+    compio driver — observed frames are all <5 % on P-log.
+  - One sample per scenario (plus one stability re-run for (a)).
+    Leaf ranks stable within +-3 pp across the two (a) runs.
+
+Next steps:
+  - F099-B (already completed in a separate commit — see entry below)
+  - F099-C: implement Fix A (BTreeMap memtable)
+  - F099-D: implement Fix B (collapse spawn_write_request + oneshot)
+  - Re-run the three flame-graph scenarios after C+D to quantify gains.
+
+Commit: docs(F099-A): R4 ceiling flame graph diagnosis (<tbd>)
+
+---
+
 Date: 2026-04-18
 TaskStatus: completed
 Task scope: F099-B — StreamClient parallel 3-replica fanout
