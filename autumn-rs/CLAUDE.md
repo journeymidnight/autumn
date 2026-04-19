@@ -58,18 +58,25 @@ On crash recovery, the partition replays: metaStream checkpoint → rowStream SS
 ```
 Put(key, value, must_sync)
   │
-  └─ Send WriteRequest{must_sync} to per-partition write_tx channel
+  └─ ps-conn: PartitionRequest{msg_type=MSG_PUT, payload, resp_tx}
+             → PartitionRouter mpsc → P-log merged_partition_loop
        │
-       └─ background_write_loop (group commit):
-            ├─ Drain up to 256 requests per batch
-            ├─ Assign seq numbers, build WAL records
+       └─ merged_partition_loop (F099-D: request dispatch + group commit in one task):
+            ├─ Decode PutReq inline (no spawn, no inner oneshot)
+            ├─ Push WriteRequest with direct WriteResponder::Put{outer=resp_tx, key}
+            │    into `pending` Vec
+            ├─ When pending >= MIN_PIPELINE_BATCH (256) OR pipeline empty:
+            │    Phase 1: assign seq, build WAL records
             │    [op:1][key_len:4][val_len:4][expires_at:8][key][value]
+            │    Launch Phase 2 future into FuturesUnordered (cap = AUTUMN_PS_INFLIGHT_CAP)
             ├─ stream_client.append_batch(log_stream_id, &blocks, batch_must_sync)
             │    ALL values (small and large) appended to log_stream in one RPC
             │    Large values (>4KB): VP stored in memtable, value stays in log_stream
-            ├─ Insert all entries into active Memtable (RwLock<BTreeMap>, batched)
+            ├─ Phase 3 (on CQ completion): insert all entries into active
+            │    Memtable (RwLock<BTreeMap>, batched via insert_batch)
             ├─ maybe_rotate_locked → push to imm queue → signal flush_tx
-            └─ Reply Ok(key) to all requestors
+            └─ WriteResponder::send_ok → encode PutResp/DeleteResp frame +
+               forward to ps-conn outer resp_tx (no inner oneshot hop)
 
 background_flush_loop (when signaled):
   ├─ Build SSTable bytes (no lock held)

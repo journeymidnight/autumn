@@ -7,16 +7,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use autumn_rpc::manager_rpc::MgrRange as Range;
-use autumn_rpc::partition_rpc::{self, *};
 use autumn_stream::StreamClient;
 use bytes::{BufMut, Bytes, BytesMut};
-use futures::stream::FuturesUnordered;
-use futures::{FutureExt, SinkExt, StreamExt};
-use futures::channel::{mpsc, oneshot};
+use futures::{StreamExt};
+use futures::channel::mpsc;
 
 use crate::*;
-use crate::sstable::{IterItem, MemtableIterator, MergeIterator, SstBuilder, SstReader, TableIterator};
+use crate::sstable::{IterItem, MergeIterator, SstBuilder, SstReader, TableIterator};
 
 /// R4 4.4 — minimum pending size required to launch a *second or later*
 /// batch while another batch is already in flight. Below this threshold the
@@ -25,7 +22,7 @@ use crate::sstable::{IterItem, MemtableIterator, MergeIterator, SstBuilder, SstR
 /// in parallel, and stealing small batches from a naturally-large burst
 /// regressed throughput in R3 Task 5b. 256 matches the client-count at
 /// perf_check N=1 × 256 threads.
-const MIN_PIPELINE_BATCH: usize = 256;
+pub(crate) const MIN_PIPELINE_BATCH: usize = 256;
 
 pub(crate) struct CompactStats {
     pub input_tables: usize,
@@ -291,256 +288,24 @@ pub(crate) async fn background_gc_loop(
 }
 
 
-pub(crate) async fn background_write_loop(
-    part_id: u64,
-    part: Rc<RefCell<PartitionData>>,
-    mut write_rx: mpsc::Receiver<WriteRequest>,
-    locked_by_other: Rc<Cell<bool>>,
-) {
-    if crate::leader_follower_enabled() {
-        background_write_loop_lf(part_id, part, locked_by_other).await;
-    } else {
-        background_write_loop_r1(part_id, part, write_rx, locked_by_other).await;
-    }
-}
-
-/// R2 Path (iii) write loop: waits for first push via await_first(), then
-/// sleeps a configurable collection window (AUTUMN_LF_COLLECT_MICROS, default
-/// 500µs) to let more pushes accumulate before draining. Signals all waiting
-/// handle_put futures after each batch.
-async fn background_write_loop_lf(
-    part_id: u64,
-    part: Rc<RefCell<PartitionData>>,
-    locked_by_other: Rc<Cell<bool>>,
-) {
-    let mut metrics = WriteLoopMetrics::new();
-    let builder = part.borrow().write_batch_builder.clone();
-
-    loop {
-        // (1) Wait for the first push — no busy-spinning.
-        builder.await_first().await;
-
-        // (2) Collection window — sleep to let more pushes accumulate.
-        let collect_micros = crate::lf_collect_micros();
-        if collect_micros > 0 {
-            compio::time::sleep(std::time::Duration::from_micros(collect_micros)).await;
-        }
-
-        // (3) Drain the accumulated batch.
-        let (batch, max_seq) = builder.drain();
-        if batch.is_empty() {
-            // Spurious wake (e.g. all pushed items were already stolen by a
-            // concurrent drain path — shouldn't happen with single leader, but
-            // be defensive). Loop back to await_first.
-            continue;
-        }
-
-        // ── Start new batch: Phase1 + launch Phase2 ──
-        match start_write_batch(&part, batch) {
-            Ok(Some(flight)) => {
-                // Await Phase2 (append I/O).
-                let r = flight.phase2_fut.await;
-                match finish_write_batch(&part, flight.data, r).await {
-                    Ok(stats) => metrics.record(stats),
-                    Err(e) => {
-                        // Signal followers even on error so they don't hang.
-                        builder.signal_complete(max_seq);
-                        if is_locked_by_other(&e) {
-                            tracing::error!(part_id, "LockedByOther detected, poisoning partition");
-                            locked_by_other.set(true);
-                            metrics.flush(part_id);
-                            return;
-                        }
-                        tracing::error!("write batch error: {e}");
-                        metrics.maybe_report(part_id);
-                        continue;
-                    }
-                }
-                // Phase 3 complete — broadcast wake to all waiting followers.
-                builder.signal_complete(max_seq);
-                metrics.maybe_report(part_id);
-            }
-            Ok(None) => {
-                // Empty batch (all out-of-range) — signal anyway so futures resolve.
-                builder.signal_complete(max_seq);
-            }
-            Err(e) => {
-                tracing::error!("write batch start error: {e}");
-                // Signal so followers don't hang indefinitely.
-                builder.signal_complete(max_seq);
-            }
-        }
-    }
-}
-
-/// R4 4.4 — P-log write loop with true N-deep SQ/CQ pipeline.
-///
-/// Previously (R3 / step 4.3) a single `InFlightBatch` was held at a time;
-/// the loop awaited its `phase2_fut` before starting the next batch. That
-/// left step 4.3's per-stream SQ/CQ worker idle for most of each RTT.
-///
-/// This revision keeps up to `ps_inflight_cap()` (default 8) Phase-2
-/// futures in flight concurrently via `FuturesUnordered`. Completions run
-/// Phase 3 (memtable insert + client reply) one at a time — the loop is
-/// single-threaded so there is no concurrent `finish_write_batch`, which
-/// preserves the partition write lock semantics and serializes
-/// `maybe_rotate`.
-///
-/// Ordering: the stream layer's per-stream SQ/CQ worker assigns offsets in
-/// submit order, and the writer_task's sequential `write_vectored_all`
-/// preserves on-wire order per TCP connection. However, Phase 2 futures
-/// may **complete** out of order (earlier large batch finishing after a
-/// later small one). Memtable MVCC keys are self-ordered by inverted
-/// sequence number, so inserting entries in completion order is correct —
-/// see CLAUDE.md "Write Path (R4 4.4)".
-async fn background_write_loop_r1(
-    part_id: u64,
-    part: Rc<RefCell<PartitionData>>,
-    mut write_rx: mpsc::Receiver<WriteRequest>,
-    locked_by_other: Rc<Cell<bool>>,
-) {
-    use futures::future::{select, Either};
-
-    let cap = crate::ps_inflight_cap();
-    let mut metrics = WriteLoopMetrics::new();
-    let mut pending: Vec<WriteRequest> = Vec::new();
-
-    /// Boxed completion future: awaits the Phase-2 append result and
-    /// carries `BatchData` along with it so the loop can run Phase 3
-    /// without additional bookkeeping.
-    type CompletionFut = std::pin::Pin<Box<dyn std::future::Future<Output = InflightCompletion>>>;
-    let mut inflight: FuturesUnordered<CompletionFut> = FuturesUnordered::new();
-
-    let batch_target = MIN_PIPELINE_BATCH.min(crate::max_write_batch());
-
-    loop {
-        // (A) Opportunistically drain any ready completions and run Phase 3.
-        while let Some(Some(c)) = inflight.next().now_or_never() {
-            handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
-            if locked_by_other.get() {
-                return;
-            }
-        }
-
-        // (B) Decide what to do based on pending + inflight state.
-        let n_inflight = inflight.len();
-        let at_cap = n_inflight >= cap;
-
-        // Launch a new batch when:
-        //   - we have pending requests AND
-        //   - cap has room AND
-        //   - either the pipeline is empty (always launch first batch) or
-        //     pending has grown to `batch_target` (R3 5b insight: small
-        //     fragmented batches regress throughput).
-        let ready_to_launch = !pending.is_empty()
-            && !at_cap
-            && (n_inflight == 0 || pending.len() >= batch_target);
-        if ready_to_launch {
-            let batch = std::mem::take(&mut pending);
-            match start_write_batch(&part, batch) {
-                Ok(Some(mut flight)) => {
-                    let data = flight.data;
-                    inflight.push(Box::pin(async move {
-                        let phase2_result = (&mut flight.phase2_fut).await;
-                        InflightCompletion { data, phase2_result }
-                    }));
-                }
-                Ok(None) => {} // empty batch (all out of range)
-                Err(e) => tracing::error!("start_write_batch err: {e}"),
-            }
-            continue;
-        }
-
-        // (C) Pipeline full — only CQ can progress.
-        if at_cap {
-            if let Some(c) = inflight.next().await {
-                handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
-                if locked_by_other.get() {
-                    return;
-                }
-            }
-            continue;
-        }
-
-        // (D) Pipeline has room but we don't want to launch yet (pending <
-        //     batch_target with something already in flight).
-        if n_inflight == 0 {
-            // Fully idle: block on write_rx alone.
-            match write_rx.next().await {
-                Some(r) => pending.push(r),
-                None => break, // channel closed — clean shutdown
-            }
-        } else {
-            let req_fut = write_rx.next();
-            let cfut = inflight.next();
-            futures::pin_mut!(req_fut);
-            match select(req_fut, Box::pin(cfut)).await {
-                Either::Left((maybe_req, _cfut_dropped)) => match maybe_req {
-                    Some(r) => pending.push(r),
-                    None => {
-                        // Channel closed: drain remaining inflight for clean
-                        // client replies, then finish any pending + exit.
-                        while let Some(c) = inflight.next().await {
-                            handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
-                            if locked_by_other.get() {
-                                return;
-                            }
-                        }
-                        break;
-                    }
-                },
-                Either::Right((maybe_completion, _req_fut_dropped)) => {
-                    if let Some(c) = maybe_completion {
-                        handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
-                        if locked_by_other.get() {
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-
-        // (E) Non-blocking drain of any queued requests before the next iter.
-        while pending.len() < crate::max_write_batch() {
-            match write_rx.next().now_or_never() {
-                Some(Some(r)) => pending.push(r),
-                _ => break,
-            }
-        }
-    }
-
-    // Shutdown path (write_rx closed): drain any still-in-flight batches so
-    // clients get their final ack (success or connection-closed err), then
-    // flush any residual pending as one last batch.
-    while let Some(c) = inflight.next().await {
-        handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
-        if locked_by_other.get() {
-            metrics.flush(part_id);
-            return;
-        }
-    }
-    if !pending.is_empty() {
-        let batch = std::mem::take(&mut pending);
-        if let Ok(Some(mut flight)) = start_write_batch(&part, batch) {
-            let r = (&mut flight.phase2_fut).await;
-            let _ = finish_write_batch(&part, flight.data, r).await;
-        }
-    }
-    metrics.flush(part_id);
-}
+/// F099-D: `background_write_loop` and its R1/LF dispatch helpers are gone —
+/// the write loop is now inlined into `merged_partition_loop` on the main
+/// P-log task. The primitives below (`start_write_batch`, `finish_write_batch`,
+/// `handle_completion`, `InflightCompletion`, `InFlightBatch`, `BatchData`)
+/// remain as building blocks used by that merged loop.
 
 /// Carrier payload pushed through the FuturesUnordered completion queue.
 /// `data` is the Phase-1 validated batch; `phase2_result` is the return
 /// value of the P-log `append_batch` / `append_segments` call.
-struct InflightCompletion {
-    data: BatchData,
-    phase2_result: Result<autumn_stream::AppendResult>,
+pub(crate) struct InflightCompletion {
+    pub(crate) data: BatchData,
+    pub(crate) phase2_result: Result<autumn_stream::AppendResult>,
 }
 
 /// Consume one completion: run Phase 3 (memtable insert + client reply),
 /// update metrics, and surface `LockedByOther` via the shared flag so the
 /// main loop can terminate the partition.
-async fn handle_completion(
+pub(crate) async fn handle_completion(
     part: &Rc<RefCell<PartitionData>>,
     metrics: &mut WriteLoopMetrics,
     locked_by_other: &Rc<Cell<bool>>,
@@ -566,20 +331,24 @@ async fn handle_completion(
 // with Phase2 (append I/O) as an in-flight future for double-buffering.
 // ---------------------------------------------------------------------------
 
-struct ValidatedEntry {
+pub(crate) struct ValidatedEntry {
     internal_key: Vec<u8>,
     user_key: Bytes,
     op: u8,
     value: Bytes,
     expires_at: u64,
     must_sync: bool,
-    resp_tx: oneshot::Sender<Result<Vec<u8>, String>>,
+    /// F099-D: direct responder. On Phase 3 success we call `send_ok` which
+    /// encodes the `PutResp` / `DeleteResp` frame bytes and forwards to the
+    /// outer ps-conn oneshot — no inner oneshot hop.
+    resp: crate::WriteResponder,
 }
 
-type Phase2Fut = std::pin::Pin<Box<dyn std::future::Future<Output = Result<autumn_stream::AppendResult>>>>;
+pub(crate) type Phase2Fut =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<autumn_stream::AppendResult>>>>;
 
 /// In-flight batch data (without the future).
-struct BatchData {
+pub(crate) struct BatchData {
     picked_at: Instant,
     phase1_ns: u64,
     phase2_started_at: Instant,
@@ -588,13 +357,13 @@ struct BatchData {
 }
 
 /// In-flight batch: Phase1 done, Phase2 future running.
-struct InFlightBatch {
-    data: BatchData,
-    phase2_fut: Phase2Fut,
+pub(crate) struct InFlightBatch {
+    pub(crate) data: BatchData,
+    pub(crate) phase2_fut: Phase2Fut,
 }
 
 /// Phase 1: validate + encode + launch Phase2 future (no await).
-fn start_write_batch(
+pub(crate) fn start_write_batch(
     part: &Rc<RefCell<PartitionData>>,
     batch: Vec<WriteRequest>,
 ) -> Result<Option<InFlightBatch>> {
@@ -617,7 +386,7 @@ fn start_write_batch(
                 }
             };
             if !in_range(&p.rg, &user_key) {
-                let _ = req.resp_tx.send(Err("key is out of range".to_string()));
+                req.resp.send_err("key is out of range".to_string());
                 continue;
             }
             p.seq_number += 1;
@@ -630,7 +399,7 @@ fn start_write_batch(
                 value,
                 expires_at,
                 must_sync: req.must_sync,
-                resp_tx: req.resp_tx,
+                resp: req.resp,
             });
         }
 
@@ -683,12 +452,12 @@ fn start_write_batch(
     }))
 }
 
-fn is_locked_by_other(e: &anyhow::Error) -> bool {
+pub(crate) fn is_locked_by_other(e: &anyhow::Error) -> bool {
     format!("{e}").contains("LockedByOther")
 }
 
 /// Phase 3: given Phase2 result, insert into memtable, reply to callers.
-async fn finish_write_batch(
+pub(crate) async fn finish_write_batch(
     part: &Rc<RefCell<PartitionData>>,
     bd: BatchData,
     phase2_result: Result<autumn_stream::AppendResult>,
@@ -700,7 +469,7 @@ async fn finish_write_batch(
         Err(e) => {
             let msg = format!("log_stream append_segments: {e}");
             for entry in bd.valid {
-                let _ = entry.resp_tx.send(Err(msg.clone()));
+                entry.resp.send_err(msg.clone());
             }
             return Err(anyhow!(msg));
         }
@@ -714,8 +483,12 @@ async fn finish_write_batch(
     // would mean N write-lock acquire/release cycles per batch. Collapsing
     // into one saves N-1 atomic-CAS pairs per batch (256 → 1 on the hot
     // --threads 256 workload) while preserving the single-writer semantics.
+    //
+    // F099-D: the per-entry responder is a direct `WriteResponder` into the
+    // outer ps-conn oneshot, carrying the encoded `PutResp` / `DeleteResp`
+    // frame bytes. No inner oneshot; `handle_put` is gone.
     let phase3_started_at = Instant::now();
-    let mut responses: Vec<(Vec<u8>, oneshot::Sender<Result<Vec<u8>, String>>)> = Vec::new();
+    let mut responders: Vec<crate::WriteResponder> = Vec::new();
     let batch_ops = bd.record_sizes.len() as u64;
     let record_sizes = bd.record_sizes;
     let base_offset = result.offset;
@@ -724,12 +497,12 @@ async fn finish_write_batch(
         let mut p = part.borrow_mut();
 
         // Materialise the inserts as an iterator that also side-effects
-        // `responses`. The iterator is fully consumed inside insert_batch,
+        // `responders`. The iterator is fully consumed inside insert_batch,
         // so the side effects all happen under the (single) write lock.
         let valid = bd.valid;
         let mut cumulative: u32 = 0;
         let mut idx: usize = 0;
-        let responses_ref = &mut responses;
+        let responders_ref = &mut responders;
         let iter = valid.into_iter().map(move |entry| {
             let record_offset = base_offset + cumulative;
             cumulative += record_sizes[idx];
@@ -755,7 +528,7 @@ async fn finish_write_batch(
             };
 
             let write_size = (entry.user_key.len() + mem_entry.value.len() + 32) as u64;
-            responses_ref.push((entry.user_key.to_vec(), entry.resp_tx));
+            responders_ref.push(entry.resp);
             (entry.internal_key, mem_entry, write_size)
         });
 
@@ -768,8 +541,10 @@ async fn finish_write_batch(
     }
     let phase3_elapsed = phase3_started_at.elapsed();
 
-    for (key, tx) in responses {
-        let _ = tx.send(Ok(key));
+    // Send replies AFTER releasing the partition borrow so a poorly-timed
+    // executor wake on the waking ps-conn can't re-enter PartitionData.
+    for resp in responders {
+        resp.send_ok();
     }
 
     Ok(BatchStats {
@@ -780,20 +555,6 @@ async fn finish_write_batch(
         phase3_ns: duration_to_ns(phase3_elapsed),
         end_to_end_ns: duration_to_ns(bd.picked_at.elapsed()),
     })
-}
-
-/// Legacy entry point used by flush_memtable_locked path.
-pub(crate) async fn process_write_batch(
-    part: &Rc<RefCell<PartitionData>>,
-    batch: Vec<WriteRequest>,
-) -> Result<BatchStats> {
-    match start_write_batch(part, batch)? {
-        Some(mut flight) => {
-            let r = flight.phase2_fut.await;
-            finish_write_batch(part, flight.data, r).await
-        }
-        None => Ok(BatchStats::default()),
-    }
 }
 
 // ---------------------------------------------------------------------------

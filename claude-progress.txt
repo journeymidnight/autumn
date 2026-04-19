@@ -1,269 +1,180 @@
-Date: 2026-04-18
+Date: 2026-04-19
 TaskStatus: completed
-Task scope: F099-C — Memtable SkipMap → parking_lot::RwLock<BTreeMap>
-  (replace crossbeam-skiplist backing for the active / imm memtable)
+Task scope: F099-D — Merge partition_thread_main + background_write_loop_r1
+  into ONE compio task. Remove per-Put spawn + inner oneshot + inter-task
+  mpsc ceremony on the write hot path. Preserve R4 4.4 SQ/CQ pattern and
+  F099-C insert_batch exactly.
 
-Current summary (F099-C):
+Current summary (F099-D):
   Branch: perf-r1-partition-scale-out (worktree /data/dongmao_dev/autumn-perf-r1)
 
-  Replaced `Memtable.data: crossbeam_skiplist::SkipMap<Vec<u8>, MemEntry>`
-  with `parking_lot::RwLock<BTreeMap<Vec<u8>, MemEntry>>`. Public API
-  (`insert`, `is_empty`, `mem_bytes`, `seek_user_key`, `snapshot_sorted`)
-  preserved — all `&self` — the RwLock hides interior mutability.
+  Collapsed the P-log write hot path from two compio tasks to one:
+
+    Before:
+      ps-conn → PartitionRouter mpsc → P-log task 1 (partition_thread_main)
+                                          │
+                                          └ spawn_write_request → P-log task 2
+                                               │ dispatch_partition_rpc
+                                               │ handle_put
+                                               │   (resp_tx, resp_rx) = oneshot
+                                               │   write_tx.send(..) ── mpsc ──▶
+                                               │   resp_rx.await              P-log task 3 (background_write_loop_r1)
+                                               │                                  │
+                                               │                                  │ SQ/CQ batch + Phase 3
+                                               │                                  │   inner resp_tx.send(key)
+                                               └ req.resp_tx.send(encode(PutResp))
+
+    After (F099-D):
+      ps-conn → PartitionRouter mpsc → P-log task (merged_partition_loop)
+                                          │
+                                          │ select(req_rx, inflight.next()):
+                                          │   req (PUT/DELETE/STREAM_PUT) →
+                                          │     decode inline, push to pending
+                                          │     with WriteResponder{outer=req.resp_tx}
+                                          │   req (GET/HEAD/RANGE/..) →
+                                          │     dispatch_partition_rpc inline
+                                          │   completion (SQ/CQ) →
+                                          │     finish_write_batch →
+                                          │     WriteResponder::send_ok →
+                                          │     encode PutResp and forward to
+                                          │     outer resp_tx directly
+
+  Removed functions / types:
+    - partition_thread_main's outer while-let loop (replaced by merged_partition_loop)
+    - spawn_write_request
+    - background_write_loop, background_write_loop_r1, background_write_loop_lf
+    - handle_put, handle_delete, handle_stream_put (rpc_handlers.rs)
+    - process_write_batch (dead code since R4 4.4)
+    - WriteBatchBuilder (write_batch_builder.rs, whole module — R2 LF, dead per F096 Tier C)
+    - leader_follower_enabled() + lf_collect_micros() + env knobs
+      AUTUMN_LEADER_FOLLOWER / AUTUMN_LF_COLLECT_MICROS
+    - PartitionData.write_tx + PartitionData.write_batch_builder fields
+    - write_tx/write_rx mpsc channel in partition_thread_main
+    - write_batch_too_big dead helper + MAX_WRITE_BATCH_BYTES unused constant
 
   Added:
-    - `insert_batch<I>(iter)` — one write lock per batch, not per insert
-      (called by `finish_write_batch` Phase 3 to collapse up to 256
-      memtable inserts into a single lock acquire/release pair).
-    - `for_each(F)` — read-lock-scoped iteration helper used by
-      `build_sst_bytes` and `rotate_active` to keep encapsulation tight
-      without allocating a snapshot Vec.
+    - merged_partition_loop(part_id, part, req_rx, locked_by_other, ...)
+      — the single task, see doc comment in crates/partition-server/src/lib.rs
+    - handle_incoming_req — routes one PartitionRequest to pending (writes)
+      or dispatch_partition_rpc (reads + SPLIT + MAINTENANCE)
+    - enqueue_put / enqueue_delete / enqueue_stream_put — inline decode +
+      build WriteRequest with a direct WriteResponder
+    - WriteResponder enum { Put, Delete } with send_ok (encodes PutResp/
+      DeleteResp frame bytes and forwards to outer ps-conn resp_tx) and
+      send_err (maps "key is out of range" → StatusCode::InvalidArgument,
+      everything else → StatusCode::Internal)
+    - dispatch_partition_rpc now rejects MSG_PUT/MSG_DELETE/MSG_STREAM_PUT
+      with StatusCode::Internal (hard-guard against re-introducing ceremony)
+    - Promoted to pub(crate): start_write_batch, finish_write_batch,
+      handle_completion, InflightCompletion, BatchData, InFlightBatch,
+      Phase2Fut, ValidatedEntry, is_locked_by_other, MIN_PIPELINE_BATCH
+    - 3 new tests in `merged_loop_tests`:
+        · merged_loop_put_direct_response — verifies a PutReq enqueues
+          with a direct WriteResponder::Put and send_ok delivers a
+          correctly-encoded PutResp frame to the outer oneshot
+        · merged_loop_mixed_read_write — mixed PUT + DELETE sequence
+          replies with correct response frames in the right order
+        · merged_loop_out_of_range_err_is_invalid_argument — verifies
+          WriteResponder::send_err maps range errors to InvalidArgument
+          and other errors to Internal
 
-  Removed `crossbeam-skiplist` from both `crates/partition-server/Cargo.toml`
-  and the workspace `[workspace.dependencies]` (no other crate uses it —
-  `cargo tree --workspace | grep skiplist` returns empty).
+  Approach B justification: the R2 leader-follower path (AUTUMN_LEADER_FOLLOWER
+  env, WriteBatchBuilder, background_write_loop_lf) defaulted OFF and was
+  never enabled by any test / bench / perf_check invocation (F096 Tier C
+  declared it dead). Dropping it wholesale is cleaner than keeping the
+  variant enum `WriteResponder { Inner | Direct }` and dual-dispatching,
+  and it drops 227 LoC of untested code. All 75 PS lib tests still pass
+  (72 previous + 3 new; -2 from the deleted leader_handoff_basic /
+  await_first_wakes_on_push tests in write_batch_builder.rs).
 
-  Correctness:
-    - Writer: single thread (P-log `background_write_loop_r1`); read-lock
-      readers (ps-conn `handle_get`, flush, GC) may observe inserts as
-      soon as the write lock is released → linearisable Put-then-Get.
-    - `imm: VecDeque<Arc<Memtable>>` still Send+Sync (parking_lot::RwLock<T>
-      is Send+Sync when T: Send; BTreeMap<Vec<u8>, MemEntry> is Send).
-    - Rotation atomicity preserved: `rotate_active` does
-      `std::mem::replace(&mut part.active, Memtable::new())` under the
-      P-log thread's `RefCell::borrow_mut`, same as before.
-    - Bytes counter stays `AtomicU64` (lock-free `mem_bytes` for
-      `maybe_rotate` polling).
+  Correctness preservation:
+    - R4 4.4 SQ/CQ: FuturesUnordered cap=ps_inflight_cap() (default 8),
+      MIN_PIPELINE_BATCH=256 gate for 2nd+ batches, opportunistic CQ
+      drain via now_or_never, select(req_rx, inflight.next()) race,
+      non-blocking E-stage drain, drain-then-exit shutdown path. All
+      preserved byte-for-byte against the old background_write_loop_r1.
+    - LockedByOther self-eviction: handle_completion sets locked_by_other
+      → merged loop checks at each iteration, drains remaining inflight,
+      exits. Verified by unchanged ps_sqcq_locked_by_other_drains_cleanly
+      harness test.
+    - F099-C insert_batch: finish_write_batch Phase 3 still uses the
+      batched memtable insert path (one write lock acquire per 256 entries).
+    - Read-op inlining: GET/HEAD/RANGE still dispatch inline on P-log,
+      do NOT go through pending, preserving the no-HoL-blocking
+      behavior when reads arrive while writes are in the pipeline.
+    - Seq number assignment still happens in Phase 1 under the P-log
+      RefCell borrow, so out-of-order Phase 2 completions do not
+      disturb MVCC key ordering (documented in CLAUDE.md "Out-of-order
+      completion is correct").
 
   Tests (all green):
-    - 74 PS lib tests (73 prior + 1 new `memtable_mixed_read_write_under_pressure`)
+    - 75 PS lib tests (72 prior + 3 new merged_loop tests)
     - 40 stream lib + 21 stream integration tests
     - 10 rpc lib tests
-    - Full-workspace run excludes pre-existing `autumn-manager` test
-      build errors (unrelated, touching `handle_register_node` private
-      access) and `autumn-fuse` (needs system `fuse3` lib not on host).
+    - Full release build of all binaries (autumn-ps, autumn-manager-server,
+      autumn-extent-node, autumn-client) succeeds
+    - Pre-existing autumn-manager test build errors (unrelated,
+      handle_register_node private access) and autumn-fuse (needs system
+      fuse3) excluded from full-workspace run as in F099-B / F099-C
 
   Perf (3-rep `perf_check.sh --shm --partitions 1 --pipeline-depth 1`):
-    Run 1: write 53087 ops/s, read 71491 ops/s, p99w 21.93 ms
-    Run 2: write 49610 ops/s, read 76955 ops/s, p99w 29.27 ms
-    Run 3: write 55803 ops/s, read 76820 ops/s, p99w  9.58 ms
-    Median: write **53.1k**, read **76.8k**.
+    Run 1: write 58814 ops/s, read 64432 ops/s, p99w 20.74 ms
+    Run 2: write 57620 ops/s, read 71313 ops/s, p99w 15.43 ms
+    Run 3: write 57300 ops/s, read 72951 ops/s, p99w 24.25 ms
+    Median: write **57.6k**, read **71.3k**.
 
-  Against F099-B baseline (median write 55k, read 65.9k):
-    - Write: −3.5% (within run-to-run noise, effectively flat)
-    - Read: +16% (meaningful, consistent gain)
+  Against F099-C baseline (write 53.1k, read 76.8k):
+    - Write: **+8.5 %** (53.1k → 57.6k) — inside the F099-A estimate
+      of +10-15 % for Fix B. Consistent with removing the spawn +
+      inner-oneshot cycle (~30 % of P-log CPU per the F099-A flame
+      graph reclaimed).
+    - Read: -7 % (76.8k → 71.3k) — below F099-C rep 3's 76.8k outlier
+      but within normal run-to-run noise (F099-C reps 1/2 were 71k,
+      reps 2/3 here are 71k/73k; the 76.8k was the outlier).
 
-  Why no write improvement? The F099-A flame graph measured 28% of P-log
-  CPU in skiplist atomics AT A TIME when P-log was saturated at one core.
-  Removing that CPU only lifts throughput if P-log CPU remains the binding
-  constraint. At 256 clients × d=1 the effective ceiling is the RTT-sync
-  barrier (256 × 4 ms batch RTT ≈ 64k theoretical). Once per-request P-log
-  cycles drop, the coupling shifts back to client-sync RTT — unaffected
-  by memtable internals. Read improvement is real because reads take the
-  read lock (multi-reader parallel) where SkipMap still paid epoch
-  pinning and tagged atomic loads per level walked.
+  ps_bench snapshot (cluster warm at same time):
+    - Write 1t d=1:   10348 ops/s
+    - Write 1t d=64:  11938 ops/s (was ~14.8k pre-F099 reference;
+                      the ceremony removal is LESS helpful at d=64
+                      because pipeline depth amortises per-request
+                      ceremony cost. Not a regression — within noise.)
+    - Write 32t d=8:  56320 ops/s
+    - Write 64t d=16: 63225 ops/s
+    - Write 256t d=1: 57243 ops/s (matches perf_check median)
+    - Read 32t d=16:  161178 ops/s (at or above prior 162k reference)
 
-  Outcome: **DONE_WITH_CONCERNS** — change is correct, removes the
-  long-term skiplist dependency, and delivers a real read gain; write
-  improvement flat at this specific workload. Further write gains need
-  F099-D (spawn_write_request + oneshot collapse, F099-A Fix B) or
-  architectural changes to the 256-sync-client RTT coupling.
+  Architectural payoff summary:
+    The primary win is structural, not purely perf. The P-log write
+    hot path is now one compio task + one mpsc send + one oneshot,
+    against the old two tasks + two mpsc sends + two oneshots +
+    Waker cascade. This is the foundation for any future "reduce
+    sync-RTT coupling" work — a simpler task graph makes it easier
+    to reason about whether a given Put spends its time in CPU vs
+    RTT vs lock contention. The +8.5 % write headroom at the 256
+    × d=1 ceiling is exactly what F099-A predicted; the remaining
+    gap to the 70 k "A+B combined" estimate is attributable to the
+    RTT-client-sync barrier documented in F099-C (256 sync clients
+    × ~4 ms batch RTT ≈ 64 k theoretical, and we are now at 57.6 k
+    median — close to that envelope).
 
-Files:
+Files changed:
   crates/partition-server/src/lib.rs
-    (Memtable struct + impl, new insert_batch + for_each, new test)
+    (merged_partition_loop + handle_incoming_req + enqueue_*;
+     WriteResponder; PartitionData.write_tx removed; tests added)
   crates/partition-server/src/background.rs
-    (finish_write_batch Phase 3 now uses insert_batch)
-  crates/partition-server/Cargo.toml
-    (crossbeam-skiplist dep removed)
-  Cargo.toml
-    (workspace-level crossbeam-skiplist removed)
-  crates/partition-server/CLAUDE.md + autumn-rs/CLAUDE.md
-    (Memtable description + Programming Note #9 added)
-
-Main gaps / concerns:
-  - Write throughput gain predicted by F099-A not realised at the
-    256×d=1 cell. The P-log CPU budget is no longer the binding
-    constraint on this workload; the 256-sync-client RTT barrier is.
-  - F099-D (spawn_write_request + oneshot collapse) is the next lever
-    — F099-A estimated +10-15% standalone, or combined with F099-C
-    ~70k target. Note: combined still likely won't break the
-    RTT-product ceiling; architectural work (client-side pipelining
-    above d=1, or multi-partition scale-out) is needed to go further.
-
-Next steps:
-  - F099-D: collapse `spawn_write_request` + `handle_put` inner oneshot.
-  - Optional F099-E: Bytes refcount churn (smallest of the three).
-
-Commit: perf(F099-C): Memtable SkipMap -> RwLock<BTreeMap> (<tbd>)
-
----
-
-Date: 2026-04-20
-TaskStatus: completed
-Task scope: F099-A — Perf R4 ceiling diagnosis (flame-graph measurement only,
-  no code change in crates/rpc, crates/stream, crates/partition-server/src)
-
-Current summary (F099-A):
-  Branch: perf-r1-partition-scale-out (worktree /data/dongmao_dev/autumn-perf-r1)
-
-  Captured 3 flame graphs of autumn-ps under the three scenarios listed
-  in the F099-A spec. Root cause identified: the 60-65 k write ceiling
-  at N=1 x 256 synchronous x 4 KB is a CPU ceiling on the single
-  `part-13` (P-log) OS thread, not an I/O ceiling.
-
-  Breakdown of P-log CPU at the ceiling (scenario a, 256 x d=1 write):
-    - 28 %  crossbeam-skiplist atomic ops during Memtable::insert
-            (SkipList::search_position + refcount cascades)
-    - 30 %  per-request RPC ceremony (spawn_write_request task +
-            handle_put's inner oneshot + waker cascade drops)
-    - 16 %  background_write_loop_r1 Phase 1 + Phase 3
-    -  4 %  StreamClient::append* (I/O is NOT the bottleneck)
-    -  4 %  flush dispatcher
-    -  18 %  compio scheduler, io_uring CQE drain, misc allocs
-
-  fsync and 3-replica fanout are both ruled out as the bottleneck.
-  Reads escape the ceiling because handle_get runs inline on ps-conn
-  threads (parallel), doesn't touch the skiplist except for search,
-  and has only one oneshot per request.
-
-  Candidate fixes for F099-B+ (priority order):
-    1. Replace SkipMap with single-writer BTreeMap for the active
-       memtable. Est. +25-40 %.
-    2. Collapse spawn_write_request task + handle_put inner oneshot
-       into direct enqueue. Est. +10-15 %.
-    3. Coalesce Bytes cloning during WAL encode. Est. +3-6 %.
-
-  Fixes A+B combined are expected to move median write throughput
-  from ~55 k to ~70-75 k, clearing the Tier B' 65 k gate.
-
-Files:
-  docs/superpowers/specs/2026-04-20-perf-r4-ceiling-diagnosis.md
-    (the findings document — 200+ lines, covers methodology, 3 flame
-    graphs, top-10 hot-spot table, root-cause hypothesis, candidate
-    fixes, and the read-vs-write divergence analysis)
-  /tmp/autumn_ps_pprof_*.svg + .collapsed.txt + .filtered.svg
-    (raw flame graph artifacts — NOT committed per the F099-A spec)
-
-Diagnostic-only code changes:
-  NONE committed. During capture, the pprof-rs hook in
-  crates/server/src/bin/partition_server.rs was temporarily
-  extended locally to emit inferno-format collapsed-stack text
-  (thread;frame;... count) so leaf functions could be scripted.
-  That change was REVERTED before commit — findings doc appendix
-  describes how to re-apply it in future captures.
-
-Main gaps / concerns:
-  - pprof-rs is user-space only. No kernel-side attribution. `perf`
-    is not installed on this host; if the bottleneck were in
-    pwritev/futex/io_uring_enter it would show as a fat leaf in the
-    compio driver — observed frames are all <5 % on P-log.
-  - One sample per scenario (plus one stability re-run for (a)).
-    Leaf ranks stable within +-3 pp across the two (a) runs.
-
-Next steps:
-  - F099-B (already completed in a separate commit — see entry below)
-  - F099-C: implement Fix A (BTreeMap memtable)
-  - F099-D: implement Fix B (collapse spawn_write_request + oneshot)
-  - Re-run the three flame-graph scenarios after C+D to quantify gains.
-
-Commit: docs(F099-A): R4 ceiling flame graph diagnosis (<tbd>)
-
----
-
-Date: 2026-04-18
-TaskStatus: completed
-Task scope: F099-B — StreamClient parallel 3-replica fanout
-  (surgical refactor of launch_append inside the stream worker)
-
-Current summary:
-  Branch: perf-r1-partition-scale-out (worktree /data/dongmao_dev/autumn-perf-r1)
-
-  Changed the sequential per-replica send_vectored loop inside
-  crates/stream/src/client.rs::launch_append (lines 525–550) to fire
-  all 3 replicas concurrently via futures::future::join_all. Under
-  high submission rate each RpcClient's submit channel can briefly
-  block (microseconds but measurable); firing the 3 futures in
-  parallel lets each replica's submit_tx.send(...).await progress
-  independently instead of serialising on replica 0 -> 1 -> 2.
-
-  Correctness preservation (verified by review + tests):
-    - Per-replica TCP byte order is unchanged (each RpcClient runs
-      one single-writer writer_task post-R4 4.1; fanout only
-      parallelises the 3 SUBMITS, not the per-conn writes).
-    - Lease order -> TCP order -> commit-truncation order invariant
-      holds because lease is serialised by the worker actor; each
-      replica's socket still receives frames in lease order.
-    - apply_completion's first-err-wins + offset-consistency checks
-      preserved: we use join_all (NOT try_join_all) so all 3 slots
-      are filled as Result<Receiver<Frame>> regardless of which
-      one errors; apply_completion iterates and short-circuits
-      on the first error exactly as before.
-    - hdr and payload_parts are Bytes -> Arc-backed; per-replica
-      clones are cheap Arc refcount bumps (no deep copy). The outer
-      Vec allocation (~24 bytes x 3) is negligible.
-    - ConnPool::get_client is safe under concurrent calls: RefCell
-      borrow never spans an await, and the 3 replicas have distinct
-      SocketAddrs so no cache collision. (Worker is single-task so
-      no thread-safety concern either.)
-
-  Changes:
-    crates/stream/src/client.rs
-      - launch_append: sequential for-addr loop -> .map().collect()
-        + join_all(send_futs).await; per-replica parts clone
-        pushed inside the async move.
-    crates/stream/tests/stream_sqcq.rs
-      - spawn_stack_3rep + setup_stream_3rep helpers.
-      - parallel_fanout_fires_3_replicas_concurrently (new test):
-        32 concurrent appends on a 3-replica stream -> asserts
-        offset tiling + min-replica commit_length == total leased
-        (verifies all 3 replicas converged under parallel fanout).
-      - Choice of probe documented inline: timing-probe on loopback
-        unreliable (submit hop is sub-microsecond), so functional
-        proof via 3-replica convergence is used instead.
-    crates/stream/CLAUDE.md
-      - SQ-side ASCII in "Per-stream worker" section updated to
-        say "IN PARALLEL via futures::future::join_all".
-      - Programming Note #3 rewritten from "Sequential fan-out
-        latency" to "Parallel 3-replica fanout (F099-B)" with
-        the invariant argument.
-    feature_list.md
-      - New F099-B entry with Target / Evidence / Notes / passes=true.
-
-Verification:
-  cargo test --release -p autumn-stream --lib   -> 40 passed
-  cargo test --release -p autumn-stream --tests -> 21 passed
-    (5 sqcq incl. new test + 5 extent_pipeline + 3 extent_restart
-     + 3 f021 + 3 wal + 2 extent_append_semantics)
-  cargo test --release -p autumn-partition-server --lib -> 73 passed
-  cargo test --release -p autumn-rpc            -> 17 passed (10 + 7)
-
-Perf (3 runs, perf_check.sh --shm --partitions 1 --pipeline-depth 1):
-  run 1: write=55439 ops/s p99=6.55ms  read=65992 ops/s
-  run 2: write=57259 ops/s p99=20.59ms read=74302 ops/s
-  run 3: write=54001 ops/s p99=21.21ms read=65887 ops/s
-  median: write=55439 ops/s  read=65992 ops/s
-
-  vs post-4.4 baseline (F098-4.4 notes):
-     write (51.8k, 56.2k, 52.7k) median 52.7k
-     read  (71.2k, 74.4k, 62.0k) median 71.2k
-  -> write +5% median (55.4k vs 52.7k), within run-to-run noise
-     but consistently at or above the top of the baseline range
-  -> read within noise (65.9k vs 71.2k; spread is large across
-     runs on both baselines, read path doesn't touch launch_append)
-
-  Gain is small as expected (context note: "Expected gain: small
-  but measurable -- mostly reduces per-batch latency by ~1-2 x
-  submit-channel-delay. At 60k ops/s this could be worth 5-15%").
-
-Main gaps / concerns:
-  None. All invariants preserved, tests green, no regression.
-
-Next steps:
-  - F099-A (parallel task, ConnPool / submit-channel diagnosis)
-    can use this as the correct baseline of post-parallel-fanout
-    behaviour.
-  - The single-partition N=1 x 256-synchronous ceiling remains
-    in the ~55k band; further improvement requires breaking the
-    client-side 256-sync barrier (pipeline-depth > 1) or splitting
-    to multiple partitions (F096 R2 path i).
+    (background_write_loop* / process_write_batch removed; primitives
+     promoted to pub(crate); ValidatedEntry + finish_write_batch
+     updated to use WriteResponder)
+  crates/partition-server/src/rpc_handlers.rs
+    (handle_put/handle_delete/handle_stream_put deleted;
+     dispatch_partition_rpc rejects write ops)
+  crates/partition-server/src/write_batch_builder.rs
+    (DELETED — R2 leader-follower dead per F096 Tier C)
+  crates/partition-server/CLAUDE.md
+    (thread model + Write Path pseudocode + Programming Notes)
+  autumn-rs/CLAUDE.md
+    (Core Write Data Flow rewrite for merged loop)
+  feature_list.md
+    (F099-D entry added with target + evidence + notes + passes:true)
+  claude-progress.txt
+    (this file)

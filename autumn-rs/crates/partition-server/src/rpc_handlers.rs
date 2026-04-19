@@ -1,16 +1,19 @@
 //! RPC dispatch and handler functions for partition operations.
+//!
+//! F099-D: `handle_put`, `handle_delete`, and `handle_stream_put` are gone —
+//! writes decode inline in `merged_partition_loop::handle_incoming_req` and
+//! push directly into the SQ/CQ pipeline's pending queue. Only read ops and
+//! low-frequency control ops (SPLIT_PART, MAINTENANCE) are handled here.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use autumn_common::metrics::ns_to_ms;
-use autumn_rpc::manager_rpc::MgrRange as Range;
 use autumn_rpc::partition_rpc::{self, *};
 use autumn_rpc::{HandlerResult, StatusCode};
 use autumn_stream::{ConnPool, StreamClient};
 use bytes::Bytes;
-use futures::SinkExt;
 
 use crate::*;
 
@@ -70,6 +73,10 @@ impl ReadMetrics {
     }
 }
 
+/// F099-D: PUT / DELETE / STREAM_PUT are handled by `merged_partition_loop`'s
+/// direct `handle_incoming_req` path (no spawn, no inner oneshot). Only
+/// reads and low-frequency control ops route through this dispatch function.
+/// Receiving a write op here is a bug — we short-circuit with an error.
 pub(crate) async fn dispatch_partition_rpc(
     msg_type: u8,
     payload: Bytes,
@@ -81,67 +88,16 @@ pub(crate) async fn dispatch_partition_rpc(
     revision: i64,
 ) -> HandlerResult {
     match msg_type {
-        MSG_PUT => handle_put(payload, part).await,
         MSG_GET => handle_get(payload, part, part_sc).await,
-        MSG_DELETE => handle_delete(payload, part).await,
         MSG_HEAD => handle_head(payload, part).await,
         MSG_RANGE => handle_range(payload, part).await,
         MSG_SPLIT_PART => handle_split_part(payload, part, part_sc, pool, manager_addr, owner_key, revision).await,
-        MSG_STREAM_PUT => handle_stream_put(payload, part).await,
         MSG_MAINTENANCE => handle_maintenance(payload, part).await,
+        MSG_PUT | MSG_DELETE | MSG_STREAM_PUT => Err((
+            StatusCode::Internal,
+            format!("write msg_type {msg_type} must be routed via merged_partition_loop"),
+        )),
         _ => Err((StatusCode::InvalidArgument, format!("unknown msg_type {msg_type}"))),
-    }
-}
-
-pub(crate) async fn handle_put(payload: Bytes, part: &Rc<RefCell<PartitionData>>) -> HandlerResult {
-    let req: PutReq = partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-
-    if crate::leader_follower_enabled() {
-        // --- R2 Path (iii): push to WriteBatchBuilder, await broadcast ---
-        // Build a WriteRequest with a detached oneshot (resp_tx unused in this path).
-        let (resp_tx, _resp_rx) = oneshot::channel();
-        let wreq = WriteRequest {
-            op: WriteOp::Put {
-                user_key: req.key.clone().into(),
-                value: req.value.into(),
-                expires_at: req.expires_at,
-            },
-            must_sync: req.must_sync,
-            resp_tx,
-        };
-        let builder = part.borrow().write_batch_builder.clone();
-        let completion = builder.push(wreq);
-        completion.await;
-        // Leader signals after successful Phase 3. Batch-level errors
-        // poison the partition in the existing flow (locked_by_other); a
-        // follower returning Ok here when the batch failed is OK because the
-        // next call will observe the poisoned state and error out.
-        Ok(partition_rpc::rkyv_encode(&PutResp {
-            code: CODE_OK,
-            message: String::new(),
-            key: req.key.into(),
-        }))
-    } else {
-        // --- R1 path: mpsc + oneshot (unchanged) ---
-        let (resp_tx, resp_rx) = oneshot::channel();
-        let mut write_tx = part.borrow().write_tx.clone();
-        write_tx.send(WriteRequest {
-            op: WriteOp::Put {
-                user_key: req.key.clone().into(),
-                value: req.value.into(),
-                expires_at: req.expires_at,
-            },
-            must_sync: req.must_sync,
-            resp_tx,
-        }).await.map_err(|_| (StatusCode::Internal, "write channel closed".to_string()))?;
-
-        let key = resp_rx.await.map_err(|_| (StatusCode::Internal, "write response dropped".to_string()))?
-            .map_err(|e| (StatusCode::Internal, e))?;
-        Ok(partition_rpc::rkyv_encode(&PutResp {
-            code: CODE_OK,
-            message: String::new(),
-            key,
-        }))
     }
 }
 
@@ -223,22 +179,6 @@ pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>
     });
 
     Ok(resp)
-}
-
-pub(crate) async fn handle_delete(payload: Bytes, part: &Rc<RefCell<PartitionData>>) -> HandlerResult {
-    let req: DeleteReq = partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-
-    let (resp_tx, resp_rx) = oneshot::channel();
-    let mut write_tx = part.borrow().write_tx.clone();
-    write_tx.send(WriteRequest {
-        op: WriteOp::Delete { user_key: req.key.clone() },
-        must_sync: false,
-        resp_tx,
-    }).await.map_err(|_| (StatusCode::Internal, "write channel closed".to_string()))?;
-
-    let key = resp_rx.await.map_err(|_| (StatusCode::Internal, "write response dropped".to_string()))?
-        .map_err(|e| (StatusCode::Internal, e))?;
-    Ok(partition_rpc::rkyv_encode(&DeleteResp { code: CODE_OK, message: String::new(), key }))
 }
 
 pub(crate) async fn handle_head(payload: Bytes, part: &Rc<RefCell<PartitionData>>) -> HandlerResult {
@@ -408,20 +348,6 @@ pub(crate) async fn handle_split_part(
     }
 
     Ok(partition_rpc::rkyv_encode(&SplitPartResp { code: CODE_OK, message: String::new() }))
-}
-
-pub(crate) async fn handle_stream_put(payload: Bytes, part: &Rc<RefCell<PartitionData>>) -> HandlerResult {
-    let req: StreamPutReq = partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-    // Delegate to put handler logic.
-    let put_req = PutReq {
-        part_id: req.part_id,
-        key: req.key,
-        value: req.value,
-        must_sync: req.must_sync,
-        expires_at: req.expires_at,
-    };
-    let payload = partition_rpc::rkyv_encode(&put_req);
-    handle_put(payload, part).await
 }
 
 pub(crate) async fn handle_maintenance(payload: Bytes, part: &Rc<RefCell<PartitionData>>) -> HandlerResult {

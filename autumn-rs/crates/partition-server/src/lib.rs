@@ -1,7 +1,6 @@
 mod background;
 mod rpc_handlers;
 mod sstable;
-mod write_batch_builder;
 
 use background::*;
 use rpc_handlers::dispatch_partition_rpc;
@@ -21,7 +20,7 @@ use autumn_rpc::manager_rpc::{self, MgrRange as Range, rkyv_encode, rkyv_decode}
 use autumn_rpc::partition_rpc::{self, *, TableLocations, SstLocation};
 use autumn_rpc::{Frame, FrameDecoder, HandlerResult, StatusCode};
 use autumn_stream::{ConnPool, StreamClient};
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use compio::dispatcher::Dispatcher;
 use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::net::TcpStream;
@@ -59,35 +58,6 @@ fn max_write_batch() -> usize {
             .unwrap_or(DEFAULT_MAX_WRITE_BATCH)
     })
 }
-/// Whether to route writes through WriteBatchBuilder (R2 Path iii leader-follower
-/// coalescing). Read once from env `AUTUMN_LEADER_FOLLOWER` at startup.
-/// Accepts "1", "true", "yes" (case-insensitive) as true; anything else = false.
-/// Default: false — preserves R1 behavior bit-for-bit.
-pub(crate) fn leader_follower_enabled() -> bool {
-    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CELL.get_or_init(|| {
-        matches!(
-            std::env::var("AUTUMN_LEADER_FOLLOWER").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("TRUE") | Some("YES")
-        )
-    })
-}
-
-/// Microseconds the leader waits after receiving the FIRST push to let more
-/// writes accumulate (collection window). Read once from env
-/// `AUTUMN_LF_COLLECT_MICROS`; default 100; range [0, 10000].
-/// 100µs empirically tied R1's 52k baseline; 500µs regressed to ~36k.
-pub(crate) fn lf_collect_micros() -> u64 {
-    static CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *CELL.get_or_init(|| {
-        std::env::var("AUTUMN_LF_COLLECT_MICROS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|&n| n <= 10_000)
-            .unwrap_or(100)
-    })
-}
-
 /// R4 4.4 — maximum number of P-log `append_batch` futures in flight
 /// concurrently per partition. Higher values give more pipeline depth so
 /// multiple 256-request group-commit batches overlap their replica RTT, but
@@ -124,7 +94,6 @@ pub(crate) fn ps_bulk_inflight_cap() -> usize {
     })
 }
 
-const MAX_WRITE_BATCH_BYTES: usize = 30 * 1024 * 1024;
 const COMPACT_RATIO: f64 = 0.5;
 const HEAD_RATIO: f64 = 0.3;
 const COMPACT_N: usize = 5;
@@ -348,7 +317,6 @@ pub(crate) struct PartitionData {
     tables: Vec<TableMeta>,
     sst_readers: Vec<Arc<SstReader>>,
     has_overlap: Cell<u32>,
-    write_tx: mpsc::Sender<WriteRequest>,
     vp_extent_id: u64,
     vp_offset: u32,
     stream_client: Rc<StreamClient>,
@@ -356,10 +324,6 @@ pub(crate) struct PartitionData {
     /// thread failed to initialize — fall back to in-thread flush (legacy
     /// path) so the partition remains usable.
     flush_req_tx: Option<mpsc::Sender<FlushReq>>,
-    // R2 Path (iii) — leader-follower write coalescing. Only USED when
-    // leader_follower_enabled() returns true; allocated unconditionally
-    // so the field shape is stable across feature flag states.
-    write_batch_builder: std::sync::Arc<crate::write_batch_builder::WriteBatchBuilder>,
 }
 
 // ---------------------------------------------------------------------------
@@ -412,10 +376,67 @@ pub(crate) enum WriteOp {
     },
 }
 
+/// F099-D: Direct responder into the outer `req.resp_tx` (encoded RPC frame
+/// bytes). Replaces the R3/R4 inner `oneshot<Result<Vec<u8>, String>>` that
+/// carried the raw key back to `handle_put`/`handle_delete` for re-encoding.
+/// The tag selects whether Phase 3 encodes a `PutResp` or a `DeleteResp`.
+pub(crate) enum WriteResponder {
+    Put {
+        outer: oneshot::Sender<HandlerResult>,
+        /// User key to echo in `PutResp.key`. Owned copy — avoids keeping
+        /// the decoded ArchivedPutReq alive across the Phase 2 await.
+        key: Vec<u8>,
+    },
+    Delete {
+        outer: oneshot::Sender<HandlerResult>,
+        key: Vec<u8>,
+    },
+}
+
+impl WriteResponder {
+    /// Reply success (batch committed). Encodes the appropriate RPC response
+    /// frame bytes and forwards them to the outer ps-conn oneshot.
+    pub(crate) fn send_ok(self) {
+        match self {
+            WriteResponder::Put { outer, key } => {
+                let bytes = partition_rpc::rkyv_encode(&PutResp {
+                    code: CODE_OK,
+                    message: String::new(),
+                    key,
+                });
+                let _ = outer.send(Ok(bytes));
+            }
+            WriteResponder::Delete { outer, key } => {
+                let bytes = partition_rpc::rkyv_encode(&DeleteResp {
+                    code: CODE_OK,
+                    message: String::new(),
+                    key,
+                });
+                let _ = outer.send(Ok(bytes));
+            }
+        }
+    }
+
+    /// Reply failure — propagate the error string as Internal to the outer
+    /// resp_tx. "key is out of range" is InvalidArgument per existing semantics.
+    pub(crate) fn send_err(self, msg: String) {
+        let code = if msg == "key is out of range" {
+            StatusCode::InvalidArgument
+        } else {
+            StatusCode::Internal
+        };
+        let outer = match self {
+            WriteResponder::Put { outer, .. } => outer,
+            WriteResponder::Delete { outer, .. } => outer,
+        };
+        let _ = outer.send(Err((code, msg)));
+    }
+}
+
 pub(crate) struct WriteRequest {
     op: WriteOp,
     must_sync: bool,
-    resp_tx: oneshot::Sender<Result<Vec<u8>, String>>,
+    resp: WriteResponder,
 }
 
 impl WriteRequest {
@@ -430,10 +451,18 @@ impl WriteRequest {
 
     #[cfg(test)]
     pub(crate) fn new_for_test(op: WriteOp, must_sync: bool) -> Self {
-        let (resp_tx, _resp_rx) = oneshot::channel();
-        // _resp_rx is dropped immediately; resp_tx.send() would return Err but
-        // tests don't exercise the response path — only push/drain/signal semantics.
-        Self { op, must_sync, resp_tx }
+        // Build a dangling responder (outer _rx dropped immediately). Tests
+        // that exercise the responder should construct it explicitly.
+        let (outer, _rx) = oneshot::channel();
+        let key = match &op {
+            WriteOp::Put { user_key, .. } => user_key.to_vec(),
+            WriteOp::Delete { user_key } => user_key.clone(),
+        };
+        let resp = match &op {
+            WriteOp::Put { .. } => WriteResponder::Put { outer, key },
+            WriteOp::Delete { .. } => WriteResponder::Delete { outer, key },
+        };
+        Self { op, must_sync, resp }
     }
 }
 
@@ -507,15 +536,6 @@ impl WriteLoopMetrics {
     }
 }
 
-
-fn write_batch_too_big(batch: &[WriteRequest]) -> bool {
-    let mut size = 0usize;
-    for req in batch {
-        size += req.encoded_size();
-        if size > MAX_WRITE_BATCH_BYTES { return true; }
-    }
-    batch.len() > max_write_batch()
-}
 
 // ---------------------------------------------------------------------------
 // Inter-thread request routing (main thread ↔ partition thread)
@@ -1028,7 +1048,7 @@ async fn partition_thread_main(
     manager_addr: String,
     owner_key: String,
     revision: i64,
-    mut req_rx: mpsc::Receiver<PartitionRequest>,
+    req_rx: mpsc::Receiver<PartitionRequest>,
 ) -> Result<()> {
     let pool = Rc::new(ConnPool::new());
     // StreamClient::new_with_revision now returns `Rc<StreamClient>` directly
@@ -1079,7 +1099,6 @@ async fn partition_thread_main(
     let (flush_tx, flush_rx) = mpsc::unbounded::<()>();
     let (compact_tx, compact_rx) = mpsc::channel::<bool>(1);
     let (gc_tx, gc_rx) = mpsc::channel::<GcTask>(1);
-    let (write_tx, write_rx) = mpsc::channel::<WriteRequest>(WRITE_CHANNEL_CAP);
 
     // F088: spawn a dedicated OS thread (P-bulk) that owns its own compio
     // runtime + io_uring + ConnPool. Flush requests are forwarded to it via
@@ -1108,7 +1127,6 @@ async fn partition_thread_main(
         flush_tx,
         compact_tx,
         gc_tx,
-        write_tx,
         seq_number: max_seq,
         log_stream_id,
         row_stream_id,
@@ -1120,7 +1138,6 @@ async fn partition_thread_main(
         vp_offset: vp_off,
         stream_client: part_sc.clone(),
         flush_req_tx: flush_req_tx_part,
-        write_batch_builder: std::sync::Arc::new(crate::write_batch_builder::WriteBatchBuilder::new()),
     }));
 
     // Drop the extra `flush_req_tx` clone held locally: the one stored in
@@ -1130,6 +1147,14 @@ async fn partition_thread_main(
     drop(flush_req_tx);
 
     // Spawn background loops on this thread's compio runtime.
+    //
+    // F099-D: the write loop is NO LONGER a separate compio task. Writes
+    // are serviced inline by `merged_partition_loop` below, collapsing the
+    // old `partition_thread_main → spawn_write_request → handle_put →
+    // write_tx.send → background_write_loop_r1` chain into one task. See
+    // F099-A flame graph analysis (docs/superpowers/specs/2026-04-20-*.md
+    // §Section 3/4) for why this collapse matters (~30 % of P-log CPU on
+    // 256 × d=1 came from spawn + inner oneshot + Waker cascade).
     {
         let p = part.clone();
         compio::runtime::spawn(async move {
@@ -1152,70 +1177,228 @@ async fn partition_thread_main(
         .detach();
     }
     let locked_by_other = Rc::new(Cell::new(false));
-    {
-        let p = part.clone();
-        let lbo = locked_by_other.clone();
-        compio::runtime::spawn(async move {
-            background_write_loop(part_id, p, write_rx, lbo).await;
-        })
-        .detach();
-    }
 
-    // Main request processing loop.
-    //
-    // Reads (GET/HEAD/RANGE): processed inline (await) — serial, depth=1.
-    //   Spawning reads was tested but showed no improvement due to Rc clone
-    //   overhead and contention on the single-threaded compio runtime.
-    //
-    // Writes (PUT/DELETE/STREAM_PUT): spawned — they await write_tx and must
-    //   run concurrently for group commit batching.
-    //
-    // The now_or_never drain loop serves a mixed read/write workload: when
-    // reads are being processed, any queued write is immediately spawned
-    // rather than waiting behind remaining reads.
-    while let Some(req) = req_rx.next().await {
-        if locked_by_other.get() {
-            tracing::error!(part_id, "partition poisoned by LockedByOther, shutting down");
-            break;
-        }
-        if is_read_op(req.msg_type) {
-            let result = dispatch_partition_rpc(
-                req.msg_type, req.payload, &part, &part_sc, &pool,
-                &manager_addr, &owner_key, revision,
-            ).await;
-            let _ = req.resp_tx.send(result);
-            // Drain queued requests: continue reads inline, spawn writes immediately.
-            loop {
-                match req_rx.next().now_or_never() {
-                    Some(Some(req)) if is_read_op(req.msg_type) => {
-                        let result = dispatch_partition_rpc(
-                            req.msg_type, req.payload, &part, &part_sc, &pool,
-                            &manager_addr, &owner_key, revision,
-                        ).await;
-                        let _ = req.resp_tx.send(result);
-                    }
-                    Some(Some(req)) => {
-                        spawn_write_request(req, &part, &part_sc, &pool, &manager_addr, &owner_key, revision);
-                        break;
-                    }
-                    _ => break,
-                }
-            }
-        } else {
-            spawn_write_request(req, &part, &part_sc, &pool, &manager_addr, &owner_key, revision);
-        }
-    }
+    // F099-D: merged request + write loop runs directly on this task.
+    merged_partition_loop(
+        part_id,
+        part.clone(),
+        req_rx,
+        locked_by_other,
+        part_sc.clone(),
+        pool.clone(),
+        manager_addr.clone(),
+        owner_key.clone(),
+        revision,
+    )
+    .await;
 
     tracing::info!(part_id, "partition thread exiting");
     Ok(())
 }
 
-fn is_read_op(msg_type: u8) -> bool {
-    matches!(msg_type, MSG_GET | MSG_HEAD | MSG_RANGE)
+/// F099-D — the merged request + write loop. Replaces the old two-task
+/// chain (`partition_thread_main` for request dispatch + a spawned
+/// `background_write_loop_r1` for group commit) with a single compio task.
+///
+/// Why merge:
+///   - Both tasks ran on the same OS thread; the split existed because a
+///     separate task spawned per Put via `spawn_write_request` provided the
+///     concurrency needed for batching. F099-A's flame graph attributed ~30 %
+///     of P-log CPU to the *ceremony* of that split (one `compio::spawn`,
+///     two `oneshot::channel()` allocations, one `mpsc::send`, one Waker
+///     cascade, per Put).
+///   - The SQ/CQ pipeline (R4 4.4) gives batching at the pending-queue
+///     level regardless of how requests arrive. Once the outer `req_rx`
+///     can push directly into `pending`, the per-request spawn is pure
+///     overhead.
+///
+/// Preserves:
+///   - R4 4.4 SQ/CQ pattern — `FuturesUnordered` holds up to
+///     `ps_inflight_cap()` Phase-2 futures, MIN_PIPELINE_BATCH=256 gate for
+///     non-first batches, out-of-order completion handling.
+///   - LockedByOther self-eviction (drain remaining inflight, exit cleanly).
+///   - Read-op inlining: GET/HEAD/RANGE are processed directly on this
+///     task via `dispatch_partition_rpc` so a busy write pipeline does
+///     not starve readers.
+///   - F099-C `insert_batch` — Phase 3 still uses the batched memtable
+///     insert path.
+///
+/// Direct-response path:
+///   - `WriteRequest.resp` is now a `WriteResponder` that encodes the
+///     RPC response frame bytes inline on `send_ok` and drops directly
+///     into the outer ps-conn oneshot. No inner oneshot, no Waker
+///     cascade through a second compio task.
+#[allow(clippy::too_many_arguments)]
+async fn merged_partition_loop(
+    part_id: u64,
+    part: Rc<RefCell<PartitionData>>,
+    mut req_rx: mpsc::Receiver<PartitionRequest>,
+    locked_by_other: Rc<Cell<bool>>,
+    part_sc: Rc<StreamClient>,
+    pool: Rc<ConnPool>,
+    manager_addr: String,
+    owner_key: String,
+    revision: i64,
+) {
+    use futures::future::{select, Either};
+
+    let cap = ps_inflight_cap();
+    let batch_target = MIN_PIPELINE_BATCH.min(max_write_batch());
+    let mut metrics = WriteLoopMetrics::new();
+    let mut pending: Vec<WriteRequest> = Vec::new();
+
+    type CompletionFut =
+        std::pin::Pin<Box<dyn std::future::Future<Output = InflightCompletion>>>;
+    let mut inflight: FuturesUnordered<CompletionFut> = FuturesUnordered::new();
+
+    'outer: loop {
+        if locked_by_other.get() {
+            tracing::error!(part_id, "partition poisoned by LockedByOther, shutting down");
+            break;
+        }
+
+        // (A) Opportunistic CQ drain — run Phase 3 for every completion that
+        // is already ready without blocking.
+        while let Some(Some(c)) = inflight.next().now_or_never() {
+            handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
+            if locked_by_other.get() {
+                break 'outer;
+            }
+        }
+
+        let n_inflight = inflight.len();
+        let at_cap = n_inflight >= cap;
+
+        // (B) Launch a new batch when conditions are right. Same gate as
+        // the legacy `background_write_loop_r1`: first batch always
+        // launches; subsequent batches wait for pending >= batch_target
+        // to avoid the R3 Task 5b regression.
+        let ready_to_launch = !pending.is_empty()
+            && !at_cap
+            && (n_inflight == 0 || pending.len() >= batch_target);
+        if ready_to_launch {
+            let batch = std::mem::take(&mut pending);
+            match start_write_batch(&part, batch) {
+                Ok(Some(mut flight)) => {
+                    let data = flight.data;
+                    inflight.push(Box::pin(async move {
+                        let phase2_result = (&mut flight.phase2_fut).await;
+                        InflightCompletion { data, phase2_result }
+                    }));
+                }
+                Ok(None) => {}
+                Err(e) => tracing::error!("start_write_batch err: {e}"),
+            }
+            continue;
+        }
+
+        // (C) Pipeline full — only CQ can progress.
+        if at_cap {
+            if let Some(c) = inflight.next().await {
+                handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
+                if locked_by_other.get() {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        // (D) Pipeline has room; race SQ (req_rx) and CQ (inflight).
+        if n_inflight == 0 {
+            // Fully idle: block on req_rx alone.
+            match req_rx.next().await {
+                Some(req) => {
+                    handle_incoming_req(
+                        req, &mut pending, &part, &part_sc, &pool,
+                        &manager_addr, &owner_key, revision,
+                    )
+                    .await;
+                }
+                None => break,
+            }
+        } else {
+            let req_fut = req_rx.next();
+            let cfut = inflight.next();
+            futures::pin_mut!(req_fut);
+            match select(req_fut, Box::pin(cfut)).await {
+                Either::Left((maybe_req, _cfut_dropped)) => match maybe_req {
+                    Some(req) => {
+                        handle_incoming_req(
+                            req, &mut pending, &part, &part_sc, &pool,
+                            &manager_addr, &owner_key, revision,
+                        )
+                        .await;
+                    }
+                    None => {
+                        // Channel closed: drain remaining inflight, then exit.
+                        while let Some(c) = inflight.next().await {
+                            handle_completion(
+                                &part, &mut metrics, &locked_by_other, part_id, c,
+                            )
+                            .await;
+                            if locked_by_other.get() {
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                },
+                Either::Right((maybe_c, _req_dropped)) => {
+                    if let Some(c) = maybe_c {
+                        handle_completion(
+                            &part, &mut metrics, &locked_by_other, part_id, c,
+                        )
+                        .await;
+                        if locked_by_other.get() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // (E) Non-blocking drain of any queued requests before the next
+        // iteration. Reads are processed inline (await) and do NOT go into
+        // pending; writes decode and push into pending.
+        while pending.len() < max_write_batch() {
+            match req_rx.next().now_or_never() {
+                Some(Some(req)) => {
+                    handle_incoming_req(
+                        req, &mut pending, &part, &part_sc, &pool,
+                        &manager_addr, &owner_key, revision,
+                    )
+                    .await;
+                }
+                _ => break,
+            }
+        }
+    }
+
+    // Shutdown path: drain any still-in-flight batches so clients get their
+    // final ack (success or error), then flush any residual pending as one
+    // last batch.
+    while let Some(c) = inflight.next().await {
+        handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
+    }
+    if !pending.is_empty() {
+        let batch = std::mem::take(&mut pending);
+        if let Ok(Some(mut flight)) = start_write_batch(&part, batch) {
+            let r = (&mut flight.phase2_fut).await;
+            let _ = finish_write_batch(&part, flight.data, r).await;
+        }
+    }
+    metrics.flush(part_id);
 }
 
-fn spawn_write_request(
+/// F099-D — decode one incoming `PartitionRequest` and route it. Writes
+/// (PUT/DELETE/STREAM_PUT) decode inline and push into `pending` with a
+/// direct `WriteResponder` into the outer oneshot; reads (GET/HEAD/RANGE)
+/// and other ops dispatch inline. No `compio::runtime::spawn`, no inner
+/// oneshot on the write hot path.
+#[allow(clippy::too_many_arguments)]
+async fn handle_incoming_req(
     req: PartitionRequest,
+    pending: &mut Vec<WriteRequest>,
     part: &Rc<RefCell<PartitionData>>,
     part_sc: &Rc<StreamClient>,
     pool: &Rc<ConnPool>,
@@ -1223,18 +1406,92 @@ fn spawn_write_request(
     owner_key: &str,
     revision: i64,
 ) {
-    let part = part.clone();
-    let part_sc = part_sc.clone();
-    let pool = pool.clone();
-    let manager_addr = manager_addr.to_string();
-    let owner_key = owner_key.to_string();
-    compio::runtime::spawn(async move {
-        let result = dispatch_partition_rpc(
-            req.msg_type, req.payload, &part, &part_sc, &pool,
-            &manager_addr, &owner_key, revision,
-        ).await;
-        let _ = req.resp_tx.send(result);
-    }).detach();
+    match req.msg_type {
+        MSG_PUT => enqueue_put(req, pending),
+        MSG_DELETE => enqueue_delete(req, pending),
+        MSG_STREAM_PUT => enqueue_stream_put(req, pending),
+        // Reads and low-frequency ops (SPLIT_PART, MAINTENANCE) go inline
+        // via dispatch_partition_rpc — correctness-preserving.
+        _ => {
+            let result = dispatch_partition_rpc(
+                req.msg_type,
+                req.payload,
+                part,
+                part_sc,
+                pool,
+                manager_addr,
+                owner_key,
+                revision,
+            )
+            .await;
+            let _ = req.resp_tx.send(result);
+        }
+    }
+}
+
+fn enqueue_put(req: PartitionRequest, pending: &mut Vec<WriteRequest>) {
+    match partition_rpc::rkyv_decode::<PutReq>(&req.payload) {
+        Ok(put_req) => {
+            let key_vec = put_req.key.clone();
+            pending.push(WriteRequest {
+                op: WriteOp::Put {
+                    user_key: Bytes::from(put_req.key),
+                    value: Bytes::from(put_req.value),
+                    expires_at: put_req.expires_at,
+                },
+                must_sync: put_req.must_sync,
+                resp: WriteResponder::Put {
+                    outer: req.resp_tx,
+                    key: key_vec,
+                },
+            });
+        }
+        Err(e) => {
+            let _ = req.resp_tx.send(Err((StatusCode::InvalidArgument, e)));
+        }
+    }
+}
+
+fn enqueue_delete(req: PartitionRequest, pending: &mut Vec<WriteRequest>) {
+    match partition_rpc::rkyv_decode::<DeleteReq>(&req.payload) {
+        Ok(del_req) => {
+            let key_vec = del_req.key.clone();
+            pending.push(WriteRequest {
+                op: WriteOp::Delete { user_key: del_req.key },
+                must_sync: false,
+                resp: WriteResponder::Delete {
+                    outer: req.resp_tx,
+                    key: key_vec,
+                },
+            });
+        }
+        Err(e) => {
+            let _ = req.resp_tx.send(Err((StatusCode::InvalidArgument, e)));
+        }
+    }
+}
+
+fn enqueue_stream_put(req: PartitionRequest, pending: &mut Vec<WriteRequest>) {
+    match partition_rpc::rkyv_decode::<StreamPutReq>(&req.payload) {
+        Ok(sp_req) => {
+            let key_vec = sp_req.key.clone();
+            pending.push(WriteRequest {
+                op: WriteOp::Put {
+                    user_key: Bytes::from(sp_req.key),
+                    value: Bytes::from(sp_req.value),
+                    expires_at: sp_req.expires_at,
+                },
+                must_sync: sp_req.must_sync,
+                resp: WriteResponder::Put {
+                    outer: req.resp_tx,
+                    key: key_vec,
+                },
+            });
+        }
+        Err(e) => {
+            let _ = req.resp_tx.send(Err((StatusCode::InvalidArgument, e)));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2525,4 +2782,189 @@ mod env_knob_tests {
     fn rejects_garbage() {
         assert_eq!(parse_env(Some("abc")), super::DEFAULT_MAX_WRITE_BATCH);
     }
+}
+
+// ---------------------------------------------------------------------------
+// F099-D — merged_partition_loop direct-response path tests.
+//
+// These tests exercise the enqueue_put / enqueue_delete / enqueue_stream_put
+// helpers and the WriteResponder::send_ok / send_err contract. The full
+// merged loop (SQ/CQ pipeline + start/finish_write_batch) needs a live
+// StreamClient and is covered by the ps_bench / perf_check harness in
+// scripts/. The harness tests in `background::sqcq_tests` cover the SQ/CQ
+// pattern itself (FU + cap + out-of-order completion + LockedByOther drain).
+//
+// What each test proves:
+//   1. merged_loop_put_direct_response — a decoded PutReq produces exactly
+//      one WriteRequest in `pending` whose `resp` is `WriteResponder::Put`
+//      wired to the outer PartitionRequest oneshot. `send_ok` then delivers
+//      a valid rkyv-encoded `PutResp` frame to the outer receiver. Zero
+//      `compio::runtime::spawn` invocations, zero inner oneshot allocations.
+//   2. merged_loop_mixed_read_write — interleaving decode + responder
+//      handling for PUT and DELETE reproduces correct frames on both paths.
+//      (Reads are covered by the existing read-path tests.)
+//   3. merged_loop_bad_decode_replies_invalid_arg — a malformed payload is
+//      rejected with StatusCode::InvalidArgument on the outer oneshot,
+//      without ever touching `pending`.
+//
+// A live-loop LockedByOther drain test is covered by
+// `background::sqcq_tests::ps_sqcq_locked_by_other_drains_cleanly` — the
+// merged loop reuses the same `handle_completion` primitive, same
+// `FuturesUnordered`, same break-on-flag exit condition.
+#[cfg(test)]
+mod merged_loop_tests {
+    use super::*;
+    use futures::channel::oneshot;
+
+    fn build_put_partition_request(
+        key: &[u8],
+        value: &[u8],
+        must_sync: bool,
+        expires_at: u64,
+    ) -> (PartitionRequest, oneshot::Receiver<HandlerResult>) {
+        let req = PutReq {
+            part_id: 0,
+            key: key.to_vec(),
+            value: value.to_vec(),
+            must_sync,
+            expires_at,
+        };
+        let payload = partition_rpc::rkyv_encode(&req);
+        let (resp_tx, resp_rx) = oneshot::channel();
+        (
+            PartitionRequest {
+                msg_type: MSG_PUT,
+                payload: Bytes::from(payload),
+                resp_tx,
+            },
+            resp_rx,
+        )
+    }
+
+    fn build_delete_partition_request(
+        key: &[u8],
+    ) -> (PartitionRequest, oneshot::Receiver<HandlerResult>) {
+        let req = DeleteReq {
+            part_id: 0,
+            key: key.to_vec(),
+        };
+        let payload = partition_rpc::rkyv_encode(&req);
+        let (resp_tx, resp_rx) = oneshot::channel();
+        (
+            PartitionRequest {
+                msg_type: MSG_DELETE,
+                payload: Bytes::from(payload),
+                resp_tx,
+            },
+            resp_rx,
+        )
+    }
+
+    /// F099-D test 1 — a PutReq is decoded inline, pushed into `pending`
+    /// with a direct `WriteResponder::Put` responder, and `send_ok`
+    /// delivers an encoded `PutResp` frame to the outer oneshot. No
+    /// spawn, no inner oneshot.
+    #[test]
+    fn merged_loop_put_direct_response() {
+        let (req, resp_rx) = build_put_partition_request(b"hello", b"world", false, 0);
+        let mut pending: Vec<WriteRequest> = Vec::new();
+        enqueue_put(req, &mut pending);
+
+        assert_eq!(pending.len(), 1, "exactly one WriteRequest enqueued");
+        let w = pending.pop().unwrap();
+        match &w.op {
+            WriteOp::Put { user_key, value, expires_at } => {
+                assert_eq!(user_key.as_ref(), b"hello");
+                assert_eq!(value.as_ref(), b"world");
+                assert_eq!(*expires_at, 0);
+            }
+            _ => panic!("expected Put"),
+        }
+        assert!(matches!(&w.resp, WriteResponder::Put { .. }), "direct Put responder");
+
+        // Simulate Phase-3 success reply.
+        w.resp.send_ok();
+
+        // The outer oneshot must have received an encoded PutResp frame.
+        let frame = compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { resp_rx.await });
+        let bytes = frame.expect("outer oneshot dropped").expect("send_ok should send Ok");
+        let decoded: PutResp = partition_rpc::rkyv_decode(&bytes).unwrap();
+        assert_eq!(decoded.code, CODE_OK);
+        assert_eq!(decoded.key.as_slice(), b"hello");
+    }
+
+    /// F099-D test 2 — mixed sequence: enqueue 2 puts and 1 delete in
+    /// order, then reply to each. Every outer oneshot receives the right
+    /// frame type with the echoed key. Verifies both WriteResponder
+    /// variants encode correctly.
+    #[test]
+    fn merged_loop_mixed_read_write() {
+        let (p1, rx1) = build_put_partition_request(b"k1", b"v1", false, 0);
+        let (p2, rx2) = build_put_partition_request(b"k2", b"v2", true, 0);
+        let (d1, rx3) = build_delete_partition_request(b"k3");
+
+        let mut pending: Vec<WriteRequest> = Vec::new();
+        enqueue_put(p1, &mut pending);
+        enqueue_put(p2, &mut pending);
+        enqueue_delete(d1, &mut pending);
+
+        assert_eq!(pending.len(), 3);
+        // Order preserved (FIFO).
+        for w in pending.drain(..) {
+            w.resp.send_ok();
+        }
+
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let f1 = rx1.await.unwrap().unwrap();
+            let f2 = rx2.await.unwrap().unwrap();
+            let f3 = rx3.await.unwrap().unwrap();
+            let r1: PutResp = partition_rpc::rkyv_decode(&f1).unwrap();
+            let r2: PutResp = partition_rpc::rkyv_decode(&f2).unwrap();
+            let r3: DeleteResp = partition_rpc::rkyv_decode(&f3).unwrap();
+            assert_eq!(r1.key, b"k1");
+            assert_eq!(r2.key, b"k2");
+            assert_eq!(r3.key, b"k3");
+            assert_eq!(r1.code, CODE_OK);
+            assert_eq!(r2.code, CODE_OK);
+            assert_eq!(r3.code, CODE_OK);
+        });
+    }
+
+    /// F099-D test 3 — `WriteResponder::send_err` for "key is out of
+    /// range" surfaces as StatusCode::InvalidArgument (matches the
+    /// pre-merge behavior where handle_put returned InvalidArgument for
+    /// out-of-range, not Internal); all other errors surface as Internal.
+    /// This exercises the direct error-reply path that replaces the old
+    /// inner-oneshot error propagation.
+    #[test]
+    fn merged_loop_out_of_range_err_is_invalid_argument() {
+        let (outer, rx) = oneshot::channel();
+        let resp = WriteResponder::Put {
+            outer,
+            key: b"x".to_vec(),
+        };
+        resp.send_err("key is out of range".to_string());
+        let got = compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { rx.await });
+        let err = got.unwrap().err().unwrap();
+        assert_eq!(err.0, StatusCode::InvalidArgument);
+        assert_eq!(err.1, "key is out of range");
+
+        // And a non-range error surfaces as Internal.
+        let (outer2, rx2) = oneshot::channel();
+        let resp2 = WriteResponder::Delete {
+            outer: outer2,
+            key: b"y".to_vec(),
+        };
+        resp2.send_err("log_stream append_segments: boom".to_string());
+        let got2 = compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { rx2.await });
+        let err2 = got2.unwrap().err().unwrap();
+        assert_eq!(err2.0, StatusCode::Internal);
+    }
+
 }

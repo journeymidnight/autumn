@@ -23,10 +23,14 @@ Dispatcher worker threads (N = CPU count, configurable via --conn-threads)
 └─ worker-N: handle_ps_connection × K
 
 Partition threads — 2 OS threads per partition (F088, PoolKind removed in F093):
-├─ part-N-log (P-log): write_loop, flush_dispatcher, compact_loop, gc_loop, dispatch_rpc
+├─ part-N-log (P-log): merged_partition_loop + flush_dispatcher + compact_loop + gc_loop
 │     • owns PartitionData (Rc<RefCell>), dedicated StreamClient + ConnPool
 │     • serves log_stream WAL appends + (rare) compact row_stream writes
 │     • all WAL appends + atomic tables/sst_readers swap run here
+│     • F099-D: the write loop is NO LONGER a separate compio task — it is
+│       inlined into `merged_partition_loop` with the request-dispatch loop.
+│       Writes decode + push to pending + run Phase 1/2/3 all on the same
+│       task. `spawn_write_request` / `handle_put` / inner oneshot removed.
 ├─ part-N-bulk (P-bulk): flush_worker_loop
 │     • own compio runtime, own io_uring, own ConnPool, own StreamClient
 │     • uses StreamClient::new_with_revision to inherit owner-lock fencing
@@ -61,7 +65,8 @@ Each connection is sequential: decode → route → await response → write. No
 │  │  row_stream_id   ← SSTables                       │    │
 │  │  meta_stream_id  ← TableLocations checkpoint      │    │
 │  │                                                   │    │
-│  │  write_tx: mpsc::Sender<WriteRequest>              │    │
+│  │  (F099-D: no write_tx — writes come directly from │    │
+│  │   req_rx via merged_partition_loop)                │    │
 │  │  seq_number: monotonic MVCC counter               │    │
 │  │  has_overlap: AtomicU32                           │    │
 │  └───────────────────────────────────────────────────┘   │
@@ -78,22 +83,30 @@ The null byte (`0x00`) is a **separator** between the user key and the inverted 
 
 The **inverted** sequence ensures that for the same user key, newer writes (higher seq) sort **before** older writes in byte order. Lookup uses `seek_user_key` which seeks to `user_key ++ 0x00 ++ BE(0)` — the smallest possible internal key for this user key — then returns the first (newest) entry found.
 
-## Write Path: Put / Delete (Group Commit, R4 4.4 SQ/CQ)
+## Write Path: Put / Delete (Group Commit, R4 4.4 SQ/CQ, F099-D merged)
 
 ```
 Put(key, value, part_id, must_sync):
-  1. Thin RPC handler: send WriteRequest{Put{key, value}, must_sync} to write_tx channel
-  2. Await response on oneshot channel
+  1. ps-conn thread: build PartitionRequest{msg_type=MSG_PUT, payload, resp_tx}
+  2. Send via PartitionRouter mpsc to the P-log partition task
+  3. P-log merged_partition_loop: decode PutReq inline, push a
+     WriteRequest with a direct `WriteResponder::Put { outer: resp_tx, key }`
+     into the `pending` Vec. NO compio::spawn, NO inner oneshot.
+  4. ps-conn thread awaits the outer resp_tx — the SAME oneshot that was
+     sent into the request; Phase 3 fires its encoded `PutResp` frame
+     directly into it.
 
-background_write_loop_r1 (per partition, R4 4.4 N-deep SQ/CQ pipeline):
+merged_partition_loop (per partition, F099-D fold-in of the old
+                       background_write_loop_r1):
   OWNS:   FuturesUnordered<Pin<Box<dyn Future<Output = InflightCompletion>>>>
   CAP:    AUTUMN_PS_INFLIGHT_CAP (default 8, range [1, 64])
   GATE:   MIN_PIPELINE_BATCH = 256  (2nd+ batch requires pending >= 256)
-  RECV:   mpsc<WriteRequest> (WRITE_CHANNEL_CAP = 1024)
+  RECV:   req_rx: mpsc<PartitionRequest> (WRITE_CHANNEL_CAP = 1024)
+          — the SAME channel that carries reads + writes from ps-conn
 
   Loop (per iteration):
     (A) drain ready completions via `inflight.next().now_or_never()`
-        → run Phase 3 (memtable insert + client reply) for each
+        → run Phase 3 (memtable insert + direct WriteResponder::send_ok) each
     (B) if pending.non_empty && !at_cap && (n_inflight==0 || pending >= 256):
           launch_new_batch:
             Phase 1: validate, seq-assign, encode WAL records
@@ -104,13 +117,17 @@ background_write_loop_r1 (per partition, R4 4.4 N-deep SQ/CQ pipeline):
           await inflight.next() (back-pressure) → run Phase 3
           continue
     (D) branch on n_inflight:
-          == 0:  await write_rx.next() alone (cold idle)
-          >  0:  select(write_rx.next, inflight.next()) — race SQ vs CQ
-                 Left  (SQ wins) → pending.push(req)
+          == 0:  await req_rx.next() alone (cold idle)
+          >  0:  select(req_rx.next, inflight.next()) — race SQ vs CQ
+                 Left  (SQ wins) → handle_incoming_req:
+                                   - PUT/DELETE/STREAM_PUT: decode + pending.push
+                                   - GET/HEAD/RANGE/SPLIT/MAINTENANCE: inline
+                                     via dispatch_partition_rpc (reads still
+                                     run inline on P-log)
                  Right (CQ wins) → run Phase 3 on the completion
-    (E) non-blocking drain of any queued requests
+    (E) non-blocking drain of any queued requests (still decode inline)
 
-  Shutdown (write_rx closed):
+  Shutdown (req_rx closed):
     Drain all inflight via await-loop; run Phase 3 on each so clients
     receive their final ack. Then flush any residual pending as one last
     batch. Finally emit metrics.
@@ -159,8 +176,11 @@ consequently higher write bandwidth). This is fine because:
 ### Cross-layer SQ/CQ stack (post-R4)
 
 ```
-┌─ PS background_write_loop_r1  (this crate, 4.4)              ┐
+┌─ PS merged_partition_loop  (this crate, 4.4 + F099-D)        ┐
 │    FU<InflightCompletion>, cap 8                              │
+│    (was background_write_loop_r1 before F099-D; merged with   │
+│     the request-dispatch loop to remove the per-Put spawn +   │
+│     inner oneshot that cost ~30 % of P-log CPU at 256 × d=1)  │
 └─────────────┬─────────────────────────────────────────────────┘
               ▼  stream_client.append_batch(log_stream_id, …)
 ┌─ autumn-stream stream_worker_loop  (step 4.3)                 ┐
@@ -349,7 +369,7 @@ After split, both child partitions will detect `has_overlap = true` on next open
 
 ## Fault Recovery: LockedByOther Self-Eviction
 
-If the `background_write_loop` receives a `CODE_LOCKED_BY_OTHER` error from the stream layer
+If the `merged_partition_loop` receives a `CODE_LOCKED_BY_OTHER` error from the stream layer
 (meaning a newer partition owner has taken the lock), it sets a `locked_by_other` flag.
 The main partition loop checks this flag on each request and exits if set.
 This prevents split-brain where two PS nodes serve the same partition.
@@ -430,15 +450,15 @@ Operates on **user keys only** (8-byte MVCC suffix stripped before hashing). 1% 
 
 5. **No local WAL file** — logStream is the sole WAL. All writes (small and large) go to logStream via `append_batch`. Recovery reads logStream from the VP head checkpoint in metaStream. If no checkpoint exists (tables is empty AND vp_eid == 0), recovery replays logStream from the very first extent, offset 0 — this covers partitions that accepted writes but were killed before their first flush. Unflushed imm tables that are in memory are also covered: logStream contains all records newer than the last SSTable flush.
 
-6. **Group commit batching** — the background_write_loop drains up to MAX_WRITE_BATCH (256) requests per RPC cycle. If ANY request in a batch has `must_sync=true`, the entire batch is synced. This allows `--nosync` clients to piggyback on sync requests from other clients without extra overhead.
+6. **Group commit batching** — the merged_partition_loop drains up to MAX_WRITE_BATCH (256) requests per RPC cycle. If ANY request in a batch has `must_sync=true`, the entire batch is synced. This allows `--nosync` clients to piggyback on sync requests from other clients without extra overhead.
 
 7. **Per-partition StreamClient** — each `PartitionData` holds its own `stream_client: Arc<StreamClient>` (no Mutex) created via `StreamClient::new_with_revision`. StreamClient is internally concurrent via per-stream locking (`DashMap<stream_id, Arc<Mutex<StreamAppendState>>>`). Different streams (log/row/meta) are fully concurrent; the same stream is serialized. The server-level `PartitionServer.stream_client` is used only in `split_part` for coordination RPCs.
 
-8. **`process_write_batch` lock scope** — the write lock is held only for seq number assignment and block encoding (Phase 1), then released before the `append_batch` network RPC (Phase 2), then re-acquired for memtable insert and VP head update (Phase 3). This prevents the partition write lock from blocking reads/flushes/compaction during network I/O.
+8. **`start_write_batch` / `finish_write_batch` lock scope** — the write lock is held only for seq number assignment and block encoding (Phase 1), then released before the `append_batch` network RPC (Phase 2), then re-acquired for memtable insert and VP head update (Phase 3). This prevents the partition write lock from blocking reads/flushes/compaction during network I/O.
 
 7. **`sst_readers` and `tables` are always aligned by index** — `tables[i]` and `sst_readers[i]` refer to the same SSTable. Operations on these must maintain alignment. Compaction's atomic swap replaces slices, not individual elements.
 
-9. **Memtable backing = `parking_lot::RwLock<BTreeMap>` (F099-C)** — the active memtable has exactly one writer (the P-log thread's `background_write_loop_r1`) and N readers (ps-conn `handle_get` call sites + P-log itself). Correctness properties:
+9. **Memtable backing = `parking_lot::RwLock<BTreeMap>` (F099-C)** — the active memtable has exactly one writer (the P-log thread's `merged_partition_loop` Phase 3) and N readers (ps-conn `handle_get` call sites + P-log itself). Correctness properties:
    - Writer holds the write lock for the duration of one `insert_batch` call (hot path, up to 256 entries), then releases. Subsequent readers take the read lock AFTER the writer releases → linearisable Put-then-Get.
    - Rotation (`rotate_active`) replaces the whole `Memtable` struct via `std::mem::replace` on the owning `PartitionData`; this is safe because `rotate_active` runs exclusively on P-log inside a `RefCell::borrow_mut`.
    - `imm: VecDeque<Arc<Memtable>>` — after rotation, frozen memtables are read-only from both P-log (during flush + GC + compaction) and P-bulk (during `build_sst_bytes`). Multiple readers acquire the read lock concurrently.
