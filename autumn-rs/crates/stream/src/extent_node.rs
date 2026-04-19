@@ -277,9 +277,6 @@ pub struct ExtentNode {
     /// WAL for small must_sync writes. None if WAL is disabled.
     /// Wrapped in Rc<RefCell<>> for interior mutability on single-threaded compio.
     pub(crate) wal: Option<Rc<RefCell<Wal>>>,
-    /// Per-extent SQ/CQ worker senders (R4 step 4.2). Lazily populated on
-    /// first APPEND/READ touching that extent_id. See extent_worker.rs.
-    pub(crate) worker_pool: Rc<DashMap<u64, futures::channel::mpsc::Sender<crate::extent_worker::ExtentSubmitMsg>>>,
 }
 
 impl Clone for ExtentNode {
@@ -292,7 +289,6 @@ impl Clone for ExtentNode {
             recovery_done: self.recovery_done.clone(),
             recovery_inflight: self.recovery_inflight.clone(),
             wal: self.wal.clone(),
-            worker_pool: self.worker_pool.clone(),
         }
     }
 }
@@ -367,6 +363,485 @@ async fn file_pread(file: &std::cell::UnsafeCell<CompioFile>, offset: u64, len: 
     Ok(buf)
 }
 
+// ───── R4 step 4.2 — inline SQ/CQ pipeline helpers ──────────────────────────
+
+/// Inflight cap — how many I/O futures `handle_connection` drives at once.
+/// Configurable via AUTUMN_EXTENT_INFLIGHT_CAP. Default 64 matches the
+/// client-side pipelining depth where extent_bench peaks.
+fn extent_inflight_cap() -> usize {
+    std::env::var("AUTUMN_EXTENT_INFLIGHT_CAP")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(64)
+}
+
+/// Decode all complete frames from `decoder`, group consecutive same-extent
+/// APPEND/READ frames, and push one I/O future per group onto `inflight`.
+/// Control RPCs are dispatched inline (as an `async move` future) and also
+/// pushed onto `inflight`.
+///
+/// Back-pressure: if `inflight.len()` reaches `cap` mid-push, we await one
+/// completion before pushing more. Completions drained during back-pressure
+/// go into `tx_bufs` and are flushed by the caller after this returns.
+async fn process_frames_backpressured(
+    node: &ExtentNode,
+    decoder: &mut FrameDecoder,
+    inflight: &mut futures::stream::FuturesUnordered<
+        std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Bytes>>>>,
+    >,
+    tx_bufs: &mut Vec<Bytes>,
+    cap: usize,
+) -> Result<()> {
+    use futures::stream::StreamExt as _;
+    // Pull all complete frames out of the decoder.
+    let mut frames: Vec<Frame> = Vec::new();
+    loop {
+        match decoder.try_decode().map_err(|e| anyhow::anyhow!(e))? {
+            Some(frame) if frame.req_id != 0 => frames.push(frame),
+            Some(_) => continue, // req_id=0: fire-and-forget, no response needed
+            None => break,
+        }
+    }
+
+    // Back-pressure: before each push, if we're at/above cap, await one
+    // completion and accumulate its bytes into tx_bufs so the caller's
+    // final write_vectored_all includes them.
+    macro_rules! backpressure {
+        () => {
+            while inflight.len() >= cap {
+                if let Some(done) = inflight.next().await {
+                    tx_bufs.extend(done);
+                } else {
+                    break;
+                }
+            }
+        };
+    }
+
+    let mut i = 0;
+    while i < frames.len() {
+        let msg_type = frames[i].msg_type;
+
+        if msg_type == MSG_APPEND {
+            // Group consecutive same-extent APPEND frames.
+            let first_req = match AppendReq::decode(frames[i].payload.clone()) {
+                Ok(r) => r,
+                Err(e) => {
+                    let req_id = frames[i].req_id;
+                    let p = autumn_rpc::RpcError::encode_status(
+                        StatusCode::InvalidArgument, &e.to_string());
+                    let bytes = Frame::error(req_id, MSG_APPEND, p).encode();
+                    inflight.push(Box::pin(async move { vec![bytes] }));
+                    i += 1;
+                    continue;
+                }
+            };
+            let anchor_extent = first_req.extent_id;
+            let mut slots: Vec<AppendSlot> = Vec::with_capacity(8);
+            slots.push(AppendSlot { req: first_req, req_id: frames[i].req_id });
+            i += 1;
+            while i < frames.len() && frames[i].msg_type == MSG_APPEND {
+                match AppendReq::decode(frames[i].payload.clone()) {
+                    Ok(r) if r.extent_id == anchor_extent => {
+                        slots.push(AppendSlot { req: r, req_id: frames[i].req_id });
+                        i += 1;
+                    }
+                    Ok(_) => break,
+                    Err(e) => {
+                        let req_id = frames[i].req_id;
+                        let p = autumn_rpc::RpcError::encode_status(
+                            StatusCode::InvalidArgument, &e.to_string());
+                        let bytes = Frame::error(req_id, MSG_APPEND, p).encode();
+                        inflight.push(Box::pin(async move { vec![bytes] }));
+                        i += 1;
+                    }
+                }
+            }
+
+            // Resolve extent; on error, synthesise one error frame per slot.
+            let extent = match node.get_extent(anchor_extent).await {
+                Ok(e) => e,
+                Err((code, msg)) => {
+                    let p = autumn_rpc::RpcError::encode_status(code, &msg);
+                    let bytes_list: Vec<Bytes> = slots
+                        .iter()
+                        .map(|s| Frame::error(s.req_id, MSG_APPEND, p.clone()).encode())
+                        .collect();
+                    inflight.push(Box::pin(async move { bytes_list }));
+                    continue;
+                }
+            };
+
+            // Back-pressure BEFORE advancing ACL state (extent.len
+            // reservation) so a pushed batch never stalls waiting to drain.
+            backpressure!();
+
+            // Run ACL + build I/O future synchronously up to the pwritev
+            // await. Early rejection paths resolve immediately (no I/O).
+            let fut = build_append_future(node.clone(), extent, slots).await;
+            inflight.push(fut);
+        } else if msg_type == MSG_READ_BYTES {
+            let first_req = match ReadBytesReq::decode(frames[i].payload.clone()) {
+                Ok(r) => r,
+                Err(e) => {
+                    let req_id = frames[i].req_id;
+                    let p = autumn_rpc::RpcError::encode_status(
+                        StatusCode::InvalidArgument, &e.to_string());
+                    let bytes = Frame::error(req_id, MSG_READ_BYTES, p).encode();
+                    inflight.push(Box::pin(async move { vec![bytes] }));
+                    i += 1;
+                    continue;
+                }
+            };
+            let anchor_extent = first_req.extent_id;
+            let mut slots: Vec<ReadSlot> = Vec::with_capacity(8);
+            slots.push(ReadSlot { req: first_req, req_id: frames[i].req_id });
+            i += 1;
+            while i < frames.len() && frames[i].msg_type == MSG_READ_BYTES {
+                match ReadBytesReq::decode(frames[i].payload.clone()) {
+                    Ok(r) if r.extent_id == anchor_extent => {
+                        slots.push(ReadSlot { req: r, req_id: frames[i].req_id });
+                        i += 1;
+                    }
+                    Ok(_) => break,
+                    Err(e) => {
+                        let req_id = frames[i].req_id;
+                        let p = autumn_rpc::RpcError::encode_status(
+                            StatusCode::InvalidArgument, &e.to_string());
+                        let bytes = Frame::error(req_id, MSG_READ_BYTES, p).encode();
+                        inflight.push(Box::pin(async move { vec![bytes] }));
+                        i += 1;
+                    }
+                }
+            }
+
+            let extent = match node.get_extent(anchor_extent).await {
+                Ok(e) => e,
+                Err((code, msg)) => {
+                    let p = autumn_rpc::RpcError::encode_status(code, &msg);
+                    let bytes_list: Vec<Bytes> = slots
+                        .iter()
+                        .map(|s| Frame::error(s.req_id, MSG_READ_BYTES, p.clone()).encode())
+                        .collect();
+                    inflight.push(Box::pin(async move { bytes_list }));
+                    continue;
+                }
+            };
+            backpressure!();
+            inflight.push(build_read_future(extent, slots));
+        } else {
+            // Control RPC — no hot-path grouping. Build a future that
+            // dispatches and encodes one response frame.
+            backpressure!();
+            let req_id = frames[i].req_id;
+            let payload = frames[i].payload.clone();
+            let node_clone = node.clone();
+            inflight.push(Box::pin(async move {
+                let resp_frame = match node_clone.dispatch(msg_type, payload).await {
+                    Ok(p) => Frame::response(req_id, msg_type, p),
+                    Err((code, message)) => {
+                        let p = autumn_rpc::RpcError::encode_status(code, &message);
+                        Frame::error(req_id, msg_type, p)
+                    }
+                };
+                vec![resp_frame.encode()]
+            }));
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+/// One append request slot routed through `handle_connection`.
+struct AppendSlot {
+    req: AppendReq,
+    req_id: u32,
+}
+
+struct ReadSlot {
+    req: ReadBytesReq,
+    req_id: u32,
+}
+
+/// Error-encode a single append slot.
+fn err_bytes(req_id: u32, msg_type: u8, code: StatusCode, msg: &str) -> Bytes {
+    Frame::error(req_id, msg_type,
+        autumn_rpc::RpcError::encode_status(code, msg),
+    ).encode()
+}
+
+/// Build the async future that performs ACL + pwritev for a same-extent
+/// APPEND batch. ACL early rejections resolve the future as an immediate
+/// pre-encoded Vec<Bytes> with no I/O.
+///
+/// The returned future is polled inside `handle_connection`'s
+/// FuturesUnordered — multiple appends to DIFFERENT extents run concurrently;
+/// appends to the SAME extent are all pushed to FU in order, and since the
+/// ACL synchronously reserves `extent.len`, overlapping same-extent futures
+/// compute non-overlapping `file_start`s.
+///
+/// NOTE: reserves `extent.len` synchronously BEFORE returning the I/O future
+/// so a subsequent submit to the same extent sees the advanced len. The
+/// returned future then calls `write_vectored_at` with pwritev at the
+/// reserved offset.
+async fn build_append_future(
+    node: ExtentNode,
+    extent: std::rc::Rc<ExtentEntry>,
+    slots: Vec<AppendSlot>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Bytes>>>> {
+    use compio::io::AsyncWriteAt;
+
+    if slots.is_empty() {
+        return Box::pin(async move { Vec::new() });
+    }
+
+    // 1. Eversion refresh: if ANY req.eversion > local, refresh from manager.
+    let local_eversion = extent.eversion.load(Ordering::SeqCst);
+    let needs_refresh = slots.iter().any(|s| s.req.eversion > local_eversion);
+    if needs_refresh {
+        let extent_id = slots[0].req.extent_id;
+        match node.extent_info_from_manager(extent_id).await {
+            Ok(Some(ex)) => {
+                let sealed_changed = ExtentNode::apply_extent_meta_ref(&extent, &ex);
+                if sealed_changed {
+                    let _ = node.save_meta(extent_id, &extent).await;
+                }
+            }
+            Ok(None) | Err(_) => {
+                let msg = format!(
+                    "cannot verify extent {} version: manager unreachable",
+                    extent_id
+                );
+                let out: Vec<Bytes> = slots
+                    .into_iter()
+                    .map(|s| err_bytes(s.req_id, MSG_APPEND, StatusCode::Unavailable, &msg))
+                    .collect();
+                return Box::pin(async move { out });
+            }
+        }
+    }
+
+    // 2. Sealed / eversion check using CURRENT local atomics.
+    let local_eversion = extent.eversion.load(Ordering::SeqCst);
+    let sealed = extent.sealed_length.load(Ordering::SeqCst) > 0
+        || extent.avali.load(Ordering::SeqCst) > 0;
+    if sealed || slots.iter().any(|s| local_eversion > s.req.eversion) {
+        let resp_payload = AppendResp { code: CODE_PRECONDITION, offset: 0, end: 0 }.encode();
+        let out: Vec<Bytes> = slots
+            .into_iter()
+            .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
+            .collect();
+        return Box::pin(async move { out });
+    }
+
+    // 3. Revision fencing: the first request's revision governs the batch.
+    let first = &slots[0].req;
+    let last_revision = extent.last_revision.load(Ordering::SeqCst);
+    if first.revision < last_revision {
+        let resp_payload = AppendResp { code: CODE_LOCKED_BY_OTHER, offset: 0, end: 0 }.encode();
+        let out: Vec<Bytes> = slots
+            .into_iter()
+            .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
+            .collect();
+        return Box::pin(async move { out });
+    }
+    let revision_changed = first.revision > last_revision;
+    if revision_changed {
+        extent.last_revision.store(first.revision, Ordering::SeqCst);
+    }
+
+    // 4. Commit reconciliation.
+    let mut file_start = extent.len.load(Ordering::SeqCst);
+    if file_start < first.commit as u64 {
+        let resp_payload = AppendResp { code: CODE_PRECONDITION, offset: 0, end: 0 }.encode();
+        let out: Vec<Bytes> = slots
+            .into_iter()
+            .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
+            .collect();
+        return Box::pin(async move { out });
+    }
+    if file_start > first.commit as u64 {
+        if let Err(e) = node.truncate_to_commit_ref(&extent, first.commit).await {
+            let out: Vec<Bytes> = slots
+                .into_iter()
+                .map(|s| err_bytes(s.req_id, MSG_APPEND, StatusCode::Internal, &e))
+                .collect();
+            return Box::pin(async move { out });
+        }
+        file_start = extent.len.load(Ordering::SeqCst);
+    }
+
+    // 5. Compute per-request offsets + collect payload Bytes for pwritev.
+    let n = slots.len();
+    let mut offsets: Vec<u32> = Vec::with_capacity(n);
+    let mut bufs: Vec<Bytes> = Vec::with_capacity(n);
+    let mut req_ids: Vec<u32> = Vec::with_capacity(n);
+    let mut cursor = file_start;
+    let mut must_sync = false;
+    let mut total_payload: usize = 0;
+    for slot in &slots {
+        offsets.push(cursor as u32);
+        cursor += slot.req.payload.len() as u64;
+        total_payload += slot.req.payload.len();
+        bufs.push(slot.req.payload.clone());
+        req_ids.push(slot.req_id);
+        must_sync |= slot.req.must_sync;
+    }
+    let total_end = cursor;
+    let extent_id = slots[0].req.extent_id;
+
+    // 6. WAL batch.
+    let use_wal = must_sync && node.wal.is_some()
+        && crate::wal::should_use_wal(true, total_payload);
+    if use_wal {
+        let wal_records: Vec<crate::wal::WalRecord> = slots
+            .iter()
+            .enumerate()
+            .map(|(k, s)| crate::wal::WalRecord {
+                extent_id,
+                start: offsets[k],
+                revision: s.req.revision,
+                payload: s.req.payload.to_vec(),
+            })
+            .collect();
+        if let Err(e) = node
+            .wal
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .write_batch(&wal_records)
+        {
+            let msg = e.to_string();
+            let out: Vec<Bytes> = req_ids
+                .into_iter()
+                .map(|id| err_bytes(id, MSG_APPEND, StatusCode::Internal, &msg))
+                .collect();
+            return Box::pin(async move { out });
+        }
+    }
+
+    // 7. Reserve `extent.len` BEFORE returning the I/O future so overlapping
+    //    same-extent futures compute non-overlapping file_starts.
+    extent.len.store(total_end, Ordering::SeqCst);
+    drop(slots); // release original AppendReq payload handles (already cloned into bufs)
+
+    // 8. Return the I/O future. Must be 'static and own everything.
+    let extent_for_io = extent;
+    Box::pin(async move {
+        let write_t0 = Instant::now();
+        // SAFETY: overlapping same-extent futures have non-overlapping
+        // file_starts (reserved in step 7); compio is single-threaded so
+        // &mut aliasing inside this closure is serialised per-future.
+        let f = unsafe { &mut *extent_for_io.file.get() };
+        let BufResult(wr, _) = f.write_vectored_at(bufs, file_start).await;
+        if let Err(e) = wr {
+            node.mark_disk_offline_for_extent(extent_id);
+            let msg = e.to_string();
+            return req_ids
+                .into_iter()
+                .map(|id| err_bytes(id, MSG_APPEND, StatusCode::Internal, &msg))
+                .collect();
+        }
+
+        if must_sync && !use_wal {
+            let f_ref: &CompioFile = unsafe { &*extent_for_io.file.get() };
+            if let Err(e) = f_ref.sync_all().await {
+                node.mark_disk_offline_for_extent(extent_id);
+                let msg = e.to_string();
+                return req_ids
+                    .into_iter()
+                    .map(|id| err_bytes(id, MSG_APPEND, StatusCode::Internal, &msg))
+                    .collect();
+            }
+        }
+
+        let write_elapsed_ns = write_t0.elapsed().as_nanos() as u64;
+        EXTENT_APPEND_METRICS.with(|m| {
+            m.borrow_mut()
+                .record(n as u64, total_payload as u64, write_elapsed_ns);
+        });
+
+        if revision_changed {
+            let _ = node.save_meta(extent_id, &extent_for_io).await;
+        }
+
+        req_ids
+            .into_iter()
+            .enumerate()
+            .map(|(k, req_id)| {
+                let end = if k + 1 < n { offsets[k + 1] } else { total_end as u32 };
+                let resp = AppendResp { code: CODE_OK, offset: offsets[k], end };
+                Frame::response(req_id, MSG_APPEND, resp.encode()).encode()
+            })
+            .collect()
+    })
+}
+
+/// Build the async future that services a same-extent READ batch. Reads
+/// are processed sequentially inside ONE future — each pread is ~1µs and
+/// the responses are written back together.
+fn build_read_future(
+    extent: std::rc::Rc<ExtentEntry>,
+    slots: Vec<ReadSlot>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Bytes>>>> {
+    Box::pin(async move {
+        use compio::io::AsyncReadAtExt;
+
+        let mut out: Vec<Bytes> = Vec::with_capacity(slots.len());
+        for slot in slots {
+            let req = slot.req;
+            let ev = extent.eversion.load(Ordering::SeqCst);
+            if req.eversion > 0 && req.eversion < ev {
+                out.push(err_bytes(
+                    slot.req_id,
+                    MSG_READ_BYTES,
+                    StatusCode::FailedPrecondition,
+                    &format!(
+                        "extent {} eversion too low: got {}, expect >= {}",
+                        req.extent_id, req.eversion, ev
+                    ),
+                ));
+                continue;
+            }
+
+            let total_len = extent.len.load(Ordering::SeqCst);
+            let end = total_len as u32;
+            let read_offset = req.offset as u64;
+            let read_size = if req.length == 0 {
+                total_len.saturating_sub(read_offset)
+            } else {
+                (req.length as u64).min(total_len.saturating_sub(read_offset))
+            };
+
+            let f: &CompioFile = unsafe { &*extent.file.get() };
+            let buf = vec![0u8; read_size as usize];
+            let BufResult(result, buf) = f.read_exact_at(buf, read_offset).await;
+            let bytes = match result {
+                Ok(_) => Frame::response(
+                    slot.req_id,
+                    MSG_READ_BYTES,
+                    ReadBytesResp {
+                        code: CODE_OK,
+                        end,
+                        payload: Bytes::from(buf),
+                    }
+                    .encode(),
+                )
+                .encode(),
+                Err(e) => err_bytes(
+                    slot.req_id,
+                    MSG_READ_BYTES,
+                    StatusCode::Internal,
+                    &e.to_string(),
+                ),
+            };
+            out.push(bytes);
+        }
+        out
+    })
+}
+
 impl ExtentNode {
     const META_MAGIC: &'static [u8; 8] = b"EXTMETA\0";
     const META_SIZE: usize = 40;
@@ -400,7 +875,6 @@ impl ExtentNode {
             recovery_done: Rc::new(std::cell::RefCell::new(Vec::new())),
             recovery_inflight: Rc::new(DashMap::new()),
             wal: None, // set after replay
-            worker_pool: Rc::new(DashMap::new()),
         };
 
         // Load existing extents from all disks.
@@ -618,267 +1092,120 @@ impl ExtentNode {
     }
 
 
-    /// Handle one TCP connection.
+    /// Handle one TCP connection (R4 step 4.2 redesign).
     ///
-    /// R4 step 4.2 — SQ/CQ pipeline:
-    ///   * **Reader** (this task): decode frames; group consecutive
-    ///     APPEND/READ frames by extent_id; send ONE AppendBatch/ReadBatch
-    ///     submit message to the target extent's ExtentWorker, receiving
-    ///     ONE oneshot::Receiver<Vec<Frame>> back per submitted batch.
-    ///     Control RPCs are dispatched in a spawned task producing a
-    ///     single-element Vec<Frame>.
-    ///   * **Completion task** (spawned): owns WriteHalf. Drains a
-    ///     FuturesUnordered of per-batch `oneshot::Receiver<Vec<Frame>>`,
-    ///     coalescing all ready frames into a single `write_vectored_all`
-    ///     per poll cycle — preserves one-syscall-per-burst.
+    /// **Inline FuturesUnordered SQ/CQ pipeline — ONE compio task per conn.**
     ///
-    /// Two-task split (not single-task with `select(read, completion)`)
-    /// avoids parking/resuming compio's io_uring read SQE mid-flight,
-    /// which triggered a deadlock in earlier attempts.
+    /// The previous 4.2 attempt (commit 3261702) used a 3-task pipeline
+    /// (reader → per-extent worker → completion) bridged by mpsc+oneshot.
+    /// Each cross-task hand-off costs several µs at async runtime scale,
+    /// and the microbench regressed 3× (210k → 68k ops/s at depth=64).
+    ///
+    /// This redesign keeps the SQ/CQ semantics (multiple I/O ops in flight
+    /// concurrently, submit doesn't await its own completion) but without
+    /// ANY task hand-off:
+    ///
+    ///   - A single `FuturesUnordered<LocalBoxFuture<Vec<Bytes>>>` of
+    ///     in-flight batch futures (each future does ACL + I/O + encodes
+    ///     response frame bytes).
+    ///   - On each loop iteration we (a) drain ready completions into a
+    ///     tx_bufs vector, (b) flush tx_bufs with ONE `write_vectored_all`
+    ///     (preserving the one-syscall-per-burst coalescing), (c) `select`
+    ///     between a pinned `reader.read(buf)` future and `inflight.next()`.
+    ///   - New TCP reads decode frames, group consecutive same-extent
+    ///     APPEND / READ frames (pwritev batch coalescing preserved), build
+    ///     one I/O future per group, and push onto `inflight`.
+    ///   - Back-pressure: when `inflight.len() >= cap`, the read future is
+    ///     NOT scheduled until at least one completion drains.
+    ///
+    /// **Deadlock avoidance**: the pinned read future is OWNED across
+    /// iterations inside `read_fut_slot: Option<Pin<Box<_>>>`. If a
+    /// completion wins the select, the read future stays pinned in its
+    /// heap slot and is re-polled next iteration — it's NEVER dropped
+    /// mid-flight. This avoids the compio io_uring SQE-cancel-then-resubmit
+    /// oscillation the prior subagent observed.
     pub async fn handle_connection(
         stream: compio::net::TcpStream,
         node: ExtentNode,
     ) -> Result<()> {
-        use futures::channel::{mpsc, oneshot};
-        use futures::sink::SinkExt;
+        use compio::io::AsyncRead;
+        use futures::FutureExt;
         use futures::stream::{FuturesUnordered, StreamExt};
-        use crate::extent_worker::{
-            get_or_spawn, AppendSlot, ExtentSubmitMsg, ReadSlot,
-        };
 
-        let (mut reader, writer) = stream.into_split();
+        const READ_BUF_SIZE: usize = 512 * 1024;
+
+        let (mut reader, mut writer) = stream.into_split();
         let mut decoder = FrameDecoder::new();
-        let mut buf = vec![0u8; 512 * 1024];
+        let mut buf: Vec<u8> = vec![0u8; READ_BUF_SIZE];
 
-        let (mut inflight_tx, inflight_rx) =
-            mpsc::channel::<oneshot::Receiver<Vec<Frame>>>(4096);
+        let cap = extent_inflight_cap();
+        let mut inflight: FuturesUnordered<
+            std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Bytes>>>>,
+        > = FuturesUnordered::new();
 
-        // Completion task.
-        compio::runtime::spawn(async move {
-            use futures::FutureExt;
-            let mut writer = writer;
-            let mut inflight_rx = inflight_rx;
-            let mut inflight: FuturesUnordered<oneshot::Receiver<Vec<Frame>>> =
-                FuturesUnordered::new();
-            loop {
-                if inflight.is_empty() {
-                    match inflight_rx.next().await {
-                        Some(rx) => inflight.push(rx),
-                        None => return,
-                    }
-                    while let Some(Some(rx)) = inflight_rx.next().now_or_never() {
-                        inflight.push(rx);
-                    }
-                    continue;
-                }
-                let new_rx_fut = inflight_rx.next();
-                let completion_fut = inflight.next();
-                futures::pin_mut!(new_rx_fut, completion_fut);
-                use futures::future::{select, Either};
-                match select(new_rx_fut, completion_fut).await {
-                    Either::Left((Some(rx), _)) => {
-                        inflight.push(rx);
-                        while let Some(Some(rx)) = inflight_rx.next().now_or_never() {
-                            inflight.push(rx);
-                        }
-                    }
-                    Either::Left((None, _)) => {
-                        while let Some(res) = inflight.next().await {
-                            if let Ok(frames) = res {
-                                let bufs: Vec<Bytes> =
-                                    frames.into_iter().map(|f| f.encode()).collect();
-                                if !bufs.is_empty() {
-                                    let _ = writer.write_vectored_all(bufs).await.0;
-                                }
-                            }
-                        }
-                        return;
-                    }
-                    Either::Right((maybe_done, _)) => {
-                        let mut ready: Vec<Bytes> = Vec::new();
-                        if let Some(Ok(frames)) = maybe_done {
-                            for f in frames { ready.push(f.encode()); }
-                        }
-                        while let Some(Some(res)) = inflight.next().now_or_never() {
-                            if let Ok(frames) = res {
-                                for f in frames { ready.push(f.encode()); }
-                            }
-                        }
-                        if !ready.is_empty() {
-                            let BufResult(r, _) = writer.write_vectored_all(ready).await;
-                            if let Err(e) = r {
-                                tracing::debug!(error = %e, "conn writer exited on write error");
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-        })
-        .detach();
+        // Response bytes collected from completions, flushed with ONE
+        // `write_vectored_all` per burst.
+        let mut tx_bufs: Vec<Bytes> = Vec::with_capacity(128);
 
-        // Reader task (this function).
         loop {
+            // (1) Block on the next TCP read. On the tight request-response
+            //     workload this is always the first await; on mixed workloads
+            //     with cross-extent concurrency, multiple inflight batches
+            //     from a previous read may still be running in FU — they'll
+            //     be drained below before we flush responses.
             let BufResult(result, buf_back) = reader.read(buf).await;
             buf = buf_back;
             let n = result?;
             if n == 0 {
-                drop(inflight_tx);
+                // EOF: drain remaining inflight, flush, exit.
+                while let Some(done) = inflight.next().await {
+                    tx_bufs.extend(done);
+                }
+                if !tx_bufs.is_empty() {
+                    let bufs = std::mem::take(&mut tx_bufs);
+                    let _ = writer.write_vectored_all(bufs).await.0;
+                }
                 return Ok(());
+            }
+
+            // (2) Opportunistically drain any completions that became ready
+            //     while we were awaiting the read — cheap non-blocking poll.
+            while let Some(Some(done)) = inflight.next().now_or_never() {
+                tx_bufs.extend(done);
             }
 
             decoder.feed(&buf[..n]);
 
-            let mut frames: Vec<Frame> = Vec::new();
-            loop {
-                match decoder.try_decode().map_err(|e| anyhow::anyhow!(e))? {
-                    Some(frame) if frame.req_id != 0 => frames.push(frame),
-                    Some(_) => continue,
-                    None => break,
+            // (3) Push one I/O future per consecutive-same-extent group from
+            //     this TCP read (APPEND/READ grouped by extent; CONTROL RPCs
+            //     each get their own future). Back-pressure: if we cross the
+            //     inflight cap mid-push, we drain one before pushing more.
+            process_frames_backpressured(&node, &mut decoder, &mut inflight,
+                &mut tx_bufs, cap).await?;
+
+            // (4) Drain all inflight futures pushed from THIS (and prior)
+            //     read. This gives us:
+            //       - Cross-extent concurrency: if the read produced 3
+            //         different-extent batches, their pwritev/pread futures
+            //         run in parallel inside FU; drain returns them as they
+            //         complete (fastest disk first).
+            //       - Simplicity: no read/inflight race → no Box::pin of
+            //         the read future, no dyn-dispatch poll overhead. Matches
+            //         the old single-task `write_vectored_all`-per-burst hot
+            //         path exactly.
+            while let Some(done) = inflight.next().await {
+                tx_bufs.extend(done);
+                // Drain any additional ready completions non-blocking.
+                while let Some(Some(d)) = inflight.next().now_or_never() {
+                    tx_bufs.extend(d);
                 }
             }
 
-            // Helper macro: push an already-resolved batch onto the
-            // completion task's inflight queue. Avoids closure-async issues.
-            macro_rules! push_resolved {
-                ($frames:expr) => {{
-                    let (tx, rx) = oneshot::channel::<Vec<Frame>>();
-                    let _ = tx.send($frames);
-                    if inflight_tx.send(rx).await.is_err() {
-                        return Ok(());
-                    }
-                }};
-            }
-
-            let mut i = 0;
-            while i < frames.len() {
-                let msg_type = frames[i].msg_type;
-
-                if msg_type == MSG_APPEND {
-                    let first_req = match AppendReq::decode(frames[i].payload.clone()) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            push_resolved!(vec![Frame::error(
-                                frames[i].req_id, MSG_APPEND,
-                                autumn_rpc::RpcError::encode_status(
-                                    StatusCode::InvalidArgument, &e.to_string()))]);
-                            i += 1;
-                            continue;
-                        }
-                    };
-                    let anchor_extent = first_req.extent_id;
-                    let mut slots: Vec<AppendSlot> = Vec::new();
-                    slots.push(AppendSlot { req: first_req, req_id: frames[i].req_id });
-                    i += 1;
-                    while i < frames.len() && frames[i].msg_type == MSG_APPEND {
-                        match AppendReq::decode(frames[i].payload.clone()) {
-                            Ok(r) if r.extent_id == anchor_extent => {
-                                slots.push(AppendSlot { req: r, req_id: frames[i].req_id });
-                                i += 1;
-                            }
-                            Ok(_) => break,
-                            Err(e) => {
-                                push_resolved!(vec![Frame::error(
-                                    frames[i].req_id, MSG_APPEND,
-                                    autumn_rpc::RpcError::encode_status(
-                                        StatusCode::InvalidArgument, &e.to_string()))]);
-                                i += 1;
-                            }
-                        }
-                    }
-
-                    let extent = match node.get_extent(anchor_extent).await {
-                        Ok(e) => e,
-                        Err((code, msg)) => {
-                            let payload = autumn_rpc::RpcError::encode_status(code, &msg);
-                            let frames_vec: Vec<Frame> = slots.iter()
-                                .map(|s| Frame::error(s.req_id, MSG_APPEND, payload.clone()))
-                                .collect();
-                            push_resolved!(frames_vec);
-                            continue;
-                        }
-                    };
-                    let (tx, rx) = oneshot::channel::<Vec<Frame>>();
-                    if inflight_tx.send(rx).await.is_err() { return Ok(()); }
-                    let mut worker_tx = get_or_spawn(&node, anchor_extent, extent);
-                    if worker_tx.send(
-                        ExtentSubmitMsg::AppendBatch { slots, resp_tx: tx }).await.is_err()
-                    {
-                        tracing::warn!(extent_id = anchor_extent, "submit append to worker failed");
-                    }
-                } else if msg_type == MSG_READ_BYTES {
-                    let first_req = match ReadBytesReq::decode(frames[i].payload.clone()) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            push_resolved!(vec![Frame::error(
-                                frames[i].req_id, MSG_READ_BYTES,
-                                autumn_rpc::RpcError::encode_status(
-                                    StatusCode::InvalidArgument, &e.to_string()))]);
-                            i += 1;
-                            continue;
-                        }
-                    };
-                    let anchor_extent = first_req.extent_id;
-                    let mut slots: Vec<ReadSlot> = Vec::new();
-                    slots.push(ReadSlot { req: first_req, req_id: frames[i].req_id });
-                    i += 1;
-                    while i < frames.len() && frames[i].msg_type == MSG_READ_BYTES {
-                        match ReadBytesReq::decode(frames[i].payload.clone()) {
-                            Ok(r) if r.extent_id == anchor_extent => {
-                                slots.push(ReadSlot { req: r, req_id: frames[i].req_id });
-                                i += 1;
-                            }
-                            Ok(_) => break,
-                            Err(e) => {
-                                push_resolved!(vec![Frame::error(
-                                    frames[i].req_id, MSG_READ_BYTES,
-                                    autumn_rpc::RpcError::encode_status(
-                                        StatusCode::InvalidArgument, &e.to_string()))]);
-                                i += 1;
-                            }
-                        }
-                    }
-
-                    let extent = match node.get_extent(anchor_extent).await {
-                        Ok(e) => e,
-                        Err((code, msg)) => {
-                            let payload = autumn_rpc::RpcError::encode_status(code, &msg);
-                            let frames_vec: Vec<Frame> = slots.iter()
-                                .map(|s| Frame::error(s.req_id, MSG_READ_BYTES, payload.clone()))
-                                .collect();
-                            push_resolved!(frames_vec);
-                            continue;
-                        }
-                    };
-                    let (tx, rx) = oneshot::channel::<Vec<Frame>>();
-                    if inflight_tx.send(rx).await.is_err() { return Ok(()); }
-                    let mut worker_tx = get_or_spawn(&node, anchor_extent, extent);
-                    if worker_tx.send(
-                        ExtentSubmitMsg::ReadBatch { slots, resp_tx: tx }).await.is_err()
-                    {
-                        tracing::warn!(extent_id = anchor_extent, "submit read to worker failed");
-                    }
-                } else {
-                    // Control RPC: spawn dispatch; response delivered as a
-                    // single-element Vec<Frame>.
-                    let req_id = frames[i].req_id;
-                    let payload = frames[i].payload.clone();
-                    let node2 = node.clone();
-                    let (tx, rx) = oneshot::channel::<Vec<Frame>>();
-                    if inflight_tx.send(rx).await.is_err() { return Ok(()); }
-                    compio::runtime::spawn(async move {
-                        let resp_frame = match node2.dispatch(msg_type, payload).await {
-                            Ok(p) => Frame::response(req_id, msg_type, p),
-                            Err((code, message)) => {
-                                let p = autumn_rpc::RpcError::encode_status(code, &message);
-                                Frame::error(req_id, msg_type, p)
-                            }
-                        };
-                        let _ = tx.send(vec![resp_frame]);
-                    })
-                    .detach();
-                    i += 1;
-                }
+            // (5) Flush ALL responses with ONE vectored write syscall.
+            if !tx_bufs.is_empty() {
+                let bufs = std::mem::take(&mut tx_bufs);
+                let BufResult(result, _) = writer.write_vectored_all(bufs).await;
+                result?;
             }
         }
     }

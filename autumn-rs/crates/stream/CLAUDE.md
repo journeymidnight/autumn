@@ -67,55 +67,60 @@ No `write_lock` — appends are serialized by the single-threaded compio runtime
 
 ### Connection Handling & Batch Optimization (R4 step 4.2)
 
-Per-TCP-connection `handle_connection` routes frames to **per-extent
-ExtentWorkers** (SQ/CQ pipeline). Two tasks per connection:
+`handle_connection` is ONE compio task per TCP connection with an INLINE
+`FuturesUnordered` of in-flight batch I/O futures — no cross-task mpsc, no
+per-extent worker. This gives SQ/CQ decoupling (multiple I/O ops can run
+concurrently when they target different extents) without the 3× task
+hand-off overhead of the earlier per-extent ExtentWorker design.
 
 ```
-TCP read → Reader task (this fn) → group by msg_type + extent_id →
-    submit AppendBatch/ReadBatch (oneshot::Sender<Vec<Frame>>) to
-    ExtentWorker[extent_id]
-                         │
-                         ▼
-       ExtentWorker loop (crates/stream/src/extent_worker.rs)
-          - FuturesUnordered<inflight I/O futures>
-          - inflight cap = AUTUMN_EXTENT_INFLIGHT_CAP (default 64)
-          - ACL (eversion / sealed / revision / commit) then pwritev / pread
-          - on completion: oneshot::send(Vec<Frame>)
-                         │
-                         ▼
-       Completion task (owns WriteHalf)
-          - FuturesUnordered<oneshot::Receiver<Vec<Frame>>>
-          - drains ready completions, flattens into ONE write_vectored_all
+┌─ ConnTask (single task) ────────────────────────────────────────┐
+│  TCP read → decode frames → process_frames_backpressured:       │
+│     • group consecutive same-extent APPEND → 1 build_append_fut │
+│     • group consecutive same-extent READ   → 1 build_read_fut   │
+│     • each control RPC                     → 1 dispatch future  │
+│  inflight: FuturesUnordered<LocalBoxFuture<Vec<Bytes>>>         │
+│     cap = AUTUMN_EXTENT_INFLIGHT_CAP (default 64)               │
+│     when at cap mid-push: await one completion → tx_bufs        │
+│                                                                 │
+│  Drain inflight → tx_bufs  (now_or_never inner-loop + .next()   │
+│                              awaiters until FU empty)           │
+│  ONE write_vectored_all(tx_bufs) flush per burst                │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-1. **MSG_APPEND batch** — consecutive append frames grouped by extent_id are
-   packaged as ONE `AppendBatch` to the per-extent worker. Worker issues
-   ONE `write_vectored_at` (pwritev) and emits N response frames as ONE
-   `Vec<Frame>` via a per-batch oneshot.
-2. **MSG_READ_BYTES batch** — same grouping, worker processes preads
-   sequentially inside the submit future.
-3. **Control RPCs** (ALLOC, DF, RECOVERY, etc.) — dispatched in a spawned
-   task, response delivered as a single-element `Vec<Frame>` via the same
-   oneshot pipeline so ordering with nearby ops is preserved.
-4. **Write coalesce** — the completion task's `now_or_never` drain merges
-   all ready oneshots into one `write_vectored_all` per poll cycle.
+1. **MSG_APPEND batch** — consecutive append frames grouped by extent_id
+   are packaged into ONE append future. The future's I/O body issues ONE
+   `write_vectored_at` (pwritev) and returns N already-encoded response
+   frame bytes.
+2. **MSG_READ_BYTES batch** — same grouping; the future runs preads
+   sequentially inside and returns N encoded response bytes.
+3. **Control RPCs** (ALLOC, DF, RECOVERY, etc.) — each becomes one future
+   pushed onto the same FU. Responses fold into the same tx_bufs flush.
+4. **Write coalesce** — drain loop accumulates Vec<Bytes> from ALL futures
+   completed during this burst → one `write_vectored_all` syscall per
+   TCP-read burst (matches the old hot-path optimisation exactly).
+5. **Cross-extent concurrency** — if a single TCP read produces batches
+   for N different extents, all N futures sit in FU simultaneously. The
+   underlying `write_vectored_at` on each extent's compio file future
+   drives them in parallel; FU returns them as they complete (fastest
+   disk first).
 
-ExtentWorkers are lazily spawned on first APPEND/READ to an extent_id and
-shared across connections. They self-remove from `worker_pool: Rc<DashMap>`
-on exit (explicit `Shutdown` or all senders drop). ACL rejects sealed
-extents with `FAILED_PRECONDITION`, preserving current correctness.
+**Extent-len reservation**: step 7 of `build_append_future` stores
+`extent.len = total_end` BEFORE returning the I/O future into FU. This
+guarantees overlapping same-extent submits (if pushed in the same burst)
+compute non-overlapping `file_start` values — necessary for the SQ/CQ
+overlap model.
 
-Extent length is reserved synchronously in the submit ACL (before pushing
-the pwritev future into FU) so overlapping submits see non-overlapping
-`file_start`s — necessary for the SQ/CQ overlap model.
-
-**Perf trade-off**: microbenchmark (`extent_bench`) shows the extra
-task boundary costs ~3× at high pipeline depths vs the previous
-single-task batch processor (209k → 68k ops/s at depth=64). End-to-end
-(perf_check.sh --shm) is unchanged at ~53k ops/s because that benchmark
-is network-RTT-bound, not server-side-bound. Subsequent R4 steps (4.3/4.4)
-close the gap by restructuring the upper layers to benefit from this
-per-extent decoupling.
+**Why single-task & inline FU, not per-extent worker?** The prior R4 4.2
+attempt (commit `3261702`) spawned a per-extent ExtentWorker task and used
+two mpsc hand-offs per request cycle (reader → worker → completion).
+Each hand-off costs several µs of scheduler round-trip; at the 4-5µs/op
+baseline this TRIPLED the cost, regressing `extent_bench` write depth=64
+from 210k → 68k ops/s. The current design keeps everything Rc-accessible
+in one task: zero mpsc, zero cross-task wake cascades. Measured
+`extent_bench` at depth=64 is 203-210k ops/s — parity with the pre-4.2
+baseline AND retaining SQ/CQ semantics (cross-extent parallelism via FU).
 
 ### Append Protocol (eversion check → seal check → fencing → commit truncation → write)
 

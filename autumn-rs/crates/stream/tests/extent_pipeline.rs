@@ -1,55 +1,24 @@
-//! Integration tests for the R4 step 4.2 per-extent SQ/CQ ExtentWorker.
+//! Integration tests for the R4 step 4.2 ExtentNode inline SQ/CQ pipeline.
 //!
 //! Exercised via the public ExtentNode RPC surface (no private internals
 //! poked). Each test spins a node, opens a TestConn, and sends real
-//! MSG_APPEND / MSG_READ_BYTES frames — the worker pool handles the routing.
+//! MSG_APPEND / MSG_READ_BYTES frames — `handle_connection`'s FuturesUnordered
+//! drives the batch futures.
 
 mod test_helpers;
 
 use std::time::{Duration, Instant};
 
-use autumn_stream::extent_rpc::{CODE_OK, CODE_PRECONDITION};
+use autumn_stream::extent_rpc::CODE_OK;
 use test_helpers::{pick_addr, start_node, TestConn};
-
-#[compio::test]
-async fn extent_worker_spawns_on_first_append() {
-    // Submit one append to a fresh extent. The worker is spawned lazily;
-    // the round-trip completing with CODE_OK and the expected offsets is
-    // sufficient evidence that the worker is alive.
-    let node_dir = tempfile::tempdir().expect("node tempdir");
-    let addr = pick_addr();
-    start_node(node_dir.path(), addr).await;
-    let conn = TestConn::new(addr);
-
-    let alloc = conn.alloc_extent(2001).await;
-    assert_eq!(alloc.code, CODE_OK);
-
-    let resp = conn
-        .append(2001, 1, 0, 10, false, b"hello".to_vec())
-        .await;
-    assert_eq!(resp.code, CODE_OK, "first append should succeed via worker");
-    assert_eq!(resp.offset, 0);
-    assert_eq!(resp.end, 5);
-
-    // Second append on the same extent — the worker is reused (DashMap lookup hit).
-    let resp2 = conn
-        .append(2001, 1, 5, 10, false, b"world".to_vec())
-        .await;
-    assert_eq!(resp2.code, CODE_OK);
-    assert_eq!(resp2.offset, 5);
-    assert_eq!(resp2.end, 10);
-}
 
 #[compio::test]
 async fn concurrent_appends_preserve_offset_order_per_extent() {
     // Pipeline 200 appends through ONE TCP connection targeting one extent.
-    // The reader decodes frames in order, groups them into AppendBatch
-    // submit_msg for the worker. The worker serializes via its single
-    // FuturesUnordered inflight slot → produces strictly contiguous offsets.
-    //
-    // This exercises the hot path: ConnTask → worker AppendBatch coalesced
-    // pwritev → N oneshot frames back. With commit=prev_end passed by the
-    // client, there's no truncate-rollback race.
+    // The reader decodes frames in order, groups them into an AppendBatch
+    // I/O future pushed onto the conn's FuturesUnordered. Same-extent futures
+    // reserve `extent.len` synchronously at submit time so offsets stay
+    // strictly contiguous regardless of completion order.
     let node_dir = tempfile::tempdir().expect("node tempdir");
     let addr = pick_addr();
     start_node(node_dir.path(), addr).await;
@@ -80,13 +49,11 @@ async fn concurrent_appends_preserve_offset_order_per_extent() {
 
 #[compio::test]
 async fn appends_to_different_extents_run_concurrently() {
-    // Two extents, each receiving a must_sync append. With per-extent
-    // workers they should run in parallel: total elapsed ≈ max(A,B),
-    // not A+B. We measure and assert total_elapsed < 1.5 × single-append.
-    //
-    // Because filesystem sync latency varies, we use a loose bound and
-    // only assert parallelism. If a single append takes S ms, serialized
-    // would give 2S; overlapped gives ~S. We require < 1.5S.
+    // Two extents, each receiving a must_sync append via its own TCP conn.
+    // Because each conn pushes its own I/O future and completions are driven
+    // by independent FuturesUnordered instances on separate tasks (one per
+    // connection), the two append futures run in parallel: total elapsed
+    // ≈ max(A,B), not A+B.
     let node_dir = tempfile::tempdir().expect("node tempdir");
     let addr = pick_addr();
     start_node(node_dir.path(), addr).await;
@@ -106,9 +73,8 @@ async fn appends_to_different_extents_run_concurrently() {
     let _ = conn.append(2010, 1, 4096, 10, true, vec![0u8; 4096]).await;
     let single = t.elapsed();
 
-    // Now run two concurrent must_sync appends on different extents.
-    // Each uses its own connection to avoid ConnTask-level serialization
-    // (consecutive same-msg frames would coalesce on ONE worker otherwise).
+    // Two concurrent must_sync appends on different extents, each on its
+    // own TCP conn.
     let conn_a = TestConn::new(addr);
     let conn_b = TestConn::new(addr);
 
@@ -124,13 +90,8 @@ async fn appends_to_different_extents_run_concurrently() {
     futures::future::join(fa, fb).await;
     let parallel = t2.elapsed();
 
-    // Loose bound: parallel should be < 1.8 × single. On a system where
-    // fsync is cheap (tmpfs) this is easy; on rotating disks it may be
-    // closer to 1.5x due to shared device queue. Assert 1.8x as a sanity
-    // check that per-extent workers ARE running concurrently.
-    //
-    // We also allow a floor: if `single` is micro-scale (<1ms, page-cache
-    // hit on tmpfs), the measurement noise dominates; skip the ratio check.
+    // Loose bound: parallel should be < 1.8 × single. If fsync is cheap
+    // (<1ms, tmpfs), measurement noise dominates; skip the ratio check.
     if single > Duration::from_millis(2) {
         assert!(
             parallel < single * 18 / 10,
@@ -139,21 +100,13 @@ async fn appends_to_different_extents_run_concurrently() {
             single,
         );
     }
-    // Regardless, both appends must have succeeded — covered by assert
-    // inside the tasks.
 }
 
 #[compio::test]
 async fn seal_rejects_subsequent_appends() {
-    // Simulates the seal flow: once extent.sealed_length > 0, the worker
-    // must reject all subsequent appends with CODE_PRECONDITION.
-    //
-    // We rely on the fact that apply_extent_meta (called on eversion
-    // mismatch refresh) sets sealed_length. We can't easily synthesize
-    // that here without a manager in the loop. Instead we test the
-    // complementary case: revision fencing (a lower-level ACL that runs
-    // on every append) correctly rejects late submissions, which proves
-    // the worker's ACL path fires per-request.
+    // Revision fencing (ACL that runs on every append batch future): once
+    // last_revision is bumped, late-arriving lower-revision appends must be
+    // rejected. Proves the per-submit ACL path is still firing.
     let node_dir = tempfile::tempdir().expect("node tempdir");
     let addr = pick_addr();
     start_node(node_dir.path(), addr).await;
@@ -173,10 +126,10 @@ async fn seal_rejects_subsequent_appends() {
     assert_eq!(
         r2.code,
         autumn_stream::extent_rpc::CODE_LOCKED_BY_OTHER,
-        "late revision must be rejected by worker ACL"
+        "late revision must be rejected by ACL"
     );
 
-    // Subsequent high-revision still works, proving the worker didn't exit.
+    // Subsequent high-revision still works, proving the connection is live.
     let r3 = conn
         .append(2020, 1, 5, 150, false, b"ok".to_vec())
         .await;
@@ -188,13 +141,14 @@ async fn seal_rejects_subsequent_appends() {
 #[compio::test]
 async fn pwritev_batch_still_coalesced() {
     // Fire 10 consecutive appends over ONE TCP connection — the reader
-    // decodes all 10 frames from the TCP read batch and sends a single
-    // AppendBatch submit_msg to the worker, which issues ONE pwritev.
+    // decodes all 10 frames (potentially from one TCP read batch), groups
+    // them into ONE AppendBatch future, and issues ONE `write_vectored_at`
+    // (pwritev) inside that future.
     //
     // Verification: final extent len == 10 × payload_len, and each
     // append's (offset, end) is contiguous. Timing check (batched
-    // << per-append serialized) is skipped here — the perf bench
-    // covers it at a larger scale.
+    // << per-append serialized) is skipped here — the perf bench covers
+    // it at a larger scale.
     let node_dir = tempfile::tempdir().expect("node tempdir");
     let addr = pick_addr();
     start_node(node_dir.path(), addr).await;
@@ -206,11 +160,6 @@ async fn pwritev_batch_still_coalesced() {
     let payload_len: u32 = 128;
     let payload = vec![0x5Au8; payload_len as usize];
 
-    // Pipeline by awaiting sequentially — but a single ConnPool open
-    // connection is used for all, so frames may or may not pack into one
-    // TCP read. The ExtentWorker AppendBatch path is exercised either way
-    // (single-frame batches are ONE pwritev with 1 iovec; multi-frame
-    // batches are ONE pwritev with N iovecs).
     for i in 0..10 {
         let resp = conn
             .append(2030, 1, i * payload_len, 10, false, payload.clone())
