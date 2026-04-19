@@ -1,3 +1,104 @@
+Date: 2026-04-18
+TaskStatus: completed
+Task scope: F099-C — Memtable SkipMap → parking_lot::RwLock<BTreeMap>
+  (replace crossbeam-skiplist backing for the active / imm memtable)
+
+Current summary (F099-C):
+  Branch: perf-r1-partition-scale-out (worktree /data/dongmao_dev/autumn-perf-r1)
+
+  Replaced `Memtable.data: crossbeam_skiplist::SkipMap<Vec<u8>, MemEntry>`
+  with `parking_lot::RwLock<BTreeMap<Vec<u8>, MemEntry>>`. Public API
+  (`insert`, `is_empty`, `mem_bytes`, `seek_user_key`, `snapshot_sorted`)
+  preserved — all `&self` — the RwLock hides interior mutability.
+
+  Added:
+    - `insert_batch<I>(iter)` — one write lock per batch, not per insert
+      (called by `finish_write_batch` Phase 3 to collapse up to 256
+      memtable inserts into a single lock acquire/release pair).
+    - `for_each(F)` — read-lock-scoped iteration helper used by
+      `build_sst_bytes` and `rotate_active` to keep encapsulation tight
+      without allocating a snapshot Vec.
+
+  Removed `crossbeam-skiplist` from both `crates/partition-server/Cargo.toml`
+  and the workspace `[workspace.dependencies]` (no other crate uses it —
+  `cargo tree --workspace | grep skiplist` returns empty).
+
+  Correctness:
+    - Writer: single thread (P-log `background_write_loop_r1`); read-lock
+      readers (ps-conn `handle_get`, flush, GC) may observe inserts as
+      soon as the write lock is released → linearisable Put-then-Get.
+    - `imm: VecDeque<Arc<Memtable>>` still Send+Sync (parking_lot::RwLock<T>
+      is Send+Sync when T: Send; BTreeMap<Vec<u8>, MemEntry> is Send).
+    - Rotation atomicity preserved: `rotate_active` does
+      `std::mem::replace(&mut part.active, Memtable::new())` under the
+      P-log thread's `RefCell::borrow_mut`, same as before.
+    - Bytes counter stays `AtomicU64` (lock-free `mem_bytes` for
+      `maybe_rotate` polling).
+
+  Tests (all green):
+    - 74 PS lib tests (73 prior + 1 new `memtable_mixed_read_write_under_pressure`)
+    - 40 stream lib + 21 stream integration tests
+    - 10 rpc lib tests
+    - Full-workspace run excludes pre-existing `autumn-manager` test
+      build errors (unrelated, touching `handle_register_node` private
+      access) and `autumn-fuse` (needs system `fuse3` lib not on host).
+
+  Perf (3-rep `perf_check.sh --shm --partitions 1 --pipeline-depth 1`):
+    Run 1: write 53087 ops/s, read 71491 ops/s, p99w 21.93 ms
+    Run 2: write 49610 ops/s, read 76955 ops/s, p99w 29.27 ms
+    Run 3: write 55803 ops/s, read 76820 ops/s, p99w  9.58 ms
+    Median: write **53.1k**, read **76.8k**.
+
+  Against F099-B baseline (median write 55k, read 65.9k):
+    - Write: −3.5% (within run-to-run noise, effectively flat)
+    - Read: +16% (meaningful, consistent gain)
+
+  Why no write improvement? The F099-A flame graph measured 28% of P-log
+  CPU in skiplist atomics AT A TIME when P-log was saturated at one core.
+  Removing that CPU only lifts throughput if P-log CPU remains the binding
+  constraint. At 256 clients × d=1 the effective ceiling is the RTT-sync
+  barrier (256 × 4 ms batch RTT ≈ 64k theoretical). Once per-request P-log
+  cycles drop, the coupling shifts back to client-sync RTT — unaffected
+  by memtable internals. Read improvement is real because reads take the
+  read lock (multi-reader parallel) where SkipMap still paid epoch
+  pinning and tagged atomic loads per level walked.
+
+  Outcome: **DONE_WITH_CONCERNS** — change is correct, removes the
+  long-term skiplist dependency, and delivers a real read gain; write
+  improvement flat at this specific workload. Further write gains need
+  F099-D (spawn_write_request + oneshot collapse, F099-A Fix B) or
+  architectural changes to the 256-sync-client RTT coupling.
+
+Files:
+  crates/partition-server/src/lib.rs
+    (Memtable struct + impl, new insert_batch + for_each, new test)
+  crates/partition-server/src/background.rs
+    (finish_write_batch Phase 3 now uses insert_batch)
+  crates/partition-server/Cargo.toml
+    (crossbeam-skiplist dep removed)
+  Cargo.toml
+    (workspace-level crossbeam-skiplist removed)
+  crates/partition-server/CLAUDE.md + autumn-rs/CLAUDE.md
+    (Memtable description + Programming Note #9 added)
+
+Main gaps / concerns:
+  - Write throughput gain predicted by F099-A not realised at the
+    256×d=1 cell. The P-log CPU budget is no longer the binding
+    constraint on this workload; the 256-sync-client RTT barrier is.
+  - F099-D (spawn_write_request + oneshot collapse) is the next lever
+    — F099-A estimated +10-15% standalone, or combined with F099-C
+    ~70k target. Note: combined still likely won't break the
+    RTT-product ceiling; architectural work (client-side pipelining
+    above d=1, or multi-partition scale-out) is needed to go further.
+
+Next steps:
+  - F099-D: collapse `spawn_write_request` + `handle_put` inner oneshot.
+  - Optional F099-E: Bytes refcount churn (smallest of the three).
+
+Commit: perf(F099-C): Memtable SkipMap -> RwLock<BTreeMap> (<tbd>)
+
+---
+
 Date: 2026-04-20
 TaskStatus: completed
 Task scope: F099-A — Perf R4 ceiling diagnosis (flame-graph measurement only,

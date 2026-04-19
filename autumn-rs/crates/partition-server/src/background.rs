@@ -707,19 +707,37 @@ async fn finish_write_batch(
     };
 
     // Phase 3: insert into memtable + update VP head.
+    //
+    // F099-C: batch all N (up to 256) memtable inserts under ONE RwLock write
+    // guard acquisition via `insert_batch`. Prior to F099-C this loop called
+    // `p.active.insert` N times; under the new RwLock<BTreeMap> backing that
+    // would mean N write-lock acquire/release cycles per batch. Collapsing
+    // into one saves N-1 atomic-CAS pairs per batch (256 → 1 on the hot
+    // --threads 256 workload) while preserving the single-writer semantics.
     let phase3_started_at = Instant::now();
     let mut responses: Vec<(Vec<u8>, oneshot::Sender<Result<Vec<u8>, String>>)> = Vec::new();
+    let batch_ops = bd.record_sizes.len() as u64;
+    let record_sizes = bd.record_sizes;
+    let base_offset = result.offset;
+    let extent_id_for_vp = result.extent_id;
     {
         let mut p = part.borrow_mut();
 
+        // Materialise the inserts as an iterator that also side-effects
+        // `responses`. The iterator is fully consumed inside insert_batch,
+        // so the side effects all happen under the (single) write lock.
+        let valid = bd.valid;
         let mut cumulative: u32 = 0;
-        for (i, entry) in bd.valid.into_iter().enumerate() {
-            let record_offset = result.offset + cumulative;
-            cumulative += bd.record_sizes[i];
+        let mut idx: usize = 0;
+        let responses_ref = &mut responses;
+        let iter = valid.into_iter().map(move |entry| {
+            let record_offset = base_offset + cumulative;
+            cumulative += record_sizes[idx];
+            idx += 1;
 
             let mem_entry = if entry.value.len() > VALUE_THROTTLE {
                 let vp = ValuePointer {
-                    extent_id: result.extent_id,
+                    extent_id: extent_id_for_vp,
                     offset: record_offset + 17 + entry.internal_key.len() as u32,
                     len: entry.value.len() as u32,
                 };
@@ -737,9 +755,11 @@ async fn finish_write_batch(
             };
 
             let write_size = (entry.user_key.len() + mem_entry.value.len() + 32) as u64;
-            p.active.insert(entry.internal_key, mem_entry, write_size);
-            responses.push((entry.user_key.to_vec(), entry.resp_tx));
-        }
+            responses_ref.push((entry.user_key.to_vec(), entry.resp_tx));
+            (entry.internal_key, mem_entry, write_size)
+        });
+
+        p.active.insert_batch(iter);
 
         p.vp_extent_id = result.extent_id;
         p.vp_offset = result.end;
@@ -753,8 +773,8 @@ async fn finish_write_batch(
     }
 
     Ok(BatchStats {
-        ops: bd.record_sizes.len() as u64,
-        batch_size: bd.record_sizes.len() as u64,
+        ops: batch_ops,
+        batch_size: batch_ops,
         phase1_ns: bd.phase1_ns,
         phase2_ns: duration_to_ns(phase2_elapsed),
         phase3_ns: duration_to_ns(phase3_elapsed),

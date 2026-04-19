@@ -67,7 +67,7 @@ Put(key, value, must_sync)
             ├─ stream_client.append_batch(log_stream_id, &blocks, batch_must_sync)
             │    ALL values (small and large) appended to log_stream in one RPC
             │    Large values (>4KB): VP stored in memtable, value stays in log_stream
-            ├─ Insert all entries into active Memtable (crossbeam SkipMap)
+            ├─ Insert all entries into active Memtable (RwLock<BTreeMap>, batched)
             ├─ maybe_rotate_locked → push to imm queue → signal flush_tx
             └─ Reply Ok(key) to all requestors
 
@@ -178,6 +178,6 @@ cargo test --workspace
 - `autumn-rpc`: custom binary RPC (10-byte frame header, replaces tonic/gRPC)
 - `autumn-etcd`: compio-native etcd v3 client (replaces etcd-client)
 - `rkyv`: zero-copy serialization (hot path), `prost` only in etcd persistence
-- `crossbeam-skiplist`: concurrent ordered memtable
+- `parking_lot::RwLock<BTreeMap>`: single-writer ordered memtable (F099-C, was `crossbeam-skiplist` until F099-B)
 - `xxhash-rust` + `crc32c`: bloom filter hashing + block checksums (also WAL chunk CRC)
 - `futures`: async utilities (channel, lock::Mutex for cross-await, StreamExt)

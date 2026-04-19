@@ -52,7 +52,7 @@ Each connection is sequential: decode → route → await response → write. No
 │  Arc<PartitionRouter>  ← shared with worker threads     │
 │                                                          │
 │  ┌──────── PartitionData (per partition thread) ───┐    │
-│  │  active: Memtable (SkipMap)                      │    │
+│  │  active: Memtable (RwLock<BTreeMap>, F099-C)     │    │
 │  │  imm: VecDeque<Arc<Memtable>>   ← frozen tables  │    │
 │  │  sst_readers: Vec<Arc<SstReader>>  ← oldest→new  │    │
 │  │  tables: Vec<TableMeta>          ← aligned        │    │
@@ -437,3 +437,10 @@ Operates on **user keys only** (8-byte MVCC suffix stripped before hashing). 1% 
 8. **`process_write_batch` lock scope** — the write lock is held only for seq number assignment and block encoding (Phase 1), then released before the `append_batch` network RPC (Phase 2), then re-acquired for memtable insert and VP head update (Phase 3). This prevents the partition write lock from blocking reads/flushes/compaction during network I/O.
 
 7. **`sst_readers` and `tables` are always aligned by index** — `tables[i]` and `sst_readers[i]` refer to the same SSTable. Operations on these must maintain alignment. Compaction's atomic swap replaces slices, not individual elements.
+
+9. **Memtable backing = `parking_lot::RwLock<BTreeMap>` (F099-C)** — the active memtable has exactly one writer (the P-log thread's `background_write_loop_r1`) and N readers (ps-conn `handle_get` call sites + P-log itself). Correctness properties:
+   - Writer holds the write lock for the duration of one `insert_batch` call (hot path, up to 256 entries), then releases. Subsequent readers take the read lock AFTER the writer releases → linearisable Put-then-Get.
+   - Rotation (`rotate_active`) replaces the whole `Memtable` struct via `std::mem::replace` on the owning `PartitionData`; this is safe because `rotate_active` runs exclusively on P-log inside a `RefCell::borrow_mut`.
+   - `imm: VecDeque<Arc<Memtable>>` — after rotation, frozen memtables are read-only from both P-log (during flush + GC + compaction) and P-bulk (during `build_sst_bytes`). Multiple readers acquire the read lock concurrently.
+   - Hot path uses `insert_batch(iter)` (one write lock per batch of 256 inserts, not 256 locks), and `for_each(closure)` (read lock held for the iteration — used by `build_sst_bytes` and `rotate_active`).
+   - The `bytes: AtomicU64` counter is not inside the lock, so `mem_bytes()` and `maybe_rotate` stay lock-free.
