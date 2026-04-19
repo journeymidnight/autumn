@@ -936,17 +936,17 @@ async fn partition_thread_main(
     mut req_rx: mpsc::Receiver<PartitionRequest>,
 ) -> Result<()> {
     let pool = Rc::new(ConnPool::new());
-    let part_sc = Rc::new(
-        StreamClient::new_with_revision(
-            &manager_addr,
-            owner_key.clone(),
-            revision,
-            3 * 1024 * 1024 * 1024,
-            pool.clone(),
-        )
-        .await
-        .context("create per-partition StreamClient")?,
-    );
+    // StreamClient::new_with_revision now returns `Rc<StreamClient>` directly
+    // (R4 step 4.3: Rc::new_cyclic for Weak-self worker removal guard).
+    let part_sc = StreamClient::new_with_revision(
+        &manager_addr,
+        owner_key.clone(),
+        revision,
+        3 * 1024 * 1024 * 1024,
+        pool.clone(),
+    )
+    .await
+    .context("create per-partition StreamClient")?;
 
     // Check commit length on all streams before recovery (Go: checkCommitLength).
     // This ensures the last extent of each stream has consistent commit length
@@ -1665,7 +1665,7 @@ fn spawn_bulk_thread(
                 )
                 .await
                 {
-                    Ok(sc) => Rc::new(sc),
+                    Ok(sc) => sc,
                     Err(e) => {
                         tracing::error!(part_id, error = %e, "bulk StreamClient init failed");
                         return;

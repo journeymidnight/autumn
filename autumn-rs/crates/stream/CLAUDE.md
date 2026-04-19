@@ -225,57 +225,141 @@ Used to bring a **sealed** extent's lagging replica up to date (e.g., after a no
 
 ## StreamClient — Client Side
 
-Used by `PartitionServer` and tests. Holds autumn-rpc connections to extent nodes via `ConnPool`. Manager calls are currently stubbed (F044 scope).
+Used by `PartitionServer` and tests. Holds autumn-rpc connections to extent
+nodes via `ConnPool`. Manager calls are currently stubbed (F044 scope).
 
 ### Connection & Ownership
 
 ```rust
-StreamClient::connect(manager_endpoint, owner_key, max_extent_size)
+StreamClient::connect(manager_endpoint, owner_key, max_extent_size, pool)
+    -> Rc<StreamClient>           // R4 step 4.3: returns Rc via Rc::new_cyclic
 ```
-- `manager_endpoint` supports **comma-separated** addresses for multi-manager HA: `"host1:9001,host2:9001,host3:9001"`.
+- `manager_endpoint` supports **comma-separated** addresses for multi-manager HA:
+  `"host1:9001,host2:9001,host3:9001"`.
 - Tries each manager to `acquire_owner_lock`, skipping `NotLeader` responses.
 - All subsequent manager RPCs use `self.manager_addr()` which returns the current leader.
 - On any manager RPC failure, `rotate_manager()` switches to the next address (round-robin).
 - `owner_key` should be unique per logical writer (e.g., `"ps/{ps_id}/partition/{part_id}"`).
+- **Return type change (4.3)**: `connect` / `new_with_revision` now return `Rc<StreamClient>`.
+  The `Rc` is needed so the internal per-stream worker tasks can hold a
+  `Weak<StreamClient>` for the exit-removal guard without creating an Rc cycle
+  that would prevent shutdown. Public API methods still take `&self`, so
+  callers deref `Rc<StreamClient> → &StreamClient` transparently.
 
-### Append Data Flow
+### Append Data Flow (R4 step 4.3 — per-stream SQ/CQ worker)
 
 ```
-append(stream_id, payload, must_sync):
-  1. Acquire per-stream state lock (stream_states DashMap → Arc<Mutex<StreamAppendState>>)
-  2. stream_tail: return cached tail, or load from manager
-  3. current_commit: use cached commit or query commit_length on ALL replicas, take MINIMUM
-  4. If EC stream (parity.len() > 0): ec_encode(payload) → per-shard byte slices
-     If replication: per-shard payload = same payload for all nodes
-  5. Parallel fan-out to all replica/shard addresses (tokio::spawn per node):
-       - Each node receives its own shard bytes (or full payload for replication)
-       - Collect results (all shards have same byte length so offsets are consistent)
-       - If any replica returns NotFound: alloc new extent, set as new tail, retry
-       - If any replica returns error/mismatch: evict tail cache
-           - First 2 retries: sleep 100ms, reload tail, retry same extent (or alloc new if sealed)
-           - After 2 retries: unconditionally call alloc_new_extent(stream_id, 0) to seal the
-             broken extent and get a new extent on healthy nodes; reset retry counter
-  6. If end >= max_extent_size: alloc_new_extent, cache new tail
-  7. Return AppendResult{extent_id, offset, end}  ← shard-level offsets for EC, identical to
-     original offsets for replication since all shards have equal byte length
+append*(stream_id, payload, must_sync):
+  1. stream_worker_sender(stream_id): look up or lazily spawn the per-stream
+     compio task (returns a cloned mpsc::Sender<StreamSubmitMsg>, cap=256).
+  2. ensure_tail_initialised(stream_id): first caller holds the per-stream
+     init mutex, loads tail from manager + queries commit_length on replicas,
+     then sends ResetTail + SeedCursor to the worker. Subsequent callers find
+     initialized=true and skip.
+  3. Retry loop (MAX_ALLOC_PER_APPEND=3):
+     a. Send Append msg — parks on bounded channel under overload.
+     b. Await ack_rx.
+     c. Ok → if result.end ≥ max_extent_size, alloc_new_extent + ResetTail
+        (preemptively rolls the extent before the next call). Return.
+     d. Err "not found on replica" → alloc_new_extent + ResetTail. Retry.
+     e. Err "LockedByOther" → propagate immediately (PS should self-evict).
+     f. Err soft (retry ≤ 2) → sleep 100ms, reload tail, ResetTail. Retry.
+     g. Err hard → alloc_new_extent + ResetTail. Retry.
 ```
 
-**Parallel fan-out**: all replicas are written concurrently via `tokio::spawn`. Different stream IDs are fully concurrent; the same stream ID is serialized by the per-stream Mutex (required for commit protocol correctness).
+### Per-stream worker (single-owner actor)
 
-**Per-stream locking**: `stream_states: DashMap<u64, Arc<Mutex<StreamAppendState>>>` — concurrent across different streams, serialized within each stream.
+```
+┌─ stream_worker_loop (ONE compio task per stream_id) ─────────────┐
+│                                                                 │
+│  OWNS: StreamAppendState                                        │
+│     - tail: Option<StreamTail>                                   │
+│     - commit: u32            (contiguous-prefix high-water)     │
+│     - lease_cursor: u32                                          │
+│     - pending_acks: BTreeMap<offset, end>                        │
+│     - in_flight: u32                                             │
+│     - poisoned: bool                                             │
+│  OWNS: inflight: FuturesUnordered<InflightFut>                   │
+│     cap = AUTUMN_STREAM_INFLIGHT_CAP (default 32)                │
+│     holds in-flight 3-replica join futures                       │
+│  RECV: submit_rx: mpsc::Receiver<StreamSubmitMsg>                │
+│                                                                 │
+│  SQ side (launch_append):                                       │
+│     - lease offset range (state.lease)                           │
+│     - build AppendReq header; header.commit = offset (Option A)  │
+│     - fire pool.send_vectored to each replica SEQUENTIALLY       │
+│       (writer_task per conn is single-writer → preserves TCP      │
+│        order = lease order on each replica's socket)             │
+│     - push the 3-replica join future into inflight               │
+│     - return to event loop; no await on any receiver             │
+│                                                                 │
+│  CQ side (apply_completion):                                    │
+│     - pop ready InflightResult from FU (or drain on demand)      │
+│     - parse 3 frames: success / NotFound / LockedByOther / err   │
+│     - success → state.ack; reply Ok(AppendResult) via ack_tx     │
+│     - error → state.rewind_or_poison; reply Err(...) via ack_tx  │
+│                                                                 │
+│  Loop (per iteration):                                           │
+│     1. while let Some(Some(r)) = inflight.next().now_or_never()  │
+│          → apply_completion (opportunistic CQ drain)             │
+│     2. if n_inflight == 0  → await submit_rx.next()              │
+│        elif at_cap         → await inflight.next() (back-pressure) │
+│        else                → select(submit_rx.next,              │
+│                                    inflight.next())              │
+│           Left  (SQ wins) → apply message                        │
+│           Right (CQ wins) → apply_completion                     │
+│                                                                 │
+│  Messages:                                                       │
+│     Append { payload_parts, must_sync, revision, ack_tx }        │
+│     ResetTail { tail }        ← public API sends after alloc     │
+│     SeedCursor { cursor }     ← seeds commit/lease_cursor        │
+│                                  to non-zero on tail init        │
+│     Shutdown                                                     │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-**No external Mutex**: `StreamClient` methods all take `&self`. Callers use `Arc<StreamClient>` directly without wrapping in `Mutex`.
+**No external Mutex**: the Arc<Mutex<StreamAppendState>> of R3 is removed.
+All state mutations happen inside the worker task. The public API talks to
+the worker via bounded mpsc + per-op oneshot.
+
+**Retry is in the public API**, not the worker (Option A from the R4 spec).
+The worker is a pure stateful single-op executor; the public API handles
+alloc_new_extent + ResetTail on NotFound / soft error / extent-full.
+
+**Tail invalidation is explicit**: after any alloc_new_extent, the public
+API sends `ResetTail` to the worker BEFORE the next Append. Because the
+retry loop awaits the previous ack before resetting, in_flight is always 0
+at the reset point — no old-extent leases stranded on the new extent.
+
+**SeedCursor** is used on stream first-use to initialise `commit = lease_cursor`
+to the replica-min `commit_length` when the stream's tail extent already
+has pre-existing data. Without it, the first append on a resumed stream
+would try to overwrite committed bytes.
+
+### Back-pressure, lifecycle, error paths
+
+| Concern | Behaviour |
+|---------|-----------|
+| Submit mpsc cap | 256 per stream. Parked callers wake as worker drains. |
+| Inflight cap | `AUTUMN_STREAM_INFLIGHT_CAP` (default 32). `at_cap` branch does CQ-only. |
+| Worker lifecycle | Spawned lazily on first append* to that stream_id. Exits on channel close or `Shutdown` msg, after draining all inflight futures for a final ack. |
+| Worker removal | On worker exit, a `WorkerRemovalGuard` drops and removes the stream's Sender from `stream_workers`. Uses `Weak<StreamClient>` to avoid Rc cycle. Next `append*` spawns a fresh worker. |
+| StreamClient drop | All senders drop → channels close → all workers drain + exit cleanly. |
+| `LockedByOther` | Propagated immediately; PS owner should self-evict. |
 
 ### Caching
 
 | Cache | Key | Value | Invalidated on |
 |-------|-----|-------|----------------|
-| `extent_clients` | addr | `ExtentServiceClient` | Never (connections reused, cheap clone) |
-| `stream_states` | stream_id | `Arc<Mutex<StreamAppendState{tail,commit}>>` | Error or NotFound response |
+| `stream_workers` | stream_id | `mpsc::Sender<StreamSubmitMsg>` | Worker exits (removal guard), StreamClient drop |
+| `stream_init_locks` | stream_id | `Rc<futures::lock::Mutex<bool>>` | Never (cheap, lives with StreamClient) |
 | `nodes_cache` | node_id | address | On replica lookup failure (lazy refresh) |
 | `extent_info_cache` | extent_id | `ExtentInfo` | On replica lookup failure |
 
-All caches use `DashMap` for lock-free concurrent access.
+`nodes_cache` + `extent_info_cache` use `DashMap` for lock-free concurrent access.
+`stream_workers` + `stream_init_locks` use `RefCell<HashMap<_,_>>` — the
+StreamClient is used from a single compio thread per-caller so RefCell is
+sufficient (and cheaper than DashMap).
 
 ### Other Public Methods
 
@@ -303,7 +387,7 @@ All caches use `DashMap` for lock-free concurrent access.
 
 4. **`must_sync` cost** — for small payloads (≤ 2MB) with WAL enabled, triggers parallel WAL sync + async extent write; the WAL sequential write is faster than random `sync_all()` on the extent file. For large payloads or WAL-disabled nodes, falls back to `sync_all()` on the extent file. Only set for records requiring guaranteed durability (e.g., partition WAL entries). SSTable data doesn't need `must_sync` since replication provides durability.
 
-5. **StreamClient is not `Clone` without `Arc`** — it holds `&mut` access to internal caches. Wrap in `Arc<Mutex<StreamClient>>` when sharing across tasks (as `PartitionServer` does).
+5. **StreamClient is always held as `Rc<StreamClient>`** — constructors return `Rc<Self>` (via `Rc::new_cyclic`) so per-stream workers can hold `Weak<StreamClient>` for the removal-guard. Callers clone the `Rc` to share. Public API methods take `&self`, so `sc.append(...)` works transparently.
 
 6. **EC vs replication compatibility** — EC is a per-stream property. `log_stream` (value log with VP sub-range reads) must use replication (`parity_shard=0`). `row_stream` and `meta_stream` are suitable for EC since each SSTable/checkpoint is one append read back in full.
 
