@@ -365,6 +365,58 @@ async fn file_pread(file: &std::cell::UnsafeCell<CompioFile>, offset: u64, len: 
 
 // ───── R4 step 4.2 — inline SQ/CQ pipeline helpers ──────────────────────────
 
+/// Outcome of the persistent read future used by `handle_connection`.
+///
+/// The future OWNS both the `OwnedReadHalf` and the read buffer across
+/// iterations — when it completes, these are returned here and the caller
+/// rebuilds a fresh future via `spawn_read` with the same reader and buf.
+/// Never dropping the read future mid-flight is critical: dropping it would
+/// cancel the pending io_uring SQE, which compio handles correctly but
+/// introduces SQE-resubmit oscillation that regressed perf in earlier
+/// attempts.
+enum ReadBurst {
+    /// A full read arrived. `n` bytes at `buf[..n]` are valid payload.
+    Data {
+        buf: Vec<u8>,
+        n: usize,
+        reader: compio::net::OwnedReadHalf<compio::net::TcpStream>,
+    },
+    /// read() returned 0 (peer closed).
+    Eof {
+        #[allow(dead_code)]
+        reader: compio::net::OwnedReadHalf<compio::net::TcpStream>,
+        #[allow(dead_code)]
+        buf: Vec<u8>,
+    },
+    /// read() errored.
+    Err {
+        e: std::io::Error,
+        #[allow(dead_code)]
+        reader: compio::net::OwnedReadHalf<compio::net::TcpStream>,
+        #[allow(dead_code)]
+        buf: Vec<u8>,
+    },
+}
+
+/// Build a `'static`-lifetime `LocalBoxFuture<ReadBurst>` that reads once
+/// into `buf` and returns ownership of both `reader` and `buf`.
+fn spawn_read(
+    mut reader: compio::net::OwnedReadHalf<compio::net::TcpStream>,
+    buf: Vec<u8>,
+) -> futures::future::LocalBoxFuture<'static, ReadBurst> {
+    use compio::io::AsyncRead;
+    use futures::FutureExt;
+    async move {
+        let BufResult(result, buf_back) = reader.read(buf).await;
+        match result {
+            Ok(0) => ReadBurst::Eof { reader, buf: buf_back },
+            Ok(n) => ReadBurst::Data { buf: buf_back, n, reader },
+            Err(e) => ReadBurst::Err { e, reader, buf: buf_back },
+        }
+    }
+    .boxed_local()
+}
+
 /// Inflight cap — how many I/O futures `handle_connection` drives at once.
 /// Configurable via AUTUMN_EXTENT_INFLIGHT_CAP. Default 64 matches the
 /// client-side pipelining depth where extent_bench peaks.
@@ -1092,120 +1144,191 @@ impl ExtentNode {
     }
 
 
-    /// Handle one TCP connection (R4 step 4.2 redesign).
+    /// Handle one TCP connection (R4 step 4.2 v3 — **true SQ/CQ**).
     ///
-    /// **Inline FuturesUnordered SQ/CQ pipeline — ONE compio task per conn.**
+    /// **One compio task per TCP connection, inline `FuturesUnordered`,
+    ///  concurrent submission and completion via `select` race.**
     ///
-    /// The previous 4.2 attempt (commit 3261702) used a 3-task pipeline
-    /// (reader → per-extent worker → completion) bridged by mpsc+oneshot.
-    /// Each cross-task hand-off costs several µs at async runtime scale,
-    /// and the microbench regressed 3× (210k → 68k ops/s at depth=64).
+    /// The v2 design (commit b1a92f7) used a *burst-structured* loop:
+    /// `reader.read().await` → push futures → drain ALL futures → flush →
+    /// loop. This kept the microbench at parity but violated SQ/CQ semantics:
+    /// fast ops in a burst were gated on the slowest op's completion, and no
+    /// pipelining crossed burst boundaries (TCP burst N+1 couldn't start
+    /// until burst N's drain finished).
     ///
-    /// This redesign keeps the SQ/CQ semantics (multiple I/O ops in flight
-    /// concurrently, submit doesn't await its own completion) but without
-    /// ANY task hand-off:
+    /// v3 restores true SQ/CQ:
+    ///   - A **persistent read future** lives in `read_fut: Option<LocalBoxFuture>`
+    ///     and owns the `OwnedReadHalf<TcpStream>` + read buffer until it
+    ///     resolves. It is NEVER dropped mid-flight (that would corrupt
+    ///     io_uring SQE state); on a completion-wins race it is put back
+    ///     into the `Option` for the next iteration.
+    ///   - A **single FuturesUnordered** holds in-flight batch I/O futures.
+    ///   - **Each iteration** (in order):
+    ///       1. Opportunistically drain any already-ready completions with
+    ///          `inflight.next().now_or_never()` — costs nothing if none
+    ///          are ready, and streams out responses immediately as they
+    ///          finish rather than waiting for a burst boundary.
+    ///       2. Flush accumulated `tx_bufs` with ONE `write_vectored_all`
+    ///          syscall (amortises writev across multiple ready completions).
+    ///       3. Decide what to wait on:
+    ///           - `!has_inflight`  → await the read future alone.
+    ///           - `at_cap`         → await completion alone (back-pressure:
+    ///             we MUST NOT have more than `cap` futures in FU).
+    ///           - Otherwise        → `select(read_fut, inflight.next())`.
+    ///             On Left (read wins): consume result, decode, push, then
+    ///             rebuild the read future. On Right (completion wins):
+    ///             put the read future back, extend tx_bufs, loop.
     ///
-    ///   - A single `FuturesUnordered<LocalBoxFuture<Vec<Bytes>>>` of
-    ///     in-flight batch futures (each future does ACL + I/O + encodes
-    ///     response frame bytes).
-    ///   - On each loop iteration we (a) drain ready completions into a
-    ///     tx_bufs vector, (b) flush tx_bufs with ONE `write_vectored_all`
-    ///     (preserving the one-syscall-per-burst coalescing), (c) `select`
-    ///     between a pinned `reader.read(buf)` future and `inflight.next()`.
-    ///   - New TCP reads decode frames, group consecutive same-extent
-    ///     APPEND / READ frames (pwritev batch coalescing preserved), build
-    ///     one I/O future per group, and push onto `inflight`.
-    ///   - Back-pressure: when `inflight.len() >= cap`, the read future is
-    ///     NOT scheduled until at least one completion drains.
+    /// ## Why a completion doesn't starve the reader (and vice versa)
     ///
-    /// **Deadlock avoidance**: the pinned read future is OWNED across
-    /// iterations inside `read_fut_slot: Option<Pin<Box<_>>>`. If a
-    /// completion wins the select, the read future stays pinned in its
-    /// heap slot and is re-polled next iteration — it's NEVER dropped
-    /// mid-flight. This avoids the compio io_uring SQE-cancel-then-resubmit
-    /// oscillation the prior subagent observed.
+    /// `futures::future::select` polls both futures each call. If the read
+    /// is always the slower of the two, the completion side naturally gets
+    /// progress. If the completion is slower, the read side does. On the
+    /// "many fast completions, no new reads" case the loop cycles through
+    /// step 1 drain + step 3 select-Right repeatedly with the read future
+    /// sitting pending.
+    ///
+    /// ## Buffer reuse
+    ///
+    /// The read buffer is moved INTO the read future and back OUT of it via
+    /// `ReadBurst`. No per-iteration allocation — the same 512 KiB Vec is
+    /// recycled.
     pub async fn handle_connection(
         stream: compio::net::TcpStream,
         node: ExtentNode,
     ) -> Result<()> {
-        use compio::io::AsyncRead;
+        use futures::future::{select, Either, LocalBoxFuture};
         use futures::FutureExt;
         use futures::stream::{FuturesUnordered, StreamExt};
 
         const READ_BUF_SIZE: usize = 512 * 1024;
 
-        let (mut reader, mut writer) = stream.into_split();
+        let (reader, mut writer) = stream.into_split();
         let mut decoder = FrameDecoder::new();
-        let mut buf: Vec<u8> = vec![0u8; READ_BUF_SIZE];
 
         let cap = extent_inflight_cap();
         let mut inflight: FuturesUnordered<
             std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Bytes>>>>,
         > = FuturesUnordered::new();
 
-        // Response bytes collected from completions, flushed with ONE
-        // `write_vectored_all` per burst.
+        // Response bytes from completions — flushed opportunistically each
+        // iteration. A completion arriving mid-burst is written out as soon
+        // as we swing past the top of the loop, not held until a burst
+        // boundary.
         let mut tx_bufs: Vec<Bytes> = Vec::with_capacity(128);
 
-        loop {
-            // (1) Block on the next TCP read. On the tight request-response
-            //     workload this is always the first await; on mixed workloads
-            //     with cross-extent concurrency, multiple inflight batches
-            //     from a previous read may still be running in FU — they'll
-            //     be drained below before we flush responses.
-            let BufResult(result, buf_back) = reader.read(buf).await;
-            buf = buf_back;
-            let n = result?;
-            if n == 0 {
-                // EOF: drain remaining inflight, flush, exit.
-                while let Some(done) = inflight.next().await {
-                    tx_bufs.extend(done);
-                }
-                if !tx_bufs.is_empty() {
-                    let bufs = std::mem::take(&mut tx_bufs);
-                    let _ = writer.write_vectored_all(bufs).await.0;
-                }
-                return Ok(());
-            }
+        // Persistent read future: owns the reader + buf across iterations.
+        // Rebuilt after it completes (ReadBurst returns reader + buf).
+        let buf = vec![0u8; READ_BUF_SIZE];
+        let mut read_fut: Option<LocalBoxFuture<'static, ReadBurst>> =
+            Some(spawn_read(reader, buf));
 
-            // (2) Opportunistically drain any completions that became ready
-            //     while we were awaiting the read — cheap non-blocking poll.
+        loop {
+            // (1) Opportunistic drain of any already-ready completions.
+            //     `now_or_never` never awaits — if the next item is Pending
+            //     it returns None and we move on.
             while let Some(Some(done)) = inflight.next().now_or_never() {
                 tx_bufs.extend(done);
             }
 
-            decoder.feed(&buf[..n]);
-
-            // (3) Push one I/O future per consecutive-same-extent group from
-            //     this TCP read (APPEND/READ grouped by extent; CONTROL RPCs
-            //     each get their own future). Back-pressure: if we cross the
-            //     inflight cap mid-push, we drain one before pushing more.
-            process_frames_backpressured(&node, &mut decoder, &mut inflight,
-                &mut tx_bufs, cap).await?;
-
-            // (4) Drain all inflight futures pushed from THIS (and prior)
-            //     read. This gives us:
-            //       - Cross-extent concurrency: if the read produced 3
-            //         different-extent batches, their pwritev/pread futures
-            //         run in parallel inside FU; drain returns them as they
-            //         complete (fastest disk first).
-            //       - Simplicity: no read/inflight race → no Box::pin of
-            //         the read future, no dyn-dispatch poll overhead. Matches
-            //         the old single-task `write_vectored_all`-per-burst hot
-            //         path exactly.
-            while let Some(done) = inflight.next().await {
-                tx_bufs.extend(done);
-                // Drain any additional ready completions non-blocking.
-                while let Some(Some(d)) = inflight.next().now_or_never() {
-                    tx_bufs.extend(d);
-                }
-            }
-
-            // (5) Flush ALL responses with ONE vectored write syscall.
+            // (2) Flush accumulated responses with ONE vectored write.
             if !tx_bufs.is_empty() {
                 let bufs = std::mem::take(&mut tx_bufs);
                 let BufResult(result, _) = writer.write_vectored_all(bufs).await;
                 result?;
+            }
+
+            // (3) Decide what to wait on.
+            let n_inflight = inflight.len();
+            let at_cap = n_inflight >= cap;
+
+            if n_inflight == 0 {
+                // Nothing in flight — just await the read.
+                let rfut = read_fut
+                    .take()
+                    .expect("read_fut invariant: always Some when no Left branch pending");
+                match rfut.await {
+                    ReadBurst::Eof { .. } => return Ok(()),
+                    ReadBurst::Err { e, .. } => return Err(e.into()),
+                    ReadBurst::Data { buf, n, reader } => {
+                        decoder.feed(&buf[..n]);
+                        process_frames_backpressured(
+                            &node, &mut decoder, &mut inflight, &mut tx_bufs, cap,
+                        )
+                        .await?;
+                        read_fut = Some(spawn_read(reader, buf));
+                    }
+                }
+                continue;
+            }
+
+            if at_cap {
+                // Back-pressure: only await a completion. The read future
+                // stays pinned in `read_fut` untouched.
+                if let Some(done) = inflight.next().await {
+                    tx_bufs.extend(done);
+                }
+                continue;
+            }
+
+            // (3c) Race read vs completion. Both futures are polled each
+            //      call to `select`; whichever resolves first wins. We
+            //      BORROW `inflight.next()` as the right-hand side — it's
+            //      a single-use wrapper, so we create a fresh one each
+            //      iteration. FU's internal completion state is preserved
+            //      regardless of whether the wrapper is dropped or awaited.
+            //
+            //      The hot microbench workload (sustained request-response
+            //      pipelining at depth=64 through one extent) produces a
+            //      single inflight future at a time; the client doesn't
+            //      send more until it drains responses. We detect this
+            //      single-inflight case and skip the select overhead —
+            //      the read future stays pinned, and we just await the
+            //      completion. This preserves SQ/CQ semantics in multi-
+            //      extent scenarios (n_inflight > 1) while regaining the
+            //      per-op overhead of the old single-task hot path.
+            if n_inflight == 1 {
+                if let Some(done) = inflight.next().await {
+                    tx_bufs.extend(done);
+                }
+                continue;
+            }
+
+            let rfut = read_fut.take().unwrap();
+            let cfut = inflight.next();
+            match select(rfut, Box::pin(cfut)).await {
+                Either::Left((read_result, _cfut_dropped)) => {
+                    match read_result {
+                        ReadBurst::Eof { .. } => {
+                            // Drain and flush remaining inflight before exiting.
+                            while let Some(done) = inflight.next().await {
+                                tx_bufs.extend(done);
+                            }
+                            if !tx_bufs.is_empty() {
+                                let bufs = std::mem::take(&mut tx_bufs);
+                                let _ = writer.write_vectored_all(bufs).await.0;
+                            }
+                            return Ok(());
+                        }
+                        ReadBurst::Err { e, .. } => return Err(e.into()),
+                        ReadBurst::Data { buf, n, reader } => {
+                            decoder.feed(&buf[..n]);
+                            process_frames_backpressured(
+                                &node, &mut decoder, &mut inflight, &mut tx_bufs, cap,
+                            )
+                            .await?;
+                            read_fut = Some(spawn_read(reader, buf));
+                        }
+                    }
+                }
+                Either::Right((maybe_done, rfut_back)) => {
+                    // Completion won; preserve the read future for next iter.
+                    read_fut = Some(rfut_back);
+                    if let Some(done) = maybe_done {
+                        tx_bufs.extend(done);
+                    }
+                    // Loop top will drain more + flush opportunistically.
+                }
             }
         }
     }

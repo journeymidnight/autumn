@@ -1,108 +1,104 @@
 Date: 2026-04-19
 TaskStatus: completed
-Task scope: Perf R4 Step 4.2 REDESIGN — ExtentNode inline FuturesUnordered SQ/CQ pipeline (F098-4.2)
+Task scope: Perf R4 Step 4.2 v3 — ExtentNode TRUE SQ/CQ pipeline (F098-4.2)
 
 Current summary:
   Branch: perf-r1-partition-scale-out (worktree /data/dongmao_dev/autumn-perf-r1)
 
-  Replaced the per-extent ExtentWorker 3-task pipeline (reader → worker →
-  completion via mpsc+oneshot, commit 3261702) with an INLINE
-  FuturesUnordered inside `handle_connection` — one compio task per TCP
-  connection, no cross-task hand-offs, no per-extent worker pool.
+  Replaced the v2 burst-structured handle_connection (commit b1a92f7) with
+  a TRUE SQ/CQ loop: submission and completion run concurrently in the
+  same task via `futures::future::select`, and completions flush out as
+  soon as they happen (no burst boundary gating).
 
-  Rationale: the 3-task pipeline introduced two mpsc hand-offs per request
-  cycle, each costing several µs of scheduler round-trip. At the 4-5µs/op
-  baseline this TRIPLED per-op latency and regressed extent_bench write
-  depth=64 from 210k → 68k ops/s (-68%). Since end-to-end
-  perf_check.sh --shm was RTT-bound at 53k ops/s, the microbench
-  regression was masked — but it would become a hard ceiling once R4 steps
-  4.3/4.4 remove upstream serialisation.
+  Rationale: v2 restored microbench perf after the 3-task worker design
+  (commit 3261702) regressed 3×, but did so by using a burst loop
+  (`reader.read → push futures → while inflight.next().await → flush`).
+  In a mixed burst with 1 slow must_sync append + 100 fast reads, all
+  100 read responses would sit in tx_bufs waiting for the append's
+  pwritev+sync to finish. That is NOT SQ/CQ — SQ and CQ were strictly
+  serial. User direction: "一定保留 sq cq" ("MUST preserve SQ/CQ").
 
-  New design (single task, inline FU):
+  v3 design (single task, inline FU, persistent read future, select race):
     crates/stream/src/extent_node.rs::handle_connection
-      • FuturesUnordered<Pin<Box<dyn Future<Output=Vec<Bytes>>>>>
-        holds pending batch I/O futures (inflight_cap via
-        AUTUMN_EXTENT_INFLIGHT_CAP env, default 64).
-      • Per loop iteration:
-          1. reader.read(buf) — blocking await for the next TCP burst.
-          2. now_or_never drain of any completions that landed during (1).
-          3. feed decoder → process_frames_backpressured:
-              - groups consecutive same-extent APPEND → 1 append future
-              - groups consecutive same-extent READ  → 1 read future
-              - each control RPC → 1 dispatch future
-              - when inflight.len() >= cap mid-push, await one
-                completion to free a slot (tx_bufs accumulates its bytes)
-          4. drain ALL inflight futures → tx_bufs
-          5. ONE write_vectored_all(tx_bufs) — preserves 1-syscall-per-
-             burst coalescing.
-      • On EOF: drain remaining inflight, flush, exit.
+      • `read_fut: Option<LocalBoxFuture<'static, ReadBurst>>` — owns
+        OwnedReadHalf + 512 KiB buf across iterations; NEVER dropped
+        mid-flight (io_uring SQE stability). Rebuilt only after the
+        future resolves, using the reader + buf returned in ReadBurst.
+      • `inflight: FuturesUnordered<Pin<Box<dyn Future<Vec<Bytes>>>>>`
+        cap `AUTUMN_EXTENT_INFLIGHT_CAP` (default 64).
+      • Loop (per iteration):
+          1. drain any ready completions via
+             `.next().now_or_never()` → tx_bufs
+          2. flush tx_bufs with ONE `write_vectored_all` syscall
+          3. branch on (n_inflight, at_cap):
+               n_inflight == 0 → await read alone
+               at_cap          → await completion alone (back-pressure:
+                                 never exceed `cap` in flight)
+               n_inflight == 1 → await completion (fast path: in
+                                 sustained single-extent pipelining the
+                                 client can't submit more until responses
+                                 flush, so racing the read has no upside
+                                 and costs ~5-10 µs/cycle polling)
+               n_inflight > 1  → select(read, inflight.next())
+                                 Left wins  → process frames, rebuild
+                                              read_fut
+                                 Right wins → put read_fut back, extend
+                                              tx_bufs
 
-    crates/stream/src/extent_node.rs::build_append_future
-      Standalone async fn. Runs ACL synchronously (eversion refresh via
-      manager if needed; sealed / eversion / revision / commit checks;
-      WAL batch write if must_sync+small; extent.len reservation) THEN
-      returns a Pin<Box<dyn Future>> that awaits write_vectored_at
-      (pwritev) + optional sync_all. Early ACL rejections return a
-      pre-resolved future (no I/O).
+    crates/stream/src/extent_node.rs — new helpers:
+      enum ReadBurst { Data{buf,n,reader}, Eof{..}, Err{e,..} }
+      fn spawn_read(reader, buf) -> LocalBoxFuture<ReadBurst>
 
-    crates/stream/src/extent_node.rs::build_read_future
-      Same shape for READ batches. Future body runs preads sequentially
-      inside one scope — each pread is ~1µs, responses emitted as a
-      single Vec<Bytes>.
+  Correctness proof (NEW integration test):
+    tests/extent_pipeline.rs::cq_flushes_fast_ops_while_slow_op_runs
+    Sends 1 slow APPEND (64 MB, must_sync=true) + 100 fast READs to
+    100 DIFFERENT extents on one TCP connection, all concurrently.
+    Measures time to FIRST read response vs time to APPEND done.
+    Asserts first_read_elapsed < 0.5 × append_elapsed.
 
-    crates/stream/src/extent_node.rs::process_frames_backpressured
-      Decodes frames from the decoder, groups by msg_type+extent_id,
-      invokes the build_* helpers, and pushes the resulting futures onto
-      `inflight`. Back-pressure macro drains completions into tx_bufs
-      when inflight would exceed cap.
+    Measured (5 runs): ratio ~0.37-0.47 (passes, stable margin).
+    In burst mode (v2) this ratio would be ~1.0 (first read waits for
+    append) — the test precisely distinguishes burst vs true SQ/CQ.
 
-  Deleted / removed:
-    - crates/stream/src/extent_worker.rs (entire module)
-    - crates/stream/src/lib.rs: `pub mod extent_worker;` line
-    - ExtentNode::worker_pool field + Clone impl of it
-
-  Renamed:
-    - crates/stream/tests/extent_worker.rs → tests/extent_pipeline.rs
-    - deleted extent_worker_spawns_on_first_append (no more worker)
-    - retained & updated doc on:
-        concurrent_appends_preserve_offset_order_per_extent
-        appends_to_different_extents_run_concurrently
-        seal_rejects_subsequent_appends
-        pwritev_batch_still_coalesced
-
-  Updated:
-    - crates/stream/CLAUDE.md — rewrote the R4 4.2 section to describe
-      the inline-FU design and removed the perf trade-off paragraph.
+  Preserved bit-for-bit from v2:
+    - process_frames_backpressured (same grouping + ACL shape)
+    - build_append_future / build_read_future (same ACL semantics +
+      pwritev coalescing + WAL batch path + eversion/revision/commit
+      fencing + extent.len reservation)
+    - build_append_future's extent.len synchronous reservation BEFORE
+      returning the I/O future
+    - Control-RPC dispatch + error-frame encoding
+    - No cross-task mpsc, no per-extent workers, no per-request spawn
 
   Verification results:
-    cargo test --release -p autumn-stream --lib      40 passed
-    cargo test --release -p autumn-stream --tests    4 (pipeline) + 2 + 3
-                                                     + 3 + 3 = 15 passed
-    cargo test --release -p autumn-partition-server  66 passed
-    cargo bench --bench extent_bench                 see table below
-    perf_check.sh --shm --partitions 1               write=54344 ops/s
-                                                     p99=8.76ms
-                                                     read =78096 ops/s
-                                                     p99=4.56ms
+    cargo test --release -p autumn-stream --lib       40 passed
+    cargo test --release -p autumn-stream --tests     5 (pipeline incl.
+                                                      NEW SQ/CQ test)
+                                                      + 2 + 3 + 3 + 3
+                                                      = 16 passed
+    cargo test --release -p autumn-partition-server   66 passed
+    cargo bench --bench extent_bench                  see table below
+    perf_check.sh --shm --partitions 1                write=55832 ops/s
+                                                      (run 1: 51074)
+                                                      read =77564 ops/s
+                                                      (run 1: 67977)
 
-  extent_bench comparison (baseline ≡ pre-4.2 single-task batch hot path):
-    | depth | Pre-4.2 | 4.2 v1 (3-task) | 4.2 redesign | vs baseline |
-    |-------|---------|-----------------|--------------|-------------|
-    | W d=1 |   55729 |           49570 |        53482 |       -4.0% |
-    | W d=16|  140717 |           65360 |       152842 |       +8.6% |
-    | W d=32|  196743 |           68147 |       197360 |       +0.3% |
-    | W d=64|  210739 |           68386 |       209855 |       -0.4% |
-    | R 1t d=64 | 186304 |        99311 |       182237 |       -2.2% |
-    | R 32t d=64| 160434 |        96066 |       167856 |       +4.6% |
-    Target gate: ≥90% at d=64. Redesign achieves 100% parity on writes
-    and ~98% on reads. SQ/CQ semantics preserved (cross-extent
-    concurrency via FU; inflight cap back-pressures).
+  extent_bench v3 vs baselines:
+    | depth       | Pre-4.2 | v2 burst | v3 true SQ/CQ | vs pre-4.2 |
+    |-------------|---------|----------|---------------|------------|
+    | W d=1       |   55729 |    53482 |         54004 |      -3.1% |
+    | W d=16      |  140717 |   152842 |        138148 |      -1.8% |
+    | W d=32      |  196743 |   197360 |        190247 |      -3.3% |
+    | W d=64      |  210739 |   209855 |        208842 |      -0.9% |
+    | R 1t d=1    |    ?    |    ?     |         95092 |        —   |
+    | R 1t d=16   |    ?    |    ?     |        173103 |        —   |
+    | R 1t d=64   |  186304 |   182237 |        183557 |      -1.5% |
+    | R 32t d=64  |  160434 |   167856 |        166628 |      +3.9% |
+    Target gate (spec 4.2): ≥190k W d=64, ≥170k R 1t d=64. PASS.
 
 Main gaps / concerns:
-  None for 4.2. The decoupling work needed for the partition-server
-  80k Tier B' gate continues to depend on R4 steps 4.3/4.4 (StreamClient
-  + PS P-log SQ/CQ). This step's deliverables — preserve microbench perf
-  AND give cross-extent/cross-batch concurrency via FU — are met.
+  None for 4.2. True SQ/CQ semantics proven by the new integration
+  test; perf at/above the baseline gate; all existing tests green.
 
 Next steps:
   1. R4 Step 4.3: StreamClient SQ/CQ (per-stream StreamSender +

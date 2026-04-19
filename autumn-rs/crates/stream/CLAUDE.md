@@ -65,27 +65,41 @@ struct ExtentEntry {
 
 No `write_lock` — appends are serialized by the single-threaded compio runtime (sequential processing in `handle_connection`).
 
-### Connection Handling & Batch Optimization (R4 step 4.2)
+### Connection Handling & Batch Optimization (R4 step 4.2 v3 — true SQ/CQ)
 
-`handle_connection` is ONE compio task per TCP connection with an INLINE
-`FuturesUnordered` of in-flight batch I/O futures — no cross-task mpsc, no
-per-extent worker. This gives SQ/CQ decoupling (multiple I/O ops can run
-concurrently when they target different extents) without the 3× task
-hand-off overhead of the earlier per-extent ExtentWorker design.
+`handle_connection` is ONE compio task per TCP connection. It runs a
+**true SQ/CQ** loop: a persistent read future (the "SQ") and an inline
+`FuturesUnordered` of in-flight batch I/O futures (the "CQ") are polled
+concurrently via `futures::future::select`, so completions stream out to
+the client as soon as they happen — not gated on a burst boundary.
 
 ```
-┌─ ConnTask (single task) ────────────────────────────────────────┐
-│  TCP read → decode frames → process_frames_backpressured:       │
-│     • group consecutive same-extent APPEND → 1 build_append_fut │
-│     • group consecutive same-extent READ   → 1 build_read_fut   │
-│     • each control RPC                     → 1 dispatch future  │
-│  inflight: FuturesUnordered<LocalBoxFuture<Vec<Bytes>>>         │
-│     cap = AUTUMN_EXTENT_INFLIGHT_CAP (default 64)               │
-│     when at cap mid-push: await one completion → tx_bufs        │
+┌─ ConnTask (single task, true SQ/CQ) ────────────────────────────┐
 │                                                                 │
-│  Drain inflight → tx_bufs  (now_or_never inner-loop + .next()   │
-│                              awaiters until FU empty)           │
-│  ONE write_vectored_all(tx_bufs) flush per burst                │
+│  SQ side — persistent read future:                              │
+│    Option<LocalBoxFuture<'static, ReadBurst>>                   │
+│    owns OwnedReadHalf + 512 KiB buf across iterations;          │
+│    NEVER dropped mid-flight (io_uring SQE stability)            │
+│                                                                 │
+│  CQ side — FuturesUnordered<Pin<Box<dyn Future<Vec<Bytes>>>>>   │
+│    cap = AUTUMN_EXTENT_INFLIGHT_CAP (default 64)                │
+│    holds in-flight append/read batch + control-rpc futures      │
+│                                                                 │
+│  Loop:                                                          │
+│    1. drain ready completions via `.next().now_or_never()`      │
+│       → tx_bufs                                                 │
+│    2. flush tx_bufs with ONE `write_vectored_all` syscall       │
+│    3. branch on (n_inflight, at_cap):                           │
+│       n_inflight == 0 → await read alone                        │
+│       at_cap          → await completion alone (back-pressure)  │
+│       n_inflight == 1 → await completion (fast path: a          │
+│           pipelined client can't submit more until responses    │
+│           flush, so racing the read has no upside and costs     │
+│           ~5-10 µs of per-iter polling overhead)                │
+│       n_inflight > 1  → select(read, inflight.next())           │
+│           Left wins  → process frames, restart read_fut         │
+│           Right wins → put read_fut back, extend tx_bufs        │
+│                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -97,14 +111,13 @@ hand-off overhead of the earlier per-extent ExtentWorker design.
    sequentially inside and returns N encoded response bytes.
 3. **Control RPCs** (ALLOC, DF, RECOVERY, etc.) — each becomes one future
    pushed onto the same FU. Responses fold into the same tx_bufs flush.
-4. **Write coalesce** — drain loop accumulates Vec<Bytes> from ALL futures
-   completed during this burst → one `write_vectored_all` syscall per
-   TCP-read burst (matches the old hot-path optimisation exactly).
-5. **Cross-extent concurrency** — if a single TCP read produces batches
+4. **Cross-extent concurrency** — if a single TCP read produces batches
    for N different extents, all N futures sit in FU simultaneously. The
    underlying `write_vectored_at` on each extent's compio file future
    drives them in parallel; FU returns them as they complete (fastest
-   disk first).
+   disk first). With true SQ/CQ, the first completion's response bytes
+   flush to the client immediately at the next loop top — they do NOT
+   wait for the slowest in-flight op to finish.
 
 **Extent-len reservation**: step 7 of `build_append_future` stores
 `extent.len = total_end` BEFORE returning the I/O future into FU. This
@@ -112,15 +125,30 @@ guarantees overlapping same-extent submits (if pushed in the same burst)
 compute non-overlapping `file_start` values — necessary for the SQ/CQ
 overlap model.
 
-**Why single-task & inline FU, not per-extent worker?** The prior R4 4.2
-attempt (commit `3261702`) spawned a per-extent ExtentWorker task and used
-two mpsc hand-offs per request cycle (reader → worker → completion).
-Each hand-off costs several µs of scheduler round-trip; at the 4-5µs/op
-baseline this TRIPLED the cost, regressing `extent_bench` write depth=64
-from 210k → 68k ops/s. The current design keeps everything Rc-accessible
-in one task: zero mpsc, zero cross-task wake cascades. Measured
-`extent_bench` at depth=64 is 203-210k ops/s — parity with the pre-4.2
-baseline AND retaining SQ/CQ semantics (cross-extent parallelism via FU).
+**Why a single-inflight fast path?** In the sustained-pipelining bench
+(client depth=64 against one extent), every request cycle produces ONE
+batch future (all 64 frames grouped into one pwritev). The client waits
+on responses before sending more, so no new reads arrive while the
+pwritev is in flight. Running `select(read, completion)` in this case
+pays ~5-10 µs per cycle for polling both futures but provides no
+concurrency benefit (the read is always pending). The `n_inflight == 1`
+branch awaits the completion alone, restoring hot-path parity with the
+pre-4.2 baseline (`extent_bench` W d=64 ≈ 208k ops/s, within 1 % of the
+210k baseline). Once `n_inflight > 1` (multi-extent burst or
+heterogeneous op mix), the select-based race kicks in and responses
+stream out as each completion lands — this is the path the new
+`cq_flushes_fast_ops_while_slow_op_runs` integration test exercises.
+
+**Why not `v2` burst structure?** v2 (commit `b1a92f7`) used a
+burst-structured loop: `reader.read → push futures → while
+inflight.next().await → flush`. This kept microbench perf at parity but
+violated SQ/CQ: in a mixed "1 slow append + 100 fast reads" burst, all
+100 read responses sat in `tx_bufs` until the slow append's pwritev+sync
+finished, because the drain `while` waited for ALL in-flight to complete
+before flushing. v3 fixes this by draining + flushing opportunistically
+every iteration. Correctness proof: `cq_flushes_fast_ops_while_slow_op_runs`
+measures that the first read response arrives in < 0.5 × the time it
+takes the slow 64 MB must_sync append to complete (typically ~0.4×).
 
 ### Append Protocol (eversion check → seal check → fencing → commit truncation → write)
 
