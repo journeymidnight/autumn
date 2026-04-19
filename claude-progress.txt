@@ -1,129 +1,130 @@
-Date: 2026-04-20
+Date: 2026-04-18
 TaskStatus: completed
-Task scope: Perf R4 Step 4.4 — PS P-log + P-bulk SQ/CQ pipeline (F098-4.4)
+Task scope: Perf R4 Task B — `ps_bench` PartitionServer pipeline-depth matrix
+  benchmark (F098-R4-B)
 
 Current summary:
   Branch: perf-r1-partition-scale-out (worktree /data/dongmao_dev/autumn-perf-r1)
 
-  Replaced the step-4.3 double-buffer write loop (at most ONE Phase 2
-  future in flight) with a FuturesUnordered-driven N-deep pipeline on
-  both the P-log and P-bulk threads.  This is the client of step 4.3's
-  per-stream SQ/CQ worker — before this change, P-log was serializing
-  at 1 outstanding `append_batch` per partition, leaving the step-4.3
-  capacity unused in the hot path.
+  New `crates/partition-server/benches/ps_bench.rs` + Cargo.toml `[[bench]]`
+  stanza. Mirrors the `extent_bench` pattern at the PS layer — sweeps
+  `(tasks × depth)` combinations, one RpcClient per task on its own OS
+  thread + compio runtime, `FuturesUnordered`-driven sliding window of
+  `depth` in-flight 4 KB `PutReq` / `GetReq` calls against the PS.
 
-  Architecture:
-    crates/partition-server/src/background.rs
-      • background_write_loop_r1 rewritten:
-          FU<Pin<Box<dyn Future<Output=InflightCompletion>>>> cap=8
-          (env AUTUMN_PS_INFLIGHT_CAP, clamped [1, 64]).
-          Per-iteration: drain ready completions via now_or_never →
-          run Phase 3, then branch on (n_inflight, at_cap):
-            ready_to_launch (pending + cap room + gate) → launch
-            at_cap                                        → await CQ only
-            n_inflight==0 & nothing to launch            → await SQ alone
-            otherwise                                    → select(SQ, CQ)
-          Shutdown (write_rx closed): drain all inflight, flush residual
-          pending as one last batch, emit metrics.
-      • MIN_PIPELINE_BATCH = 256 gate (R3 Task 5b insight) — a SECOND or
-        later batch requires pending >= 256 before launch; the first
-        batch (n_inflight == 0) always launches.  Avoids the "small
-        fragmented batches steal from naturally-large bursts" regression.
-      • Phase 1 / Phase 3 primitives (start_write_batch / finish_write_batch
-        / InFlightBatch) preserved exactly — the refactor is purely about
-        the loop that schedules them.
-      • Out-of-order Phase-2 completion is handled correctly:
-          seq numbers assigned in Phase 1 in launch order
-          memtable MVCC keys are self-sorting (internal key = user_key ++
-            0x00 ++ BE(u64::MAX - seq)) so insertion order doesn't matter
-          client oneshot replies are per-request
-          logStream offsets preserved by the step-4.3 stream worker's
-            lease/ack cursor
+  Unlike `extent_bench`, the PS benchmark connects to an **already-running**
+  cluster (manager + 3 extent nodes + PS launched via `cluster.sh start 3`)
+  rather than spinning one in-process, because PartitionKv requires a full
+  manager + extent-node stack and bootstrap.
 
-    crates/partition-server/src/lib.rs
-      • flush_worker_loop rewritten on same pattern, cap=2 (env
-        AUTUMN_PS_BULK_INFLIGHT_CAP, clamped [1, 16]).  Each in-flight
-        flush holds a 128 MB SST buffer in RAM — cap deliberately small.
-        Overlaps `build_sst_bytes` (CPU, spawn_blocking) of the next
-        flush with the current flush's 128 MB `row_stream.append`
-        (network).
-      • ps_inflight_cap() and ps_bulk_inflight_cap() env getters added
-        using OnceLock, ranges clamped as above.
+  Structure (matches spec):
+    - Config parsed from args: --manager <addr>, --duration <s>, --value-size
+      (defaults: 127.0.0.1:9001, 10, 4096).
+    - resolve_target(): RpcClient::connect on manager (20 × 100 ms retries),
+      then MSG_GET_REGIONS → pick first region → decode MgrPsDetail to find
+      PS address.
+    - connect_ps_with_retry(): 20 × 100 ms before panicking.
+    - warmup(500 puts) before first measurement.
+    - run_scenario() for writes: each task spawns its own OS thread +
+      compio runtime, connects its own RpcClient to the PS, runs a
+      FuturesUnordered pipeline up to `depth`; exits when deadline hit
+      AND inflight drained. AtomicU64 aggregates total_ops across tasks.
+      Per-op latency captured inside the future and summed per-thread so
+      avg latency = sum(lat) / count.
+    - run_read_scenario(): a seeded read variant — pre-writes 20 000
+      `psb_read_*` keys with a separate 64-depth warmup loop, then each
+      reader task cycles through those keys (staggered by task id * 997)
+      so readers genuinely hit data rather than all missing on the same
+      hot memtable entry.
+    - Output format matches extent_bench: `=== 4KB Write, N tasks, depth=D ===`
+      block with Total ops / Elapsed / Ops/sec / Throughput / Avg latency.
 
-  Tests added (crates/partition-server/src/background.rs sqcq_tests mod):
-    ps_sqcq_handles_concurrent_in_flight — cap=4, 4 × 100ms futures
-      complete in < 300ms; proves FU-based pipeline genuinely
-      parallelizes Phase-2 RTT.  Asserts max_inflight >= 2.
-    ps_sqcq_memtable_rotation_works_out_of_order — 5 items with
-      descending delays; completions arrive in reverse launch order;
-      aggregate set is complete and no duplicates, proving memtable-
-      insert-in-completion-order is safe.
-    ps_sqcq_backpressure_at_cap — cap=2, 10 items; verify max observed
-      inflight count == 2 (never exceeds cap).  Validates `at_cap`
-      branch gating.
-    ps_sqcq_locked_by_other_drains_cleanly — inject LBO on item 2 of 4;
-      verify flag is set, LBO item is in collected set, and no
-      duplicated / lost entries.
-    ps_inflight_cap_default_and_bounds / ps_bulk_inflight_cap_default_and_bounds
-      / min_pipeline_batch_matches_client_count — constant+env sanity
-      guards.
+  Scenarios (written and measured):
+    Writes (12 cells):
+      (1,1), (1,4), (1,16), (1,64),
+      (8,1), (8,8),
+      (32,1), (32,8),
+      (64,16),
+      (256,1), (256,4), (256,8).
+    Reads (4 cells, after 20 000-key seed):
+      (1,1), (1,16), (1,64), (32,16).
 
-  Doc updates:
-    crates/partition-server/CLAUDE.md — write-path section rewritten
-    to describe the R4 4.4 loop shape + the MIN_PIPELINE_BATCH rationale
-    + out-of-order completion correctness + cross-layer SQ/CQ diagram
-    (RpcClient SQ → Stream worker SQ/CQ → PS P-log SQ/CQ → ExtentNode
-    SQ/CQ).  P-bulk SQ/CQ section added.
+  No new runtime deps — uses only what's already in the crate (+ bytes via
+  workspace + futures + compio).
+  No `pub` visibility change needed: `PutReq`, `GetReq`, `MSG_PUT`, `MSG_GET`,
+  `rkyv_encode/rkyv_decode` are already public in `autumn-rpc::partition_rpc`.
 
-  Verification results:
-    cargo test --release -p autumn-partition-server --lib   73 passed
-                                                            (66 prior + 7 new)
-    cargo test --release -p autumn-stream     --lib         40 passed
-    cargo test --release -p autumn-stream     --tests       20 passed
-    cargo test --release -p autumn-rpc                      17 passed (10+7)
-    cargo build --release -p autumn-server                  OK
+  Files touched:
+    NEW: crates/partition-server/benches/ps_bench.rs (~430 LOC)
+    EDIT: crates/partition-server/Cargo.toml (add `[[bench]]` stanza)
+    EDIT: feature_list.md (add F098-R4-B ledger entry)
+    EDIT: claude-progress.txt (this file)
 
-    perf_check.sh --shm --partitions 1 (3 runs, cluster-clean between):
-      Run 1: write 51805 / read 71202
-      Run 2: write 56195 / read 74367
-      Run 3: write 52748 / read 62026
-      Median:  write 52748 / read 71202
+  Build:
+    cargo build --release --bench ps_bench -p autumn-partition-server  OK
+    (0 bench warnings after cleanup; 19 pre-existing lib warnings unchanged)
 
-    Tier verdict: baseline preserved, below 70k / Tier B' gate.  The
-    single-partition × 256-sync-client workload is fundamentally
-    constrained by 256 × RTT (~4ms) = 64k ceiling; both R3 and the R4
-    4.4 spec explicitly flagged this (see spec §4 Tier B' rationale +
-    Task 5b regression).  The refactor IS architecturally correct and
-    unlocks concurrent Phase-2 issuance at the PS layer — but with
-    synchronous clients that wait for each reply before submitting,
-    pending doesn't grow WHILE inflight is active, so effective
-    pipeline depth stays near 1 during steady-state burst cycling.
-    Average batch size observed in metrics: 128 ops (vs 256 cap), with
-    2ms avg Phase 2 — consistent with effective depth ~1.5-2 but still
-    RTT-bound overall.
+Verification / smoke run:
+  bash cluster.sh clean
+  AUTUMN_DATA_ROOT=/dev/shm/autumn-rs bash cluster.sh start 3
+  cargo bench --bench ps_bench -p autumn-partition-server
+
+  Cluster: 3-node shm cluster, 3+0 replication, N=1 partition.
+
+  Write scaling (4 KB, must_sync=false):
+    1 task  d=1   → 11 689 ops/s  ( 45.7 MB/s,  85.0 µs)
+    1 task  d=4   → 14 788 ops/s  ( 57.8 MB/s, 269.8 µs)     [+27 %]
+    1 task  d=16  → 14 838 ops/s  ( 58.0 MB/s,   1.08 ms)
+    1 task  d=64  → 14 316 ops/s  ( 55.9 MB/s,   4.47 ms)    [saturated]
+    8 tasks d=1   → 41 183 ops/s  (160.9 MB/s, 193.6 µs)
+    8 tasks d=8   → 47 260 ops/s  (184.6 MB/s,   1.35 ms)
+   32 tasks d=1   → 62 891 ops/s  (245.7 MB/s, 506.1 µs)
+   32 tasks d=8   → 59 111 ops/s  (230.9 MB/s,   4.31 ms)
+   64 tasks d=16  → 44 723 ops/s  (174.7 MB/s,  22.87 ms)    [deep queue pathological]
+  256 tasks d=1   → 64 591 ops/s  (252.3 MB/s,   3.56 ms)    [matches perf-check]
+  256 tasks d=4   → 39 349 ops/s  (153.7 MB/s,  25.98 ms)    [head-of-line build-up]
+  256 tasks d=8   → 61 593 ops/s  (240.6 MB/s,  33.04 ms)
+
+  Read scaling (4 KB, 20 000-key seed):
+    1 task  d=1   →  22 210 ops/s ( 86.8 MB/s,  44.5 µs)
+    1 task  d=16  →  54 140 ops/s (211.5 MB/s, 295.0 µs)    [+144 % vs d=1]
+    1 task  d=64  →  34 480 ops/s (134.7 MB/s,   1.84 ms)
+   32 tasks d=16  → 162 093 ops/s (633.2 MB/s,   3.16 ms)   [clean scaling]
+
+  Interpretation:
+    - Single-task writes peak around d=4 (~15k) — past that, one TCP
+      connection's P-log submit serializes through the bounded submit
+      queue without additional parallelism.
+    - 32-task / 256-task writes converge at ~60k ops/s — the 256-sync-
+      barrier ceiling the R4 spec §6 predicted (256 × 4 ms RTT = 64k).
+      Adding pipeline depth at 256 tasks PESSIMIZES numbers (256 × 4 = 1024
+      in-flight floods group-commit and replica fanout, inflating tail
+      latency to 33 ms without lifting throughput).
+    - Reads scale cleanly with depth: 1t d=16 = 54k (+144 % over 1t d=1),
+      32t d=16 = 162k ops/s. Read path is stateless (no group-commit
+      barrier, no replica write fanout), so PS-layer pipelining pays off
+      directly.
+
+  These numbers confirm the thesis motivating Task A (extend perf-check
+  with `--pipeline-depth`): the 256-sync-clients workload is barrier-
+  bound at ~64 k, and the only way past it is either fewer clients with
+  deeper pipelines (cooperating clients) or more partitions (orthogonal
+  parallelism).
 
 Main gaps / concerns:
-  1. Write throughput median 52.7k is within run-to-run noise of the
-     post-4.3 baseline (51-56k across prior runs).  Not a regression,
-     but also not the 70-80k the spec aspired to.  The spec itself
-     says "Real gains depend on TCP write bandwidth to replicas and
-     disk fsync latency; we're removing a pure-serialization
-     bottleneck, not a real bottleneck, so expect ~50% improvement at
-     realistic workload." — the shm/sync-256 workload isn't a realistic
-     workload in that sense.  R4 Step 4.5 / 4.6 gate runs and any
-     further pipelining at higher client counts / async workloads
-     should now show the architectural benefit.
-  2. MIN_PIPELINE_BATCH = 256 tuning: the gate's first-batch bypass
-     (n_inflight == 0 always launches) means under sustained-burst
-     cycling the pipeline oscillates between depth 1 and 2 — matches
-     the observed 128 avg batch.  Lowering the gate would risk the 5b
-     regression for non-barrier workloads; leaving at 256 preserves
-     correctness for the primary benchmark shape.
+  - None functional. The bench is a diagnostic tool and runs end-to-end.
+  - Single-task writes saturate earlier than extent_bench (15k vs 125k at
+    depth=64). Expected: PS write path = P-log group-commit + 3-replica
+    fan-out over StreamClient + log_stream append, whereas extent_bench
+    hits the extent node directly. The bench captures this exactly —
+    that's the point of having a matched PS-layer harness.
+  - 256t × d=4 cell shows a degenerate ~39k — looks like when 256 × 4 =
+    1024 in-flight overwhelm the PS submit channel (cap 1024) and the
+    backpressure / buffer bloat spikes tail latency. Documented as a
+    scenario finding rather than a bug.
 
 Next steps:
-  1. R4 Step 4.5: 3-rep perf gate on shm N=1, read regression guard >=
-     69.8k, write target >= 80k (Tier B').  If write does not hit 80k
-     (likely — see above), document as a Tier A result with analysis
-     of the 256-client-barrier ceiling.
-  2. R4 Step 4.6: N=2, N=4 regression guards.
-  3. R4 Step 4.7: F098 ledger finalisation.
+  1. R4 Task A (parallel): `autumn-client perf-check --pipeline-depth K`.
+     Already referenced in autumn_client.rs per context.
+  2. R4 Step 4.5: 3-rep perf gate on shm N=1.
+  3. Use ps_bench periodically as a depth/scaling regression harness.
