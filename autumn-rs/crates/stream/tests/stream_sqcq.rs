@@ -63,6 +63,75 @@ fn spawn_stack() -> (SocketAddr, SocketAddr) {
     (mgr_addr, n_addr)
 }
 
+/// Spawn manager + 3 extent nodes (each with its own OS thread + compio
+/// runtime). Returns `(manager_addr, [node_addr; 3])`.
+fn spawn_stack_3rep() -> (SocketAddr, [SocketAddr; 3]) {
+    let mgr_addr = pick_addr();
+    std::thread::spawn(move || {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let manager = AutumnManager::new();
+            let _ = manager.serve(mgr_addr).await;
+        });
+    });
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    let mut addrs = [SocketAddr::from(([0u8, 0, 0, 0], 0)); 3];
+    for a in addrs.iter_mut() {
+        *a = pick_addr();
+    }
+
+    for addr in addrs {
+        let n_dir = {
+            let td = tempfile::tempdir().expect("node tempdir");
+            let p = td.path().to_path_buf();
+            std::mem::forget(td);
+            p
+        };
+        std::thread::spawn(move || {
+            compio::runtime::Runtime::new().unwrap().block_on(async {
+                let n = ExtentNode::new(ExtentNodeConfig::new(n_dir, 1))
+                    .await
+                    .expect("node");
+                let _ = n.serve(addr).await;
+            });
+        });
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    (mgr_addr, addrs)
+}
+
+/// Register 3 nodes + create a 3-replica stream. Returns `stream_id`.
+async fn setup_stream_3rep(mgr_addr: SocketAddr, n_addrs: [SocketAddr; 3]) -> u64 {
+    let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+    for (i, addr) in n_addrs.iter().enumerate() {
+        let resp = mgr
+            .call(
+                MSG_REGISTER_NODE,
+                rkyv_encode(&RegisterNodeReq {
+                    addr: addr.to_string(),
+                    disk_uuids: vec![format!("disk-fanout-{i}")],
+                }),
+            )
+            .await
+            .expect("register node");
+        let _: RegisterNodeResp =
+            rkyv_decode(&resp).expect("decode RegisterNodeResp");
+    }
+    let resp = mgr
+        .call(
+            MSG_CREATE_STREAM,
+            rkyv_encode(&CreateStreamReq {
+                replicates: 3,
+                ec_data_shard: 0,
+                ec_parity_shard: 0,
+            }),
+        )
+        .await
+        .expect("create stream");
+    let created: CreateStreamResp = rkyv_decode(&resp).expect("decode");
+    created.stream.expect("stream").stream_id
+}
+
 /// Register the node + create a 1-replica stream.  Returns `stream_id`.
 async fn setup_stream(mgr_addr: SocketAddr, n_addr: SocketAddr) -> u64 {
     let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
@@ -367,5 +436,112 @@ fn sq_continues_submitting_while_cq_drains() {
             "concurrent throughput must be > 1.3× sequential (saw {speedup:.2}×, seq={:?} par={:?})",
             seq_elapsed, par_elapsed,
         );
+    });
+}
+
+/// Test 5 (F099-B): parallel 3-replica fanout.
+///
+/// Validates that `launch_append` fires the 3 per-replica `send_vectored`
+/// futures concurrently via `futures::future::join_all` rather than
+/// awaiting them sequentially. The structural proof is in the source
+/// (`join_all` over the per-replica send futures inside `launch_append`).
+/// This test asserts the end-to-end correctness preservation under the
+/// parallel path: on a real 3-replica stream, N concurrent appends all
+/// succeed, all three replicas converge to equal `commit_length`, and
+/// every leased byte range `[offset, end)` tiles `[0, total)` exactly
+/// once. If parallel fanout broke lease/ack ordering, commit would
+/// diverge or the offsets would overlap/gap.
+///
+/// Choice of probe (documented per spec): timing-based "first-send-on-all-
+/// replicas within 1ms" is unreliable on loopback where submit-channel
+/// hand-off is sub-µs. Instead, we validate the functional consequences
+/// of parallel fanout: 3-replica correctness (offset unity + commit
+/// convergence) under concurrent submission — the code path that would
+/// fail if `join_all` were wired wrong (e.g. replica-0 error short-
+/// circuiting replica-1/2, or payload_parts mis-cloned across the three
+/// parallel futures).
+#[test]
+fn parallel_fanout_fires_3_replicas_concurrently() {
+    let (mgr_addr, n_addrs) = spawn_stack_3rep();
+
+    compio::runtime::Runtime::new().unwrap().block_on(async move {
+        let stream_id = setup_stream_3rep(mgr_addr, n_addrs).await;
+        let pool = Rc::new(ConnPool::new());
+        let client = StreamClient::connect(
+            &mgr_addr.to_string(),
+            "owner/sqcq/fanout".to_string(),
+            256 * 1024 * 1024,
+            pool,
+        )
+        .await
+        .expect("stream client");
+
+        const N: usize = 32;
+        const PAYLOAD: usize = 256;
+
+        // Fire N appends concurrently — each goes through launch_append's
+        // new parallel 3-replica send_vectored fanout.
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let client = client.clone();
+                let payload = vec![b'a' + (i as u8 % 26); PAYLOAD];
+                compio::runtime::spawn(async move {
+                    client
+                        .append(stream_id, &payload, false)
+                        .await
+                        .expect("append")
+                })
+            })
+            .collect();
+
+        let mut results: Vec<_> = Vec::with_capacity(N);
+        for h in handles {
+            results.push(h.await.expect("spawn task panicked"));
+        }
+
+        // All N leased ranges must tile [0, N*PAYLOAD) exactly once —
+        // the same invariant Test 1 checks, but with 3 replicas so the
+        // parallel-fanout fast path is exercised.
+        results.sort_by_key(|r| r.offset);
+        let total = (N * PAYLOAD) as u32;
+        assert_eq!(results[0].offset, 0, "first offset must be 0");
+        for w in results.windows(2) {
+            assert_eq!(
+                w[0].end, w[1].offset,
+                "contiguous ranges (gap between {} and {})",
+                w[0].end, w[1].offset
+            );
+        }
+        assert_eq!(results.last().unwrap().end, total, "total bytes leased");
+
+        // StreamClient::commit_length returns min over all replicas. If
+        // parallel fanout somehow delivered inconsistent data to the 3
+        // replicas (e.g. payload_parts misclone bug), one replica would
+        // lag and the min would be < total.
+        let cl = client
+            .commit_length(stream_id)
+            .await
+            .expect("commit length");
+        assert_eq!(
+            cl, total,
+            "min-replica commit_length must match total leased — all 3 replicas converged"
+        );
+
+        // Concurrent-vs-sequential speedup proxy: if parallel fanout
+        // regressed to sequential submits, the 3-replica path adds
+        // ~3 × submit-channel hops per append. This is typically
+        // sub-µs on loopback so we can't reliably measure it, but the
+        // test still asserts liveness of 32 concurrent ops against 3
+        // replicas — the above commit_length match is the primary
+        // correctness proof.
+        let t = Instant::now();
+        for _ in 0..64 {
+            client
+                .append(stream_id, &vec![b'p'; PAYLOAD], false)
+                .await
+                .expect("post append");
+        }
+        let elapsed = t.elapsed();
+        println!("F099-B: 64 sequential appends on 3-rep stream: {:?}", elapsed);
     });
 }

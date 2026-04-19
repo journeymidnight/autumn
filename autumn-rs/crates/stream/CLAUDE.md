@@ -287,9 +287,11 @@ append*(stream_id, payload, must_sync):
 │  SQ side (launch_append):                                       │
 │     - lease offset range (state.lease)                           │
 │     - build AppendReq header; header.commit = offset (Option A)  │
-│     - fire pool.send_vectored to each replica SEQUENTIALLY       │
-│       (writer_task per conn is single-writer → preserves TCP      │
-│        order = lease order on each replica's socket)             │
+│     - fire pool.send_vectored to each replica IN PARALLEL via    │
+│       futures::future::join_all over the 3 per-replica futures   │
+│       (F099-B; each replica's writer_task is single-writer so    │
+│        per-replica TCP byte order = lease order on that socket;  │
+│        inter-replica fanout order is irrelevant).                │
 │     - push the 3-replica join future into inflight               │
 │     - return to event loop; no await on any receiver             │
 │                                                                 │
@@ -383,7 +385,7 @@ sufficient (and cheaper than DashMap).
 
 2. **Eversion changes on seal** — if the manager seals an extent (e.g., during split or extent rolling), the eversion is bumped. The next append will see a mismatched eversion, fetch the updated ExtentInfo, and handle accordingly.
 
-3. **Sequential fan-out latency** — for a 3-replica stream, each append sends 3 sequential RPCs. If adding parallelism here, the offset-consistency check must be preserved.
+3. **Parallel 3-replica fanout (F099-B)** — `launch_append` fires the 3 per-replica `pool.send_vectored` futures concurrently via `futures::future::join_all`. Each per-replica future awaits its own RpcClient submit channel independently, so one slow/back-pressured replica doesn't serialise the others. Per-replica TCP byte order is still preserved because each RpcClient runs a single-writer `writer_task` (R4 step 4.1) — the fanout order across replicas is irrelevant because every replica is independent. The `AppendResp.offset/end` consistency check in `apply_completion` still enforces that all replicas agree on the file-level offset.
 
 4. **`must_sync` cost** — for small payloads (≤ 2MB) with WAL enabled, triggers parallel WAL sync + async extent write; the WAL sequential write is faster than random `sync_all()` on the extent file. For large payloads or WAL-disabled nodes, falls back to `sync_all()` on the extent file. Only set for records requiring guaranteed durability (e.g., partition WAL entries). SSTable data doesn't need `must_sync` since replication provides durability.
 

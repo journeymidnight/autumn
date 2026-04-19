@@ -522,23 +522,36 @@ async fn launch_append(
         must_sync,
     );
 
-    // Fire send_vectored to each replica SEQUENTIALLY. Because each RpcClient's
-    // writer_task is a single-writer task (R4 step 4.1), sequential submit
-    // from this worker → in-order bytes on each replica's TCP connection.
-    // That preserves per-replica append ordering = lease ordering, which is
-    // required for the commit-truncation protocol (header.commit = offset
-    // must equal that replica's file_len on arrival).
-    let mut receivers: Vec<(String, Result<oneshot::Receiver<autumn_rpc::Frame>>)> =
-        Vec::with_capacity(tail.replica_addrs.len());
-    for addr in &tail.replica_addrs {
+    // Fire send_vectored to each replica IN PARALLEL (F099-B). Each
+    // RpcClient's writer_task is single-writer (R4 step 4.1), so per-
+    // replica TCP byte order is still determined by the order this
+    // worker's submits land on each replica's submit_tx — and since
+    // this worker is single-task, submits into a given submit_tx
+    // happen in lease order. Firing the 3 submits concurrently only
+    // lets each replica's submit channel progress without waiting on
+    // the others (they are independent); it does NOT interleave bytes
+    // on any one replica's socket, so the commit-truncation invariant
+    // (header.commit = offset must equal that replica's file_len on
+    // arrival) is preserved.
+    //
+    // Preserve the "all 3 slots filled with Result" shape so
+    // apply_completion's error handling (first-err-wins) is unchanged
+    // from the pre-parallel version: use join_all, NOT try_join_all.
+    let send_futs = tail.replica_addrs.iter().map(|addr| {
+        let addr = addr.clone();
         let mut parts = Vec::with_capacity(1 + payload_parts.len());
         parts.push(hdr.clone());
         for seg in &payload_parts {
             parts.push(seg.clone());
         }
-        let rx_res = pool.send_vectored(addr, MSG_APPEND, parts).await;
-        receivers.push((addr.clone(), rx_res));
-    }
+        let pool = pool.clone();
+        async move {
+            let rx_res = pool.send_vectored(&addr, MSG_APPEND, parts).await;
+            (addr, rx_res)
+        }
+    });
+    let receivers: Vec<(String, Result<oneshot::Receiver<autumn_rpc::Frame>>)> =
+        join_all(send_futs).await;
 
     let fut = async move {
         let wait_futs = receivers.into_iter().map(|(addr, rx_res)| async move {
