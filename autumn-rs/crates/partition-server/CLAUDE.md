@@ -78,31 +78,112 @@ The null byte (`0x00`) is a **separator** between the user key and the inverted 
 
 The **inverted** sequence ensures that for the same user key, newer writes (higher seq) sort **before** older writes in byte order. Lookup uses `seek_user_key` which seeks to `user_key ++ 0x00 ++ BE(0)` — the smallest possible internal key for this user key — then returns the first (newest) entry found.
 
-## Write Path: Put / Delete (Group Commit)
+## Write Path: Put / Delete (Group Commit, R4 4.4 SQ/CQ)
 
 ```
 Put(key, value, part_id, must_sync):
   1. Thin RPC handler: send WriteRequest{Put{key, value}, must_sync} to write_tx channel
   2. Await response on oneshot channel
 
-background_write_loop (per partition):
-  1. Recv first WriteRequest (blocking)
-  2. Drain up to MAX_WRITE_BATCH (128) more non-blocking
-  3. Acquire partition write lock
-  4. Validate each key is in_range; error invalid ones
-  5. Assign seq_numbers, compute internal_keys
-  6. Encode all entries as WAL records: [op:1][key_len:4 LE][val_len:4 LE][expires_at:8 LE][key][value]
-  7. batch_must_sync = any(req.must_sync) — if ANY request needs fsync, whole batch syncs
-  8. stream_client.append_batch(log_stream_id, &blocks, batch_must_sync) — 1 RPC for entire batch
-     ALL entries (small and large) go to log_stream (no separate local WAL file)
-  9. Compute VP for large values (>4KB): VP points to record in logStream
-  10. Insert all into active Memtable
-  11. Update vp_extent_id / vp_offset to end of batch
-  12. maybe_rotate_locked() → flush if thresholds exceeded
-  13. Drop lock, reply Ok(key) to all requestors
+background_write_loop_r1 (per partition, R4 4.4 N-deep SQ/CQ pipeline):
+  OWNS:   FuturesUnordered<Pin<Box<dyn Future<Output = InflightCompletion>>>>
+  CAP:    AUTUMN_PS_INFLIGHT_CAP (default 8, range [1, 64])
+  GATE:   MIN_PIPELINE_BATCH = 256  (2nd+ batch requires pending >= 256)
+  RECV:   mpsc<WriteRequest> (WRITE_CHANNEL_CAP = 1024)
+
+  Loop (per iteration):
+    (A) drain ready completions via `inflight.next().now_or_never()`
+        → run Phase 3 (memtable insert + client reply) for each
+    (B) if pending.non_empty && !at_cap && (n_inflight==0 || pending >= 256):
+          launch_new_batch:
+            Phase 1: validate, seq-assign, encode WAL records
+            Launch Phase 2: stream_client.append_batch future (NOT awaited)
+            Push (BatchData, Phase2Fut → InflightCompletion) into FU
+          continue
+    (C) if at_cap:
+          await inflight.next() (back-pressure) → run Phase 3
+          continue
+    (D) branch on n_inflight:
+          == 0:  await write_rx.next() alone (cold idle)
+          >  0:  select(write_rx.next, inflight.next()) — race SQ vs CQ
+                 Left  (SQ wins) → pending.push(req)
+                 Right (CQ wins) → run Phase 3 on the completion
+    (E) non-blocking drain of any queued requests
+
+  Shutdown (write_rx closed):
+    Drain all inflight via await-loop; run Phase 3 on each so clients
+    receive their final ack. Then flush any residual pending as one last
+    batch. Finally emit metrics.
+
+  Error handling:
+    LockedByOther on any completion  → set locked_by_other flag, drain
+      remaining inflight cleanly, return (partition self-evicts in the
+      enclosing loop).
+    Other append errors              → log + propagate Err(_) to each
+      client's oneshot. Loop continues.
 ```
 
+**Phase 1 / Phase 3 primitives** (`start_write_batch` / `finish_write_batch`
+in `background.rs`) are unchanged from R3; Phase 2 is wrapped into a boxed
+`InflightCompletion` future. Phase 3 runs at most once per loop iteration
+(single-threaded compio task), so the partition write lock is never held
+concurrently — `maybe_rotate_locked` remains correct.
+
 `Delete` sends `WriteOp::Delete{user_key}`, writes `op = 2` (tombstone).
+
+### Why a `MIN_PIPELINE_BATCH` gate?
+
+R3 Task 5b found that greedily splitting a naturally-full 256-op burst
+into multiple small batches regressed throughput because per-batch
+overhead (encode, 3-replica `send_vectored`, lease/ack state machine
+cycle) outweighs the concurrency gain of running two small batches in
+parallel. The gate says: a *second or later* batch launches only when
+pending has grown to the full burst size (256 — matches the
+`--threads 256` perf_check workload). The first batch after an idle
+period always launches (avoiding starvation on low-load streams).
+
+### Out-of-order completion is correct
+
+Phase 2 completions may arrive in a different order than launch order
+(e.g., batch B finishes before batch A if A had a larger payload and
+consequently higher write bandwidth). This is fine because:
+- **Seq numbers** were assigned in Phase 1 in batch-launch order, so A
+  always has lower seqs than B.
+- **Memtable MVCC keys** are `user_key ++ 0x00 ++ BE(u64::MAX - seq)`.
+  Byte-sort order is independent of insertion order.
+- **Client oneshot replies** are per-request, not per-batch-order.
+- **LogStream ordering** is preserved by the stream worker's
+  lease/ack cursor (step 4.3): both batches land at distinct contiguous
+  offsets regardless of Phase 2 completion order.
+
+### Cross-layer SQ/CQ stack (post-R4)
+
+```
+┌─ PS background_write_loop_r1  (this crate, 4.4)              ┐
+│    FU<InflightCompletion>, cap 8                              │
+└─────────────┬─────────────────────────────────────────────────┘
+              ▼  stream_client.append_batch(log_stream_id, …)
+┌─ autumn-stream stream_worker_loop  (step 4.3)                 ┐
+│    FU<3-replica-join>, cap 32, per stream_id                  │
+└─────────────┬─────────────────────────────────────────────────┘
+              ▼  pool.send_vectored per replica
+┌─ autumn-rpc writer_task (step 4.1) — single SQ per conn       ┐
+└─────────────┬─────────────────────────────────────────────────┘
+              ▼  TCP
+┌─ autumn-stream handle_connection (step 4.2 v3, server side)   ┐
+│    FU<batch-io>, cap 64, persistent read future               │
+└───────────────────────────────────────────────────────────────┘
+```
+
+## P-bulk SQ/CQ (flush_worker_loop, R4 4.4)
+
+Same FuturesUnordered + select pattern on the bulk thread, cap = 2
+(default, env `AUTUMN_PS_BULK_INFLIGHT_CAP`, range [1, 16]). Each
+in-flight flush holds a 128 MB SST buffer, so the cap is deliberately
+small. The benefit is that while one SST is uploading via
+`row_stream.append`, the next flush can start its `build_sst_bytes`
+`spawn_blocking` — overlapping CPU (build) with network (upload) without
+ballooning peak memory.
 
 **Record format**: `[op:1][key_len:4 LE][val_len:4 LE][expires_at:8 LE][key][value]` (17-byte header)
 

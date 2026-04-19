@@ -29,6 +29,7 @@ use compio::BufResult;
 use crossbeam_skiplist::SkipMap;
 use dashmap::DashMap;
 use futures::channel::{mpsc, oneshot};
+use futures::stream::FuturesUnordered;
 use futures::{FutureExt, SinkExt, StreamExt};
 
 use sstable::{IterItem, MemtableIterator, MergeIterator, SstBuilder, SstReader, TableIterator};
@@ -85,6 +86,42 @@ pub(crate) fn lf_collect_micros() -> u64 {
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|&n| n <= 10_000)
             .unwrap_or(100)
+    })
+}
+
+/// R4 4.4 — maximum number of P-log `append_batch` futures in flight
+/// concurrently per partition. Higher values give more pipeline depth so
+/// multiple 256-request group-commit batches overlap their replica RTT, but
+/// also raise peak memory (each in-flight batch may hold up to
+/// `MAX_WRITE_BATCH_BYTES` = 30 MB of encoded segments).
+///
+/// Default = 8 → up to 8 × 30 MB = 240 MB worst-case memory per partition.
+/// Range clamped to [1, 64]. Read once from env `AUTUMN_PS_INFLIGHT_CAP`.
+pub(crate) fn ps_inflight_cap() -> usize {
+    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("AUTUMN_PS_INFLIGHT_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.clamp(1, 64))
+            .unwrap_or(8)
+    })
+}
+
+/// R4 4.4 — maximum number of P-bulk (flush) in-flight SST uploads per
+/// partition. Each in-flight request holds a full 128 MB SSTable buffer
+/// (peak), so this cap is deliberately small. Default = 2 lets the next
+/// flush start its `build_sst_bytes` while the previous one's 128 MB
+/// `row_stream.append` is streaming. Range clamped to [1, 16]. Read once
+/// from env `AUTUMN_PS_BULK_INFLIGHT_CAP`.
+pub(crate) fn ps_bulk_inflight_cap() -> usize {
+    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("AUTUMN_PS_BULK_INFLIGHT_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.clamp(1, 16))
+            .unwrap_or(2)
     })
 }
 
@@ -1678,11 +1715,43 @@ fn spawn_bulk_thread(
         })
 }
 
+/// R4 4.4 — P-bulk flush worker with N-deep SQ/CQ pipeline.
+///
+/// Earlier this loop was strictly sequential: recv FlushReq → build SST
+/// bytes → upload → reply → recv next. On a rapidly-rotating partition
+/// (many 256 MB memtables per second), the next `build_sst_bytes`
+/// `spawn_blocking` would not start until the previous 128 MB
+/// `row_stream.append` returned.
+///
+/// The cap is deliberately small (default 2, env
+/// `AUTUMN_PS_BULK_INFLIGHT_CAP`) because each in-flight flush holds a
+/// full 128 MB SSTable buffer in RAM. `build_sst_bytes` dominates CPU,
+/// while `row_stream.append` dominates network — with cap=2 they overlap
+/// (one is CPU-bound, one is I/O-bound) without ballooning peak memory.
+///
+/// FlushReqs arrive one per memtable rotation, so in most workloads the
+/// pipeline is effectively single-depth. The benefit kicks in during
+/// burst flushes (recovery, or back-to-back memtable-full triggers).
 async fn flush_worker_loop(
     bulk_sc: Rc<StreamClient>,
     mut flush_req_rx: mpsc::Receiver<FlushReq>,
 ) {
-    while let Some(req) = flush_req_rx.next().await {
+    use futures::future::{select, Either};
+
+    let cap = crate::ps_bulk_inflight_cap();
+
+    /// Carrier for a single in-flight flush: owns the response channel and
+    /// the Result produced by `do_flush_on_bulk`. Kept here so the
+    /// FuturesUnordered element type is a concrete future.
+    struct FlushCompletion {
+        resp_tx: oneshot::Sender<Result<(TableMeta, SstReader)>>,
+        result: Result<(TableMeta, SstReader)>,
+    }
+
+    type FlushFut = std::pin::Pin<Box<dyn std::future::Future<Output = FlushCompletion>>>;
+    let mut inflight: FuturesUnordered<FlushFut> = FuturesUnordered::new();
+
+    let launch = |req: FlushReq, bulk_sc: &Rc<StreamClient>| -> FlushFut {
         let FlushReq {
             imm,
             vp_eid,
@@ -1692,17 +1761,70 @@ async fn flush_worker_loop(
             tables_before,
             resp_tx,
         } = req;
-        let result = do_flush_on_bulk(
-            &bulk_sc,
-            imm,
-            vp_eid,
-            vp_off,
-            row_stream_id,
-            meta_stream_id,
-            tables_before,
-        )
-        .await;
-        let _ = resp_tx.send(result);
+        let bulk_sc = bulk_sc.clone();
+        Box::pin(async move {
+            let result = do_flush_on_bulk(
+                &bulk_sc,
+                imm,
+                vp_eid,
+                vp_off,
+                row_stream_id,
+                meta_stream_id,
+                tables_before,
+            )
+            .await;
+            FlushCompletion { resp_tx, result }
+        })
+    };
+
+    loop {
+        // (A) Opportunistic CQ drain.
+        while let Some(Some(done)) = inflight.next().now_or_never() {
+            let _ = done.resp_tx.send(done.result);
+        }
+
+        let n_inflight = inflight.len();
+        let at_cap = n_inflight >= cap;
+
+        if n_inflight == 0 {
+            // Idle: only SQ can progress.
+            match flush_req_rx.next().await {
+                Some(req) => inflight.push(launch(req, &bulk_sc)),
+                None => break,
+            }
+            continue;
+        }
+
+        if at_cap {
+            // Back-pressure: only CQ can progress.
+            if let Some(done) = inflight.next().await {
+                let _ = done.resp_tx.send(done.result);
+            }
+            continue;
+        }
+
+        // 0 < n_inflight < cap → race SQ vs CQ.
+        let sq_fut = flush_req_rx.next();
+        let cq_fut = inflight.next();
+        futures::pin_mut!(sq_fut);
+        match select(sq_fut, Box::pin(cq_fut)).await {
+            Either::Left((maybe_req, _cq_dropped)) => match maybe_req {
+                Some(req) => inflight.push(launch(req, &bulk_sc)),
+                None => {
+                    // Channel closed: drain remaining inflight so callers
+                    // receive their final response, then exit.
+                    while let Some(done) = inflight.next().await {
+                        let _ = done.resp_tx.send(done.result);
+                    }
+                    break;
+                }
+            },
+            Either::Right((maybe_done, _sq_dropped)) => {
+                if let Some(done) = maybe_done {
+                    let _ = done.resp_tx.send(done.result);
+                }
+            }
+        }
     }
 }
 

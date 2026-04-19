@@ -1,127 +1,129 @@
 Date: 2026-04-20
 TaskStatus: completed
-Task scope: Perf R4 Step 4.3 — StreamClient per-stream SQ/CQ worker (F098-4.3)
+Task scope: Perf R4 Step 4.4 — PS P-log + P-bulk SQ/CQ pipeline (F098-4.4)
 
 Current summary:
   Branch: perf-r1-partition-scale-out (worktree /data/dongmao_dev/autumn-perf-r1)
 
-  Removed the R3 `stream_states: DashMap<u64, Arc<Mutex<StreamAppendState>>>`
-  Mutex-guarded per-stream state.  Replaced with ONE single-owner compio
-  worker task per stream_id that owns the full `StreamAppendState` and a
-  `FuturesUnordered` of in-flight 3-replica joins.  Public API talks to
-  the worker via a bounded `mpsc<StreamSubmitMsg>` (cap=256) + per-op
-  oneshot ack.
-
-  Rationale: even R3's short lease/ack locks still serialize multiple
-  concurrent callers of `append_payload_segments(stream_id, ...)`.  Step
-  4.3 removes all locks around the state machine by making state
-  single-owner — access is serialized by the actor pattern, not by a
-  Mutex.  This unblocks step 4.4 (PS P-log concurrent submits into the
-  stream worker).
+  Replaced the step-4.3 double-buffer write loop (at most ONE Phase 2
+  future in flight) with a FuturesUnordered-driven N-deep pipeline on
+  both the P-log and P-bulk threads.  This is the client of step 4.3's
+  per-stream SQ/CQ worker — before this change, P-log was serializing
+  at 1 outstanding `append_batch` per partition, leaving the step-4.3
+  capacity unused in the hot path.
 
   Architecture:
-    crates/stream/src/client.rs
-      • StreamClient constructor now uses Rc::new_cyclic so the struct
-        stores Weak<StreamClient>; per-stream workers carry the weak
-        ref in a WorkerRemovalGuard that cleans up `stream_workers`
-        on exit — no Rc cycle, clean shutdown.
-      • connect / new_with_revision return `Rc<StreamClient>` now.
-        Public API methods still take `&self`, so callers' `sc.append()`
-        works via Deref.  Partition-server's `Rc::new(new_with_revision(...))`
-        simplified to just the constructor.
-      • StreamSubmitMsg { Append{payload_parts, must_sync, revision,
-        ack_tx}, ResetTail{tail}, SeedCursor{cursor}, Shutdown }
-      • stream_worker_loop — true SQ/CQ (4.2 v3 pattern adapted):
-          1. drain ready completions via `inflight.next().now_or_never()`
-          2. branch on (n_inflight, at_cap):
-               n_inflight == 0 → await submit_rx alone
-               at_cap          → await inflight.next() alone (back-pressure)
-               otherwise       → select(submit_rx.next, inflight.next())
-                                 Left  (SQ wins) → apply message (Append
-                                                 fires 3 send_vectored
-                                                 sequentially, pushes the
-                                                 3-replica join future
-                                                 into FU, returns)
-                                 Right (CQ wins) → apply_completion:
-                                                 parse 3 frames, ack or
-                                                 rewind/poison, send
-                                                 AppendResult via ack_tx
-      • Retry lives in the public API (Option A):
-          for alloc_retry in 0..MAX_ALLOC_PER_APPEND (3):
-            send Append, await ack
-            Ok     → if end >= max_extent_size: alloc + ResetTail; return
-            NotFnd → alloc + ResetTail; retry
-            Locked → propagate immediately
-            soft   → sleep 100ms, reload tail, ResetTail; retry (≤2×)
-            hard   → alloc + ResetTail; retry
-      • ensure_tail_initialised — per-stream futures::lock::Mutex<bool>
-        serialises first-use so multiple concurrent first-callers don't
-        each RPC the manager.  Sends ResetTail + SeedCursor (if
-        commit_length > 0) to the worker before returning.
-      • Preserved R3 state-machine semantics exactly:
-          lease_cursor monotonic, ack advances commit over contiguous
-          prefix via BTreeMap, rewind_or_poison on failure, poisoned
-          flag on out-of-order failures, MAX_ALLOC_PER_APPEND=3,
-          header.commit = lease-time cursor (Option A).
+    crates/partition-server/src/background.rs
+      • background_write_loop_r1 rewritten:
+          FU<Pin<Box<dyn Future<Output=InflightCompletion>>>> cap=8
+          (env AUTUMN_PS_INFLIGHT_CAP, clamped [1, 64]).
+          Per-iteration: drain ready completions via now_or_never →
+          run Phase 3, then branch on (n_inflight, at_cap):
+            ready_to_launch (pending + cap room + gate) → launch
+            at_cap                                        → await CQ only
+            n_inflight==0 & nothing to launch            → await SQ alone
+            otherwise                                    → select(SQ, CQ)
+          Shutdown (write_rx closed): drain all inflight, flush residual
+          pending as one last batch, emit metrics.
+      • MIN_PIPELINE_BATCH = 256 gate (R3 Task 5b insight) — a SECOND or
+        later batch requires pending >= 256 before launch; the first
+        batch (n_inflight == 0) always launches.  Avoids the "small
+        fragmented batches steal from naturally-large bursts" regression.
+      • Phase 1 / Phase 3 primitives (start_write_batch / finish_write_batch
+        / InFlightBatch) preserved exactly — the refactor is purely about
+        the loop that schedules them.
+      • Out-of-order Phase-2 completion is handled correctly:
+          seq numbers assigned in Phase 1 in launch order
+          memtable MVCC keys are self-sorting (internal key = user_key ++
+            0x00 ++ BE(u64::MAX - seq)) so insertion order doesn't matter
+          client oneshot replies are per-request
+          logStream offsets preserved by the step-4.3 stream worker's
+            lease/ack cursor
 
-  New tests (tests/stream_sqcq.rs):
-    1. concurrent_append_preserves_order_within_stream
-       10 concurrent callers append to the same stream; sorted offsets
-       must be contiguous, total bytes = N*PAYLOAD, commit_length
-       matches.  Validates worker actor serialises lease() across
-       concurrent public-API callers without gaps.
-    2. worker_handles_back_pressure
-       AUTUMN_STREAM_INFLIGHT_CAP=4, submit 100 concurrent ops.  All
-       complete (no deadlock). Validates `at_cap` branch does CQ-only
-       until slots free; callers parked on bounded send().await
-       eventually progress.
-    3. cq_advances_commit_on_out_of_order_completion
-       30 concurrent small appends, joined via futures::join_all.
-       Final commit_length == total bytes leased.  Validates BTreeMap
-       prefix-advance under overlapping completion.
-    4. sq_continues_submitting_while_cq_drains
-       1000 concurrent vs sequential appends; assert concurrent ≥ 1.3×
-       speedup.  Measured typical: 2.4× speedup.  Indirect proof that
-       SQ and CQ overlap in the worker loop (would collapse to 1× if
-       the worker were lease→fanout→await→ack sequentially per op).
+    crates/partition-server/src/lib.rs
+      • flush_worker_loop rewritten on same pattern, cap=2 (env
+        AUTUMN_PS_BULK_INFLIGHT_CAP, clamped [1, 16]).  Each in-flight
+        flush holds a 128 MB SST buffer in RAM — cap deliberately small.
+        Overlaps `build_sst_bytes` (CPU, spawn_blocking) of the next
+        flush with the current flush's 128 MB `row_stream.append`
+        (network).
+      • ps_inflight_cap() and ps_bulk_inflight_cap() env getters added
+        using OnceLock, ranges clamped as above.
+
+  Tests added (crates/partition-server/src/background.rs sqcq_tests mod):
+    ps_sqcq_handles_concurrent_in_flight — cap=4, 4 × 100ms futures
+      complete in < 300ms; proves FU-based pipeline genuinely
+      parallelizes Phase-2 RTT.  Asserts max_inflight >= 2.
+    ps_sqcq_memtable_rotation_works_out_of_order — 5 items with
+      descending delays; completions arrive in reverse launch order;
+      aggregate set is complete and no duplicates, proving memtable-
+      insert-in-completion-order is safe.
+    ps_sqcq_backpressure_at_cap — cap=2, 10 items; verify max observed
+      inflight count == 2 (never exceeds cap).  Validates `at_cap`
+      branch gating.
+    ps_sqcq_locked_by_other_drains_cleanly — inject LBO on item 2 of 4;
+      verify flag is set, LBO item is in collected set, and no
+      duplicated / lost entries.
+    ps_inflight_cap_default_and_bounds / ps_bulk_inflight_cap_default_and_bounds
+      / min_pipeline_batch_matches_client_count — constant+env sanity
+      guards.
+
+  Doc updates:
+    crates/partition-server/CLAUDE.md — write-path section rewritten
+    to describe the R4 4.4 loop shape + the MIN_PIPELINE_BATCH rationale
+    + out-of-order completion correctness + cross-layer SQ/CQ diagram
+    (RpcClient SQ → Stream worker SQ/CQ → PS P-log SQ/CQ → ExtentNode
+    SQ/CQ).  P-bulk SQ/CQ section added.
 
   Verification results:
-    cargo test --release -p autumn-stream --lib      40 passed
-    cargo test --release -p autumn-stream --tests   20 passed
-                                                    (4+5+3+3+4 new+3)
-    cargo test --release -p autumn-partition-server 66 passed
-    cargo test --release -p autumn-rpc              17 passed (10+7)
-    cargo bench --bench extent_bench                unchanged — doesn't
-                                                    go through StreamClient.
-                                                    Sampled: W d=64 204k,
-                                                    W d=32 165k, R 1t d=64
-                                                    179k — within noise of
-                                                    4.2 baseline.
-    perf_check.sh --shm --partitions 1 (5-run median):
-      write = 51.4k ops/s (5 runs: 47.3, 49.0, 51.4, 52.2, 55.2)
-      read  = 72.1k ops/s
-    Post-4.2 baseline: write 51.1k (run 1) / 55.8k (run 5);
-                      read  68.0k (run 1) / 77.5k (run 5).
-    Write median unchanged (51.4k vs 51.1k / 55.8k baseline — within
-    run-to-run noise).  Read ~7% below 4.2's later-run median, but
-    reads don't touch the new stream-worker code path and the delta is
-    within the baseline's own run-to-run variance.  No structural
-    regression.  Gate requirement: ≥50k median write — met (51.4k).
+    cargo test --release -p autumn-partition-server --lib   73 passed
+                                                            (66 prior + 7 new)
+    cargo test --release -p autumn-stream     --lib         40 passed
+    cargo test --release -p autumn-stream     --tests       20 passed
+    cargo test --release -p autumn-rpc                      17 passed (10+7)
+    cargo build --release -p autumn-server                  OK
+
+    perf_check.sh --shm --partitions 1 (3 runs, cluster-clean between):
+      Run 1: write 51805 / read 71202
+      Run 2: write 56195 / read 74367
+      Run 3: write 52748 / read 62026
+      Median:  write 52748 / read 71202
+
+    Tier verdict: baseline preserved, below 70k / Tier B' gate.  The
+    single-partition × 256-sync-client workload is fundamentally
+    constrained by 256 × RTT (~4ms) = 64k ceiling; both R3 and the R4
+    4.4 spec explicitly flagged this (see spec §4 Tier B' rationale +
+    Task 5b regression).  The refactor IS architecturally correct and
+    unlocks concurrent Phase-2 issuance at the PS layer — but with
+    synchronous clients that wait for each reply before submitting,
+    pending doesn't grow WHILE inflight is active, so effective
+    pipeline depth stays near 1 during steady-state burst cycling.
+    Average batch size observed in metrics: 128 ops (vs 256 cap), with
+    2ms avg Phase 2 — consistent with effective depth ~1.5-2 but still
+    RTT-bound overall.
 
 Main gaps / concerns:
-  None.  Step 4.3 preserved the R3 state-machine semantics bit-for-bit
-  (all 4 state-machine unit tests still pass) while removing the
-  per-stream Mutex.  Expected post-4.3 perf jump is predicated on step
-  4.4 (PS P-log with multiple concurrent submits into the worker);
-  single-partition single-PS is bottlenecked by PS's own loop before
-  the StreamClient actor pattern pays off.
+  1. Write throughput median 52.7k is within run-to-run noise of the
+     post-4.3 baseline (51-56k across prior runs).  Not a regression,
+     but also not the 70-80k the spec aspired to.  The spec itself
+     says "Real gains depend on TCP write bandwidth to replicas and
+     disk fsync latency; we're removing a pure-serialization
+     bottleneck, not a real bottleneck, so expect ~50% improvement at
+     realistic workload." — the shm/sync-256 workload isn't a realistic
+     workload in that sense.  R4 Step 4.5 / 4.6 gate runs and any
+     further pipelining at higher client counts / async workloads
+     should now show the architectural benefit.
+  2. MIN_PIPELINE_BATCH = 256 tuning: the gate's first-batch bypass
+     (n_inflight == 0 always launches) means under sustained-burst
+     cycling the pipeline oscillates between depth 1 and 2 — matches
+     the observed 128 avg batch.  Lowering the gate would risk the 5b
+     regression for non-barrier workloads; leaving at 256 preserves
+     correctness for the primary benchmark shape.
 
 Next steps:
-  1. R4 Step 4.4: PS P-log + P-bulk SQ/CQ (spec §3.3).  Replace
-     background_write_loop's "drain batch → await append → drain next"
-     pattern with: fanout task + completion task.  Per-request WriteRequest
-     flows independently into the 3-replica SQ channels (via ConnPool),
-     responses drain back via CQ; no batching at the PS layer.
-     Expected: double-digit ops/s gain vs current 51k median.
-  2. R4 Step 4.5: 3-rep perf gate on shm N=1, target write ≥ 80k;
-     regression guards at N=2/N=4.
+  1. R4 Step 4.5: 3-rep perf gate on shm N=1, read regression guard >=
+     69.8k, write target >= 80k (Tier B').  If write does not hit 80k
+     (likely — see above), document as a Tier A result with analysis
+     of the 256-client-barrier ceiling.
+  2. R4 Step 4.6: N=2, N=4 regression guards.
+  3. R4 Step 4.7: F098 ledger finalisation.
