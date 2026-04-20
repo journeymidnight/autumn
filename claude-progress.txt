@@ -88,26 +88,46 @@ Main gaps (carry into next session):
   3. F099-I (per-conn reply batching) not implemented. Only useful if
      --pipeline-depth > 1 is exercised.
 
-Next steps (explicit priority order from user):
+Next steps (explicit priority order from user — UPDATED 2026-04-20):
 
-  A. Diagnose F099-K N=4 scaling gap.
-     - Verify client connection distribution across ports (ss -t during run)
-     - Verify each partition's P-log CPU % (top -H)
-     - Verify extent-node CPU % (not bottleneck)
-     - Expected: should see ~4× throughput with each partition ~25% CPU
-     - If bottleneck is elsewhere (e.g., client-side thread count / shared
-       state), adjust accordingly.
-
-  B. Implement F099-I (per-conn reply batching).
+  STEP 1 (FIRST — was "B"): Implement F099-I (per-conn reply batching).
      - Scope: handle_ps_connection inner loop in crates/partition-server/src/lib.rs
      - Change: decode ALL frames from one TCP read, fire to partition
-       concurrently, collect oneshot responses into Vec<Bytes>, write_vectored_all
-     - Net effect: if client uses --pipeline-depth > 1, server coalesces N
-       replies into one tcp_sendmsg (saves 0.8 cores of small-frame TCP CPU)
-     - Target workload: 32 threads × d=8 with F099-K N=4 = 8 conns per partition
-       each with 8 in-flight. Server should comfortably exceed 100k write.
+       concurrently (collect N oneshots into FuturesUnordered), drain as
+       ready into Vec<Bytes>, write_vectored_all replies per burst.
+     - At --pipeline-depth=1: degenerates to write_all([single_frame]) — no
+       regression, no gain.
+     - At --pipeline-depth ≥ 4: server coalesces N replies into one
+       tcp_sendmsg (F099-H measured 0.8 cores of small-frame TCP per 57k
+       writes; this batching cuts that by N).
+     - Add tests:
+       * Correctness: N in-flight puts per conn return correctly via
+         batched write (decode_all + FuturesUnordered + write_vectored_all
+         pattern, similar to R4 4.2 v3 ExtentNode).
+       * Perf: manually verify with bpftrace/ss that tcp_sendmsg count
+         drops N-fold at --pipeline-depth=N.
+     - Target workload: 32 threads × d=8 with F099-K N=4 (= 8 conns per
+       partition, each with 8 in-flight). Expected write throughput: ≥ 100k.
+     - Effort: 1-1.5 days.
 
-  C. (If A+B clear gate) Tier verdict + feature_list + merge-decision gate.
+  STEP 2 (SECOND — was "A"): Diagnose F099-K N=4 scaling gap.
+     - After F099-I lands, re-measure N=4 with both --pipeline-depth=1
+       and --pipeline-depth=8.
+     - If N=4 × d=8 clears 100k+: F099-I + F099-K combo works; gap was
+       "d=1 can't actually drive multi-partition".
+     - If N=4 × d=8 still flat:
+       * Run `ss -t state established` during bench; confirm 256 conns
+         distribute across 4 ports.
+       * `top -H -p <ps_pid>` during bench; verify each P-log thread
+         gets ~25% CPU (not one at 100% / rest idle).
+       * `top -H -p <extent_pid>` for each extent-node; if saturated,
+         the 3 extent-nodes are the shared bottleneck.
+       * `top -H -p <autumn-client-pid>`; client-side contention check.
+     - Fix root cause based on findings.
+     - Effort: 0.5-1 day diagnosis + variable fix time.
+
+  STEP 3: (If STEP 1+2 clear gate) Tier verdict + feature_list update +
+     merge-decision gate.
 
 Do NOT touch main worktree at /data/dongmao_dev/autumn (branch compio).
 
