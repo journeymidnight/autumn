@@ -1,110 +1,114 @@
 Date: 2026-04-20
 TaskStatus: not_completed
-Task scope: F099-J — collapse PS Dispatcher worker pool into the per-partition
-  P-log thread. Thread-per-partition architecture: all I/O and state for a
-  given partition happens on ONE OS thread. Accept OS thread unchanged; main
-  compio thread forwards each accepted fd across a futures::channel::mpsc to
-  the owning partition's P-log runtime. P-log's fd-drain task converts
-  std::TcpStream -> compio::TcpStream and spawns handle_ps_connection on the
-  SAME compio runtime that runs merged_partition_loop. ps-conn -> merged_loop
-  handoff is now a same-thread PartitionRequest mpsc (no eventfd wake, no
-  cross-thread futex). PartitionRouter DashMap deleted. N=1 fast path only;
-  N>1 routing marked TODO(F099-K).
+Task scope: F099-K committed; N=4 scaling not yet verified; F099-A/B deferred to next round
 
-Current summary (F099-J):
-  Branch: perf-r1-partition-scale-out (worktree /data/dongmao_dev/autumn-perf-r1)
-  Parent commit: 10a4900 (F099-H docs)
+Branch: perf-r1-partition-scale-out
+Worktree: /data/dongmao_dev/autumn-perf-r1
+Main worktree /data/dongmao_dev/autumn (branch compio) MUST NOT be touched.
 
-  Files changed:
-    crates/partition-server/src/lib.rs       — PartitionRouter removed;
-      PartitionServer.router/conn_threads fields removed; open_partition
-      rewritten to create an fd-handoff mpsc and pass fd_rx into
-      partition_thread_main; serve() strips the Dispatcher and forwards fds
-      directly to the partition's fd_tx; handle_ps_connection takes
-      (TcpStream, mpsc::Sender<PartitionRequest>, owner_part: u64) instead
-      of (TcpStream, Arc<PartitionRouter>); partition_thread_main now
-      receives fd_rx and spawns a fd-drain task + per-connection ps-conn
-      tasks on THIS compio runtime; dashmap + compio::dispatcher::Dispatcher
-      imports dropped. Two F099-J tests added.
-    crates/server/src/bin/partition_server.rs — --conn-threads made a no-op
-      (preserved for CLI compat); NonZeroUsize import + Args field removed;
-      set_conn_threads call removed.
-    crates/partition-server/CLAUDE.md        — Thread Model section rewritten.
-    autumn-rs/CLAUDE.md                      — Write Path + two-OS-thread
-      note updated.
+Current summary:
+  R4 + F099 (A-K) committed this session. 16 commits on branch.
+  Architecture is Seastar-style thread-per-partition:
+    - Each partition binds its own TcpListener (base_port + ord)
+    - Each partition's P-log runtime hosts: accept task + N ps-conn tasks +
+      merged_partition_loop + compact + gc + flush_dispatcher
+    - P-bulk per partition still separate (128MB SST upload isolation)
+    - No central accept thread, no central Dispatcher, no PartitionRouter
+    - Client resolves part_id → port via manager's part_addrs in GetRegions
 
-  Tests:
-    cargo test --release -p autumn-partition-server --lib → 77/77 pass
-      (75 pre-existing + 2 new: f099j_single_threaded_write_path_no_router,
-       f099j_n1_load_basic_sanity)
-    cargo test --release -p autumn-stream              → 40/40 pass
-    cargo test --release -p autumn-rpc                 → 10/10 pass
+Perf state (last measured):
+  Pre-R4 baseline:     51.7k write / 80k read     (F099-D-era earlier runs)
+  Post F099-D:         57.6k write / 71.3k read   (peak of R4+F099 cycle)
+  Post F099-J:         42.8k write / 38.8k read   (single-thread saturation)
+  Post F099-K N=1:     41.5k write / 45.4k read   (same as F099-J — 1 partition still limited)
+  Post F099-K N=4:     41.3k write / 54.8k read   (NOT scaling — diagnosis required)
 
-  Perf validation (3-rep perf_check.sh --shm --partitions 1 --pipeline-depth 1
-  --duration 30, on a freshly-bootstrapped cluster each run):
-    Rep 1 write: 39726 ops/s  | read: 38802 ops/s
-    Rep 2 write: 43092 ops/s  | read: 42455 ops/s
-    Rep 3 write: 42769 ops/s  | read: 36124 ops/s
-    Median    : 42769 (write) | 38802 (read)
-    vs F099-D  : 57.6 k       |  71.3 k
-    Δ         :  -25 %        |  -46 %
+Commits this session (newest first):
+  d5228d2 perf(F099-K): per-partition listener + benchmark routing
+  9c9f65e perf(F099-J): collapse PS worker threads into P-log
+  10a4900 docs(F099-H): kernel RTT decomposition
+  d5278ab perf(F099-D): merge partition_thread_main + write loop
+  c66a501 perf(F099-C): Memtable SkipMap -> RwLock<BTreeMap>
+  a0a5548 docs(F099-A): R4 ceiling flame graph diagnosis
+  37a0f6a perf(F099-B): StreamClient parallel 3-replica fanout
+  644f2f0 perf(R4): autumn-client perf-check --pipeline-depth
+  c25f436 perf(R4): ps_bench — PS RPC pipeline-depth matrix
+  c06dee0 perf(R4): PS P-log + P-bulk SQ/CQ (step 4.4)
+  199c345 perf(R4): StreamClient per-stream SQ/CQ worker (step 4.3)
+  1e7e456 perf(R4): ExtentNode true SQ/CQ (step 4.2 v3)
+  b1a92f7 perf(R4): ExtentNode inline FuturesUnordered (step 4.2 redesign)
+  3261702 perf(R4): ExtentNode per-extent SQ/CQ worker (step 4.2)
+  b5d53ca perf(R4): RpcClient SQ writer task (step 4.1)
+  fc5d0e0 perf(R4): spec — SQ/CQ pipeline architecture (F098)
 
-  P-log CPU during the 256 × d=1 write phase (top -H snapshot):
-    part-13 (P-log):  99.9 % user  ← SATURATED
-    part-13-bulk:     ~90 %       (expected — processing flushes)
-    main / ps-accept: ~0.0 %
+Key findings from F099-H (kernel flame graph):
+  - Write ceiling at N=1 × 256 × d=1 is CPU-bound on kernel TCP stack,
+    not user-space CPU.
+  - 91% of tcp_sendmsg calls carry 32-63B (tiny PutResp frames), at 22µs
+    each, = 0.8 cores burning on small-frame TCP delivery.
+  - Reads scale naturally (187k) because reply is one big frame.
+  - P-log at pre-F099-J baseline was only ~57% user CPU (the other 43%
+    was idle waiting in io_uring_enter for remote CQEs — pprof couldn't
+    see this).
 
-  Secondary scenarios (1 × d=64 write + 32 × d=16 read, indicative only):
-    Scenario B (1 × d=64)  write 12.9 k ops/s  (vs F099-H 12 k — parity+)
-    Scenario C (32 × d=16) read  ~60-70 k ops/s (1t d=16 → 87.7 k, indicative)
+Test state:
+  autumn-partition-server: 79/79 lib tests green (77 pre-F099-K + 2 new)
+  autumn-stream: 40 lib + 21 integration green
+  autumn-rpc: 17 green
+  Full workspace builds clean (excluding autumn-fuse pre-existing env issue).
 
-  ps_bench 4 KB matrix (non-baseline-controlled — same cluster hot, short 10 s
-  scenarios):
-    Write 256 t d=1        46.8 k ops/s  (vs F099-D baseline 57 k  → -18 %)
-    Write 1 t d=64         12.6 k ops/s  (≈ parity with F099-H Scenario B)
-    Read 32 t d=16         122 k ops/s  (vs F099-D 160 k          → -24 %)
+Documentation:
+  - /data/dongmao_dev/autumn-perf-r1/docs/superpowers/specs/
+      2026-04-18-perf-r4-sqcq-pipeline-design.md  (R4 spec)
+      2026-04-20-perf-r4-ceiling-diagnosis.md     (F099-A)
+      2026-04-20-perf-f099-h-kernel-rtt.md        (F099-H)
+  - autumn-rs/CLAUDE.md: updated thread model
+  - crates/partition-server/CLAUDE.md: updated write-path
+  - crates/stream/CLAUDE.md: updated SQ/CQ, parallel fanout
 
-  Root cause of regression (anticipated by the task spec and confirmed):
-    256 ps-conn tasks now share the P-log compio runtime. Each task does
-    read(4 KB frame).await → req_tx.send.await → resp_rx.await → write(40 B
-    frame).await per cycle. At 256 concurrent clients this drives P-log user
-    CPU from ~57 % (F099-H measurement) to ~100 %. The merged_loop write
-    pump's 4 ms batch RTT stalls slightly because it now competes with
-    frame decoding + dispatch + response-encoding on the same thread.
+Main gaps (carry into next session):
+  1. F099-K N=4 does NOT show expected 4× scaling.
+     Likely causes (need diagnosis):
+     a. Benchmark client distribution — verify all 256 threads actually
+        connect to ports 9201-9204 in balanced ratio. `ss -t state
+        established` during the bench run.
+     b. ExtentNode bottleneck — 3 extent-nodes shared by all 4 partitions;
+        check per-node CPU + io_uring_enter stats. If saturated, each
+        partition is limited by shared extent node capacity, not local
+        P-log.
+     c. StreamClient per-stream serialization — post-F099-K, each partition
+        has its own StreamClient; verify each has a separate ConnPool.
+     d. autumn-client benchmark — 256 threads in one client process might
+        have shared-channel contention (aggregation paths); verify with
+        `top -H -p <client-pid>`.
+  2. `autumn-client info` command still shows ps=127.0.0.1:9201 for all
+     partitions (display bug — uses ps_details not part_addrs). Fix is
+     ~5 lines in crates/server/src/bin/autumn_client.rs info handler.
+     Display-only; doesn't affect routing.
+  3. F099-I (per-conn reply batching) not implemented. Only useful if
+     --pipeline-depth > 1 is exercised.
 
-    At low connection counts (Scenario B at 1 × d=64) there is no competing
-    work, so F099-J neither helps nor hurts.
+Next steps (explicit priority order from user):
 
-TaskStatus: not_completed — perf regressed at 256-client workload; see
-  Main gaps below.
+  A. Diagnose F099-K N=4 scaling gap.
+     - Verify client connection distribution across ports (ss -t during run)
+     - Verify each partition's P-log CPU % (top -H)
+     - Verify extent-node CPU % (not bottleneck)
+     - Expected: should see ~4× throughput with each partition ~25% CPU
+     - If bottleneck is elsewhere (e.g., client-side thread count / shared
+       state), adjust accordingly.
 
-Main gaps:
-  1. PERF REGRESSION at 256-client workload (primary harness). Cause: ps-conn
-     + merged_loop collocation saturates P-log at 100 % CPU. Spec-predicted
-     failure mode. No mitigation in scope for F099-J (would require
-     introducing scheduler partitioning within a single compio runtime, or
-     re-splitting ps-conn onto its own runtime — either of which defeats the
-     same-thread motivation).
-  2. N > 1 fd routing deferred to F099-K (TODO markers in lib.rs). Current
-     code sends every fd to the first partition in the map; at N > 1
-     misrouted requests reject with NotFound.
-  3. --conn-threads is a harmless no-op (preserved for CLI compat) but could
-     be removed entirely in a follow-up cleanup pass.
+  B. Implement F099-I (per-conn reply batching).
+     - Scope: handle_ps_connection inner loop in crates/partition-server/src/lib.rs
+     - Change: decode ALL frames from one TCP read, fire to partition
+       concurrently, collect oneshot responses into Vec<Bytes>, write_vectored_all
+     - Net effect: if client uses --pipeline-depth > 1, server coalesces N
+       replies into one tcp_sendmsg (saves 0.8 cores of small-frame TCP CPU)
+     - Target workload: 32 threads × d=8 with F099-K N=4 = 8 conns per partition
+       each with 8 in-flight. Server should comfortably exceed 100k write.
 
-Next steps:
-  A. Decide disposition:
-     (A1) Accept regression as the cost of architectural simplification.
-          Commit as-is; future work (F099-I SQE coalescing, F099-K multi-
-          partition routing) builds on the simpler foundation.
-     (A2) Revert F099-J on the perf-r1 branch and explore a hybrid:
-          ps-conn tasks distributed across 2-4 compio worker threads to
-          spread decode CPU, cross-thread mpsc to P-log. Gives up the
-          "no eventfd on hot path" benefit but keeps P-log under saturation.
-     (A3) Introduce scheduler fairness inside compio — yield more
-          aggressively in merged_loop. Speculative; compio does cooperative
-          scheduling so this is limited.
-  B. Regardless of disposition, the architectural understanding from this
-     experiment (P-log is the bottleneck at 256-client, ps-conn on P-log
-     saturates it) is new and documented in claude-progress + CLAUDE.md.
-  C. F099-I (SQE coalescing per F099-H recommendation) remains the highest-
-     leverage next perf fix; orthogonal to F099-J.
+  C. (If A+B clear gate) Tier verdict + feature_list + merge-decision gate.
+
+Do NOT touch main worktree at /data/dongmao_dev/autumn (branch compio).
+
+The work has been commit-clean. Next session starts from HEAD = d5228d2.
