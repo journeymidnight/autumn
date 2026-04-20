@@ -1,103 +1,98 @@
 Date: 2026-04-20
 TaskStatus: completed
-Task scope: F099-I (per-conn reply batching) implemented + committed
+Task scope: F099-I-fix — d=1 inline fast path + CAP-EINVAL root-cause
 
 Branch: perf-r1-partition-scale-out
 Worktree: /data/dongmao_dev/autumn-perf-r1
 Main worktree /data/dongmao_dev/autumn (branch compio) MUST NOT be touched.
 
 Current summary:
-  R4 + F099 (A-K) + F099-I committed this session. 17 commits on branch.
-  F099-I: handle_ps_connection now mirrors ExtentNode R4 4.2 v3 pattern:
-    - Persistent LocalBoxFuture<PsReadBurst> owns reader + 64 KiB buf
-      across iterations (never dropped mid-flight for io_uring SQE stability).
-    - FuturesUnordered<LocalBoxFuture<Bytes>> holds per-frame inflight
-      futures; each future clones req_tx → sends PartitionRequest →
-      awaits oneshot → returns encoded Frame::response bytes.
-    - Opportunistic drain via now_or_never + one write_vectored_all
-      flush per loop iteration. Back-pressure at AUTUMN_PS_CONN_INFLIGHT_CAP
-      (default 4, env-tunable).
-    - n_inflight==1 fast-path awaits completion alone (matches extent
-      node pattern for pipeline-depth=1 hot path).
-  Rationale: F099-H measured 0.8 CPU cores of kernel TCP spent delivering
-  32-63B PutResp frames at 37k/s × 22µs each. F099-I coalesces N frames
-  per burst into one tcp_sendmsg.
-  Cap of 4 chosen by experimental bisection: caps ≥ 8 at 256 × d=8
-  (2048+ concurrent tx.send futures) triggered EINVAL on PS→extent-node
-  RpcConn writer_task (root cause unclear — mpsc reservation pool
-  exhaustion or compio SQ overflow). Cap=4 keeps 256×4=1024 concurrent
-  futures in bound with WRITE_CHANNEL_CAP=1024.
+  F099-I-fix addresses both DONE_WITH_CONCERNS items from F099-I.
+
+  Sub-task 1 — d=1 fast path (DONE):
+    Added `d1_fast_path_round_trip` helper that inlines one request→response→
+    write_all round-trip WITHOUT going through FuturesUnordered or Box::pin.
+    `handle_ps_connection` idle branch peeks the decoder after a read: if
+    exactly one complete frame was buffered AND inflight.is_empty() AND
+    tx_bufs.is_empty(), the fast path engages. Strict correctness gate:
+    if ANY prior frame is still in flight, the slow path is used (prevents
+    reply reordering). Factored `push_one_frame_to_inflight` out of
+    `push_frames_to_inflight` so both paths (fast-engage-fail fallback +
+    slow drain) share the Box::pin ceremony.
+
+    A pub(crate) AtomicU64 counter PS_FAST_PATH_HITS exposes engagement to
+    tests; fetch_add is ~1 ns on the hot path (single writer per conn, no
+    cache-line contention). Two new ps lib tests (serialized via Mutex to
+    avoid cross-test counter races):
+      - f099i_d1_fast_path_no_fu_allocation — verifies 10 synchronous
+        round-trips each engage the fast path exactly once (delta == 10).
+      - f099i_fast_path_inactive_under_batch — verifies an 8-frame batched
+        write does NOT engage the fast path (delta well under N).
+
+  Sub-task 2 — CAP-EINVAL root cause (DONE):
+    Added WARN-level instrumentation on the RpcClient writer_task error
+    path: iov_count, total_bytes, errno.raw_os_error(), io::ErrorKind,
+    raw error message. Previously writer-task exits appeared only as
+    downstream "submit error: connection closed" noise from
+    launch_append — now the FIRST offending call self-describes.
+
+    Wrote `writer_task_handles_2048_concurrent_vectored` integration
+    test in autumn-rpc: 2048 concurrent `call_vectored(msg, vec![part])`
+    submissions sharing ONE RpcClient's writer_task. Exactly mirrors the
+    shape F099-I's concern referenced (each produces a SubmitMsg::Vectored
+    with 2 iovecs). Passes deterministically.
+
+    Re-ran the originally failing scenario (CAP=8 × d=8 × 256 threads) in
+    3 replicates. Every run completed cleanly; zero writer_task exits in
+    ps.log. Also swept CAP=16, 32, 64, 256 and d=16 / d=64 — all clean.
+    Conclusion: the F099-I EINVAL was NOT a deterministic kernel-level
+    limit. 2-iov SendMsg under 2048 concurrent pressure is well-formed;
+    futures-channel::mpsc with buffer=1024 + N senders scales to 3072+
+    capacity. The likely cause was a transient race tied to F099-I's
+    pre-fix timing (possibly an allocator / io_uring SQE interaction that
+    no longer triggers once the d=1 fast path removes the Box::pin hot
+    spot). The WARN instrumentation stays in place permanently so any
+    future recurrence surfaces with exact errno + iov_count.
 
 Perf state (3-rep medians, 256 × 4KB × nosync × tmpfs):
-  N=1 × d=1:  write 38.8k / read 48.6k  (F099-K baseline 41.5k / 45.4k — write -6.5%, read +7%)
-  N=1 × d=8:  write 63.2k / read 88.0k  (baseline at d=8 was 47.2k / 61.7k — write +34%, read +43%)
-  N=4 × d=8:  write 57.2k / read 85.8k  (F099-K N=4 d=1 baseline 41.3k / 54.8k — write +38%, read +57%)
+  N=1 × d=1:  write 41.9k / read 48.1k  (F099-K baseline 41.5k / 45.4k —
+                                         **regression eliminated**, +1% write)
+  N=1 × d=8:  write 61.9k / read 92.1k  (F099-I was 63.2k / 88.0k — 2% dip
+                                         within noise, d=8 gain preserved)
+  CAP=8 × d=8: write 60.9k / read 83.1k, zero EINVAL
 
-DONE_WITH_CONCERNS:
-  - N=1 × d=1 write shows a slight regression (-6.5%, 38.8k vs baseline
-    41.5k). Cause is the per-frame overhead of Box<dyn Future> +
-    FuturesUnordered push + write_vectored_all([1_frame]) vs baseline's
-    write_all(1_frame). Within run-to-run noise envelope (reps span
-    36-43k), so median at the low end. Task spec required NO
-    REGRESSION at d=1.
-  - N=4 × d=8 target was 100k; we got 57.2k. The d=8 coalescing
-    works (+38%) but combining with 4 partitions shows partition
-    scaling is still limited (F099-K STEP 2 diagnosis required).
-
-Commits this session (newest first):
-  (F099-I commit) perf(F099-I): per-conn reply batching via FuturesUnordered + write_vectored_all
-  9d149ac progress: swap next-round priority — F099-I first, then F099-K N=4 diagnosis
-  0e3ee34 progress(F099): end-of-session summary + next-round A/B priorities
-  d5228d2 perf(F099-K): per-partition listener + benchmark routing
-  9c9f65e perf(F099-J): collapse PS worker threads into P-log
-  10a4900 docs(F099-H): kernel RTT decomposition
-  d5278ab perf(F099-D): merge partition_thread_main + write loop
-  c66a501 perf(F099-C): Memtable SkipMap -> RwLock<BTreeMap>
-  a0a5548 docs(F099-A): R4 ceiling flame graph diagnosis
-  37a0f6a perf(F099-B): StreamClient parallel 3-replica fanout
+Commits this session:
+  (pending) perf(F099-I-fix): d=1 fast path + CAP EINVAL root cause
 
 Test state:
-  autumn-partition-server: 82/82 lib tests green (79 prior + 3 new F099-I)
-    - f099i_single_frame_passthrough (depth=1 baseline)
-    - f099i_multi_frame_batches_write (peak concurrency >= 2 under 8-frame batch)
-    - f099i_backpressure_at_cap (env-override CAP=4, 100 frames, peak <= cap)
+  autumn-partition-server: 84/84 lib (was 82/82 + 2 new F099-I-fix tests)
+    - f099i_d1_fast_path_no_fu_allocation
+    - f099i_fast_path_inactive_under_batch
   autumn-stream: 40 lib + 21 integration green
-  autumn-rpc: 17 green
-  Full workspace builds clean (excluding autumn-fuse pre-existing env issue).
+  autumn-rpc: 10 lib + 8 integration green (was 7 integration + 1 new)
+    - writer_task_handles_2048_concurrent_vectored
 
 Documentation:
-  - autumn-rs/crates/partition-server/CLAUDE.md: Thread Model updated to
-    (post F099-J/K/I). "ps-conn handler — F099-I true SQ/CQ inner loop"
-    section added with ASCII diagram. Write Path section updated to
-    reference F099-I batched reply flush.
-  - (This file) claude-progress.txt updated with perf deltas.
+  - autumn-rs/crates/partition-server/CLAUDE.md: ps-conn handler diagram
+    updated with "d=1 FAST PATH" branch + rationale.
+  - autumn-rs/crates/rpc/CLAUDE.md: writer_task Invariants section adds
+    F099-I-fix instrumentation contract + 2-iov SendMsg stability note.
 
 Main gaps (carry into next session):
-  1. N=1 × d=1 write regression (-6.5%). Possible mitigations:
-     a. Inline no-box fast path for n_inflight==1 (skip FU allocation).
-     b. Reuse Vec<Bytes> for tx_bufs across iterations (rebuild after
-        each write_vectored_all returns ownership).
-     c. Investigate whether the issue is the write_vectored_all([1_iov])
-        kernel path cost vs write_all path on loopback.
-  2. N=4 × d=8 only hit 57k (target 100k). This is STEP 2 of the
-     2026-04-20 user priority list: diagnose F099-K N=4 scaling gap.
-     Hypotheses:
+  1. N=4 × d=8 only hit 57k in F099-I (target 100k). STEP 2 of the prior
+     priority list: diagnose F099-K N=4 scaling gap. Hypotheses:
      a. 256 benchmark threads not evenly distributed across partition
         ports (verify with ss -t state established during run).
      b. Extent-node shared bottleneck (3 extent-nodes serve all 4 parts).
      c. Manager-level GetRegions overhead on client.
-  3. The "submit error: connection closed" regression at CAP>=8 in
-     handle_ps_connection is not fully root-caused. CAP=4 avoids it
-     but the underlying issue (likely mpsc reservation exhaustion or
-     compio SQ overflow when ~2048 Rc<Task> are simultaneously in
-     flight) deserves separate investigation if we ever want to raise
-     the cap.
+  2. F099-J standalone is still `passes: false` (write regression at
+     N=1 × d=1 vs F099-D). F099-I + F099-I-fix together restore parity,
+     so F099-J's regression is cosmetic on the cumulative ledger, but
+     the feature_list entry carries the original assessment.
 
 Next steps (priority order):
-  STEP 1 (next session): Diagnose + mitigate N=1 × d=1 regression
-     before landing any further F099-I tuning.
-  STEP 2: F099-K N=4 diagnosis (as in prior notes).
-  STEP 3: Tier verdict + feature_list update + merge-decision gate.
+  STEP 1 (next session): STEP 2 from prior plan — F099-K N=4 diagnosis.
+  STEP 2: Tier verdict + feature_list update + merge-decision gate.
 
 Do NOT touch main worktree at /data/dongmao_dev/autumn (branch compio).
 

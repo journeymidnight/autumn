@@ -331,6 +331,18 @@ async fn writer_task(
 ) {
     while let Some(msg) = submit_rx.next().await {
         let req_id = msg.req_id();
+        // F099-I-fix instrumentation: capture iov count + total bytes
+        // before the syscall so the EINVAL path can attribute the error
+        // to the exact shape of the Vectored message. Negligible cost
+        // (2 integer ops per msg; the logging formatter only runs on the
+        // rare error branch).
+        let (iov_count, total_bytes) = match &msg {
+            SubmitMsg::Single { bytes, .. } => (1usize, bytes.len()),
+            SubmitMsg::Vectored { bufs, .. } => {
+                let total: usize = bufs.iter().map(|b| b.len()).sum();
+                (bufs.len(), total)
+            }
+        };
         let result = match msg {
             SubmitMsg::Single { bytes, .. } => {
                 let BufResult(r, _) = writer.write_all(bytes).await;
@@ -343,11 +355,22 @@ async fn writer_task(
         };
 
         if let Err(e) = result {
+            // F099-I-fix (CAP-EINVAL): ALWAYS log the write error at
+            // WARN so production runs surface the root-cause signature
+            // (iov_count, total_bytes, errno.raw_os_error()) rather than
+            // just a downstream "submit error: connection closed" cascade.
+            // The original F099-I concern speculated about `IOV_MAX`
+            // exhaustion; in practice the shape logged here lets us
+            // confirm or reject that hypothesis from a single bench run.
             tracing::warn!(
                 addr = %peer_addr,
                 req_id,
+                iov_count,
+                total_bytes,
+                errno = ?e.raw_os_error(),
+                kind = ?e.kind(),
                 error = %e,
-                "rpc client writer exited on write error"
+                "rpc client writer exited on write error (F099-I-fix instrumentation)"
             );
             // Remove this request's pending entry so the caller surfaces
             // ConnectionClosed immediately (req_id 0 never had one).

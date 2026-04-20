@@ -56,6 +56,20 @@ Error responses encode status as: `[status_code: u8][message bytes]`.
   - `submit_tx` is cloned from a `RefCell` borrow (scoped), never borrowed
     across `.send().await` — avoids RefCell-across-await panics.
   - `next_req_id` skips `0` on wraparound (0 reserved for fire-and-forget).
+- **F099-I-fix writer_task instrumentation**: on any write error, the
+  writer_task logs `iov_count`, `total_bytes`, `errno.raw_os_error()`,
+  `kind`, and the error message at WARN before exiting. This makes the
+  previously opaque "submit error: connection closed" downstream cascade
+  (see `stream::client::launch_append`) self-explanatory — the FIRST
+  writer that encountered a kernel-level error in a stress run surfaces
+  with the exact shape of the offending SendMsg, eliminating guesswork.
+- **2-iov SendMsg shape is stable**: every `call_vectored` /
+  `send_vectored` produces a `SubmitMsg::Vectored { bufs: [hdr, part] }`
+  with exactly 2 iovecs — well under UIO_MAXIOV=1024. The writer_task
+  serialises submits so concurrent callers never combine their iovs in
+  one syscall. Stress-tested at 2048 concurrent futures sharing one
+  writer_task in `writer_task_handles_2048_concurrent_vectored` — no
+  EINVAL, no EAGAIN, all requests complete.
 
 ### `server.rs`
 - `RpcServer::new(handler)`: create server with async handler `Fn(u8, Bytes) -> Result<Bytes, (StatusCode, String)>`

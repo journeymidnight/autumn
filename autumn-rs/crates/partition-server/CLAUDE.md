@@ -80,7 +80,12 @@ progress concurrently with SST uploads.
 │        → tx_bufs                                                │
 │    (B) flush tx_bufs with ONE `write_vectored_all` syscall      │
 │    (C) branch on (n_inflight, at_cap):                          │
-│       n_inflight == 0 → await read alone                        │
+│       n_inflight == 0 → await read alone; then                  │
+│         d=1 FAST PATH: if the burst yielded exactly one          │
+│         complete frame AND inflight/tx_bufs are empty,           │
+│         run request→response→write inline via `write_all`       │
+│         (no FU, no Box::pin, no write_vectored). Restores       │
+│         pre-F099-I cost at pipeline-depth=1.                     │
 │       at_cap          → await completion alone (back-pressure)  │
 │       n_inflight == 1 → await completion (fast path: avoid      │
 │           5-10 µs per-iter select polling cost at d=1)          │
@@ -92,8 +97,12 @@ progress concurrently with SST uploads.
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-At `--pipeline-depth=1`: degenerates to `write_vectored_all([one_frame])`
-per reply, same cost as pre-F099-I `write_all(one_frame)`; NO regression.
+At `--pipeline-depth=1`: the d=1 fast path engages — after reading a
+single-frame burst with no earlier in-flight replies, the ps-conn task
+does `tx.send(req) → resp_rx.await → writer.write_all(bytes)` inline.
+No `Box::pin(async {...})` heap alloc, no `FuturesUnordered::push`, no
+`write_vectored_all([1_iov])` — strictly cheaper than the pre-F099-I
+baseline's `write_all(one_frame)` path.
 
 At `--pipeline-depth ≥ N`: one TCP read delivers N frames → all N futures
 in `inflight` concurrently → drain-all-ready collects up to N ready replies

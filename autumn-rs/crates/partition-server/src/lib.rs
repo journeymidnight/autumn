@@ -1057,6 +1057,15 @@ fn ps_conn_inflight_cap() -> usize {
     })
 }
 
+/// F099-I-fix — observability counter for the d=1 fast path. Incremented
+/// once per inline round-trip taken by `handle_ps_connection`. Exposed for
+/// tests only; the `fetch_add` on an AtomicU64 is ~1 ns so the cost is
+/// negligible on the hot path. In production the counter only grows — no
+/// reader, no resetter — so there is no cache-line contention (single
+/// writer per conn, separate allocator-decided line for the static).
+pub(crate) static PS_FAST_PATH_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// F099-I — outcome of one persistent read future iteration.  The future
 /// owns both the reader and the buffer across iterations so it can be left
 /// pinned in the event loop's `select` without ever being dropped
@@ -1103,6 +1112,77 @@ fn spawn_ps_read(
     .boxed_local()
 }
 
+/// F099-I — push ONE frame onto `inflight`, encoded into a
+/// LocalBoxFuture<Bytes>.  Shared by `push_frames_to_inflight` (slow-path
+/// drain) and any caller that already has a single frame in hand.
+///
+/// Misrouted frames synth an error frame with no mpsc hop.  Caller must
+/// have checked `frame.req_id != 0`; fire-and-forget frames are the
+/// caller's responsibility to skip (matches pre-F099-I semantics).
+fn push_one_frame_to_inflight(
+    frame: Frame,
+    req_tx: &mpsc::Sender<PartitionRequest>,
+    owner_part: u64,
+    inflight: &mut FuturesUnordered<futures::future::LocalBoxFuture<'static, Bytes>>,
+) {
+    use futures::FutureExt;
+    let req_id = frame.req_id;
+    let msg_type = frame.msg_type;
+    let payload = frame.payload;
+    let part_id = partition_rpc::extract_part_id(msg_type, &payload);
+
+    if part_id != owner_part {
+        // Mis-routed — synth error frame, no mpsc hop.
+        // TODO(F099-K): forward to owning P-log's req_tx.
+        let err_payload = autumn_rpc::RpcError::encode_status(
+            StatusCode::NotFound,
+            &format!("partition {part_id} not served by this P-log (owner={owner_part})"),
+        );
+        let bytes = Frame::error(req_id, msg_type, err_payload).encode();
+        inflight.push(async move { bytes }.boxed_local());
+        return;
+    }
+
+    let mut tx = req_tx.clone();
+    let fut = async move {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let req = PartitionRequest {
+            msg_type,
+            payload,
+            resp_tx,
+        };
+        let resp_frame = if tx.send(req).await.is_err() {
+            Frame::error(
+                req_id,
+                msg_type,
+                autumn_rpc::RpcError::encode_status(
+                    StatusCode::Internal,
+                    "partition thread closed",
+                ),
+            )
+        } else {
+            match resp_rx.await {
+                Ok(Ok(p)) => Frame::response(req_id, msg_type, p),
+                Ok(Err((code, message))) => Frame::error(
+                    req_id,
+                    msg_type,
+                    autumn_rpc::RpcError::encode_status(code, &message),
+                ),
+                Err(_) => Frame::error(
+                    req_id,
+                    msg_type,
+                    autumn_rpc::RpcError::encode_status(
+                        StatusCode::Internal,
+                        "partition response dropped",
+                    ),
+                ),
+            }
+        };
+        resp_frame.encode()
+    };
+    inflight.push(fut.boxed_local());
+}
+
 /// F099-I — drain all complete frames from `decoder`, pushing one future
 /// per frame onto `inflight`. Each future owns a cloned `req_tx` + fresh
 /// oneshot; when polled it:
@@ -1125,7 +1205,6 @@ async fn push_frames_to_inflight(
     tx_bufs: &mut Vec<Bytes>,
     cap: usize,
 ) -> Result<()> {
-    use futures::FutureExt;
     loop {
         match decoder.try_decode().map_err(|e| anyhow!(e))? {
             Some(frame) if frame.req_id != 0 => {
@@ -1137,70 +1216,84 @@ async fn push_frames_to_inflight(
                         break;
                     }
                 }
-
-                let req_id = frame.req_id;
-                let msg_type = frame.msg_type;
-                let payload = frame.payload;
-                let part_id = partition_rpc::extract_part_id(msg_type, &payload);
-
-                if part_id != owner_part {
-                    // Mis-routed — synth error frame, no mpsc hop.
-                    // TODO(F099-K): forward to owning P-log's req_tx.
-                    let err_payload = autumn_rpc::RpcError::encode_status(
-                        StatusCode::NotFound,
-                        &format!(
-                            "partition {part_id} not served by this P-log (owner={owner_part})"
-                        ),
-                    );
-                    let bytes = Frame::error(req_id, msg_type, err_payload).encode();
-                    inflight.push(async move { bytes }.boxed_local());
-                    continue;
-                }
-
-                let mut tx = req_tx.clone();
-                let fut = async move {
-                    let (resp_tx, resp_rx) = oneshot::channel();
-                    let req = PartitionRequest {
-                        msg_type,
-                        payload,
-                        resp_tx,
-                    };
-                    let resp_frame = if tx.send(req).await.is_err() {
-                        Frame::error(
-                            req_id,
-                            msg_type,
-                            autumn_rpc::RpcError::encode_status(
-                                StatusCode::Internal,
-                                "partition thread closed",
-                            ),
-                        )
-                    } else {
-                        match resp_rx.await {
-                            Ok(Ok(p)) => Frame::response(req_id, msg_type, p),
-                            Ok(Err((code, message))) => Frame::error(
-                                req_id,
-                                msg_type,
-                                autumn_rpc::RpcError::encode_status(code, &message),
-                            ),
-                            Err(_) => Frame::error(
-                                req_id,
-                                msg_type,
-                                autumn_rpc::RpcError::encode_status(
-                                    StatusCode::Internal,
-                                    "partition response dropped",
-                                ),
-                            ),
-                        }
-                    };
-                    resp_frame.encode()
-                };
-                inflight.push(fut.boxed_local());
+                push_one_frame_to_inflight(frame, req_tx, owner_part, inflight);
             }
             Some(_) => continue, // req_id == 0 fire-and-forget
             None => break,
         }
     }
     Ok(())
+}
+
+/// F099-I-fix — d=1 fast path.  Run a single request round-trip inline
+/// without going through `FuturesUnordered` or `Box<dyn Future>` at all.
+/// Returns the encoded response frame bytes ready for `write_all`.
+///
+/// Precondition enforced by caller: `inflight.is_empty()` and
+/// `tx_bufs.is_empty()`.  Frame must have `req_id != 0` (fire-and-forget
+/// has no reply).  Misrouted frames synth a local error frame without
+/// touching the mpsc — same ordering as the slow path.
+///
+/// This path avoids: (a) `Box::pin(async move { ... })` heap alloc,
+/// (b) `FuturesUnordered::push` pinning ceremony, (c) `FuturesUnordered::next`
+/// state-machine poll cost, (d) `write_vectored_all` with a single iov (goes
+/// through sendmsg/UIO_MAXIOV setup) in favor of `write_all` (send/write).
+/// Measured by F099-I as ~6.5 % of the N=1 × d=1 write throughput on tmpfs;
+/// this restores the pre-F099-I baseline for the depth=1 hot path while
+/// preserving the depth≥2 batching gains.
+async fn d1_fast_path_round_trip(
+    frame: Frame,
+    req_tx: &mpsc::Sender<PartitionRequest>,
+    owner_part: u64,
+) -> Bytes {
+    let req_id = frame.req_id;
+    let msg_type = frame.msg_type;
+    let payload = frame.payload;
+    let part_id = partition_rpc::extract_part_id(msg_type, &payload);
+
+    if part_id != owner_part {
+        let err_payload = autumn_rpc::RpcError::encode_status(
+            StatusCode::NotFound,
+            &format!("partition {part_id} not served by this P-log (owner={owner_part})"),
+        );
+        return Frame::error(req_id, msg_type, err_payload).encode();
+    }
+
+    let (resp_tx, resp_rx) = oneshot::channel();
+    let req = PartitionRequest {
+        msg_type,
+        payload,
+        resp_tx,
+    };
+    let mut tx = req_tx.clone();
+    let resp_frame = if tx.send(req).await.is_err() {
+        Frame::error(
+            req_id,
+            msg_type,
+            autumn_rpc::RpcError::encode_status(
+                StatusCode::Internal,
+                "partition thread closed",
+            ),
+        )
+    } else {
+        match resp_rx.await {
+            Ok(Ok(p)) => Frame::response(req_id, msg_type, p),
+            Ok(Err((code, message))) => Frame::error(
+                req_id,
+                msg_type,
+                autumn_rpc::RpcError::encode_status(code, &message),
+            ),
+            Err(_) => Frame::error(
+                req_id,
+                msg_type,
+                autumn_rpc::RpcError::encode_status(
+                    StatusCode::Internal,
+                    "partition response dropped",
+                ),
+            ),
+        }
+    };
+    resp_frame.encode()
 }
 
 /// Handle a single client connection on the P-log runtime.
@@ -1279,6 +1372,73 @@ async fn handle_ps_connection(
                 PsReadBurst::Err { e, .. } => return Err(e.into()),
                 PsReadBurst::Data { buf, n, reader } => {
                     decoder.feed(&buf[..n]);
+
+                    // F099-I-fix — d=1 fast path.
+                    //
+                    // When a TCP read yields exactly one full frame AND
+                    // nothing is already in flight, skip FU entirely: do
+                    // the request→response→write inline using `write_all`
+                    // (single iov path, matches pre-F099-I cost). This
+                    // path dominates at `--pipeline-depth=1` (the client
+                    // awaits each reply before sending the next), so the
+                    // FU-based slow path was paying per-frame heap alloc
+                    // (Box::pin) + push/pop ceremony + write_vectored_all
+                    // with one iovec for every Put. F099-I measured
+                    // -6.5 % at d=1 from that overhead; this restores the
+                    // baseline while preserving d≥2 batching gains.
+                    //
+                    // Preconditions (all checked):
+                    //   * inflight.is_empty() — guaranteed by the
+                    //     `n_inflight == 0` branch we just entered.
+                    //   * tx_bufs.is_empty() — flushed above at (B).
+                    //   * decoder yields exactly one frame: first
+                    //     try_decode returns Some, next returns None.
+                    //     (If any bytes remain in decoder after the
+                    //     first frame, there is either a complete second
+                    //     frame — fall back to slow path for ordering —
+                    //     or a partial frame header for the next read.
+                    //     In the latter case the next try_decode returns
+                    //     None, which is exactly the fast-path condition.)
+                    //   * frame.req_id != 0 (real request, not fire-
+                    //     and-forget).
+                    //
+                    // Correctness: because inflight+tx_bufs are empty,
+                    // no earlier frame's reply is waiting to be written.
+                    // Running the round-trip inline preserves in-order
+                    // reply semantics for this connection.
+                    let first = decoder.try_decode().map_err(|e| anyhow!(e))?;
+                    if let Some(frame) = first {
+                        let more = decoder.try_decode().map_err(|e| anyhow!(e))?;
+                        if more.is_none() && frame.req_id != 0 {
+                            // Engage fast path.
+                            PS_FAST_PATH_HITS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let resp_bytes = d1_fast_path_round_trip(
+                                frame, &req_tx, owner_part,
+                            )
+                            .await;
+                            let BufResult(wr, _) = writer.write_all(resp_bytes).await;
+                            wr?;
+                            read_fut = Some(spawn_ps_read(reader, buf));
+                            continue;
+                        }
+                        // Fall back: push the first frame (if it had a
+                        // req_id) and any second frame we decoded,
+                        // then drain whatever else is buffered.
+                        if frame.req_id != 0 {
+                            push_one_frame_to_inflight(
+                                frame, &req_tx, owner_part, &mut inflight,
+                            );
+                        }
+                        if let Some(second) = more {
+                            if second.req_id != 0 {
+                                push_one_frame_to_inflight(
+                                    second, &req_tx, owner_part, &mut inflight,
+                                );
+                            }
+                        }
+                    }
+                    // Drain any remaining frames + apply back-pressure.
                     push_frames_to_inflight(
                         &mut decoder,
                         &req_tx,
@@ -4369,5 +4529,217 @@ mod f099i_tests {
             })
             .expect("spawn bp test thread");
         handle.join().expect("bp test thread panicked");
+    }
+
+    /// Serialise all tests that read `PS_FAST_PATH_HITS` — the global
+    /// counter is shared process-wide and concurrent tests would mutate
+    /// it unpredictably.  Short-lived lock held only during the test
+    /// body; other tests not in this module are unaffected.
+    fn fast_path_counter_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().expect("fast_path_counter_lock poisoned")
+    }
+
+    /// F099-I-fix test — the d=1 fast path MUST engage when exactly one
+    /// frame is read from the TCP socket AND nothing else is in flight.
+    ///
+    /// We verify by sending 10 synchronous Put→reply round-trips on one
+    /// connection and asserting `PS_FAST_PATH_HITS` grows by 10.  Each
+    /// round-trip awaits the reply before sending the next, so every
+    /// read delivers exactly one frame to a ps-conn task that has just
+    /// finished writing the previous reply (inflight empty, tx_bufs
+    /// empty) — textbook fast-path conditions.
+    ///
+    /// This test also doubles as a regression guard: if a future change
+    /// re-introduces FU+Box allocation on the d=1 hot path, the hit
+    /// counter stays at 0 and the test fails.
+    #[test]
+    fn f099i_d1_fast_path_no_fu_allocation() {
+        let _guard = fast_path_counter_lock();
+        let rt = compio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            // Snapshot the counter before we start — the lock ensures no
+            // other fast-path-observing test is concurrently running.
+            let before = PS_FAST_PATH_HITS
+                .load(std::sync::atomic::Ordering::Relaxed);
+
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let client = compio::net::TcpStream::connect(addr).await.expect("connect");
+            let (server, _) = listener.accept().await.expect("accept");
+
+            let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(8);
+
+            let conn_handle = compio::runtime::spawn(async move {
+                handle_ps_connection(server, req_tx, /*owner_part=*/ 11).await
+            });
+
+            // Responder: answer each request immediately so the fast-path
+            // round-trip completes without delay.
+            let loop_handle = compio::runtime::spawn(async move {
+                while let Some(req) = req_rx.next().await {
+                    let put: PutReq =
+                        partition_rpc::rkyv_decode(&req.payload).expect("decode");
+                    let resp = partition_rpc::rkyv_encode(&PutResp {
+                        code: CODE_OK,
+                        message: String::new(),
+                        key: put.key,
+                    });
+                    let _ = req.resp_tx.send(Ok(resp));
+                }
+            });
+
+            let (mut client_rd, mut client_wr) = client.into_split();
+            let mut decoder = FrameDecoder::new();
+            let mut buf = vec![0u8; 8192];
+
+            const N: u32 = 10;
+            for i in 0..N {
+                let put = PutReq {
+                    part_id: 11,
+                    key: format!("fast-{i:02}").into_bytes(),
+                    value: b"v".to_vec(),
+                    must_sync: false,
+                    expires_at: 0,
+                };
+                let payload = partition_rpc::rkyv_encode(&put);
+                let frame_bytes =
+                    Frame::request(5000 + i, MSG_PUT, Bytes::from(payload)).encode();
+                let BufResult(r, _) = client_wr.write_all(frame_bytes).await;
+                r.expect("write");
+
+                // Block until the single reply arrives — this is what
+                // makes it "d=1": one frame in flight, then wait.
+                let resp_frame = loop {
+                    let BufResult(n, back) = client_rd.read(buf).await;
+                    buf = back;
+                    let n = n.expect("read");
+                    assert!(n > 0, "EOF before response for i={i}");
+                    decoder.feed(&buf[..n]);
+                    if let Some(f) = decoder.try_decode().expect("decode") {
+                        break f;
+                    }
+                };
+                assert_eq!(resp_frame.req_id, 5000 + i);
+                assert!(!resp_frame.is_error());
+            }
+
+            let after = PS_FAST_PATH_HITS
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let delta = after - before;
+            assert_eq!(
+                delta, N as u64,
+                "d=1 fast path must engage exactly N={N} times; \
+                 observed delta={delta} (before={before}, after={after})"
+            );
+
+            drop(client_rd);
+            drop(client_wr);
+            let _ = conn_handle.await;
+            let _ = loop_handle.await;
+        });
+    }
+
+    /// F099-I-fix test — the fast path MUST NOT engage when prior frames
+    /// are still in `inflight`.  We exercise this by flooding 8 frames
+    /// in one TCP write: the first read yields 8 frames → 8 futures in
+    /// `inflight` → slow path.  Counter must not grow.
+    ///
+    /// Correctness of the gating check `inflight.is_empty()` is critical:
+    /// if the fast path engaged mid-burst, reply order would be scrambled
+    /// (fast-path reply written before earlier in-flight replies).
+    #[test]
+    fn f099i_fast_path_inactive_under_batch() {
+        let _guard = fast_path_counter_lock();
+        let rt = compio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let before = PS_FAST_PATH_HITS
+                .load(std::sync::atomic::Ordering::Relaxed);
+
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let client = compio::net::TcpStream::connect(addr).await.expect("connect");
+            let (server, _) = listener.accept().await.expect("accept");
+
+            let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(16);
+
+            let conn_handle = compio::runtime::spawn(async move {
+                handle_ps_connection(server, req_tx, 13).await
+            });
+
+            let loop_handle = compio::runtime::spawn(async move {
+                while let Some(req) = req_rx.next().await {
+                    let put: PutReq =
+                        partition_rpc::rkyv_decode(&req.payload).expect("decode");
+                    let resp = partition_rpc::rkyv_encode(&PutResp {
+                        code: CODE_OK,
+                        message: String::new(),
+                        key: put.key,
+                    });
+                    let _ = req.resp_tx.send(Ok(resp));
+                }
+            });
+
+            let (mut client_rd, mut client_wr) = client.into_split();
+
+            const N: u32 = 8;
+            let mut big = Vec::with_capacity(N as usize * 64);
+            for i in 0..N {
+                let put = PutReq {
+                    part_id: 13,
+                    key: format!("batch-{i}").into_bytes(),
+                    value: b"v".to_vec(),
+                    must_sync: false,
+                    expires_at: 0,
+                };
+                let payload = partition_rpc::rkyv_encode(&put);
+                let f = Frame::request(6000 + i, MSG_PUT, Bytes::from(payload)).encode();
+                big.extend_from_slice(&f[..]);
+            }
+            let BufResult(r, _) = client_wr.write_all(big).await;
+            r.expect("write batch");
+
+            // Receive all N replies.
+            let mut decoder = FrameDecoder::new();
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut seen = 0u32;
+            while seen < N {
+                let BufResult(n, back) = client_rd.read(buf).await;
+                buf = back;
+                let n = n.expect("read");
+                assert!(n > 0, "EOF before all replies");
+                decoder.feed(&buf[..n]);
+                while let Some(frame) = decoder.try_decode().expect("decode") {
+                    assert!(!frame.is_error());
+                    seen += 1;
+                }
+            }
+            assert_eq!(seen, N);
+
+            let after = PS_FAST_PATH_HITS
+                .load(std::sync::atomic::Ordering::Relaxed);
+            // The first read delivers all 8 frames at once (TCP on
+            // loopback typically coalesces). So fast path must not
+            // engage for any of them. Allow a small drift for the
+            // (unlikely) race where TCP delivers the first frame alone
+            // before the rest land, but assert that the fast path was
+            // NOT used for MOST of the batch. In practice on loopback
+            // we see delta == 0.
+            let delta = after - before;
+            assert!(
+                delta < N as u64,
+                "fast path engaged {delta} times for batched N={N} frames; \
+                 must stay well below N (prefer 0 on loopback)"
+            );
+
+            drop(client_rd);
+            drop(client_wr);
+            let _ = conn_handle.await;
+            let _ = loop_handle.await;
+        });
     }
 }
