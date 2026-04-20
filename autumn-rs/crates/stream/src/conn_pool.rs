@@ -135,6 +135,29 @@ impl Default for ConnPool {
     }
 }
 
+/// F099-M: route `extent_id` to the correct shard port.
+///
+/// If `shard_ports` is empty, returns `address` unchanged (legacy mode).
+/// Otherwise replaces the port in `address` with `shard_ports[extent_id % K]`
+/// and returns the resulting `host:port` string.
+pub fn shard_addr_for_extent(address: &str, shard_ports: &[u16], extent_id: u64) -> String {
+    if shard_ports.is_empty() {
+        return address.to_string();
+    }
+    let k = shard_ports.len();
+    let port = shard_ports[(extent_id as usize) % k];
+    // Replace port while preserving host. Address may be of the form
+    // "host:port" or "[ipv6]:port". Split at the last ':' before the port.
+    let addr_trimmed = address
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    if let Some(colon) = addr_trimmed.rfind(':') {
+        format!("{}:{}", &addr_trimmed[..colon], port)
+    } else {
+        format!("{address}:{port}")
+    }
+}
+
 /// Parse a "host:port" address into a SocketAddr.
 pub fn parse_addr(addr: &str) -> Result<SocketAddr> {
     let stripped = addr

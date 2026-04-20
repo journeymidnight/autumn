@@ -217,6 +217,18 @@ pub struct ExtentNodeConfig {
     disks: Vec<(PathBuf, Option<u64>)>,
     pub manager_endpoint: Option<String>,
     pub wal_dir: Option<PathBuf>,
+    /// F099-M: this shard's index (0..shard_count). Only extents where
+    /// `extent_id % shard_count == shard_idx` are owned by this instance.
+    pub shard_idx: u32,
+    /// F099-M: total shard count in the extent-node process. 1 = legacy
+    /// single-threaded mode; >1 enables per-shard filtering + routing.
+    pub shard_count: u32,
+    /// F099-M: sibling shards' local listener addresses on this process
+    /// (typically `127.0.0.1:<shard_ports[i]>`). Used by control-plane
+    /// RPC handlers (alloc, re_avali, convert_to_ec, copy_extent,
+    /// require_recovery) to forward a mismatched extent_id to the
+    /// owning sibling shard via localhost loopback.
+    pub sibling_addrs: Vec<String>,
 }
 
 impl ExtentNodeConfig {
@@ -226,6 +238,9 @@ impl ExtentNodeConfig {
             disks: vec![(data_dir, Some(disk_id))],
             manager_endpoint: None,
             wal_dir: None,
+            shard_idx: 0,
+            shard_count: 1,
+            sibling_addrs: Vec::new(),
         }
     }
 
@@ -236,6 +251,9 @@ impl ExtentNodeConfig {
             disks: data_dirs.into_iter().map(|d| (d, None)).collect(),
             manager_endpoint: None,
             wal_dir: None,
+            shard_idx: 0,
+            shard_count: 1,
+            sibling_addrs: Vec::new(),
         }
     }
 
@@ -246,6 +264,25 @@ impl ExtentNodeConfig {
 
     pub fn with_wal_dir(mut self, wal_dir: PathBuf) -> Self {
         self.wal_dir = Some(wal_dir);
+        self
+    }
+
+    /// F099-M: mark this config as a shard of a multi-shard extent-node.
+    /// `shard_idx` must be < `shard_count`. `sibling_addrs[i]` is the
+    /// local address of shard `i` (normally `127.0.0.1:<shard_ports[i]>`).
+    pub fn with_shard(mut self, shard_idx: u32, shard_count: u32, sibling_addrs: Vec<String>) -> Self {
+        assert!(shard_count >= 1, "shard_count must be >= 1");
+        assert!(shard_idx < shard_count, "shard_idx must be < shard_count");
+        if shard_count > 1 {
+            assert_eq!(
+                sibling_addrs.len(),
+                shard_count as usize,
+                "sibling_addrs must have exactly shard_count entries"
+            );
+        }
+        self.shard_idx = shard_idx;
+        self.shard_count = shard_count;
+        self.sibling_addrs = sibling_addrs;
         self
     }
 }
@@ -277,6 +314,14 @@ pub struct ExtentNode {
     /// WAL for small must_sync writes. None if WAL is disabled.
     /// Wrapped in Rc<RefCell<>> for interior mutability on single-threaded compio.
     pub(crate) wal: Option<Rc<RefCell<Wal>>>,
+    /// F099-M: shard_idx / shard_count for per-shard extent ownership.
+    /// Default is (0, 1) = legacy single-thread mode.
+    shard_idx: u32,
+    shard_count: u32,
+    /// F099-M: local sibling shard addresses for cross-shard control RPC
+    /// forwarding. `sibling_addrs[i]` is the address of shard `i` on this
+    /// host. Empty in single-thread mode.
+    sibling_addrs: Rc<Vec<String>>,
 }
 
 impl Clone for ExtentNode {
@@ -289,6 +334,9 @@ impl Clone for ExtentNode {
             recovery_done: self.recovery_done.clone(),
             recovery_inflight: self.recovery_inflight.clone(),
             wal: self.wal.clone(),
+            shard_idx: self.shard_idx,
+            shard_count: self.shard_count,
+            sibling_addrs: self.sibling_addrs.clone(),
         }
     }
 }
@@ -912,9 +960,17 @@ impl ExtentNode {
             disk_map.insert(disk_id, Rc::new(disk));
         }
 
-        // Open WAL before loading extents so we can replay into freshly loaded files.
+        // F099-M: per-shard WAL subdir so fsync on one shard does not
+        // serialise with fsync on another (they live on separate compio
+        // runtimes and would otherwise block each other through a shared
+        // Wal record writer).
         let wal_result = if let Some(wal_dir) = config.wal_dir {
-            Some(Wal::open(wal_dir)?)
+            let resolved = if config.shard_count > 1 {
+                wal_dir.join(format!("shard_{}", config.shard_idx))
+            } else {
+                wal_dir
+            };
+            Some(Wal::open(resolved)?)
         } else {
             None
         };
@@ -927,12 +983,17 @@ impl ExtentNode {
             recovery_done: Rc::new(std::cell::RefCell::new(Vec::new())),
             recovery_inflight: Rc::new(DashMap::new()),
             wal: None, // set after replay
+            shard_idx: config.shard_idx,
+            shard_count: config.shard_count,
+            sibling_addrs: Rc::new(config.sibling_addrs),
         };
 
         // Load existing extents from all disks.
         node.load_extents().await?;
 
-        // Replay WAL records into extent files.
+        // Replay WAL records into extent files. Only this shard's WAL is
+        // replayed; cross-shard records live in sibling WAL dirs which
+        // the corresponding shard will replay on its own init.
         if let Some((mut wal, replay_files)) = wal_result {
             node.replay_wal(&replay_files).await;
             wal.cleanup_old_wals();
@@ -940,6 +1001,39 @@ impl ExtentNode {
         }
 
         Ok(node)
+    }
+
+    /// F099-M: does this shard own `extent_id`?
+    #[inline]
+    pub(crate) fn owns_extent(&self, extent_id: u64) -> bool {
+        self.shard_count <= 1 || (extent_id % self.shard_count as u64) as u32 == self.shard_idx
+    }
+
+    /// F099-M: return the local sibling address that owns `extent_id`
+    /// (this host's shard for the target extent). None in single-thread mode.
+    #[inline]
+    fn sibling_for_extent(&self, extent_id: u64) -> Option<&str> {
+        if self.shard_count <= 1 {
+            return None;
+        }
+        let owner = (extent_id % self.shard_count as u64) as usize;
+        self.sibling_addrs.get(owner).map(|s| s.as_str())
+    }
+
+    /// F099-M: forward a control-plane RPC to a sibling shard on the same
+    /// host. Used when an RPC arrives at a non-owner shard. Uses the
+    /// manager_pool as a general-purpose ConnPool (the sibling address is
+    /// a localhost loopback; per-shard reuse amortises the TCP cost).
+    async fn forward_rpc_to_sibling(
+        &self,
+        sibling_addr: &str,
+        msg_type: u8,
+        payload: Bytes,
+    ) -> HandlerResult {
+        self.manager_pool
+            .call(sibling_addr, msg_type, payload)
+            .await
+            .map_err(|e| (StatusCode::Unavailable, format!("forward to shard {sibling_addr}: {e}")))
     }
 
     /// Return the first online disk, or None if all are offline.
@@ -1075,6 +1169,21 @@ impl ExtentNode {
             .await?;
 
             for extent_id in found {
+                // F099-M: only load extents this shard owns. Under normal
+                // operation the other shards will never have touched this
+                // extent file (disk hash-byte vs. extent_id-modulo are
+                // independent, so all extents with the same id collide on
+                // the same file and shard). A mis-owned extent here would
+                // indicate a prior run with a different shard_count.
+                if !self.owns_extent(extent_id) {
+                    tracing::debug!(
+                        extent_id,
+                        shard_idx = self.shard_idx,
+                        shard_count = self.shard_count,
+                        "skip load: extent does not belong to this shard"
+                    );
+                    continue;
+                }
                 let path = disk.extent_path(extent_id);
                 let file = match OpenOptions::new()
                     .create(true)
@@ -1350,6 +1459,22 @@ impl ExtentNode {
     }
 
     async fn get_extent(&self, extent_id: u64) -> Result<Rc<ExtentEntry>, (StatusCode, String)> {
+        // F099-M: hot-path RPCs (append/read/commit_length) must hit the
+        // owning shard. A wrong-shard request signals a client routing
+        // bug — surface it as FailedPrecondition so the client logs it
+        // instead of silently succeeding on the wrong shard.
+        if !self.owns_extent(extent_id) {
+            return Err((
+                StatusCode::FailedPrecondition,
+                format!(
+                    "extent {} belongs to shard {} not shard {} (shard_count={})",
+                    extent_id,
+                    extent_id % self.shard_count as u64,
+                    self.shard_idx,
+                    self.shard_count,
+                ),
+            ));
+        }
         self.extents
             .get(&extent_id)
             .map(|v| Rc::clone(v.value()))
@@ -1357,6 +1482,17 @@ impl ExtentNode {
     }
 
     async fn ensure_extent(&self, extent_id: u64) -> Result<Rc<ExtentEntry>, String> {
+        // F099-M: a non-owning shard should never `ensure_extent`. This is
+        // an invariant violation — log loudly and reject.
+        if !self.owns_extent(extent_id) {
+            return Err(format!(
+                "ensure_extent on wrong shard: extent {} → shard {}, this is shard {} (count={})",
+                extent_id,
+                extent_id % self.shard_count as u64,
+                self.shard_idx,
+                self.shard_count,
+            ));
+        }
         if let Some(v) = self.extents.get(&extent_id) {
             return Ok(Rc::clone(v.value()));
         }
@@ -1889,6 +2025,20 @@ impl ExtentNode {
         let req = CommitLengthReq::decode(payload)
             .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
 
+        // F099-M: commit_length is a hot-path RPC; reject wrong-shard.
+        if !self.owns_extent(req.extent_id) {
+            return Err((
+                StatusCode::FailedPrecondition,
+                format!(
+                    "extent {} belongs to shard {} not shard {} (shard_count={})",
+                    req.extent_id,
+                    req.extent_id % self.shard_count as u64,
+                    self.shard_idx,
+                    self.shard_count,
+                ),
+            ));
+        }
+
         let entry = self
             .extents
             .get(&req.extent_id)
@@ -1924,6 +2074,15 @@ impl ExtentNode {
     async fn handle_alloc_extent(&self, payload: Bytes) -> HandlerResult {
         let req: AllocExtentReq = rkyv_decode(&payload)
             .map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        // F099-M: forward to owner shard if we don't own this extent.
+        if !self.owns_extent(req.extent_id) {
+            if let Some(sibling) = self.sibling_for_extent(req.extent_id) {
+                return self
+                    .forward_rpc_to_sibling(sibling, MSG_ALLOC_EXTENT, payload)
+                    .await;
+            }
+        }
 
         let disk = self
             .choose_disk()
@@ -2043,6 +2202,15 @@ impl ExtentNode {
         let req: RequireRecoveryReq = rkyv_decode(&payload)
             .map_err(|e| (StatusCode::InvalidArgument, e))?;
 
+        // F099-M: forward to owner shard.
+        if !self.owns_extent(req.task.extent_id) {
+            if let Some(sibling) = self.sibling_for_extent(req.task.extent_id) {
+                return self
+                    .forward_rpc_to_sibling(sibling, MSG_REQUIRE_RECOVERY, payload)
+                    .await;
+            }
+        }
+
         let task = req.task;
 
         if self.manager_endpoint.is_none() {
@@ -2111,6 +2279,15 @@ impl ExtentNode {
     async fn handle_re_avali(&self, payload: Bytes) -> HandlerResult {
         let req: ReAvaliReq = rkyv_decode(&payload)
             .map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        // F099-M: forward to owner shard.
+        if !self.owns_extent(req.extent_id) {
+            if let Some(sibling) = self.sibling_for_extent(req.extent_id) {
+                return self
+                    .forward_rpc_to_sibling(sibling, MSG_RE_AVALI, payload)
+                    .await;
+            }
+        }
 
         let extent = match self.get_extent(req.extent_id).await {
             Ok(v) => v,
@@ -2202,8 +2379,17 @@ impl ExtentNode {
     }
 
     async fn handle_copy_extent(&self, payload: Bytes) -> HandlerResult {
-        let req = CopyExtentReq::decode(payload)
+        let req = CopyExtentReq::decode(payload.clone())
             .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
+
+        // F099-M: forward to owner shard.
+        if !self.owns_extent(req.extent_id) {
+            if let Some(sibling) = self.sibling_for_extent(req.extent_id) {
+                return self
+                    .forward_rpc_to_sibling(sibling, MSG_COPY_EXTENT, payload)
+                    .await;
+            }
+        }
 
         let extent = self.get_extent(req.extent_id).await?;
         let mut logical_len = extent.len.load(Ordering::SeqCst);
@@ -2275,6 +2461,15 @@ impl ExtentNode {
     async fn handle_convert_to_ec(&self, payload: Bytes) -> HandlerResult {
         let req: ConvertToEcReq = rkyv_decode(&payload)
             .map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        // F099-M: forward to owner shard.
+        if !self.owns_extent(req.extent_id) {
+            if let Some(sibling) = self.sibling_for_extent(req.extent_id) {
+                return self
+                    .forward_rpc_to_sibling(sibling, MSG_CONVERT_TO_EC, payload)
+                    .await;
+            }
+        }
 
         let extent_id = req.extent_id;
         let data_shards = req.data_shards as usize;
@@ -2373,8 +2568,17 @@ impl ExtentNode {
     }
 
     async fn handle_write_shard(&self, payload: Bytes) -> HandlerResult {
-        let req = WriteShardReq::decode(payload)
+        let req = WriteShardReq::decode(payload.clone())
             .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
+
+        // F099-M: forward to owner shard.
+        if !self.owns_extent(req.extent_id) {
+            if let Some(sibling) = self.sibling_for_extent(req.extent_id) {
+                return self
+                    .forward_rpc_to_sibling(sibling, MSG_WRITE_SHARD, payload)
+                    .await;
+            }
+        }
 
         self.write_shard_local(
             req.extent_id,

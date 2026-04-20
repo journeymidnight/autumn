@@ -47,6 +47,7 @@ async fn register_node(mgr: &RpcClient, addr: &str, disk: &str) -> RegisterNodeR
             rkyv_encode(&RegisterNodeReq {
                 addr: addr.to_string(),
                 disk_uuids: vec![disk.to_string()],
+                shard_ports: vec![],
             }),
         )
         .await

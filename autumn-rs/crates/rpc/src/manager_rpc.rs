@@ -71,11 +71,18 @@ pub struct MgrRange {
 }
 
 /// Node metadata.
+///
+/// F099-M: `shard_ports` lists the per-shard TCP listener ports on the
+/// extent-node process. Clients route hot-path RPCs (append, read_bytes,
+/// commit_length) by `extent_id % shard_ports.len()`. When `shard_ports`
+/// is empty, clients fall back to `address` (legacy single-thread mode).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct MgrNodeInfo {
     pub node_id: u64,
     pub address: String,
     pub disks: Vec<u64>,
+    /// Optional per-shard ports. Empty = legacy single-thread extent-node.
+    pub shard_ports: Vec<u16>,
 }
 
 /// Disk metadata.
@@ -194,6 +201,9 @@ pub struct AcquireOwnerLockResp {
 pub struct RegisterNodeReq {
     pub addr: String,
     pub disk_uuids: Vec<String>,
+    /// F099-M: per-shard ports the extent-node listens on. Empty = legacy
+    /// single-thread mode (clients route all extents to `addr`).
+    pub shard_ports: Vec<u16>,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]

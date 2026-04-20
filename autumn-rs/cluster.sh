@@ -176,6 +176,20 @@ do_start() {
             $(echo "$disk_arg" | tr ',' ' ')
     fi
 
+    # F099-M: when AUTUMN_EXTENT_SHARDS is set, launch each extent-node
+    # with K shards. Each shard listens on port + shard_idx * shard_stride
+    # (stride 10 by default). cluster.sh passes --shards so the binary
+    # spawns K compio runtimes in one process; cluster.sh must also tell
+    # the manager about the shard_ports via `register-node --shard-ports`
+    # so the manager/PS can route each extent to the owning shard.
+    local shards="${AUTUMN_EXTENT_SHARDS:-1}"
+    [[ "$shards" =~ ^[0-9]+$ ]] && (( shards >= 1 )) || shards=1
+    local shard_stride="${AUTUMN_EXTENT_SHARD_STRIDE:-10}"
+    [[ "$shard_stride" =~ ^[0-9]+$ ]] && (( shard_stride >= 1 )) || shard_stride=10
+    if (( shards > 1 )); then
+        echo "[cluster] F099-M: extent-node shards=$shards stride=$shard_stride"
+    fi
+
     # Launch extent-node processes.
     for (( i=1; i<=replicas; i++ )); do
         local port=$(( 9100 + i ))
@@ -184,12 +198,26 @@ do_start() {
         # multidisk-1node sends multiple paths through --data and OMITS --disk-id
         # (extent-node switches to multi-disk mode when --data has commas AND --disk-id is absent).
         if [[ "$disk_arg" == *,* ]]; then
-            start_proc "node$i" \
-                "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR"
+            if (( shards > 1 )); then
+                start_proc "node$i" \
+                    "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR" \
+                    --shards "$shards" --shard-stride "$shard_stride"
+            else
+                start_proc "node$i" \
+                    "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR"
+            fi
         else
-            start_proc "node$i" \
-                "$NODE" --port "$port" --disk-id "$i" --data "$disk_arg" --manager "$MANAGER_ADDR"
+            if (( shards > 1 )); then
+                start_proc "node$i" \
+                    "$NODE" --port "$port" --disk-id "$i" --data "$disk_arg" --manager "$MANAGER_ADDR" \
+                    --shards "$shards" --shard-stride "$shard_stride"
+            else
+                start_proc "node$i" \
+                    "$NODE" --port "$port" --disk-id "$i" --data "$disk_arg" --manager "$MANAGER_ADDR"
+            fi
         fi
+        # Wait for the primary (shard 0) port. Sibling shard ports come up
+        # around the same time from the same process.
         wait_port "$port" "node$i"
     done
 
@@ -197,7 +225,23 @@ do_start() {
     if [[ "${CLUSTER_MODE:-default}" != "multidisk-1node" ]]; then
         for (( i=1; i<=replicas; i++ )); do
             local port=$(( 9100 + i ))
-            "$AC" --manager "$MANAGER_ADDR" register-node --addr "127.0.0.1:$port" --disk "disk-$i"
+            if (( shards > 1 )); then
+                # Build comma-separated shard_ports: port, port+stride, port+2*stride, ...
+                local shard_ports_csv=""
+                for (( s=0; s<shards; s++ )); do
+                    local sp=$(( port + s * shard_stride ))
+                    if [[ -z "$shard_ports_csv" ]]; then
+                        shard_ports_csv="$sp"
+                    else
+                        shard_ports_csv="${shard_ports_csv},${sp}"
+                    fi
+                done
+                "$AC" --manager "$MANAGER_ADDR" register-node \
+                    --addr "127.0.0.1:$port" --disk "disk-$i" \
+                    --shard-ports "$shard_ports_csv"
+            else
+                "$AC" --manager "$MANAGER_ADDR" register-node --addr "127.0.0.1:$port" --disk "disk-$i"
+            fi
         done
         echo "[cluster] extent node(s) registered"
     else

@@ -102,6 +102,10 @@ enum Command {
     RegisterNode {
         addr: String,
         disks: Vec<String>,
+        /// F099-M: per-shard listener ports on the extent-node process.
+        /// Empty = legacy single-thread extent-node (client routes all
+        /// extents to `addr`).
+        shard_ports: Vec<u16>,
     },
     Format {
         listen: String,
@@ -366,10 +370,21 @@ fn parse_args() -> Args {
         "register-node" => {
             let mut addr = String::new();
             let mut disks: Vec<String> = Vec::new();
+            let mut shard_ports: Vec<u16> = Vec::new();
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--addr" => { i += 1; addr = raw[i].clone(); }
                     "--disk" => { i += 1; disks.push(raw[i].clone()); }
+                    "--shard-ports" => {
+                        i += 1;
+                        for part in raw[i].split(',') {
+                            let p = part.trim();
+                            if p.is_empty() { continue; }
+                            let port: u16 = p.parse()
+                                .expect("--shard-ports entries must be u16");
+                            shard_ports.push(port);
+                        }
+                    }
                     _ => {}
                 }
                 i += 1;
@@ -381,7 +396,7 @@ fn parse_args() -> Args {
             if disks.is_empty() {
                 disks.push("disk-default".to_string());
             }
-            Command::RegisterNode { addr, disks }
+            Command::RegisterNode { addr, disks, shard_ports }
         }
         "format" => {
             let mut listen = String::new();
@@ -1084,12 +1099,13 @@ async fn main() -> Result<()> {
             println!("forcegc triggered for partition {part_id}, extents={extent_ids:?}");
         }
 
-        Command::RegisterNode { addr, disks } => {
+        Command::RegisterNode { addr, disks, shard_ports } => {
             // Retry on CODE_NOT_LEADER: manager may still be completing etcd
             // leader election when cluster.sh fires the first register-node.
             let req_bytes = rkyv_encode(&RegisterNodeReq {
                 addr: addr.clone(),
                 disk_uuids: disks,
+                shard_ports: shard_ports.clone(),
             });
             let mut attempt = 0u32;
             let resp = loop {
@@ -1135,6 +1151,8 @@ async fn main() -> Result<()> {
                     rkyv_encode(&RegisterNodeReq {
                         addr: advertise.clone(),
                         disk_uuids: disk_uuids.clone(),
+                        // F099-M: format path always uses legacy single-shard mode.
+                        shard_ports: vec![],
                     }),
                 )
                 .await

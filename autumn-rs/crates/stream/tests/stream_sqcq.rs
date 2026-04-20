@@ -110,6 +110,7 @@ async fn setup_stream_3rep(mgr_addr: SocketAddr, n_addrs: [SocketAddr; 3]) -> u6
                 rkyv_encode(&RegisterNodeReq {
                     addr: addr.to_string(),
                     disk_uuids: vec![format!("disk-fanout-{i}")],
+                    shard_ports: vec![],
                 }),
             )
             .await
@@ -141,6 +142,7 @@ async fn setup_stream(mgr_addr: SocketAddr, n_addr: SocketAddr) -> u64 {
             rkyv_encode(&RegisterNodeReq {
                 addr: n_addr.to_string(),
                 disk_uuids: vec!["disk-sqcq".to_string()],
+                shard_ports: vec![],
             }),
         )
         .await

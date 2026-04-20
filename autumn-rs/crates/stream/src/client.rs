@@ -597,8 +597,10 @@ pub struct StreamClient {
     /// Shared connection pool — one RpcClient per remote address, with
     /// heartbeat health checks for extent nodes.
     pool: Rc<ConnPool>,
-    /// Node-id → address map (refreshed on miss).
-    nodes_cache: DashMap<u64, String>,
+    /// Node-id → (address, shard_ports) map (refreshed on miss). F099-M:
+    /// `shard_ports` is used to route hot-path RPCs by `extent_id % K`.
+    /// Empty `shard_ports` means legacy single-thread extent-node.
+    nodes_cache: DashMap<u64, (String, Vec<u16>)>,
     /// Cached ExtentInfo for read path.
     extent_info_cache: DashMap<u64, ExtentInfo>,
     /// R4 4.3: per-stream single-owner worker sender.  Spawned lazily on
@@ -785,7 +787,7 @@ impl StreamClient {
             return Err(anyhow!("nodes_info failed: {}", resp.message));
         }
         for (id, node) in resp.nodes {
-            self.nodes_cache.insert(id, node.address);
+            self.nodes_cache.insert(id, (node.address, node.shard_ports));
         }
         Ok(())
     }
@@ -793,11 +795,17 @@ impl StreamClient {
     fn replica_addrs_from_cache(&self, ex: &ExtentInfo) -> Result<Vec<String>> {
         let mut addrs = Vec::with_capacity(ex.replicates.len() + ex.parity.len());
         for node_id in ex.replicates.iter().chain(ex.parity.iter()) {
-            let addr = self
+            let entry = self
                 .nodes_cache
                 .get(node_id)
                 .ok_or_else(|| anyhow!("node {} missing", node_id))?;
-            addrs.push(addr.clone());
+            let (addr, shard_ports) = entry.value();
+            // F099-M: route this extent to the owning shard port.
+            addrs.push(crate::conn_pool::shard_addr_for_extent(
+                addr,
+                shard_ports,
+                ex.extent_id,
+            ));
         }
         if addrs.is_empty() {
             return Err(anyhow!("extent {} has no replicas", ex.extent_id));

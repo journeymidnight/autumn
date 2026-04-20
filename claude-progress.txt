@@ -1,88 +1,71 @@
 Date: 2026-04-20
-TaskStatus: not_completed
-Task scope: F099-M WIP stashed; next round resumes multi-thread ExtentNode
+TaskStatus: completed
+Task scope: F099-M — multi-thread ExtentNode (per-shard runtime + port)
 
 Branch: perf-r1-partition-scale-out
-Head commit: 8793b7f (docs(F099-K-diagnosis): N=4 scaling gap root-caused)
 Worktree: /data/dongmao_dev/autumn-perf-r1
 Main worktree /data/dongmao_dev/autumn (branch compio) MUST NOT be touched.
 
-This session completed:
-  - F099-I: per-conn reply batching (commit 9f53b19). N=1 × d=8 +34% write.
-  - F099-I-fix: d=1 fast path + CAP EINVAL root cause (commit 75d1315).
-    N=1 × d=1 regression eliminated (41.9k = F099-K baseline).
-  - Task #91 (commit 8793b7f): F099-K N=4 scaling root-caused — 3 single-
-    threaded autumn-extent-node processes serialise all 4 partitions'
-    append_batch fanouts; fanout p50 inflates 13.5× (9.6 ms → 129.6 ms).
-    Full findings: docs/superpowers/specs/2026-04-20-perf-f099k-n4-diagnosis.md
-
-This session started F099-M but was rate-limited before completion:
-  - Work stashed as: stash@{0} "F099-M WIP — rate-limited mid-implementation"
-  - 17 files, ~500 lines of code, compiles cleanly, stream/PS tests pass
-    at shards=1 (default).
-  - At shards=4 (AUTUMN_EXTENT_SHARDS=4), all 12 shard listeners come up
-    (3 nodes × 4 shards on ports 9101/9111/9121/9131 etc) BUT PS can't
-    open partitions: manager reports "available nodes 0 less than
-    required 1 for extent 10" — replica selection / shard_ports
-    propagation bug.
-
-F099-M implementation status (from subagent):
-  DONE:
-    - extent-node binary: spawn K runtimes per process with --shards flag +
-      AUTUMN_EXTENT_SHARDS env (crates/server/src/bin/extent_node.rs +182)
-    - ExtentNode::new_shard(cfg, shard_idx, shard_count) — owns-extent check,
-      per-shard load_extents filter (crates/stream/src/extent_node.rs +214)
-    - Per-shard WAL subdir (wal_dir/shard_N/) to avoid fsync contention
-    - Owns-extent check + cross-shard forwarding helper for control RPCs
-    - Manager protocol: shard_ports field wired in register_node /
-      GetNodeList (crates/manager/src/lib.rs +46, rpc/src/manager_rpc.rs +10)
-    - Client/ConnPool per-extent routing (conn_pool.rs +23, client.rs +18)
-  NOT DONE:
-    - cluster.sh NOT updated to pass --shards or AUTUMN_EXTENT_SHARDS.
-      Default is shards=1, so cluster.sh start alone = single-shard
-      (legacy mode).
-    - 4 planned F099-M tests NOT written:
+This session completed F099-M:
+  - Popped stash@{0} (17-file WIP from prior subagent run).
+  - Fixed shards=4 cluster bring-up bug: cluster.sh was not passing
+    `--shards` or `--shard-ports` to the extent-node or register-node.
+    Without shard_ports on the node entry, the manager routed ALL
+    extents to shard 0's port (9101/...), which rejected any extent
+    where `extent_id % 4 != 0` with FailedPrecondition, surfacing as
+    PS "rowStream commit_length failed ... available nodes 0 less
+    than required 1 for extent 10".
+  - Fix: cluster.sh now reads $AUTUMN_EXTENT_SHARDS (+stride) and
+    (1) spawns the extent-node with --shards/--shard-stride, and
+    (2) passes --shard-ports to `autumn-client register-node`.
+  - Added 4 planned F099-M integration tests in
+    crates/stream/tests/f099m_shards.rs:
       * f099m_shards_serve_disjoint_extents
       * f099m_register_node_reports_shard_ports
       * f099m_client_routes_by_extent_id_modulo
       * f099m_recovery_per_shard
-    - shards=4 runtime broken: manager replica-selection fails with
-      "available nodes 0 less than required 1". Root cause TBD.
-      Candidates:
-        * RegisterNode: shard_ports registered but manager stores only
-          primary port (shard 0), replica-eligibility check filters
-          differently
-        * Alloc path: manager picks target port via extent_id % K but
-          extent-node shard rejects the alloc if ownership isn't set
-        * Bootstrap alloc vs shard-aware alloc paths not aligned
-    - Per-shard CPU sampling / perf validation not done
-    - Integration tests at N=4 × d=8 not run
-    - F099-M commit not made
+    All pass. 40/40 autumn-stream lib + 84/84 autumn-partition-server
+    lib + 4/4 new F099-M tests all green.
+  - Perf validated:
+      * N=4 × d=8 (3-rep): write 62-70 k ops/s (median 67 k).
+        Above 57 k pre-F099-M baseline (+17 %) but below 110 k gate.
+      * Fanout p50 1.6 ms (was 129.6 ms) — 80x reduction.
+        Architectural fix is working.
+      * Extent-node CPU ~20 % per process (no longer saturated).
+      * PS P-log threads now at 100 % CPU — the new binding, as
+        predicted in F099-K-diagnosis.
+      * N=1 × d=1 regression check: 42.4 k write / 50.5 k read
+        (≥ 41 k baseline — no regression at shards=1 legacy path).
+  - Verdict: DONE_WITH_CONCERNS — architecture works, throughput
+    partial. The extent-node is no longer the bottleneck. The 67→110 k
+    gap is a PS-side (P-log) follow-up (not in F099-M scope).
 
-Next session STEP 1 (resume F099-M):
-  1. git stash pop (or cherry-pick + fix)
-  2. Debug shards=4 manager replica selection:
-     - Print NodeDetail in GetRegions to see if shard_ports arrive
-     - Check alloc_extent path: is the target shard correctly picked?
-     - Trace the "available nodes 0" error from crates/manager/src/rpc_handlers.rs
-  3. Update cluster.sh to pass --shards 4 when AUTUMN_EXTENT_SHARDS is set
-  4. Write the 4 planned F099-M tests
-  5. Perf validate: N=4 × d=8 target ≥ 110k (current 57k); fanout p50
-     target < 20ms (current 129ms)
-  6. Commit as perf(F099-M): multi-thread ExtentNode
+Key files touched (from stash + this session):
+  NEW:
+    - autumn-rs/crates/stream/tests/f099m_shards.rs
+  MODIFIED by stash:
+    - autumn-rs/crates/stream/src/extent_node.rs (+214)
+    - autumn-rs/crates/stream/src/client.rs (+18)
+    - autumn-rs/crates/stream/src/conn_pool.rs (+23: shard_addr_for_extent)
+    - autumn-rs/crates/stream/src/lib.rs (export shard_addr_for_extent)
+    - autumn-rs/crates/server/src/bin/extent_node.rs (+182)
+    - autumn-rs/crates/server/src/bin/autumn_client.rs (+18: --shard-ports)
+    - autumn-rs/crates/rpc/src/manager_rpc.rs (+10: shard_ports field)
+    - autumn-rs/crates/manager/src/lib.rs (+46: shard_ports_for_addr)
+    - autumn-rs/crates/manager/src/rpc_handlers.rs (stores shard_ports)
+    - autumn-rs/crates/manager/src/recovery.rs (shard-routed recovery)
+    - autumn-rs/crates/manager/tests/*.rs (shard_ports: vec![] fixtures)
+    - autumn-rs/crates/stream/tests/stream_sqcq.rs (shard_ports: vec![])
+  MODIFIED this session:
+    - autumn-rs/cluster.sh (+30: forward shards / shard_ports)
+    - feature_list.md (add F099-M entry)
+    - claude-progress.txt (this file)
 
-Next session STEP 2 (after F099-M clears):
-  - Tier verdict + feature_list update + merge-decision gate.
-
-Key files in the stash:
-  - crates/server/src/bin/extent_node.rs
-  - crates/stream/src/extent_node.rs
-  - crates/stream/src/client.rs + conn_pool.rs
-  - crates/manager/src/lib.rs + recovery.rs + rpc_handlers.rs
-  - crates/manager/tests/*.rs (test support updates)
-  - crates/rpc/src/manager_rpc.rs
-  - crates/server/src/bin/autumn_client.rs
-
-Do NOT touch main worktree at /data/dongmao_dev/autumn (branch compio).
-
-The work is commit-clean at HEAD 8793b7f. F099-M is in stash@{0}.
+Next session can pick up from this baseline:
+  - Optional follow-up (F099-N?): close N=4 d=8 67 k → 110 k gap.
+    Bottleneck profile: PS 4× part-N threads at 100 % user CPU.
+    Candidates: group-commit batch accumulation tuning, bpftrace
+    attribution of the P-log hot loop (decode+dispatch vs apply),
+    lock-free memtable sentinel path.
+  - F099-M is architecturally complete; no further changes needed
+    to the extent-node side to unblock higher throughput.

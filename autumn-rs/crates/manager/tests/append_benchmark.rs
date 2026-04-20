@@ -91,6 +91,7 @@ fn benchmark_append_stream_throughput() {
                 rkyv_encode(&RegisterNodeReq {
                     addr: n1_addr.to_string(),
                     disk_uuids: vec!["disk-bench-1".to_string()],
+                    shard_ports: vec![],
                 }),
             )
             .await
@@ -103,6 +104,7 @@ fn benchmark_append_stream_throughput() {
                 rkyv_encode(&RegisterNodeReq {
                     addr: n2_addr.to_string(),
                     disk_uuids: vec!["disk-bench-2".to_string()],
+                    shard_ports: vec![],
                 }),
             )
             .await

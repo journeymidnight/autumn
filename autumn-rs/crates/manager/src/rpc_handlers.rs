@@ -177,6 +177,7 @@ impl AutumnManager {
                 node_id,
                 address: req.addr,
                 disks: disk_ids,
+                shard_ports: req.shard_ports,
             };
             s.nodes.insert(node_id, node.clone());
             (node, disk_infos, uuid_map, node_id)

@@ -86,6 +86,7 @@ async fn setup_ec_stream(
                 rkyv_encode(&RegisterNodeReq {
                     addr: addr.to_string(),
                     disk_uuids: vec![disk.to_string()],
+                    shard_ports: vec![],
                 }),
             )
             .await
