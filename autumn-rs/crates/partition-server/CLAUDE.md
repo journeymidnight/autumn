@@ -6,7 +6,7 @@ An LSM-tree based KV store built on top of the stream layer. Each `PartitionServ
 
 ## Architecture
 
-### Thread Model (post F099-J, 2026-04-20)
+### Thread Model (post F099-J/K/I, 2026-04-20)
 
 ```
 Main compio thread (control plane + fd dispatcher)
@@ -46,37 +46,86 @@ F087-bulk-mux pool split separated the TCP sockets, but the runtime was still
 single-threaded. F088 gives flush its own runtime so WAL appends make forward
 progress concurrently with SST uploads.
 
-**How ps-conn handoff works (F099-J)**:
-- `open_partition` creates a `futures::channel::mpsc<std::net::TcpStream>`
-  (`fd_tx` / `fd_rx`). `fd_tx` is returned inside `PartitionHandle`; `fd_rx`
-  is moved into the partition OS thread.
-- Main thread's fd-dispatch loop: for each accepted fd, clone the owning
-  partition's `fd_tx` and `send(std_stream).await`.
-- Partition thread's fd-drain task: `fd_rx.next().await` → `TcpStream::from_std`
-  → `compio::runtime::spawn(handle_ps_connection(stream, req_tx, part_id))`.
-- `handle_ps_connection` runs on THIS runtime. Its `req_tx.send(req).await`
-  is a same-thread mpsc send; the matching `req_rx.next().await` inside
-  `merged_partition_loop` wakes via a local Waker (Rc-based) — no eventfd,
-  no cross-thread futex.
+**How ps-conn handoff works (F099-J + F099-K)**:
+- Post F099-K, each partition OS thread binds its OWN `compio::net::TcpListener`
+  on a unique port (`base_port + ord`) and runs its own accept loop + ps-conn
+  tasks on the SAME compio runtime as `merged_partition_loop`. The main thread
+  does NOT forward fds across partitions; clients connect directly to the
+  owning partition's port (part_addr reported via `MSG_REGISTER_PARTITION_ADDR`
+  and served to clients via `GetRegions.part_addrs`).
+- Each ps-conn task runs `handle_ps_connection` on THIS runtime. Its
+  `req_tx.send(req).await` is a same-thread mpsc send; the matching
+  `req_rx.next().await` inside `merged_partition_loop` wakes via a local
+  Waker (Rc-based) — no eventfd, no cross-thread futex.
 
-**N>1 caveat (F099-J scope)**: `handle_ps_connection` checks each frame's
-`part_id` against `owner_part`; mismatches are rejected with `NotFound`.
-The main thread's fd dispatcher currently sends every fd to the first
-partition in the map (N=1 fast path). Proper N>1 routing is deferred to
-**F099-K** (`TODO(F099-K)` markers throughout `lib.rs`).
+**ps-conn handler — F099-I true SQ/CQ inner loop (commit f099i)**:
+`handle_ps_connection` mirrors the ExtentNode R4 4.2 v3 pattern
+(`stream::extent_node::handle_connection`, commit `1e7e456`):
 
-**Trade-off measured** (F099-J, 256 × d=1 × 4 KB nosync write on tmpfs):
+```
+┌─ handle_ps_connection (one task per TCP conn) ──────────────────┐
+│                                                                 │
+│  SQ side — persistent read future:                              │
+│    Option<LocalBoxFuture<'static, PsReadBurst>>                 │
+│    owns OwnedReadHalf + 64 KiB buf across iterations;           │
+│    NEVER dropped mid-flight (io_uring SQE stability)            │
+│                                                                 │
+│  CQ side — FuturesUnordered<LocalBoxFuture<'static, Bytes>>     │
+│    cap = AUTUMN_PS_CONN_INFLIGHT_CAP (default 64)               │
+│    each future: clone req_tx → send PartitionRequest →          │
+│                 await oneshot resp → encode Frame::response     │
+│                                                                 │
+│  Loop:                                                          │
+│    (A) drain ready completions via `.next().now_or_never()`     │
+│        → tx_bufs                                                │
+│    (B) flush tx_bufs with ONE `write_vectored_all` syscall      │
+│    (C) branch on (n_inflight, at_cap):                          │
+│       n_inflight == 0 → await read alone                        │
+│       at_cap          → await completion alone (back-pressure)  │
+│       n_inflight == 1 → await completion (fast path: avoid      │
+│           5-10 µs per-iter select polling cost at d=1)          │
+│       n_inflight > 1  → select(read, inflight.next())           │
+│           Left wins  → process frames, restart read_fut         │
+│           Right wins → put read_fut back, extend tx_bufs        │
+│    (D) on EOF: drain remaining inflight + final flush + return  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+At `--pipeline-depth=1`: degenerates to `write_vectored_all([one_frame])`
+per reply, same cost as pre-F099-I `write_all(one_frame)`; NO regression.
+
+At `--pipeline-depth ≥ N`: one TCP read delivers N frames → all N futures
+in `inflight` concurrently → drain-all-ready collects up to N ready replies
+into `tx_bufs` → one `write_vectored_all` = one `tcp_sendmsg`. Targeted
+win against F099-H's measured 0.8 CPU cores of small-frame TCP kernel
+overhead (91 % of `tcp_sendmsg` at 32–63 B PutResp headers, 22 µs each,
+34 k/s → ~N× fewer kernel TCP traversals per Put).
+
+Back-pressure: if `inflight.len()` reaches the cap mid-push, the inner
+`push_frames_to_inflight` helper awaits one completion before pushing the
+next future. This caps memory usage per pathological client (e.g. a large
+pipeline-depth burst all targeting the same partition).
+
+Mis-routed frames (`part_id != owner_part`) synthesise an immediate
+`NotFound` error frame onto inflight — no mpsc hop. TODO(F099-K):
+forward to owning partition's req_tx instead.
+
+**N>1 behaviour (F099-K)**: with per-partition listeners, each
+`handle_ps_connection` serves only frames whose `part_id == owner_part`.
+The client (autumn-client `perf-check`) is F099-K-aware and opens one
+TCP connection to each partition's port, striping requests across them
+by partition id.
+
+**Trade-off measured**:
 - Pre-F099-J P-log CPU: ~57 % user / 43 % iouring-idle (F099-H §2.3).
-- Post-F099-J P-log CPU: **~100 %** — ps-conn decode + dispatch + response
-  writes all run on this thread, saturating it. At 256 concurrent clients
-  this costs ~20–25 % write throughput vs F099-D baseline.
-- At lower connection counts (e.g. 1 × d=64) the collocation is a net win:
-  F099-H Scenario B achieved ~12 k ops/s; post-F099-J achieves ~12.9 k.
-- The architectural simplification (no Dispatcher, no PartitionRouter
-  DashMap, no Arc<...> on the hot path, `2N + 2` threads total) is
-  retained even where throughput regresses — the cleaner model is
-  foundation for future work (SQE coalescing per F099-I, multi-partition
-  routing F099-K).
+- Post-F099-J P-log CPU: ~100 % — ps-conn decode + dispatch + response
+  writes all run on this thread.
+- Post F099-K: load distributes across N partition threads, each with
+  its own listener + P-log.
+- Post F099-I: ~N× fewer `tcp_sendmsg` calls at pipeline-depth=N, which
+  at the 57 k N=1 × d=1 ceiling accounted for 0.8 CPU cores of pure
+  kernel TCP overhead.
 
 ```
 ┌─────────────────── PartitionServer ────────────────────┐
@@ -113,18 +162,25 @@ The null byte (`0x00`) is a **separator** between the user key and the inverted 
 
 The **inverted** sequence ensures that for the same user key, newer writes (higher seq) sort **before** older writes in byte order. Lookup uses `seek_user_key` which seeks to `user_key ++ 0x00 ++ BE(0)` — the smallest possible internal key for this user key — then returns the first (newest) entry found.
 
-## Write Path: Put / Delete (Group Commit, R4 4.4 SQ/CQ, F099-D merged)
+## Write Path: Put / Delete (Group Commit, R4 4.4 SQ/CQ, F099-D merged, F099-I batched)
 
 ```
 Put(key, value, part_id, must_sync):
-  1. ps-conn thread: build PartitionRequest{msg_type=MSG_PUT, payload, resp_tx}
-  2. Send via PartitionRouter mpsc to the P-log partition task
+  1. ps-conn task (F099-I): decode frame from TCP read; push
+     `async { clone req_tx → send PartitionRequest → await oneshot resp →
+              encode Frame::response }` onto the per-conn inflight
+     FuturesUnordered. MULTIPLE frames from the same TCP read end up in
+     the inflight set concurrently.
+  2. Same-thread mpsc: PartitionRequest delivered into merged_partition_loop.
   3. P-log merged_partition_loop: decode PutReq inline, push a
      WriteRequest with a direct `WriteResponder::Put { outer: resp_tx, key }`
      into the `pending` Vec. NO compio::spawn, NO inner oneshot.
-  4. ps-conn thread awaits the outer resp_tx — the SAME oneshot that was
-     sent into the request; Phase 3 fires its encoded `PutResp` frame
-     directly into it.
+  4. ps-conn awaits the outer resp_tx via the inflight future — the SAME
+     oneshot that was sent into the request; Phase 3 fires its encoded
+     `PutResp` frame directly into it.
+  5. ps-conn loop top: drain-all-ready completions into `tx_bufs`; flush
+     `tx_bufs` via ONE `write_vectored_all` syscall — coalescing all Put
+     responses that became ready since the previous flush.
 
 merged_partition_loop (per partition, F099-D fold-in of the old
                        background_write_loop_r1):

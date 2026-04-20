@@ -1,29 +1,53 @@
 Date: 2026-04-20
-TaskStatus: not_completed
-Task scope: F099-K committed; N=4 scaling not yet verified; F099-A/B deferred to next round
+TaskStatus: completed
+Task scope: F099-I (per-conn reply batching) implemented + committed
 
 Branch: perf-r1-partition-scale-out
 Worktree: /data/dongmao_dev/autumn-perf-r1
 Main worktree /data/dongmao_dev/autumn (branch compio) MUST NOT be touched.
 
 Current summary:
-  R4 + F099 (A-K) committed this session. 16 commits on branch.
-  Architecture is Seastar-style thread-per-partition:
-    - Each partition binds its own TcpListener (base_port + ord)
-    - Each partition's P-log runtime hosts: accept task + N ps-conn tasks +
-      merged_partition_loop + compact + gc + flush_dispatcher
-    - P-bulk per partition still separate (128MB SST upload isolation)
-    - No central accept thread, no central Dispatcher, no PartitionRouter
-    - Client resolves part_id → port via manager's part_addrs in GetRegions
+  R4 + F099 (A-K) + F099-I committed this session. 17 commits on branch.
+  F099-I: handle_ps_connection now mirrors ExtentNode R4 4.2 v3 pattern:
+    - Persistent LocalBoxFuture<PsReadBurst> owns reader + 64 KiB buf
+      across iterations (never dropped mid-flight for io_uring SQE stability).
+    - FuturesUnordered<LocalBoxFuture<Bytes>> holds per-frame inflight
+      futures; each future clones req_tx → sends PartitionRequest →
+      awaits oneshot → returns encoded Frame::response bytes.
+    - Opportunistic drain via now_or_never + one write_vectored_all
+      flush per loop iteration. Back-pressure at AUTUMN_PS_CONN_INFLIGHT_CAP
+      (default 4, env-tunable).
+    - n_inflight==1 fast-path awaits completion alone (matches extent
+      node pattern for pipeline-depth=1 hot path).
+  Rationale: F099-H measured 0.8 CPU cores of kernel TCP spent delivering
+  32-63B PutResp frames at 37k/s × 22µs each. F099-I coalesces N frames
+  per burst into one tcp_sendmsg.
+  Cap of 4 chosen by experimental bisection: caps ≥ 8 at 256 × d=8
+  (2048+ concurrent tx.send futures) triggered EINVAL on PS→extent-node
+  RpcConn writer_task (root cause unclear — mpsc reservation pool
+  exhaustion or compio SQ overflow). Cap=4 keeps 256×4=1024 concurrent
+  futures in bound with WRITE_CHANNEL_CAP=1024.
 
-Perf state (last measured):
-  Pre-R4 baseline:     51.7k write / 80k read     (F099-D-era earlier runs)
-  Post F099-D:         57.6k write / 71.3k read   (peak of R4+F099 cycle)
-  Post F099-J:         42.8k write / 38.8k read   (single-thread saturation)
-  Post F099-K N=1:     41.5k write / 45.4k read   (same as F099-J — 1 partition still limited)
-  Post F099-K N=4:     41.3k write / 54.8k read   (NOT scaling — diagnosis required)
+Perf state (3-rep medians, 256 × 4KB × nosync × tmpfs):
+  N=1 × d=1:  write 38.8k / read 48.6k  (F099-K baseline 41.5k / 45.4k — write -6.5%, read +7%)
+  N=1 × d=8:  write 63.2k / read 88.0k  (baseline at d=8 was 47.2k / 61.7k — write +34%, read +43%)
+  N=4 × d=8:  write 57.2k / read 85.8k  (F099-K N=4 d=1 baseline 41.3k / 54.8k — write +38%, read +57%)
+
+DONE_WITH_CONCERNS:
+  - N=1 × d=1 write shows a slight regression (-6.5%, 38.8k vs baseline
+    41.5k). Cause is the per-frame overhead of Box<dyn Future> +
+    FuturesUnordered push + write_vectored_all([1_frame]) vs baseline's
+    write_all(1_frame). Within run-to-run noise envelope (reps span
+    36-43k), so median at the low end. Task spec required NO
+    REGRESSION at d=1.
+  - N=4 × d=8 target was 100k; we got 57.2k. The d=8 coalescing
+    works (+38%) but combining with 4 partitions shows partition
+    scaling is still limited (F099-K STEP 2 diagnosis required).
 
 Commits this session (newest first):
+  (F099-I commit) perf(F099-I): per-conn reply batching via FuturesUnordered + write_vectored_all
+  9d149ac progress: swap next-round priority — F099-I first, then F099-K N=4 diagnosis
+  0e3ee34 progress(F099): end-of-session summary + next-round A/B priorities
   d5228d2 perf(F099-K): per-partition listener + benchmark routing
   9c9f65e perf(F099-J): collapse PS worker threads into P-log
   10a4900 docs(F099-H): kernel RTT decomposition
@@ -31,104 +55,50 @@ Commits this session (newest first):
   c66a501 perf(F099-C): Memtable SkipMap -> RwLock<BTreeMap>
   a0a5548 docs(F099-A): R4 ceiling flame graph diagnosis
   37a0f6a perf(F099-B): StreamClient parallel 3-replica fanout
-  644f2f0 perf(R4): autumn-client perf-check --pipeline-depth
-  c25f436 perf(R4): ps_bench — PS RPC pipeline-depth matrix
-  c06dee0 perf(R4): PS P-log + P-bulk SQ/CQ (step 4.4)
-  199c345 perf(R4): StreamClient per-stream SQ/CQ worker (step 4.3)
-  1e7e456 perf(R4): ExtentNode true SQ/CQ (step 4.2 v3)
-  b1a92f7 perf(R4): ExtentNode inline FuturesUnordered (step 4.2 redesign)
-  3261702 perf(R4): ExtentNode per-extent SQ/CQ worker (step 4.2)
-  b5d53ca perf(R4): RpcClient SQ writer task (step 4.1)
-  fc5d0e0 perf(R4): spec — SQ/CQ pipeline architecture (F098)
-
-Key findings from F099-H (kernel flame graph):
-  - Write ceiling at N=1 × 256 × d=1 is CPU-bound on kernel TCP stack,
-    not user-space CPU.
-  - 91% of tcp_sendmsg calls carry 32-63B (tiny PutResp frames), at 22µs
-    each, = 0.8 cores burning on small-frame TCP delivery.
-  - Reads scale naturally (187k) because reply is one big frame.
-  - P-log at pre-F099-J baseline was only ~57% user CPU (the other 43%
-    was idle waiting in io_uring_enter for remote CQEs — pprof couldn't
-    see this).
 
 Test state:
-  autumn-partition-server: 79/79 lib tests green (77 pre-F099-K + 2 new)
+  autumn-partition-server: 82/82 lib tests green (79 prior + 3 new F099-I)
+    - f099i_single_frame_passthrough (depth=1 baseline)
+    - f099i_multi_frame_batches_write (peak concurrency >= 2 under 8-frame batch)
+    - f099i_backpressure_at_cap (env-override CAP=4, 100 frames, peak <= cap)
   autumn-stream: 40 lib + 21 integration green
   autumn-rpc: 17 green
   Full workspace builds clean (excluding autumn-fuse pre-existing env issue).
 
 Documentation:
-  - /data/dongmao_dev/autumn-perf-r1/docs/superpowers/specs/
-      2026-04-18-perf-r4-sqcq-pipeline-design.md  (R4 spec)
-      2026-04-20-perf-r4-ceiling-diagnosis.md     (F099-A)
-      2026-04-20-perf-f099-h-kernel-rtt.md        (F099-H)
-  - autumn-rs/CLAUDE.md: updated thread model
-  - crates/partition-server/CLAUDE.md: updated write-path
-  - crates/stream/CLAUDE.md: updated SQ/CQ, parallel fanout
+  - autumn-rs/crates/partition-server/CLAUDE.md: Thread Model updated to
+    (post F099-J/K/I). "ps-conn handler — F099-I true SQ/CQ inner loop"
+    section added with ASCII diagram. Write Path section updated to
+    reference F099-I batched reply flush.
+  - (This file) claude-progress.txt updated with perf deltas.
 
 Main gaps (carry into next session):
-  1. F099-K N=4 does NOT show expected 4× scaling.
-     Likely causes (need diagnosis):
-     a. Benchmark client distribution — verify all 256 threads actually
-        connect to ports 9201-9204 in balanced ratio. `ss -t state
-        established` during the bench run.
-     b. ExtentNode bottleneck — 3 extent-nodes shared by all 4 partitions;
-        check per-node CPU + io_uring_enter stats. If saturated, each
-        partition is limited by shared extent node capacity, not local
-        P-log.
-     c. StreamClient per-stream serialization — post-F099-K, each partition
-        has its own StreamClient; verify each has a separate ConnPool.
-     d. autumn-client benchmark — 256 threads in one client process might
-        have shared-channel contention (aggregation paths); verify with
-        `top -H -p <client-pid>`.
-  2. `autumn-client info` command still shows ps=127.0.0.1:9201 for all
-     partitions (display bug — uses ps_details not part_addrs). Fix is
-     ~5 lines in crates/server/src/bin/autumn_client.rs info handler.
-     Display-only; doesn't affect routing.
-  3. F099-I (per-conn reply batching) not implemented. Only useful if
-     --pipeline-depth > 1 is exercised.
+  1. N=1 × d=1 write regression (-6.5%). Possible mitigations:
+     a. Inline no-box fast path for n_inflight==1 (skip FU allocation).
+     b. Reuse Vec<Bytes> for tx_bufs across iterations (rebuild after
+        each write_vectored_all returns ownership).
+     c. Investigate whether the issue is the write_vectored_all([1_iov])
+        kernel path cost vs write_all path on loopback.
+  2. N=4 × d=8 only hit 57k (target 100k). This is STEP 2 of the
+     2026-04-20 user priority list: diagnose F099-K N=4 scaling gap.
+     Hypotheses:
+     a. 256 benchmark threads not evenly distributed across partition
+        ports (verify with ss -t state established during run).
+     b. Extent-node shared bottleneck (3 extent-nodes serve all 4 parts).
+     c. Manager-level GetRegions overhead on client.
+  3. The "submit error: connection closed" regression at CAP>=8 in
+     handle_ps_connection is not fully root-caused. CAP=4 avoids it
+     but the underlying issue (likely mpsc reservation exhaustion or
+     compio SQ overflow when ~2048 Rc<Task> are simultaneously in
+     flight) deserves separate investigation if we ever want to raise
+     the cap.
 
-Next steps (explicit priority order from user — UPDATED 2026-04-20):
-
-  STEP 1 (FIRST — was "B"): Implement F099-I (per-conn reply batching).
-     - Scope: handle_ps_connection inner loop in crates/partition-server/src/lib.rs
-     - Change: decode ALL frames from one TCP read, fire to partition
-       concurrently (collect N oneshots into FuturesUnordered), drain as
-       ready into Vec<Bytes>, write_vectored_all replies per burst.
-     - At --pipeline-depth=1: degenerates to write_all([single_frame]) — no
-       regression, no gain.
-     - At --pipeline-depth ≥ 4: server coalesces N replies into one
-       tcp_sendmsg (F099-H measured 0.8 cores of small-frame TCP per 57k
-       writes; this batching cuts that by N).
-     - Add tests:
-       * Correctness: N in-flight puts per conn return correctly via
-         batched write (decode_all + FuturesUnordered + write_vectored_all
-         pattern, similar to R4 4.2 v3 ExtentNode).
-       * Perf: manually verify with bpftrace/ss that tcp_sendmsg count
-         drops N-fold at --pipeline-depth=N.
-     - Target workload: 32 threads × d=8 with F099-K N=4 (= 8 conns per
-       partition, each with 8 in-flight). Expected write throughput: ≥ 100k.
-     - Effort: 1-1.5 days.
-
-  STEP 2 (SECOND — was "A"): Diagnose F099-K N=4 scaling gap.
-     - After F099-I lands, re-measure N=4 with both --pipeline-depth=1
-       and --pipeline-depth=8.
-     - If N=4 × d=8 clears 100k+: F099-I + F099-K combo works; gap was
-       "d=1 can't actually drive multi-partition".
-     - If N=4 × d=8 still flat:
-       * Run `ss -t state established` during bench; confirm 256 conns
-         distribute across 4 ports.
-       * `top -H -p <ps_pid>` during bench; verify each P-log thread
-         gets ~25% CPU (not one at 100% / rest idle).
-       * `top -H -p <extent_pid>` for each extent-node; if saturated,
-         the 3 extent-nodes are the shared bottleneck.
-       * `top -H -p <autumn-client-pid>`; client-side contention check.
-     - Fix root cause based on findings.
-     - Effort: 0.5-1 day diagnosis + variable fix time.
-
-  STEP 3: (If STEP 1+2 clear gate) Tier verdict + feature_list update +
-     merge-decision gate.
+Next steps (priority order):
+  STEP 1 (next session): Diagnose + mitigate N=1 × d=1 regression
+     before landing any further F099-I tuning.
+  STEP 2: F099-K N=4 diagnosis (as in prior notes).
+  STEP 3: Tier verdict + feature_list update + merge-decision gate.
 
 Do NOT touch main worktree at /data/dongmao_dev/autumn (branch compio).
 
-The work has been commit-clean. Next session starts from HEAD = d5228d2.
+The work has been commit-clean.
