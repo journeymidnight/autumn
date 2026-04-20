@@ -1,5 +1,4 @@
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
 
 use anyhow::{Context, Result};
 #[cfg(unix)]
@@ -11,7 +10,6 @@ struct Args {
     psid: u64,
     manager: String,
     advertise: Option<String>,
-    conn_threads: Option<NonZeroUsize>,
 }
 
 fn parse_args() -> Args {
@@ -19,7 +17,6 @@ fn parse_args() -> Args {
     let mut psid: u64 = 0;
     let mut manager = String::from("127.0.0.1:9001");
     let mut advertise: Option<String> = None;
-    let mut conn_threads: Option<NonZeroUsize> = None;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -41,10 +38,18 @@ fn parse_args() -> Args {
                 i += 1;
                 advertise = Some(args[i].clone());
             }
+            // F099-J: `--conn-threads` is a no-op. Pre-F099-J it sized the
+            // compio Dispatcher worker pool that ran ps-conn tasks; after
+            // F099-J every ps-conn task runs on the owning partition's
+            // P-log runtime and there is no worker pool. The flag is
+            // accepted and ignored to preserve CLI compatibility with
+            // existing deployment scripts.
             "--conn-threads" => {
                 i += 1;
-                let n: usize = args[i].parse().expect("--conn-threads must be a positive number");
-                conn_threads = NonZeroUsize::new(n);
+                let _ = args[i].clone();
+                tracing::warn!(
+                    "--conn-threads is a no-op post F099-J; worker pool removed"
+                );
             }
             "--help" | "-h" => {
                 eprintln!("Usage: autumn-ps --psid <ID> [OPTIONS]");
@@ -54,7 +59,7 @@ fn parse_args() -> Args {
                 eprintln!("  --port <PORT>        Listen port [default: 9201]");
                 eprintln!("  --manager <ADDR>     Manager endpoint [default: 127.0.0.1:9001]");
                 eprintln!("  --advertise <ADDR>   Advertise address for cluster discovery");
-                eprintln!("  --conn-threads <N>   Connection worker threads [default: CPU count]");
+                eprintln!("  --conn-threads <N>   [DEPRECATED, F099-J] accepted but ignored");
                 std::process::exit(0);
             }
             other => eprintln!("unknown arg: {other}"),
@@ -72,7 +77,6 @@ fn parse_args() -> Args {
         psid,
         manager,
         advertise,
-        conn_threads,
     }
 }
 
@@ -154,13 +158,9 @@ async fn main() -> Result<()> {
         advertise,
     );
 
-    let mut ps = PartitionServer::connect_with_advertise(args.psid, &args.manager, Some(advertise))
+    let ps = PartitionServer::connect_with_advertise(args.psid, &args.manager, Some(advertise))
         .await
         .context("connect partition server")?;
-
-    if let Some(n) = args.conn_threads {
-        ps.set_conn_threads(n);
-    }
 
     tracing::info!("autumn-ps ready, serving on {addr}");
 

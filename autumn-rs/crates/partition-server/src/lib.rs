@@ -8,7 +8,6 @@ use rpc_handlers::dispatch_partition_rpc;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -21,11 +20,9 @@ use autumn_rpc::partition_rpc::{self, *, TableLocations, SstLocation};
 use autumn_rpc::{Frame, FrameDecoder, HandlerResult, StatusCode};
 use autumn_stream::{ConnPool, StreamClient};
 use bytes::Bytes;
-use compio::dispatcher::Dispatcher;
 use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::net::TcpStream;
 use compio::BufResult;
-use dashmap::DashMap;
 use futures::channel::{mpsc, oneshot};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, SinkExt, StreamExt};
@@ -540,8 +537,27 @@ impl WriteLoopMetrics {
 // ---------------------------------------------------------------------------
 // Inter-thread request routing (main thread ↔ partition thread)
 // ---------------------------------------------------------------------------
+//
+// F099-J (2026-04-20): PartitionRouter + worker-pool + per-request mpsc hop
+// REMOVED. New architecture is thread-per-partition:
+//   * Accept OS thread → std::mpsc → main compio runtime (Dispatcher).
+//   * Main compio runtime → per-P-log `fd_tx` (cross-thread futures mpsc).
+//   * P-log compio runtime: drains fd_tx, converts std::TcpStream →
+//     compio::TcpStream, spawns `handle_ps_connection` on itself. All
+//     request decode + dispatch + response happens on the SAME thread that
+//     owns `Rc<RefCell<PartitionData>>`, so write handoff is via a
+//     same-thread `PartitionRequest` mpsc (no eventfd cross-thread wake).
+//
+// See `docs/superpowers/specs/2026-04-20-perf-f099-h-kernel-rtt.md` §2.3
+// (P-log was 57 % user / 43 % iouring-idle before this change) and §2.1
+// (21.4 s futex + 1.03 M eventfd wakes / 30 s across 258 threads — the
+// cross-thread wake tax this refactor eliminates).
 
-/// A request dispatched from the main (accept) thread to a partition thread.
+/// A request dispatched from a ps-conn task (running on P-log runtime)
+/// into `merged_partition_loop` for write group-commit or for inline
+/// read/maintenance dispatch. After F099-J this channel's endpoints BOTH
+/// live on the same compio runtime, so `futures::channel::mpsc`'s wake
+/// path stays in-process (no eventfd).
 pub struct PartitionRequest {
     msg_type: u8,
     payload: Bytes,
@@ -549,15 +565,18 @@ pub struct PartitionRequest {
 }
 
 /// Handle to a running partition thread.
+///
+/// Owned by the main compio thread. `fd_tx` is the per-P-log fd handoff
+/// channel: the main thread sends freshly-accepted `std::net::TcpStream`s
+/// across it; the P-log thread's fd-drain task receives them and spawns
+/// one `handle_ps_connection` task per connection.
 struct PartitionHandle {
-    req_tx: mpsc::Sender<PartitionRequest>,
+    fd_tx: mpsc::Sender<std::net::TcpStream>,
+    /// JoinHandle retained for RAII — dropping the handle does not wait
+    /// for the thread, but holding it keeps the thread-name metadata
+    /// around for tooling (e.g. `top -H`) and signals explicit ownership.
+    #[allow(dead_code)]
     join: Option<std::thread::JoinHandle<()>>,
-}
-
-/// Thread-safe routing table shared with Dispatcher worker threads.
-/// Maps partition ID to its request channel sender.
-struct PartitionRouter {
-    routes: DashMap<u64, mpsc::Sender<PartitionRequest>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -577,10 +596,6 @@ pub struct PartitionServer {
     /// Server-level owner key and revision for split coordination.
     server_owner_key: String,
     server_revision: Rc<Cell<i64>>,
-    /// Send-safe routing table shared with connection worker threads.
-    router: Arc<PartitionRouter>,
-    /// Number of connection worker threads (None = CPU count).
-    conn_threads: Option<NonZeroUsize>,
 }
 
 impl PartitionServer {
@@ -633,10 +648,6 @@ impl PartitionServer {
                             pool,
                             server_owner_key: owner_key,
                             server_revision: Rc::new(Cell::new(resp.revision)),
-                            router: Arc::new(PartitionRouter {
-                                routes: DashMap::new(),
-                            }),
-                            conn_threads: None,
                         };
                         // Jump to register_ps below
                         return server.finish_connect().await;
@@ -677,11 +688,6 @@ impl PartitionServer {
         server.sync_regions_once().await?;
 
         Ok(server)
-    }
-
-    /// Set the number of connection worker threads (default: CPU count).
-    pub fn set_conn_threads(&mut self, n: NonZeroUsize) {
-        self.conn_threads = Some(n);
     }
 
     async fn register_ps(&self) -> Result<()> {
@@ -786,12 +792,15 @@ impl PartitionServer {
             }
         }
 
-        // Remove partitions no longer assigned.
+        // Remove partitions no longer assigned. Dropping the PartitionHandle
+        // closes its `fd_tx`; the P-log fd-drain task sees `.next() == None`
+        // and exits, which in turn closes every ps-conn task's `req_tx`
+        // clone — merged_partition_loop observes `req_rx.next() == None` and
+        // drains. The partition thread then joins on its own.
         let current: Vec<u64> = self.partitions.borrow().keys().copied().collect();
         for part_id in current {
             if !wanted.contains_key(&part_id) {
                 self.partitions.borrow_mut().remove(&part_id);
-                self.router.routes.remove(&part_id);
             }
         }
 
@@ -811,6 +820,14 @@ impl PartitionServer {
     }
 
     /// Spawn a dedicated OS thread with its own compio runtime for this partition.
+    ///
+    /// F099-J: the partition thread now OWNS the ps-conn tasks for this
+    /// partition. The main thread pushes accepted `std::net::TcpStream`s
+    /// across `fd_tx` → `fd_rx`; inside the partition runtime an
+    /// `fd_drain_task` converts them to `compio::net::TcpStream` and
+    /// spawns `handle_ps_connection` on the same runtime. Request handoff
+    /// from ps-conn → `merged_partition_loop` is a same-thread
+    /// `PartitionRequest` mpsc (no eventfd cross-thread wake).
     async fn open_partition(
         &self,
         part_id: u64,
@@ -819,9 +836,10 @@ impl PartitionServer {
         row_stream_id: u64,
         meta_stream_id: u64,
     ) -> Result<PartitionHandle> {
-        let (req_tx, req_rx) = mpsc::channel::<PartitionRequest>(WRITE_CHANNEL_CAP);
-        // Publish to router so worker threads can route requests to this partition.
-        self.router.routes.insert(part_id, req_tx.clone());
+        // fd handoff: main compio thread → P-log compio thread. Bounded
+        // buffer matches the old `ps accept` channel capacity (256);
+        // momentary overshoot is absorbed as with the pre-F099-J design.
+        let (fd_tx, fd_rx) = mpsc::channel::<std::net::TcpStream>(256);
         let manager_addr = self.manager_addrs.join(",");
         let owner_key = self.server_owner_key.clone();
         let revision = self.server_revision.get();
@@ -840,7 +858,7 @@ impl PartitionServer {
                         manager_addr,
                         owner_key,
                         revision,
-                        req_rx,
+                        fd_rx,
                     )
                     .await
                     {
@@ -851,17 +869,24 @@ impl PartitionServer {
             .context("spawn partition thread")?;
 
         Ok(PartitionHandle {
-            req_tx,
+            fd_tx,
             join: Some(join),
         })
     }
 
     // ── Serve ──────────────────────────────────────────────────────────
     //
-    // Uses the same Dispatcher pattern as autumn-rpc's RpcServer:
-    //   - Dedicated OS thread for blocking accept
-    //   - compio Dispatcher spreads connections across N worker threads
-    //   - Control-plane (heartbeat, region_sync) stays on main thread
+    // F099-J thread model:
+    //   - 1 accept OS thread (std::net blocking accept) — unchanged.
+    //   - 1 main compio thread: control plane (heartbeat/region_sync) +
+    //     fd dispatcher. Forwards each accepted fd to the owning partition's
+    //     P-log runtime. No worker pool.
+    //   - N × 2 partition OS threads: per-partition P-log + P-bulk.
+    //     P-log now ALSO hosts every ps-conn task for its partition, so
+    //     the per-request mpsc hop no longer crosses threads (no eventfd
+    //     wake). Pre-F099-J this was `N + 2N + 1 + 1 = 3N + 2` threads
+    //     with ~CPU-count ps-conn workers — the wake-fan-out F099-H §2.1
+    //     measured at 21 s futex / 1 M eventfd writes per 30 s.
 
     pub async fn serve(&self, addr: SocketAddr) -> Result<()> {
         let std_listener = std::net::TcpListener::bind(addr)?;
@@ -874,19 +899,7 @@ impl PartitionServer {
         let s = self.clone();
         compio::runtime::spawn(async move { s.region_sync_loop().await }).detach();
 
-        // Dispatcher for connection worker threads.
-        let dispatcher = {
-            let mut builder = Dispatcher::builder();
-            if let Some(n) = self.conn_threads {
-                builder = builder.worker_threads(n);
-            }
-            builder
-                .thread_names(|i| format!("ps-conn-{i}"))
-                .build()
-                .context("build ps dispatcher")?
-        };
-
-        // Blocking accept thread → channel → main thread → Dispatcher.
+        // Blocking accept thread → futures::channel::mpsc → main runtime.
         let (tx, mut rx) =
             futures::channel::mpsc::channel::<(std::net::TcpStream, SocketAddr)>(256);
         std::thread::Builder::new()
@@ -910,47 +923,78 @@ impl PartitionServer {
             })
             .context("spawn ps accept thread")?;
 
-        // Dispatch accepted connections to worker threads.
-        let router = self.router.clone();
+        // Main fd-dispatcher loop: for each accepted fd, pick the owning
+        // partition's `fd_tx` and send the std::TcpStream across.
+        //
+        // TODO(F099-K): proper multi-partition fd routing. Today the
+        // protocol only reveals `part_id` AFTER the first frame is decoded,
+        // which is problematic here because we have to pick a P-log BEFORE
+        // decoding. For N=1 this is a non-issue (one partition gets every
+        // fd). For N>1 the simplest scheme is:
+        //   a) round-robin to any P-log; ps-conn peeks `part_id` in the
+        //      first frame and rejects with a "redirect" status if it's
+        //      not the owner, OR
+        //   b) each P-log's ps-conn forwards misrouted frames to the right
+        //      P-log via a per-target same-process mpsc (still cheaper
+        //      than eventfd since all threads share a ConnPool).
+        // The writes to implement either will come in F099-K; for now we
+        // broadcast to the first partition in the map. This is correct at
+        // N=1 and buggy at N>1, matching the stated F099-J scope.
         loop {
             let (std_stream, peer) = match rx.next().await {
                 Some(v) => v,
                 None => return Ok(()),
             };
-            let router = router.clone();
-            if dispatcher
-                .dispatch(move || async move {
-                    let stream = match TcpStream::from_std(std_stream) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::warn!(peer = %peer, error = %e, "from_std failed");
-                            return;
-                        }
-                    };
-                    let _ = stream.set_nodelay(true);
-                    if let Err(e) = handle_ps_connection(stream, router).await {
-                        tracing::debug!(peer = %peer, error = %e, "ps connection ended");
+            // N=1 fast path: send to the first (and only) partition's fd_tx.
+            // TODO(F099-K): replace with proper multi-partition routing.
+            let fd_tx_opt = self
+                .partitions
+                .borrow()
+                .values()
+                .next()
+                .map(|h| h.fd_tx.clone());
+            match fd_tx_opt {
+                Some(mut fd_tx) => {
+                    if let Err(e) = fd_tx.send(std_stream).await {
+                        tracing::warn!(peer = %peer, error = %e, "fd handoff failed");
                     }
-                })
-                .is_err()
-            {
-                tracing::error!("all ps worker threads panicked");
-                break;
+                }
+                None => {
+                    tracing::warn!(peer = %peer, "no partition open; dropping connection");
+                    drop(std_stream);
+                }
             }
         }
-        Ok(())
     }
 }
 
 // ---------------------------------------------------------------------------
-// Connection handler — runs on Dispatcher worker threads
+// Connection handler — F099-J: runs on the owning partition's P-log runtime
 // ---------------------------------------------------------------------------
 
-/// Handle a single client connection on a worker thread.
-/// Sequential per-connection: decode → route to partition → await response → write.
+/// Handle a single client connection on the P-log runtime.
+///
+/// Sequential per-connection: decode → push PartitionRequest → await oneshot
+/// response → write. After F099-J the request mpsc and the oneshot both
+/// live on the same compio runtime as `merged_partition_loop`, so the
+/// wake path is Rc/Waker-only (no eventfd, no cross-thread futex).
+///
+/// Arguments:
+///   * `stream`      — client socket (owned; split into read/write halves)
+///   * `req_tx`      — sender into merged_partition_loop's request channel.
+///                     Owned by `handle_ps_connection`; a new clone is made
+///                     per call.  Closing `req_tx` is the signal to
+///                     merged_partition_loop that no more work is coming.
+///   * `owner_part`  — the partition id this P-log thread serves.  Requests
+///                     for other partitions are rejected with `NotFound`
+///                     (matches pre-F099-J behavior where the router
+///                     DashMap would miss).
+///                     TODO(F099-K): replace this single-partition check
+///                     with a real routing table / forwarder for N>1.
 async fn handle_ps_connection(
     stream: TcpStream,
-    router: Arc<PartitionRouter>,
+    mut req_tx: mpsc::Sender<PartitionRequest>,
+    owner_part: u64,
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     let mut decoder = FrameDecoder::new();
@@ -974,55 +1018,58 @@ async fn handle_ps_connection(
                     let payload = frame.payload;
 
                     let part_id = partition_rpc::extract_part_id(msg_type, &payload);
-                    let resp_frame =
-                        if let Some(tx) = router.routes.get(&part_id) {
-                            let mut req_tx: mpsc::Sender<PartitionRequest> = tx.clone();
-                            drop(tx); // release DashMap ref before await
-                            let (resp_tx, resp_rx) = oneshot::channel();
-                            let req = PartitionRequest {
-                                msg_type,
-                                payload,
-                                resp_tx,
-                            };
-                            if req_tx.send(req).await.is_err() {
-                                Frame::error(
-                                    req_id,
-                                    msg_type,
-                                    autumn_rpc::RpcError::encode_status(
-                                        StatusCode::Internal,
-                                        "partition thread closed",
-                                    ),
-                                )
-                            } else {
-                                match resp_rx.await {
-                                    Ok(Ok(p)) => Frame::response(req_id, msg_type, p),
-                                    Ok(Err((code, message))) => Frame::error(
-                                        req_id,
-                                        msg_type,
-                                        autumn_rpc::RpcError::encode_status(
-                                            code, &message,
-                                        ),
-                                    ),
-                                    Err(_) => Frame::error(
-                                        req_id,
-                                        msg_type,
-                                        autumn_rpc::RpcError::encode_status(
-                                            StatusCode::Internal,
-                                            "partition response dropped",
-                                        ),
-                                    ),
-                                }
-                            }
-                        } else {
+                    let resp_frame = if part_id == owner_part {
+                        let (resp_tx, resp_rx) = oneshot::channel();
+                        let req = PartitionRequest {
+                            msg_type,
+                            payload,
+                            resp_tx,
+                        };
+                        if req_tx.send(req).await.is_err() {
                             Frame::error(
                                 req_id,
                                 msg_type,
                                 autumn_rpc::RpcError::encode_status(
-                                    StatusCode::NotFound,
-                                    &format!("partition {part_id} not found"),
+                                    StatusCode::Internal,
+                                    "partition thread closed",
                                 ),
                             )
-                        };
+                        } else {
+                            match resp_rx.await {
+                                Ok(Ok(p)) => Frame::response(req_id, msg_type, p),
+                                Ok(Err((code, message))) => Frame::error(
+                                    req_id,
+                                    msg_type,
+                                    autumn_rpc::RpcError::encode_status(
+                                        code, &message,
+                                    ),
+                                ),
+                                Err(_) => Frame::error(
+                                    req_id,
+                                    msg_type,
+                                    autumn_rpc::RpcError::encode_status(
+                                        StatusCode::Internal,
+                                        "partition response dropped",
+                                    ),
+                                ),
+                            }
+                        }
+                    } else {
+                        // TODO(F099-K): multi-partition fd routing — forward
+                        // misrouted frames to the owning P-log's req_tx
+                        // instead of rejecting.  For N=1 this branch is
+                        // never hit.
+                        Frame::error(
+                            req_id,
+                            msg_type,
+                            autumn_rpc::RpcError::encode_status(
+                                StatusCode::NotFound,
+                                &format!(
+                                    "partition {part_id} not served by this P-log (owner={owner_part})"
+                                ),
+                            ),
+                        )
+                    };
 
                     let data = resp_frame.encode();
                     let BufResult(result, _) = writer.write_all(data).await;
@@ -1048,8 +1095,13 @@ async fn partition_thread_main(
     manager_addr: String,
     owner_key: String,
     revision: i64,
-    req_rx: mpsc::Receiver<PartitionRequest>,
+    fd_rx: mpsc::Receiver<std::net::TcpStream>,
 ) -> Result<()> {
+    // F099-J: create the same-thread ps-conn ↔ merged_partition_loop
+    // channel. Both endpoints live on THIS compio runtime, so sends and
+    // wakes do not cross threads.
+    let (req_tx, req_rx) = mpsc::channel::<PartitionRequest>(WRITE_CHANNEL_CAP);
+
     let pool = Rc::new(ConnPool::new());
     // StreamClient::new_with_revision now returns `Rc<StreamClient>` directly
     // (R4 step 4.3: Rc::new_cyclic for Weak-self worker removal guard).
@@ -1177,6 +1229,46 @@ async fn partition_thread_main(
         .detach();
     }
     let locked_by_other = Rc::new(Cell::new(false));
+
+    // F099-J: spawn the fd-drain task. It consumes `fd_rx`, converts each
+    // incoming std::net::TcpStream into a compio::net::TcpStream, and
+    // spawns a `handle_ps_connection` task on THIS runtime. When `fd_rx`
+    // closes (main thread drops this partition's PartitionHandle), the
+    // drain task exits, which drops its clone of `req_tx`; merged_loop
+    // below observes `req_rx` close once all outstanding ps-conn tasks
+    // also drop their clones, and itself shuts down.
+    {
+        let req_tx_for_drain = req_tx.clone();
+        compio::runtime::spawn(async move {
+            let mut fd_rx = fd_rx;
+            while let Some(std_stream) = fd_rx.next().await {
+                let stream = match TcpStream::from_std(std_stream) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(part_id, error = %e, "TcpStream::from_std failed");
+                        continue;
+                    }
+                };
+                let _ = stream.set_nodelay(true);
+                let req_tx_conn = req_tx_for_drain.clone();
+                compio::runtime::spawn(async move {
+                    if let Err(e) =
+                        handle_ps_connection(stream, req_tx_conn, part_id).await
+                    {
+                        tracing::debug!(part_id, error = %e, "ps connection ended");
+                    }
+                })
+                .detach();
+            }
+            tracing::info!(part_id, "fd-drain task exiting");
+        })
+        .detach();
+    }
+    // Drop our extra clone of req_tx — the only senders left are the
+    // fd-drain task's clone (+ per-conn clones it hands out). Once all
+    // of those drop, merged_loop's `req_rx.next()` returns None and it
+    // shuts down.
+    drop(req_tx);
 
     // F099-D: merged request + write loop runs directly on this task.
     merged_partition_loop(
@@ -2967,4 +3059,215 @@ mod merged_loop_tests {
         assert_eq!(err2.0, StatusCode::Internal);
     }
 
+}
+
+
+// ---------------------------------------------------------------------------
+// F099-J — ps-conn on P-log runtime (same-thread, no worker pool) tests.
+//
+// These tests pin the two properties of the F099-J refactor:
+//   1. `handle_ps_connection` no longer requires an Arc<PartitionRouter>
+//      DashMap — it runs on the owning partition's compio runtime and
+//      communicates with `merged_partition_loop` via a same-thread
+//      `mpsc::Sender<PartitionRequest>`. No cross-thread wake (eventfd
+//      + futex) on the write hot path.
+//   2. Under load (1000 sequential ops on one TCP connection), the full
+//      decode → push → await → write cycle remains correct. This is a
+//      lightweight correctness-under-load check (not a perf test).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod f099j_tests {
+    use super::*;
+
+    /// F099-J test 1 — `handle_ps_connection` accepts a direct
+    /// `mpsc::Sender<PartitionRequest>` and `owner_part` id. We drive
+    /// one Put request through a loopback connection with BOTH the
+    /// ps-conn task and the simulated merged_loop running on the SAME
+    /// compio runtime. There is no spawned dispatcher worker thread,
+    /// no DashMap, and no Arc<PartitionRouter>. Success = the response
+    /// arrives with the exact key echoed.
+    #[test]
+    fn f099j_single_threaded_write_path_no_router() {
+        let rt = compio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            // Bind a loopback listener and a client socket on the same runtime.
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind listener");
+            let server_addr = listener.local_addr().expect("local_addr");
+            let client = compio::net::TcpStream::connect(server_addr)
+                .await
+                .expect("connect client");
+            let (server_stream, _) = listener.accept().await.expect("accept");
+
+            // Same-thread req channel — consumer is the simulated merged_loop
+            // spawned on THIS compio runtime (no OS thread spawned).
+            let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(16);
+
+            // Spawn the ps-conn task with the direct req_tx (no router).
+            let conn_handle = compio::runtime::spawn(async move {
+                handle_ps_connection(server_stream, req_tx, /*owner_part=*/ 7).await
+            });
+
+            // Spawn a simulated merged_loop that answers the single Put.
+            let loop_handle = compio::runtime::spawn(async move {
+                if let Some(req) = req_rx.next().await {
+                    assert_eq!(req.msg_type, MSG_PUT);
+                    // Simulate Phase-3 success: encode PutResp + send.
+                    let put: PutReq =
+                        partition_rpc::rkyv_decode(&req.payload).expect("decode");
+                    let resp = partition_rpc::rkyv_encode(&PutResp {
+                        code: CODE_OK,
+                        message: String::new(),
+                        key: put.key,
+                    });
+                    let _ = req.resp_tx.send(Ok(resp));
+                }
+                // Exit — dropping rx closes the channel; ps-conn will exit
+                // when the client closes its socket below.
+            });
+
+            // Client: build one PutReq frame, send it, read response.
+            let put = PutReq {
+                part_id: 7,
+                key: b"hello".to_vec(),
+                value: b"world".to_vec(),
+                must_sync: false,
+                expires_at: 0,
+            };
+            let payload = partition_rpc::rkyv_encode(&put);
+            let frame = Frame::request(42, MSG_PUT, Bytes::from(payload));
+            let bytes = frame.encode();
+
+            let (mut client_rd, mut client_wr) = client.into_split();
+            let BufResult(r, _buf) = client_wr.write_all(bytes).await;
+            r.expect("write request");
+
+            // Read the response frame.
+            let mut decoder = FrameDecoder::new();
+            let mut buf = vec![0u8; 8192];
+            let mut decoded: Option<Frame> = None;
+            while decoded.is_none() {
+                let BufResult(n, back) = client_rd.read(buf).await;
+                buf = back;
+                let n = n.expect("read response");
+                assert!(n > 0, "unexpected EOF before response arrived");
+                decoder.feed(&buf[..n]);
+                decoded = decoder.try_decode().expect("decode");
+            }
+            let resp_frame = decoded.unwrap();
+            assert_eq!(resp_frame.req_id, 42);
+            assert_eq!(resp_frame.msg_type, MSG_PUT);
+            // Response is success — no status-code header.
+            assert!(!resp_frame.is_error(), "response should not be error");
+
+            let resp: PutResp =
+                partition_rpc::rkyv_decode(&resp_frame.payload).expect("decode resp");
+            assert_eq!(resp.code, CODE_OK);
+            assert_eq!(resp.key, b"hello");
+
+            // Close client → ps-conn exits.
+            drop(client_rd);
+            drop(client_wr);
+            let _ = conn_handle.await;
+            let _ = loop_handle.await;
+        });
+    }
+
+    /// F099-J test 2 — correctness under load. Fire 1000 sequential
+    /// Put requests on one TCP connection, verify every response arrives
+    /// with the correct echoed key. No threading, no routing; all on
+    /// the single compio runtime. Elapsed time bound (2 s) is
+    /// generous — this is a correctness check, not a perf test.
+    #[test]
+    fn f099j_n1_load_basic_sanity() {
+        let rt = compio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("local_addr");
+            let client = compio::net::TcpStream::connect(addr).await.expect("connect");
+            let (server, _) = listener.accept().await.expect("accept");
+
+            let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(128);
+
+            let conn_handle = compio::runtime::spawn(async move {
+                handle_ps_connection(server, req_tx, 1).await
+            });
+
+            // Simulated merged_loop: echo every Put.
+            let loop_handle = compio::runtime::spawn(async move {
+                while let Some(req) = req_rx.next().await {
+                    let put: PutReq =
+                        partition_rpc::rkyv_decode(&req.payload).expect("decode");
+                    let resp = partition_rpc::rkyv_encode(&PutResp {
+                        code: CODE_OK,
+                        message: String::new(),
+                        key: put.key,
+                    });
+                    let _ = req.resp_tx.send(Ok(resp));
+                }
+            });
+
+            let (mut client_rd, mut client_wr) = client.into_split();
+            let n_ops: u32 = 1000;
+            let start = Instant::now();
+
+            // Send all 1000 requests first (pipelined at the TCP layer,
+            // serialized at ps-conn). Then read 1000 responses.
+            let mut big_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+            for i in 0..n_ops {
+                let key = format!("k{:04}", i).into_bytes();
+                let value = format!("v{:04}", i).into_bytes();
+                let put = PutReq {
+                    part_id: 1,
+                    key: key.clone(),
+                    value,
+                    must_sync: false,
+                    expires_at: 0,
+                };
+                let payload = partition_rpc::rkyv_encode(&put);
+                let f = Frame::request(i + 1, MSG_PUT, Bytes::from(payload));
+                big_buf.extend_from_slice(&f.encode()[..]);
+            }
+            let BufResult(r, _) = client_wr.write_all(big_buf).await;
+            r.expect("write all requests");
+
+            // Read and verify all 1000 responses.
+            let mut decoder = FrameDecoder::new();
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut verified: u32 = 0;
+            while verified < n_ops {
+                let BufResult(n, back) = client_rd.read(buf).await;
+                buf = back;
+                let n = n.expect("read");
+                assert!(n > 0, "unexpected EOF at verified={}", verified);
+                decoder.feed(&buf[..n]);
+                while let Some(resp_frame) = decoder.try_decode().expect("decode") {
+                    assert_eq!(resp_frame.req_id, verified + 1);
+                    assert_eq!(resp_frame.msg_type, MSG_PUT);
+                    assert!(!resp_frame.is_error());
+                    let r: PutResp =
+                        partition_rpc::rkyv_decode(&resp_frame.payload).expect("decode resp");
+                    assert_eq!(r.code, CODE_OK);
+                    let expected_key = format!("k{:04}", verified).into_bytes();
+                    assert_eq!(r.key, expected_key);
+                    verified += 1;
+                }
+            }
+            let elapsed = start.elapsed();
+            assert_eq!(verified, n_ops);
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "1000 ops should complete well under 5s on loopback; took {:?}",
+                elapsed,
+            );
+
+            drop(client_rd);
+            drop(client_wr);
+            let _ = conn_handle.await;
+            let _ = loop_handle.await;
+        });
+    }
 }

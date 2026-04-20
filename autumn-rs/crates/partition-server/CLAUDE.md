@@ -6,39 +6,38 @@ An LSM-tree based KV store built on top of the stream layer. Each `PartitionServ
 
 ## Architecture
 
-### Thread Model
+### Thread Model (post F099-J, 2026-04-20)
 
 ```
-Main compio thread (control plane)
+Main compio thread (control plane + fd dispatcher)
 ├─ heartbeat_loop          ← periodic manager heartbeat
 ├─ region_sync_loop        ← discover/open/close partitions
-└─ dispatch loop           ← rx.next() → Dispatcher
+└─ fd-dispatch loop        ← rx.next() → partition handle.fd_tx
 
 Accept OS thread (blocking)
 └─ std::net::accept → tx   ← dedicated accept, sends to main via channel
 
-Dispatcher worker threads (N = CPU count, configurable via --conn-threads)
-├─ worker-0: handle_ps_connection × K
-├─ worker-1: handle_ps_connection × K
-└─ worker-N: handle_ps_connection × K
-
-Partition threads — 2 OS threads per partition (F088, PoolKind removed in F093):
-├─ part-N-log (P-log): merged_partition_loop + flush_dispatcher + compact_loop + gc_loop
-│     • owns PartitionData (Rc<RefCell>), dedicated StreamClient + ConnPool
-│     • serves log_stream WAL appends + (rare) compact row_stream writes
-│     • all WAL appends + atomic tables/sst_readers swap run here
-│     • F099-D: the write loop is NO LONGER a separate compio task — it is
-│       inlined into `merged_partition_loop` with the request-dispatch loop.
-│       Writes decode + push to pending + run Phase 1/2/3 all on the same
-│       task. `spawn_write_request` / `handle_put` / inner oneshot removed.
+Partition threads — 2 OS threads per partition:
+├─ part-N (P-log): OWNS
+│     • merged_partition_loop (request dispatch + group-commit SQ/CQ)
+│     • fd-drain task: fd_rx.next() → compio::TcpStream → spawn ps-conn task
+│     • ps-conn task × K (one per live client connection, all on this runtime)
+│     • background_flush_loop, background_compact_loop, background_gc_loop
+│     • PartitionData (Rc<RefCell>) shared across all tasks on this runtime
+│     • dedicated StreamClient + ConnPool for log_stream/meta_stream
+│     • F099-D: write loop inlined into merged_partition_loop (no spawn/oneshot)
+│     • F099-J: ps-conn tasks collocated here; per-request mpsc hop is now
+│       same-thread (no eventfd, no cross-thread futex).
 ├─ part-N-bulk (P-bulk): flush_worker_loop
-│     • own compio runtime, own io_uring, own ConnPool, own StreamClient
-│     • uses StreamClient::new_with_revision to inherit owner-lock fencing
+│     • own compio runtime + io_uring + ConnPool + StreamClient
 │     • runs build_sst_bytes + row_stream.append + save_table_locs_raw
 │
 P-log → P-bulk: mpsc::Sender<FlushReq> (capacity 1 → sequential flushes)
 P-bulk → P-log: oneshot::Sender<Result<(TableMeta, SstReader)>>
 ```
+
+**Thread count**: `1 main + 1 ps-accept + 2N partition` = `2N + 2` OS threads.
+At N=1 this is **4** OS threads total (vs pre-F099-J `3 + (CPU-count workers) + 2 = ~194`).
 
 **Why two OS threads per partition?** A 128 MB row_stream flush holds the P-log
 compio runtime for hundreds of ms (syscall + 3-replica fanout CQE wait), head-
@@ -47,13 +46,44 @@ F087-bulk-mux pool split separated the TCP sockets, but the runtime was still
 single-threaded. F088 gives flush its own runtime so WAL appends make forward
 progress concurrently with SST uploads.
 
-Workers communicate with partition threads via `PartitionRouter` (DashMap<part_id, mpsc::Sender>).
-Each connection is sequential: decode → route → await response → write. No Mutex writer.
+**How ps-conn handoff works (F099-J)**:
+- `open_partition` creates a `futures::channel::mpsc<std::net::TcpStream>`
+  (`fd_tx` / `fd_rx`). `fd_tx` is returned inside `PartitionHandle`; `fd_rx`
+  is moved into the partition OS thread.
+- Main thread's fd-dispatch loop: for each accepted fd, clone the owning
+  partition's `fd_tx` and `send(std_stream).await`.
+- Partition thread's fd-drain task: `fd_rx.next().await` → `TcpStream::from_std`
+  → `compio::runtime::spawn(handle_ps_connection(stream, req_tx, part_id))`.
+- `handle_ps_connection` runs on THIS runtime. Its `req_tx.send(req).await`
+  is a same-thread mpsc send; the matching `req_rx.next().await` inside
+  `merged_partition_loop` wakes via a local Waker (Rc-based) — no eventfd,
+  no cross-thread futex.
+
+**N>1 caveat (F099-J scope)**: `handle_ps_connection` checks each frame's
+`part_id` against `owner_part`; mismatches are rejected with `NotFound`.
+The main thread's fd dispatcher currently sends every fd to the first
+partition in the map (N=1 fast path). Proper N>1 routing is deferred to
+**F099-K** (`TODO(F099-K)` markers throughout `lib.rs`).
+
+**Trade-off measured** (F099-J, 256 × d=1 × 4 KB nosync write on tmpfs):
+- Pre-F099-J P-log CPU: ~57 % user / 43 % iouring-idle (F099-H §2.3).
+- Post-F099-J P-log CPU: **~100 %** — ps-conn decode + dispatch + response
+  writes all run on this thread, saturating it. At 256 concurrent clients
+  this costs ~20–25 % write throughput vs F099-D baseline.
+- At lower connection counts (e.g. 1 × d=64) the collocation is a net win:
+  F099-H Scenario B achieved ~12 k ops/s; post-F099-J achieves ~12.9 k.
+- The architectural simplification (no Dispatcher, no PartitionRouter
+  DashMap, no Arc<...> on the hot path, `2N + 2` threads total) is
+  retained even where throughput regresses — the cleaner model is
+  foundation for future work (SQE coalescing per F099-I, multi-partition
+  routing F099-K).
 
 ```
 ┌─────────────────── PartitionServer ────────────────────┐
 │  Rc<RefCell<HashMap<part_id, PartitionHandle>>>         │
-│  Arc<PartitionRouter>  ← shared with worker threads     │
+│  (F099-J: no Arc<PartitionRouter> — ps-conn tasks run   │
+│           on the P-log runtime and use a same-thread    │
+│           PartitionRequest mpsc; no cross-thread wake)  │
 │                                                          │
 │  ┌──────── PartitionData (per partition thread) ───┐    │
 │  │  active: Memtable (RwLock<BTreeMap>, F099-C)     │    │

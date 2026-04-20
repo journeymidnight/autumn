@@ -58,8 +58,10 @@ On crash recovery, the partition replays: metaStream checkpoint → rowStream SS
 ```
 Put(key, value, must_sync)
   │
-  └─ ps-conn: PartitionRequest{msg_type=MSG_PUT, payload, resp_tx}
-             → PartitionRouter mpsc → P-log merged_partition_loop
+  └─ ps-conn task (on P-log runtime): PartitionRequest{msg_type=MSG_PUT, payload, resp_tx}
+             → same-thread mpsc → merged_partition_loop (same runtime)
+             (F099-J: ps-conn is spawned by P-log's fd-drain task; the
+              main compio thread only forwards fds across partitions.)
        │
        └─ merged_partition_loop (F099-D: request dispatch + group commit in one task):
             ├─ Decode PutReq inline (no spawn, no inner oneshot)
@@ -93,7 +95,10 @@ calling `acquire_owner_lock` again. `StreamClient` is internally concurrent via 
 locking (`DashMap<stream_id, Arc<Mutex<StreamAppendState>>>`), so no external Mutex is needed.
 The server-level `PartitionServer.stream_client` is reserved for split coordination RPCs only.
 
-**Two OS threads per partition (F088)**: each partition additionally owns a **P-bulk** thread
+**Two OS threads per partition (F088 + F099-J)**: After F099-J, P-log also
+hosts the ps-conn tasks for its partition — ps-conn ↔ merged_partition_loop
+runs on the same compio runtime (no cross-thread wake). Each partition
+additionally owns a **P-bulk** thread
 running its own compio runtime + ConnPool + StreamClient (also via `new_with_revision` to
 inherit owner-lock fencing). `background_flush_loop` on P-log ships `FlushReq` over a
 bounded-1 channel to P-bulk, which runs the 128 MB `row_stream.append` + meta checkpoint
