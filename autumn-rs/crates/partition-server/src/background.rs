@@ -19,10 +19,24 @@ use crate::sstable::{IterItem, MergeIterator, SstBuilder, SstReader, TableIterat
 /// batch while another batch is already in flight. Below this threshold the
 /// per-batch overhead (encode + 3-replica send_vectored + lease/ack state
 /// machine) outweighs the concurrency gain from running two small batches
-/// in parallel, and stealing small batches from a naturally-large burst
-/// regressed throughput in R3 Task 5b. 256 matches the client-count at
-/// perf_check N=1 × 256 threads.
-pub(crate) const MIN_PIPELINE_BATCH: usize = 256;
+/// in parallel. 256 matches the client-count at perf_check N=1 × 256 threads.
+///
+/// F099-K/M/N — env-configurable so N>1 partitions (with fewer clients per
+/// partition) can lower the gate. At N=8 × 256 clients, clients/partition = 32,
+/// and pending typically can't reach 256 → second batch never launches →
+/// effective depth=1 per partition. Use `AUTUMN_PS_MIN_BATCH=32` or similar.
+const DEFAULT_MIN_PIPELINE_BATCH: usize = 256;
+pub(crate) fn min_pipeline_batch() -> usize {
+    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("AUTUMN_PS_MIN_BATCH")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n >= 1 && n <= 10_000)
+            .unwrap_or(DEFAULT_MIN_PIPELINE_BATCH)
+    })
+}
+pub(crate) const MIN_PIPELINE_BATCH: usize = DEFAULT_MIN_PIPELINE_BATCH;
 
 pub(crate) struct CompactStats {
     pub input_tables: usize,

@@ -1870,7 +1870,7 @@ async fn merged_partition_loop(
     use futures::future::{select, Either};
 
     let cap = ps_inflight_cap();
-    let batch_target = MIN_PIPELINE_BATCH.min(max_write_batch());
+    let batch_target = crate::background::min_pipeline_batch().min(max_write_batch());
     let mut metrics = WriteLoopMetrics::new();
     let mut pending: Vec<WriteRequest> = Vec::new();
 
