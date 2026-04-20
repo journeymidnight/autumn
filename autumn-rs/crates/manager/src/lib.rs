@@ -696,6 +696,10 @@ impl AutumnManager {
             .collect();
         for part_id in stale {
             state.regions.remove(&part_id);
+            // F099-K: a dropped region implies the old per-partition
+            // listener address is also invalid; drop it so clients can't
+            // be handed back a dead addr via GetRegions.
+            state.part_addrs.remove(&part_id);
         }
 
         if state.ps_nodes.is_empty() {

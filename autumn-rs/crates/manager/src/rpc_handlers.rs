@@ -95,6 +95,7 @@ impl AutumnManager {
             MSG_UPSERT_PARTITION => self.handle_upsert_partition(payload).await,
             MSG_GET_REGIONS => self.handle_get_regions().await,
             MSG_HEARTBEAT_PS => self.handle_heartbeat_ps(payload).await,
+            MSG_REGISTER_PARTITION_ADDR => self.handle_register_partition_addr(payload).await,
             _ => Err((
                 StatusCode::InvalidArgument,
                 format!("unknown msg_type {msg_type}"),
@@ -1115,11 +1116,23 @@ impl AutumnManager {
                 )
             })
             .collect();
+        // F099-K: per-partition listener addresses. Only emit entries for
+        // partitions that actually have a region assignment — this keeps
+        // stale `part_addrs` entries (e.g. from a dropped partition whose
+        // registration entry wasn't cleared) from being returned to
+        // clients and confusing routing.
+        let part_addrs: Vec<(u64, String)> = s
+            .part_addrs
+            .iter()
+            .filter(|(pid, _)| s.regions.contains_key(*pid))
+            .map(|(&pid, addr)| (pid, addr.clone()))
+            .collect();
         Ok(rkyv_encode(&GetRegionsResp {
             code: CODE_OK,
             message: String::new(),
             regions,
             ps_details,
+            part_addrs,
         }))
     }
 
@@ -1135,6 +1148,31 @@ impl AutumnManager {
                 .borrow_mut()
                 .insert(req.ps_id, Instant::now());
         }
+        Ok(rkyv_encode(&CodeResp {
+            code: CODE_OK,
+            message: String::new(),
+        }))
+    }
+
+    async fn handle_register_partition_addr(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&CodeResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+            }));
+        }
+        let req: RegisterPartitionAddrReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        // F099-K — record the per-partition listener address. We do NOT
+        // validate that `part_id` is owned by `ps_id` here: the manager's
+        // region table is the source of truth for ownership, and the
+        // mapping is re-validated on `GetRegions` (only partitions with
+        // an assigned region are returned). Overwrites are allowed —
+        // if a PS re-binds a partition on a new port (restart, split),
+        // the latest report wins.
+        let mut s = self.store.inner.borrow_mut();
+        let _ = req.ps_id; // reserved for future validation
+        s.part_addrs.insert(req.part_id, req.address);
         Ok(rkyv_encode(&CodeResp {
             code: CODE_OK,
             message: String::new(),

@@ -214,19 +214,31 @@ do_start() {
         --psid 1 --port 9201 \
         --manager "$MANAGER_ADDR" \
         --advertise 127.0.0.1:9201
-    wait_port 9201 ps 60  # longer timeout: PS waits for manager leader election
+    # F099-K: no central PS listener — partitions bind their own ports
+    # AFTER they are opened. Don't wait for port 9201 here; bootstrap
+    # below creates partitions, and the per-partition listener (9201,
+    # 9202, ...) will come up as the PS opens each partition.
+    echo "[cluster] PS launched (F099-K: per-partition listeners bind on partition open)"
 
     # bootstrap (create streams + partitions) — only on a fresh data dir
     if [[ -f "$bootstrap_marker" ]]; then
         echo "[cluster] skipping bootstrap (already done — use 'restart' for a fresh cluster)"
+        # Give PS a moment to sync regions and re-bind listeners on restart.
+        wait_port 9201 ps 60
     else
         # Use 3+0 replication when >= 3 nodes, otherwise match node count
         local repl
         if (( replicas >= 3 )); then repl="3+0"; else repl="${replicas}+0"; fi
         sleep 2  # give PS a moment to register with manager
         # AUTUMN_BOOTSTRAP_PRESPLIT: e.g. "4:3fffffff,7ffffffe,bffffffd"
+        # The literal split points in the env var are documentation only;
+        # autumn-client's `--presplit N:hexstring` calls hex_split_ranges(N)
+        # internally and produces the same 0x3FFF.../0x7FFF.../0xBFFF... split
+        # points. Forward just the partition count with `hexstring` kind.
         if [[ -n "${AUTUMN_BOOTSTRAP_PRESPLIT:-}" ]]; then
-            "$AC" --manager "$MANAGER_ADDR" bootstrap --replication "$repl" --presplit "$AUTUMN_BOOTSTRAP_PRESPLIT"
+            local n_parts_arg="${AUTUMN_BOOTSTRAP_PRESPLIT%%:*}"
+            [[ "$n_parts_arg" =~ ^[0-9]+$ ]] || n_parts_arg=1
+            "$AC" --manager "$MANAGER_ADDR" bootstrap --replication "$repl" --presplit "${n_parts_arg}:hexstring"
         else
             "$AC" --manager "$MANAGER_ADDR" bootstrap --replication "$repl"
         fi
@@ -244,6 +256,10 @@ do_start() {
         (( wait_secs < 3 )) && wait_secs=3
         echo "[cluster] waiting ${wait_secs}s for PS to open ${n_parts} partition(s)..."
         sleep "$wait_secs"
+        # F099-K: confirm the first partition's listener is actually up.
+        # Under F099-K the per-partition listener on :9201 only exists
+        # once partition 0 has been opened and registered with the mgr.
+        wait_port 9201 "partition 0 listener" 60
     fi
 
     echo ""

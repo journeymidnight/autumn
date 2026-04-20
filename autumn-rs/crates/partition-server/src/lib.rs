@@ -538,20 +538,31 @@ impl WriteLoopMetrics {
 // Inter-thread request routing (main thread ↔ partition thread)
 // ---------------------------------------------------------------------------
 //
-// F099-J (2026-04-20): PartitionRouter + worker-pool + per-request mpsc hop
-// REMOVED. New architecture is thread-per-partition:
-//   * Accept OS thread → std::mpsc → main compio runtime (Dispatcher).
-//   * Main compio runtime → per-P-log `fd_tx` (cross-thread futures mpsc).
-//   * P-log compio runtime: drains fd_tx, converts std::TcpStream →
-//     compio::TcpStream, spawns `handle_ps_connection` on itself. All
-//     request decode + dispatch + response happens on the SAME thread that
-//     owns `Rc<RefCell<PartitionData>>`, so write handoff is via a
-//     same-thread `PartitionRequest` mpsc (no eventfd cross-thread wake).
+// F099-K (2026-04-20): Per-partition listener (Seastar-style thread-per-
+// shard completion). The central accept thread + main-thread fd dispatcher
+// from F099-J are GONE. Each partition thread owns:
+//
+//   * A dedicated `compio::net::TcpListener` bound to `base_port + ord`
+//     where `ord` is a monotonic counter bumped once per `open_partition`
+//     call. Port conflicts surface as a hard error (no silent fallback).
+//   * Its own accept task that loops `listener.accept().await` on the
+//     partition's compio runtime and spawns `handle_ps_connection` for
+//     each fd on the SAME runtime. No cross-thread fd handoff.
+//   * Registration with the manager via `MSG_REGISTER_PARTITION_ADDR`
+//     once the listener is bound — `GetRegions` then returns the per-
+//     partition address, and `ClusterClient` routes each client thread
+//     to the owning partition's P-log directly. At N=4 + 256 benchmark
+//     threads, the 256 ps-conn tasks distribute across 4 P-log runtimes
+//     (~64 each) instead of sharing one, clearing the F099-J saturation
+//     ceiling.
+//
+// F099-J context preserved for the per-partition path: handle_ps_connection
+// still runs on the same runtime as merged_partition_loop, so the request
+// handoff is a same-thread mpsc + oneshot with no eventfd/futex wake.
 //
 // See `docs/superpowers/specs/2026-04-20-perf-f099-h-kernel-rtt.md` §2.3
-// (P-log was 57 % user / 43 % iouring-idle before this change) and §2.1
-// (21.4 s futex + 1.03 M eventfd wakes / 30 s across 258 threads — the
-// cross-thread wake tax this refactor eliminates).
+// (per-partition P-log utilization after F099-J saturated under 256 × d=1;
+// F099-K fans the load out across N P-log threads).
 
 /// A request dispatched from a ps-conn task (running on P-log runtime)
 /// into `merged_partition_loop` for write group-commit or for inline
@@ -566,15 +577,22 @@ pub struct PartitionRequest {
 
 /// Handle to a running partition thread.
 ///
-/// Owned by the main compio thread. `fd_tx` is the per-P-log fd handoff
-/// channel: the main thread sends freshly-accepted `std::net::TcpStream`s
-/// across it; the P-log thread's fd-drain task receives them and spawns
-/// one `handle_ps_connection` task per connection.
+/// Owned by the main compio thread. After F099-K the partition thread
+/// binds its own listener and runs its own accept loop; the main thread
+/// does NOT push fds across. The only thing we hang on to is a shutdown
+/// signal (drop-to-close oneshot) used on `region_sync` eviction to ask
+/// the partition thread to tear down its accept loop.
 struct PartitionHandle {
-    fd_tx: mpsc::Sender<std::net::TcpStream>,
-    /// JoinHandle retained for RAII — dropping the handle does not wait
-    /// for the thread, but holding it keeps the thread-name metadata
-    /// around for tooling (e.g. `top -H`) and signals explicit ownership.
+    /// Dropping `shutdown_tx` closes the oneshot and signals the
+    /// partition's accept task to stop.  We wrap it in `Option` so we
+    /// can take/drop it explicitly.
+    #[allow(dead_code)]
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Address (`host:port`) the partition is listening on. Reported to
+    /// the manager via `MSG_REGISTER_PARTITION_ADDR` on open.
+    #[allow(dead_code)]
+    part_addr: String,
+    /// JoinHandle retained for RAII.
     #[allow(dead_code)]
     join: Option<std::thread::JoinHandle<()>>,
 }
@@ -596,6 +614,20 @@ pub struct PartitionServer {
     /// Server-level owner key and revision for split coordination.
     server_owner_key: String,
     server_revision: Rc<Cell<i64>>,
+    /// F099-K — base TCP port. The first partition opened binds
+    /// `base_port + 1`; subsequent partitions bind `base_port + 2`,
+    /// `base_port + 3`, ... (monotonically increasing, tracked via
+    /// `next_port_ord`).
+    base_port: Cell<u16>,
+    /// F099-K — monotonic port-ordinal counter, bumped once per
+    /// `open_partition` call. Partitions keep their assigned port
+    /// across region-sync cycles as long as the `PartitionHandle` is
+    /// alive; a port is never reused by a different partition.
+    next_port_ord: Rc<Cell<u16>>,
+    /// F099-K — host component for the per-partition advertise
+    /// address. Defaults to `127.0.0.1` if `--advertise` is omitted or
+    /// is not parseable as `host:port`.
+    advertise_host: Rc<std::cell::RefCell<String>>,
 }
 
 impl PartitionServer {
@@ -648,6 +680,13 @@ impl PartitionServer {
                             pool,
                             server_owner_key: owner_key,
                             server_revision: Rc::new(Cell::new(resp.revision)),
+                            // F099-K — placeholders; populated by `serve()`
+                            // once the base port + advertise host are known.
+                            base_port: Cell::new(0),
+                            next_port_ord: Rc::new(Cell::new(0)),
+                            advertise_host: Rc::new(std::cell::RefCell::new(
+                                String::from("127.0.0.1"),
+                            )),
                         };
                         // Jump to register_ps below
                         return server.finish_connect().await;
@@ -821,13 +860,18 @@ impl PartitionServer {
 
     /// Spawn a dedicated OS thread with its own compio runtime for this partition.
     ///
-    /// F099-J: the partition thread now OWNS the ps-conn tasks for this
-    /// partition. The main thread pushes accepted `std::net::TcpStream`s
-    /// across `fd_tx` → `fd_rx`; inside the partition runtime an
-    /// `fd_drain_task` converts them to `compio::net::TcpStream` and
-    /// spawns `handle_ps_connection` on the same runtime. Request handoff
-    /// from ps-conn → `merged_partition_loop` is a same-thread
-    /// `PartitionRequest` mpsc (no eventfd cross-thread wake).
+    /// F099-K: the partition thread BINDS its own TcpListener on a unique
+    /// port (`base_port + next_port_ord`) and runs an accept loop on its
+    /// own compio runtime, so there is no cross-thread fd handoff. Once
+    /// the listener is bound, the partition thread registers its address
+    /// with the manager via `MSG_REGISTER_PARTITION_ADDR`, which is then
+    /// returned to clients via `GetRegionsResp.part_addrs`.
+    ///
+    /// Port allocation is monotonic — we never reuse a port within the
+    /// lifetime of a PS process, even if a partition is closed and then
+    /// re-opened, so there is no TIME_WAIT hazard across region-sync
+    /// cycles. The ordinal is bumped BEFORE spawn so a bind failure on
+    /// one partition does not collapse the whole port sequence.
     async fn open_partition(
         &self,
         part_id: u64,
@@ -836,14 +880,42 @@ impl PartitionServer {
         row_stream_id: u64,
         meta_stream_id: u64,
     ) -> Result<PartitionHandle> {
-        // fd handoff: main compio thread → P-log compio thread. Bounded
-        // buffer matches the old `ps accept` channel capacity (256);
-        // momentary overshoot is absorbed as with the pre-F099-J design.
-        let (fd_tx, fd_rx) = mpsc::channel::<std::net::TcpStream>(256);
         let manager_addr = self.manager_addrs.join(",");
         let owner_key = self.server_owner_key.clone();
         let revision = self.server_revision.get();
+        let ps_id = self.ps_id;
 
+        // F099-K port allocation: reserve the next ordinal eagerly so a
+        // later `open_partition` never collides with this one even if the
+        // actual `bind` below is delayed by the worker thread startup.
+        let ord = self.next_port_ord.get().checked_add(1).ok_or_else(|| {
+            anyhow!("exhausted partition port ordinal space (u16 overflow)")
+        })?;
+        self.next_port_ord.set(ord);
+        let base_port = self.base_port.get();
+        let listen_port = base_port.checked_add(ord).ok_or_else(|| {
+            anyhow!(
+                "base_port={} + ord={} overflows u16; pick a smaller base port",
+                base_port, ord,
+            )
+        })?;
+        let listen_addr: SocketAddr = format!("0.0.0.0:{}", listen_port)
+            .parse()
+            .context("parse per-partition listen addr")?;
+        let advertise_host = self.advertise_host.borrow().clone();
+        let advertise_addr = format!("{}:{}", advertise_host, listen_port);
+
+        // Shutdown signal: main thread drops `shutdown_tx` to tell the
+        // partition's accept loop to exit.
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        // Report bind + registration success/failure back to the caller,
+        // so we can fail loudly and reclaim the ordinal if needed.
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<()>>();
+
+        let manager_addr_for_thread = manager_addr.clone();
+        let owner_key_for_thread = owner_key.clone();
+        let advertise_addr_for_thread = advertise_addr.clone();
         let join = std::thread::Builder::new()
             .name(format!("part-{part_id}"))
             .spawn(move || {
@@ -855,10 +927,14 @@ impl PartitionServer {
                         log_stream_id,
                         row_stream_id,
                         meta_stream_id,
-                        manager_addr,
-                        owner_key,
+                        manager_addr_for_thread,
+                        owner_key_for_thread,
                         revision,
-                        fd_rx,
+                        ps_id,
+                        listen_addr,
+                        advertise_addr_for_thread,
+                        ready_tx,
+                        shutdown_rx,
                     )
                     .await
                     {
@@ -868,102 +944,88 @@ impl PartitionServer {
             })
             .context("spawn partition thread")?;
 
+        // Wait for the partition thread to bind its listener and register
+        // with the manager. If either step fails, bubble the error up so
+        // `sync_regions_once` reports the failure (operator-visible; no
+        // silent skip).
+        match ready_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return Err(e.context(format!(
+                    "partition {part_id} failed to bind listener on {listen_addr} or register addr"
+                )));
+            }
+            Err(_canceled) => {
+                return Err(anyhow!(
+                    "partition {part_id} thread exited before reporting listener readiness"
+                ));
+            }
+        }
+
         Ok(PartitionHandle {
-            fd_tx,
+            shutdown_tx: Some(shutdown_tx),
+            part_addr: advertise_addr,
             join: Some(join),
         })
     }
 
     // ── Serve ──────────────────────────────────────────────────────────
     //
-    // F099-J thread model:
-    //   - 1 accept OS thread (std::net blocking accept) — unchanged.
-    //   - 1 main compio thread: control plane (heartbeat/region_sync) +
-    //     fd dispatcher. Forwards each accepted fd to the owning partition's
-    //     P-log runtime. No worker pool.
-    //   - N × 2 partition OS threads: per-partition P-log + P-bulk.
-    //     P-log now ALSO hosts every ps-conn task for its partition, so
-    //     the per-request mpsc hop no longer crosses threads (no eventfd
-    //     wake). Pre-F099-J this was `N + 2N + 1 + 1 = 3N + 2` threads
-    //     with ~CPU-count ps-conn workers — the wake-fan-out F099-H §2.1
-    //     measured at 21 s futex / 1 M eventfd writes per 30 s.
+    // F099-K thread model:
+    //   - 1 main compio thread: control plane only (heartbeat_loop +
+    //     region_sync_loop). No listener, no accept, no fd dispatch.
+    //   - N × 2 partition OS threads: per-partition P-log + P-bulk. P-log
+    //     binds its OWN `compio::net::TcpListener` on a unique port and
+    //     runs its OWN accept task + ps-conn tasks + merged_partition_loop
+    //     on the same compio runtime. The only mpsc on the hot path is
+    //     same-thread `PartitionRequest` (ps-conn → merged_loop). Total
+    //     OS threads at N partitions: `1 + 2N` (pre-F099-K it was `2 + 2N`
+    //     because of the separate accept thread).
 
     pub async fn serve(&self, addr: SocketAddr) -> Result<()> {
-        let std_listener = std::net::TcpListener::bind(addr)?;
-        let local_addr = std_listener.local_addr()?;
-        tracing::info!(addr = %local_addr, "partition server listening");
+        // F099-K: the `addr` arg is repurposed as the FIRST PARTITION's
+        // listener address. Partition N (1-indexed by open order) binds
+        // `addr.port() + (N-1)`. `base_port` is therefore `addr.port() - 1`
+        // so that `base_port + 1 == addr.port()` — preserves CLI compat
+        // with the existing `--port 9201` convention.
+        let first_port = addr.port();
+        if first_port == 0 {
+            return Err(anyhow!(
+                "--port 0 (ephemeral) is not supported for PartitionServer; pick a stable base port"
+            ));
+        }
+        let base_port = first_port - 1;
+        self.base_port.set(base_port);
 
-        // Control-plane stays on main compio thread.
+        // Parse advertise host from `advertise_addr` (falls back to
+        // `127.0.0.1`). The per-partition advertise becomes
+        // `"{host}:{listen_port}"`.
+        let host = self
+            .advertise_addr
+            .as_ref()
+            .and_then(|a| a.rsplit_once(':').map(|(h, _)| h.to_string()))
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        *self.advertise_host.borrow_mut() = host;
+
+        tracing::info!(
+            base_port = base_port,
+            first_part_port = first_port,
+            "partition server serving (per-partition listeners)"
+        );
+
+        // Control-plane loops run on main compio thread and never exit.
         let s = self.clone();
         compio::runtime::spawn(async move { s.heartbeat_loop().await }).detach();
         let s = self.clone();
         compio::runtime::spawn(async move { s.region_sync_loop().await }).detach();
 
-        // Blocking accept thread → futures::channel::mpsc → main runtime.
-        let (tx, mut rx) =
-            futures::channel::mpsc::channel::<(std::net::TcpStream, SocketAddr)>(256);
-        std::thread::Builder::new()
-            .name("ps-accept".into())
-            .spawn(move || {
-                let mut tx = tx;
-                loop {
-                    match std_listener.accept() {
-                        Ok((stream, peer)) => {
-                            if let Err(e) = stream.set_nonblocking(true) {
-                                tracing::warn!(peer = %peer, error = %e, "set_nonblocking failed");
-                                continue;
-                            }
-                            if tx.try_send((stream, peer)).is_err() {
-                                tracing::warn!("ps accept channel full, dropping connection");
-                            }
-                        }
-                        Err(e) => tracing::warn!(error = %e, "ps accept failed"),
-                    }
-                }
-            })
-            .context("spawn ps accept thread")?;
-
-        // Main fd-dispatcher loop: for each accepted fd, pick the owning
-        // partition's `fd_tx` and send the std::TcpStream across.
-        //
-        // TODO(F099-K): proper multi-partition fd routing. Today the
-        // protocol only reveals `part_id` AFTER the first frame is decoded,
-        // which is problematic here because we have to pick a P-log BEFORE
-        // decoding. For N=1 this is a non-issue (one partition gets every
-        // fd). For N>1 the simplest scheme is:
-        //   a) round-robin to any P-log; ps-conn peeks `part_id` in the
-        //      first frame and rejects with a "redirect" status if it's
-        //      not the owner, OR
-        //   b) each P-log's ps-conn forwards misrouted frames to the right
-        //      P-log via a per-target same-process mpsc (still cheaper
-        //      than eventfd since all threads share a ConnPool).
-        // The writes to implement either will come in F099-K; for now we
-        // broadcast to the first partition in the map. This is correct at
-        // N=1 and buggy at N>1, matching the stated F099-J scope.
+        // F099-K: region_sync_loop above drives all open/close of partition
+        // threads. Partitions bind their own listeners; `serve()` never
+        // returns unless manual shutdown is implemented (future work).
+        // Park the main task forever — compio::time::sleep covers both
+        // normal runtime operation and idle periods between syncs.
         loop {
-            let (std_stream, peer) = match rx.next().await {
-                Some(v) => v,
-                None => return Ok(()),
-            };
-            // N=1 fast path: send to the first (and only) partition's fd_tx.
-            // TODO(F099-K): replace with proper multi-partition routing.
-            let fd_tx_opt = self
-                .partitions
-                .borrow()
-                .values()
-                .next()
-                .map(|h| h.fd_tx.clone());
-            match fd_tx_opt {
-                Some(mut fd_tx) => {
-                    if let Err(e) = fd_tx.send(std_stream).await {
-                        tracing::warn!(peer = %peer, error = %e, "fd handoff failed");
-                    }
-                }
-                None => {
-                    tracing::warn!(peer = %peer, "no partition open; dropping connection");
-                    drop(std_stream);
-                }
-            }
+            compio::time::sleep(Duration::from_secs(3600)).await;
         }
     }
 }
@@ -1095,7 +1157,11 @@ async fn partition_thread_main(
     manager_addr: String,
     owner_key: String,
     revision: i64,
-    fd_rx: mpsc::Receiver<std::net::TcpStream>,
+    ps_id: u64,
+    listen_addr: SocketAddr,
+    advertise_addr: String,
+    ready_tx: oneshot::Sender<Result<()>>,
+    shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
     // F099-J: create the same-thread ps-conn ↔ merged_partition_loop
     // channel. Both endpoints live on THIS compio runtime, so sends and
@@ -1230,44 +1296,133 @@ async fn partition_thread_main(
     }
     let locked_by_other = Rc::new(Cell::new(false));
 
-    // F099-J: spawn the fd-drain task. It consumes `fd_rx`, converts each
-    // incoming std::net::TcpStream into a compio::net::TcpStream, and
-    // spawns a `handle_ps_connection` task on THIS runtime. When `fd_rx`
-    // closes (main thread drops this partition's PartitionHandle), the
-    // drain task exits, which drops its clone of `req_tx`; merged_loop
-    // below observes `req_rx` close once all outstanding ps-conn tasks
-    // also drop their clones, and itself shuts down.
+    // F099-K: bind this partition's dedicated TcpListener on THIS
+    // compio runtime and report readiness (bind + manager-side register)
+    // back to the caller via `ready_tx`. If EITHER step fails, we report
+    // the error and exit the partition thread so the main loop can
+    // reclaim the partition slot and, on the next sync cycle, retry.
+    let listener = match compio::net::TcpListener::bind(listen_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = ready_tx.send(Err(anyhow!("bind {}: {}", listen_addr, e)));
+            return Ok(());
+        }
+    };
+    match listener.local_addr() {
+        Ok(actual) => tracing::info!(part_id, addr = %actual, "partition listener bound"),
+        Err(_) => tracing::info!(part_id, addr = %listen_addr, "partition listener bound"),
+    }
+
+    // Register this partition's address with the manager. Do it on this
+    // runtime so we can await the RPC without blocking the main thread.
     {
-        let req_tx_for_drain = req_tx.clone();
+        let req = manager_rpc::rkyv_encode(&manager_rpc::RegisterPartitionAddrReq {
+            ps_id,
+            part_id,
+            address: advertise_addr.clone(),
+        });
+        // Use the already-open `pool` (created above for StreamClient); it
+        // normalizes manager addrs and round-robins internally.
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut registered = false;
+        for mgr in manager_addr.split(',') {
+            let mgr = mgr.trim();
+            if mgr.is_empty() {
+                continue;
+            }
+            let mgr_norm = autumn_stream::conn_pool::normalize_endpoint(mgr);
+            match pool
+                .call(&mgr_norm, manager_rpc::MSG_REGISTER_PARTITION_ADDR, req.clone())
+                .await
+            {
+                Ok(bytes) => {
+                    match manager_rpc::rkyv_decode::<manager_rpc::CodeResp>(&bytes) {
+                        Ok(r) if r.code == manager_rpc::CODE_OK => {
+                            registered = true;
+                            break;
+                        }
+                        Ok(r) => {
+                            last_err = Some(anyhow!(
+                                "register_partition_addr rejected by {}: {}",
+                                mgr, r.message
+                            ));
+                        }
+                        Err(e) => {
+                            last_err = Some(anyhow!("decode register_partition_addr resp: {}", e));
+                        }
+                    }
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                }
+            }
+        }
+        if !registered {
+            let err = last_err.unwrap_or_else(|| anyhow!("no manager addresses to register with"));
+            let _ = ready_tx.send(Err(err));
+            return Ok(());
+        }
+    }
+
+    // Signal the main thread that the listener is up AND the address is
+    // registered; `open_partition` can now return Ok.
+    let _ = ready_tx.send(Ok(()));
+
+    // F099-K accept loop: own the listener on this runtime, spawn
+    // `handle_ps_connection` on this runtime for every new fd. The accept
+    // task races against `shutdown_rx`: when the main thread drops its
+    // `shutdown_tx`, `shutdown_rx.await` resolves and the task exits.
+    //
+    // IMPORTANT: this task holds a clone of `req_tx`. When it exits, its
+    // clone is dropped. Once every per-connection task's clone is also
+    // dropped, merged_partition_loop observes `req_rx.next() == None` and
+    // shuts down cleanly.
+    {
+        let req_tx_for_accept = req_tx.clone();
         compio::runtime::spawn(async move {
-            let mut fd_rx = fd_rx;
-            while let Some(std_stream) = fd_rx.next().await {
-                let stream = match TcpStream::from_std(std_stream) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!(part_id, error = %e, "TcpStream::from_std failed");
-                        continue;
+            let mut shutdown_rx = shutdown_rx;
+            use futures::future::{select, Either};
+            loop {
+                // Race accept against shutdown. `shutdown_rx.await`
+                // resolves when the main thread drops its sender.
+                let accept_fut = listener.accept();
+                futures::pin_mut!(accept_fut);
+                let res = match select(accept_fut, &mut shutdown_rx).await {
+                    Either::Left((r, _pending_shutdown)) => r,
+                    Either::Right((_canceled_shutdown, _pending_accept)) => {
+                        tracing::info!(part_id, "accept: shutdown signaled, exiting");
+                        break;
                     }
                 };
-                let _ = stream.set_nodelay(true);
-                let req_tx_conn = req_tx_for_drain.clone();
-                compio::runtime::spawn(async move {
-                    if let Err(e) =
-                        handle_ps_connection(stream, req_tx_conn, part_id).await
-                    {
-                        tracing::debug!(part_id, error = %e, "ps connection ended");
+                match res {
+                    Ok((stream, peer)) => {
+                        let _ = stream.set_nodelay(true);
+                        let req_tx_conn = req_tx_for_accept.clone();
+                        compio::runtime::spawn(async move {
+                            if let Err(e) =
+                                handle_ps_connection(stream, req_tx_conn, part_id).await
+                            {
+                                tracing::debug!(part_id, peer = %peer, error = %e, "ps connection ended");
+                            }
+                        })
+                        .detach();
                     }
-                })
-                .detach();
+                    Err(e) => {
+                        tracing::warn!(part_id, error = %e, "accept failed");
+                        // Accept errors on loopback are rare; sleep briefly
+                        // to avoid busy-looping on a persistent failure.
+                        compio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
             }
-            tracing::info!(part_id, "fd-drain task exiting");
+            tracing::info!(part_id, "accept task exiting");
         })
         .detach();
     }
-    // Drop our extra clone of req_tx — the only senders left are the
-    // fd-drain task's clone (+ per-conn clones it hands out). Once all
-    // of those drop, merged_loop's `req_rx.next()` returns None and it
-    // shuts down.
+
+    // Drop our extra clone of req_tx — the accept task's clone (and any
+    // per-conn clones it hands out) are the only remaining senders. When
+    // they all drop, merged_loop shuts down.
     drop(req_tx);
 
     // F099-D: merged request + write loop runs directly on this task.
@@ -3269,5 +3424,306 @@ mod f099j_tests {
             let _ = conn_handle.await;
             let _ = loop_handle.await;
         });
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// F099-K — per-partition listener tests.
+//
+// These tests pin the two core properties of the F099-K refactor:
+//   1. A partition thread binds its OWN `compio::net::TcpListener` on a
+//      unique port and runs its OWN accept loop + `handle_ps_connection`
+//      tasks on the same compio runtime — no central accept thread, no
+//      fd dispatcher. Clients connect directly to the partition's port.
+//   2. At N > 1, N partitions bind N distinct ports and requests land on
+//      the owning partition's listener. Each `handle_ps_connection` only
+//      accepts requests whose `part_id` matches its `owner_part`; a request
+//      for a foreign partition gets a `NotFound` error.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod f099k_tests {
+    use super::*;
+
+    /// Spin up one "partition" accept loop on a dedicated compio runtime
+    /// thread, returning (listen_port, shutdown_tx, join). The accept loop:
+    ///   - binds `127.0.0.1:0` (OS-assigned port)
+    ///   - spawns `handle_ps_connection` on the same runtime for each
+    ///     accepted fd, with the provided `owner_part` id
+    ///   - runs a simulated merged_loop that echoes every Put with a
+    ///     `PutResp { code: CODE_OK, key: put.key }`
+    ///   - exits when `shutdown_rx` resolves (drop of the sender)
+    fn spawn_partition_listener(
+        owner_part: u64,
+    ) -> (u16, std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (port_tx, port_rx) = std::sync::mpsc::channel::<u16>();
+        let (shutdown_tx, shutdown_rx_std) = std::sync::mpsc::channel::<()>();
+
+        let join = std::thread::Builder::new()
+            .name(format!("f099k-part-{owner_part}"))
+            .spawn(move || {
+                let rt = compio::runtime::Runtime::new().expect("rt");
+                rt.block_on(async move {
+                    let listener = compio::net::TcpListener::bind("127.0.0.1:0")
+                        .await
+                        .expect("bind");
+                    let port = listener.local_addr().expect("local_addr").port();
+                    let _ = port_tx.send(port);
+
+                    // Same-thread ps-conn <-> merged_loop channel.
+                    let (req_tx, mut req_rx) =
+                        mpsc::channel::<PartitionRequest>(WRITE_CHANNEL_CAP);
+
+                    // Simulated merged_loop: echo every Put while req_rx is open.
+                    let loop_handle = compio::runtime::spawn(async move {
+                        while let Some(req) = req_rx.next().await {
+                            // Accept both MSG_PUT and MSG_GET; echo on Put.
+                            if req.msg_type == MSG_PUT {
+                                let put: PutReq =
+                                    partition_rpc::rkyv_decode(&req.payload)
+                                        .expect("decode put");
+                                let resp = partition_rpc::rkyv_encode(&PutResp {
+                                    code: CODE_OK,
+                                    message: String::new(),
+                                    key: put.key,
+                                });
+                                let _ = req.resp_tx.send(Ok(resp));
+                            } else {
+                                let _ = req
+                                    .resp_tx
+                                    .send(Err((StatusCode::Internal, "test".to_string())));
+                            }
+                        }
+                    });
+
+                    // Accept loop: racy shutdown via a polling check (the
+                    // test-only listener uses std::mpsc for signalling since
+                    // we're crossing the spawning OS thread here).
+                    let req_tx_accept = req_tx.clone();
+                    let accept_handle = compio::runtime::spawn(async move {
+                        loop {
+                            // Poll shutdown; break on EITHER a message OR
+                            // sender-drop (tests drop `shutdown_tx` without
+                            // sending).
+                            match shutdown_rx_std.try_recv() {
+                                Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                            }
+                            // Race accept against a short timer so the shutdown
+                            // poll runs at least every 50 ms.
+                            let accept_fut = listener.accept();
+                            let timer_fut =
+                                compio::time::sleep(Duration::from_millis(50));
+                            futures::pin_mut!(accept_fut);
+                            futures::pin_mut!(timer_fut);
+                            match futures::future::select(accept_fut, timer_fut).await {
+                                futures::future::Either::Left((r, _)) => match r {
+                                    Ok((stream, _peer)) => {
+                                        let _ = stream.set_nodelay(true);
+                                        let tx = req_tx_accept.clone();
+                                        compio::runtime::spawn(async move {
+                                            let _ = handle_ps_connection(
+                                                stream, tx, owner_part,
+                                            )
+                                            .await;
+                                        })
+                                        .detach();
+                                    }
+                                    Err(_) => {
+                                        compio::time::sleep(Duration::from_millis(10)).await;
+                                    }
+                                },
+                                futures::future::Either::Right(_) => {
+                                    // Fall through to the shutdown poll.
+                                }
+                            }
+                        }
+                    });
+
+                    drop(req_tx);
+                    let _ = accept_handle.await;
+                    let _ = loop_handle.await;
+                });
+            })
+            .expect("spawn");
+
+        let port = port_rx.recv().expect("bind port reported");
+        (port, shutdown_tx, join)
+    }
+
+    /// F099-K test 1 — one partition thread binds its own listener on
+    /// an OS-assigned port; a client connects to that port and issues a
+    /// Put; the response round-trips correctly. Verifies the "thread
+    /// owns its listener" architectural property.
+    #[test]
+    fn f099k_n1_single_partition_listener() {
+        let owner_part: u64 = 42;
+        let (port, shutdown_tx, join) = spawn_partition_listener(owner_part);
+
+        // Client: open a TCP connection and send one Put on a separate
+        // compio runtime (matching what autumn-client does in perf-check).
+        std::thread::spawn(move || {
+            compio::runtime::Runtime::new().unwrap().block_on(async move {
+                let addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
+                    .parse()
+                    .expect("parse addr");
+                let stream = compio::net::TcpStream::connect(addr)
+                    .await
+                    .expect("connect");
+                let (mut rd, mut wr) = stream.into_split();
+
+                let put = PutReq {
+                    part_id: owner_part,
+                    key: b"k_n1".to_vec(),
+                    value: b"v_n1".to_vec(),
+                    must_sync: false,
+                    expires_at: 0,
+                };
+                let payload = partition_rpc::rkyv_encode(&put);
+                let frame = Frame::request(1, MSG_PUT, Bytes::from(payload)).encode();
+                let BufResult(r, _) = wr.write_all(frame).await;
+                r.expect("write");
+
+                let mut decoder = FrameDecoder::new();
+                let mut buf = vec![0u8; 4096];
+                let resp_frame = loop {
+                    let BufResult(n, back) = rd.read(buf).await;
+                    buf = back;
+                    let n = n.expect("read");
+                    assert!(n > 0, "EOF before response");
+                    decoder.feed(&buf[..n]);
+                    if let Some(f) = decoder.try_decode().expect("decode") {
+                        break f;
+                    }
+                };
+                assert_eq!(resp_frame.req_id, 1);
+                assert!(!resp_frame.is_error(), "unexpected error response");
+                let resp: PutResp =
+                    partition_rpc::rkyv_decode(&resp_frame.payload).expect("decode resp");
+                assert_eq!(resp.code, CODE_OK);
+                assert_eq!(resp.key, b"k_n1");
+            });
+        })
+        .join()
+        .expect("client thread");
+
+        drop(shutdown_tx);
+        let _ = join.join();
+    }
+
+    /// F099-K test 2 — four partition threads bind four distinct ports;
+    /// requests with the matching `part_id` on each port succeed, and
+    /// a request targeting the wrong partition returns `NotFound`.
+    /// Verifies that (a) ports are distinct, (b) each listener is
+    /// isolated to its owner partition.
+    #[test]
+    fn f099k_n4_distinct_ports() {
+        let owners: [u64; 4] = [101, 102, 103, 104];
+        let mut ports: Vec<u16> = Vec::with_capacity(4);
+        let mut shutdowns: Vec<std::sync::mpsc::Sender<()>> = Vec::with_capacity(4);
+        let mut joins: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(4);
+        for &o in &owners {
+            let (p, st, j) = spawn_partition_listener(o);
+            ports.push(p);
+            shutdowns.push(st);
+            joins.push(j);
+        }
+
+        // All four ports distinct.
+        let mut sorted = ports.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 4, "partition ports must be distinct: {:?}", ports);
+
+        // Drive a Put into each partition on its own port and verify
+        // correct routing; also fire a mis-routed request that hits a
+        // partition on the wrong port and expect `NotFound`.
+        std::thread::spawn(move || {
+            compio::runtime::Runtime::new().unwrap().block_on(async move {
+                for (i, &o) in owners.iter().enumerate() {
+                    let port = ports[i];
+                    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
+                        .parse()
+                        .unwrap();
+                    let stream = compio::net::TcpStream::connect(addr)
+                        .await
+                        .expect("connect");
+                    let (mut rd, mut wr) = stream.into_split();
+
+                    // (a) correct part_id on owner's port → CODE_OK.
+                    let put = PutReq {
+                        part_id: o,
+                        key: format!("k-{o}").into_bytes(),
+                        value: format!("v-{o}").into_bytes(),
+                        must_sync: false,
+                        expires_at: 0,
+                    };
+                    let payload = partition_rpc::rkyv_encode(&put);
+                    let f =
+                        Frame::request(10, MSG_PUT, Bytes::from(payload)).encode();
+                    let BufResult(r, _) = wr.write_all(f).await;
+                    r.expect("write put");
+
+                    let mut decoder = FrameDecoder::new();
+                    let mut buf = vec![0u8; 4096];
+                    let resp = loop {
+                        let BufResult(n, back) = rd.read(buf).await;
+                        buf = back;
+                        let n = n.expect("read");
+                        assert!(n > 0, "EOF before response for part {o}");
+                        decoder.feed(&buf[..n]);
+                        if let Some(fr) = decoder.try_decode().expect("decode") {
+                            break fr;
+                        }
+                    };
+                    assert!(!resp.is_error(), "part {o} on port {port} unexpectedly errored");
+                    let pr: PutResp =
+                        partition_rpc::rkyv_decode(&resp.payload).expect("decode");
+                    assert_eq!(pr.code, CODE_OK);
+                    assert_eq!(pr.key, format!("k-{o}").into_bytes());
+
+                    // (b) Mis-routed: send a request with WRONG part_id to
+                    // this listener. handle_ps_connection should answer with
+                    // NotFound (owner mismatch).
+                    let wrong = PutReq {
+                        part_id: o + 1000, // definitely not this listener's owner
+                        key: b"bogus".to_vec(),
+                        value: b"bogus".to_vec(),
+                        must_sync: false,
+                        expires_at: 0,
+                    };
+                    let payload = partition_rpc::rkyv_encode(&wrong);
+                    let f =
+                        Frame::request(11, MSG_PUT, Bytes::from(payload)).encode();
+                    let BufResult(r, _) = wr.write_all(f).await;
+                    r.expect("write mis-routed put");
+
+                    let mut buf = vec![0u8; 4096];
+                    let resp = loop {
+                        let BufResult(n, back) = rd.read(buf).await;
+                        buf = back;
+                        let n = n.expect("read");
+                        assert!(n > 0, "EOF before mis-route response for part {o}");
+                        decoder.feed(&buf[..n]);
+                        if let Some(fr) = decoder.try_decode().expect("decode") {
+                            break fr;
+                        }
+                    };
+                    assert!(
+                        resp.is_error(),
+                        "mis-routed request to part {o}'s port {port} should error"
+                    );
+                }
+            });
+        })
+        .join()
+        .expect("client thread");
+
+        for st in shutdowns {
+            drop(st);
+        }
+        for j in joins {
+            let _ = j.join();
+        }
     }
 }

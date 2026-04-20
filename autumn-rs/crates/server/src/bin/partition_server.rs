@@ -56,9 +56,11 @@ fn parse_args() -> Args {
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!("  --psid <ID>          Partition server ID (required, non-zero)");
-                eprintln!("  --port <PORT>        Listen port [default: 9201]");
+                eprintln!("  --port <PORT>        First partition's listener port [default: 9201]");
+                eprintln!("                       (F099-K: subsequent partitions bind PORT+1, PORT+2, ...)");
                 eprintln!("  --manager <ADDR>     Manager endpoint [default: 127.0.0.1:9001]");
-                eprintln!("  --advertise <ADDR>   Advertise address for cluster discovery");
+                eprintln!("  --advertise <ADDR>   Advertise host for cluster discovery");
+                eprintln!("                       (F099-K: the `host:port` base — port comes from --port)");
                 eprintln!("  --conn-threads <N>   [DEPRECATED, F099-J] accepted but ignored");
                 std::process::exit(0);
             }
@@ -151,18 +153,22 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| format!("127.0.0.1:{}", args.port));
 
     tracing::info!(
-        "autumn-ps starting: psid={}, listen={}, manager={}, advertise={}",
+        "autumn-ps starting: psid={}, first_part_port={}, manager={}, advertise={}",
         args.psid,
         addr,
         args.manager,
         advertise,
+    );
+    tracing::info!(
+        "F099-K: per-partition listener — partition N binds port={}+N-1",
+        args.port,
     );
 
     let ps = PartitionServer::connect_with_advertise(args.psid, &args.manager, Some(advertise))
         .await
         .context("connect partition server")?;
 
-    tracing::info!("autumn-ps ready, serving on {addr}");
+    tracing::info!("autumn-ps ready (F099-K: per-partition listeners; first partition on {addr})");
 
     ps.serve(addr).await?;
     Ok(())

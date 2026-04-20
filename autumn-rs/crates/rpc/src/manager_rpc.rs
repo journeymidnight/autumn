@@ -32,6 +32,11 @@ pub const MSG_UPSERT_PARTITION: u8 = 0x2D;
 pub const MSG_GET_REGIONS: u8 = 0x2E;
 pub const MSG_HEARTBEAT_PS: u8 = 0x2F;
 
+// F099-K: per-partition listener address registration (PS reports the
+// `host:port` of each partition's TcpListener to the manager so clients
+// can target the owning partition's CPU shard directly).
+pub const MSG_REGISTER_PARTITION_ADDR: u8 = 0x30;
+
 // ── rkyv helpers ────────────────────────────────────────────────────────────
 
 /// Serialize a value to Bytes using rkyv.
@@ -370,12 +375,31 @@ pub struct GetRegionsResp {
     pub regions: Vec<(u64, MgrRegionInfo)>,
     /// (ps_id, MgrPsDetail) pairs
     pub ps_details: Vec<(u64, MgrPsDetail)>,
+    /// F099-K: per-partition listener addresses (`host:port`). Populated
+    /// by `RegisterPartitionAddr` calls from the PS; one entry per open
+    /// partition. Clients prefer this over `ps_details[ps_id].address`
+    /// when present, so traffic is routed to the specific partition's
+    /// listener thread (Seastar-style thread-per-shard).
+    pub part_addrs: Vec<(u64, String)>,
 }
 
 // --- HeartbeatPs ---
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct HeartbeatPsReq {
     pub ps_id: u64,
+}
+// Response: CodeResp
+
+// --- RegisterPartitionAddr (F099-K) ---
+// PS calls this once per partition after binding that partition's
+// dedicated TcpListener. Manager records `(part_id -> address)` in memory
+// and returns it via `GetRegionsResp.part_addrs`. Clients use it to
+// target the exact CPU-shard listener that owns the partition.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct RegisterPartitionAddrReq {
+    pub ps_id: u64,
+    pub part_id: u64,
+    pub address: String,
 }
 // Response: CodeResp
 
