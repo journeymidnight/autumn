@@ -1,0 +1,42 @@
+/*
+ * F099-H: context switches + wakeups per TID.
+ *
+ * Usage:  bpftrace -e "$(cat sched_count.bt)" <TID>
+ *
+ * For the P-log thread specifically, count how often it's descheduled
+ * (@switches) and how often something wakes it up (@wakes). Excessive
+ * context switching for a thread that's supposed to be CPU-bound is a
+ * red flag.
+ */
+
+BEGIN { printf("sched_count: target TID = %d\n", $1); }
+
+tracepoint:sched:sched_switch
+/ args->prev_pid == $1 || args->next_pid == $1 /
+{
+    if (args->prev_pid == $1) {
+        @switches_out = count();
+    }
+    if (args->next_pid == $1) {
+        @switches_in = count();
+    }
+}
+
+tracepoint:sched:sched_wakeup
+/ args->pid == $1 /
+{
+    @wakes_as_target = count();
+}
+
+tracepoint:sched:sched_wakeup_new
+/ args->pid == $1 /
+{
+    @wakes_new_as_target = count();
+}
+
+END {
+    print(@switches_out);
+    print(@switches_in);
+    print(@wakes_as_target);
+    print(@wakes_new_as_target);
+}

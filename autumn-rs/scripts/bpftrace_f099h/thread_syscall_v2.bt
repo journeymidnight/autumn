@@ -1,0 +1,40 @@
+/*
+ * F099-H v2: thread-filtered (TID) syscall histogram. Same as syscall_v2.bt
+ * but /tid == $1/ rather than /pid == $1/, so you can isolate P-log or a
+ * single ps-conn thread.
+ */
+
+BEGIN { printf("thread_syscall_v2: target TID = %d\n", $1); }
+
+tracepoint:syscalls:sys_enter_pwritev /tid == $1/ { @s_pwritev[tid] = nsecs; @size_pwritev_vlen = hist(args->vlen); }
+tracepoint:syscalls:sys_exit_pwritev  /@s_pwritev[tid]/ { $d = nsecs - @s_pwritev[tid]; @c_pwritev = count(); @tot_pwritev = sum($d); @lat_pwritev = hist($d); delete(@s_pwritev[tid]); }
+
+tracepoint:syscalls:sys_enter_writev /tid == $1/ { @s_writev[tid] = nsecs; @size_writev_vlen = hist(args->vlen); }
+tracepoint:syscalls:sys_exit_writev  /@s_writev[tid]/ { $d = nsecs - @s_writev[tid]; @c_writev = count(); @tot_writev = sum($d); @lat_writev = hist($d); if (args->ret > 0) { @ret_writev_bytes = hist((uint64)args->ret); } delete(@s_writev[tid]); }
+
+tracepoint:syscalls:sys_enter_write /tid == $1/ { @s_write[tid] = nsecs; @size_write_count = hist(args->count); }
+tracepoint:syscalls:sys_exit_write  /@s_write[tid]/ { $d = nsecs - @s_write[tid]; @c_write = count(); @tot_write = sum($d); @lat_write = hist($d); delete(@s_write[tid]); }
+
+tracepoint:syscalls:sys_enter_read /tid == $1/ { @s_read[tid] = nsecs; @size_read_count = hist(args->count); }
+tracepoint:syscalls:sys_exit_read  /@s_read[tid]/ { $d = nsecs - @s_read[tid]; @c_read = count(); @tot_read = sum($d); @lat_read = hist($d); if (args->ret > 0) { @ret_read_bytes = hist((uint64)args->ret); } delete(@s_read[tid]); }
+
+tracepoint:syscalls:sys_enter_sendto /tid == $1/ { @s_sendto[tid] = nsecs; @size_sendto_len = hist(args->len); }
+tracepoint:syscalls:sys_exit_sendto  /@s_sendto[tid]/ { $d = nsecs - @s_sendto[tid]; @c_sendto = count(); @tot_sendto = sum($d); @lat_sendto = hist($d); delete(@s_sendto[tid]); }
+
+tracepoint:syscalls:sys_enter_recvfrom /tid == $1/ { @s_recvfrom[tid] = nsecs; @size_recvfrom_size = hist(args->size); }
+tracepoint:syscalls:sys_exit_recvfrom  /@s_recvfrom[tid]/ { $d = nsecs - @s_recvfrom[tid]; @c_recvfrom = count(); @tot_recvfrom = sum($d); @lat_recvfrom = hist($d); if (args->ret > 0) { @ret_recvfrom_bytes = hist((uint64)args->ret); } delete(@s_recvfrom[tid]); }
+
+tracepoint:syscalls:sys_enter_io_uring_enter /tid == $1/ { @s_iouring[tid] = nsecs; }
+tracepoint:syscalls:sys_exit_io_uring_enter  /@s_iouring[tid]/ { $d = nsecs - @s_iouring[tid]; @c_iouring = count(); @tot_iouring = sum($d); @lat_iouring = hist($d); delete(@s_iouring[tid]); }
+
+tracepoint:syscalls:sys_enter_futex /tid == $1/ { @s_futex[tid] = nsecs; }
+tracepoint:syscalls:sys_exit_futex  /@s_futex[tid]/ { $d = nsecs - @s_futex[tid]; @c_futex = count(); @tot_futex = sum($d); @lat_futex = hist($d); delete(@s_futex[tid]); }
+
+interval:s:30 {
+    printf("\n=== snapshot @ 30s ===\n");
+    printf("COUNTS:\n"); print(@c_iouring); print(@c_pwritev); print(@c_writev); print(@c_write); print(@c_read); print(@c_sendto); print(@c_recvfrom); print(@c_futex);
+    printf("TOTAL NS:\n"); print(@tot_iouring); print(@tot_pwritev); print(@tot_writev); print(@tot_write); print(@tot_read); print(@tot_sendto); print(@tot_recvfrom); print(@tot_futex);
+    printf("LAT HIST (log2 ns):\n"); print(@lat_iouring); print(@lat_pwritev); print(@lat_writev); print(@lat_write); print(@lat_read); print(@lat_sendto); print(@lat_recvfrom); print(@lat_futex);
+    printf("SIZE HIST:\n"); print(@size_pwritev_vlen); print(@size_writev_vlen); print(@size_write_count); print(@size_read_count); print(@size_sendto_len); print(@size_recvfrom_size); print(@ret_writev_bytes); print(@ret_read_bytes); print(@ret_recvfrom_bytes);
+    exit();
+}

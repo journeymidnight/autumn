@@ -1,3 +1,103 @@
+Date: 2026-04-20
+TaskStatus: completed
+Task scope: F099-H — kernel RTT decomposition of the 57 k write ceiling at
+  N=1 × 256 sync clients × 4 KB. Measurement-only diagnostic. Primary
+  deliverable: per-process + per-thread + per-syscall latency + size
+  breakdown using bpftrace (tracepoint + kprobe) and strace cross-check.
+  No source modifications. Bpftrace scripts landed under scripts/bpftrace_f099h/.
+
+Current summary (F099-H):
+  Branch: perf-r1-partition-scale-out (worktree /data/dongmao_dev/autumn-perf-r1)
+  Findings doc: docs/superpowers/specs/2026-04-20-perf-f099-h-kernel-rtt.md
+
+  Three scenarios captured, each with 30 s bpftrace window during steady state:
+    A: 256 × d=1 nosync write → ~57 k ops/s (the ceiling)
+    B: 1 × d=64 nosync write  → ~12 k ops/s
+    C: 32 × d=16 read         → ~22 k ops/s (lower than ps_bench's 162 k
+                                because perf-check read phase uses only a
+                                single write phase's seed data)
+
+  KEY FINDINGS
+    1. compio uses io_uring for EVERY I/O (file + TCP + eventfd), so the
+       classic tracepoints (sys_enter_pwritev / sendto / recvfrom / writev)
+       never fire on the hot path. Useful probing required kprobes on
+       tcp_sendmsg / tcp_recvmsg (which capture the kernel TCP cost that
+       io_uring ultimately drives inside kernel).
+
+    2. Scenario A kernel TCP CPU (kprobe, PS process, 30 s):
+         tcp_sendmsg: 1.12 M calls, 24.0 s  (80 %  of 1 core)
+         tcp_recvmsg: 1.93 M calls, 59.4 s  (198 % of 1 core)
+         COMBINED:                  83.4 s = 2.78 CPU cores of kernel TCP
+       91 % of tcp_sendmsg calls carry only 32-63 B (small reply frames).
+       Loopback TCP pipeline is the dominant invisible cost.
+
+    3. P-log thread (TID=part-13) in Scenario A is **not at 100 % CPU**
+       as F099-A's pprof suggested. 13.4 s of P-log's 30 s wall-clock is
+       spent *blocked inside io_uring_enter*, waiting for extent-node
+       append CQEs + Put-request body recvs. True P-log user+kernel CPU
+       is roughly 57 % of 1 core. The other 43 % is idle-wait on remote
+       peers, not CPU starvation.
+
+    4. Scenario C (read) shows 35x less kernel TCP CPU (2.4 s vs 83 s)
+       because read replies are 1 × 4 KB sendmsg per Get, whereas write
+       replies are 256 small header sends per batch. This confirms the
+       write path's small-header-flood is the dominant kernel-side cost.
+
+    5. Context switches on P-log = 674/s (2.6 x one full RTT), well
+       below any thrash threshold. Scheduler overhead ≈ 0.004 % of P-log.
+       Scheduling is NOT material to the ceiling.
+
+    6. Scenario B's P-log does 29 k io_uring_enters/s at 20 µs each vs
+       Scenario A's 595/s at 750 µs each. B is bound by per-batch
+       round-trip latency (~300 µs per 64-op batch), not by any
+       specific syscall. This reinforces that single-TCP-connection RTT
+       is the 12 k ops/s cap for d=64.
+
+  ROOT CAUSE (H1 picked): kernel TCP send/recv pipeline on loopback,
+    specifically the small-response-frame flood: 37 k tcp_sendmsg/s
+    with 91 % at 32-63 B. Each call costs ~22 µs of kernel CPU for
+    skb alloc + header copy + loopback delivery; collectively ~0.8
+    cores of pure overhead beyond the actual payload.
+
+  F099-I RECOMMENDATION: coalesce ps-conn reply-frame io_uring SQE
+    submissions (micro-batch window of ~50 µs / ~4 KB). Expected gain:
+    +30-40 % write throughput (57 k -> 80 k). Effort: 2 days. Files:
+    primarily crates/partition-server/src/connection.rs + env knob.
+
+  BPFTRACE SCRIPTS COMMITTED under scripts/bpftrace_f099h/:
+    syscall_v2.bt         (per-PID, string-key-free version — v1 was
+                           verifier-rejected on kernel 6.1 due to
+                           misaligned-stack-access on composite keys)
+    thread_syscall_v2.bt  (per-TID equivalent)
+    syscall_summary.bt    (original v1, kept for historical reference)
+    thread_syscall.bt     (original v1)
+    tcp_sendmsg.bt        (kprobe tcp_sendmsg / tcp_recvmsg /
+                           tcp_write_xmit / __tcp_push_pending_frames)
+    sched_count.bt        (sched_switch + sched_wakeup per TID)
+
+  RAW TRACES (not committed, present at /tmp/f099h/):
+    scenario_{a,b,c}/*.txt — 14 bpftrace + 3 TCP kprobe + 1 sched_count
+    strace_{plog,node1,ps}_write.txt — 3 strace cross-checks
+
+Next steps (F099-I, not in this task):
+  - Implement ps-conn reply-frame io_uring SQE coalescing
+  - Re-run the F099-H bpftrace probes to verify tcp_sendmsg count drops 3x+
+    and avg size per call rises from ~100 B to ~400+ B
+  - Expected outcome: 60 k → 80+ k ops/s ceiling at 256 × d=1
+
+Files committed in this task:
+  docs/superpowers/specs/2026-04-20-perf-f099-h-kernel-rtt.md  (findings)
+  autumn-rs/scripts/bpftrace_f099h/syscall_v2.bt               (new)
+  autumn-rs/scripts/bpftrace_f099h/thread_syscall_v2.bt        (new)
+  autumn-rs/scripts/bpftrace_f099h/syscall_summary.bt          (v1 reference)
+  autumn-rs/scripts/bpftrace_f099h/thread_syscall.bt           (v1 reference)
+  autumn-rs/scripts/bpftrace_f099h/tcp_sendmsg.bt              (kprobe)
+  autumn-rs/scripts/bpftrace_f099h/sched_count.bt              (sched)
+  claude-progress.txt                                          (this entry)
+  autumn-rs/feature_list.md                                    (F099-H ledger)
+
+================================================================================
+
 Date: 2026-04-19
 TaskStatus: completed
 Task scope: F099-D — Merge partition_thread_main + background_write_loop_r1
