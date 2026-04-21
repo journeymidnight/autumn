@@ -92,6 +92,10 @@ pub struct ClusterClient {
     ps_conns: std::cell::RefCell<HashMap<String, Rc<RpcClient>>>,
     regions: Vec<(u64, MgrRegionInfo)>,
     ps_details: HashMap<u64, MgrPsDetail>,
+    /// F099-K — per-partition listener addresses, indexed by `part_id`.
+    /// When an entry is present, it supersedes `ps_details[ps_id].address`
+    /// for routing decisions (thread-per-partition shard target).
+    part_addrs: HashMap<u64, String>,
 }
 
 impl ClusterClient {
@@ -179,6 +183,7 @@ impl ClusterClient {
             ps_conns: std::cell::RefCell::new(HashMap::new()),
             regions: Vec::new(),
             ps_details: HashMap::new(),
+            part_addrs: HashMap::new(),
         };
 
         // Try connecting to each manager until one responds
@@ -243,6 +248,7 @@ impl ClusterClient {
         }
         self.regions = sorted;
         self.ps_details = resp.ps_details.into_iter().collect();
+        self.part_addrs = resp.part_addrs.into_iter().collect();
         Ok(())
     }
 
@@ -294,7 +300,11 @@ impl ClusterClient {
             return None;
         }
         let (_, region) = &self.regions[idx];
-        let addr = self.ps_details.get(&region.ps_id)?.address.clone();
+        // F099-K: prefer per-partition listener if registered.
+        let addr = match self.part_addrs.get(&region.part_id) {
+            Some(a) => a.clone(),
+            None => self.ps_details.get(&region.ps_id)?.address.clone(),
+        };
         Some((region.part_id, addr))
     }
 
@@ -308,20 +318,26 @@ impl ClusterClient {
     }
 
     pub async fn resolve_part_id(&mut self, part_id: u64) -> Result<String> {
+        // F099-K: prefer the per-partition listener address when
+        // registered; fall back to the PS-level base address otherwise.
         let lookup = |regions: &Vec<(u64, MgrRegionInfo)>,
-                      ps_details: &HashMap<u64, MgrPsDetail>| {
+                      ps_details: &HashMap<u64, MgrPsDetail>,
+                      part_addrs: &HashMap<u64, String>| {
             regions
                 .iter()
                 .find(|(_, r)| r.part_id == part_id)
                 .and_then(|(_, region)| {
+                    if let Some(a) = part_addrs.get(&region.part_id) {
+                        return Some(a.clone());
+                    }
                     ps_details.get(&region.ps_id).map(|d| d.address.clone())
                 })
         };
-        if let Some(addr) = lookup(&self.regions, &self.ps_details) {
+        if let Some(addr) = lookup(&self.regions, &self.ps_details, &self.part_addrs) {
             return Ok(addr);
         }
         self.refresh_regions().await?;
-        lookup(&self.regions, &self.ps_details)
+        lookup(&self.regions, &self.ps_details, &self.part_addrs)
             .ok_or_else(|| anyhow!("partition {} not found", part_id))
     }
 
@@ -333,15 +349,59 @@ impl ClusterClient {
             .regions
             .iter()
             .map(|(_, region)| {
+                // F099-K: prefer per-partition listener address when present.
                 let addr = self
-                    .ps_details
-                    .get(&region.ps_id)
-                    .map(|d| d.address.clone())
+                    .part_addrs
+                    .get(&region.part_id)
+                    .cloned()
+                    .or_else(|| {
+                        self.ps_details
+                            .get(&region.ps_id)
+                            .map(|d| d.address.clone())
+                    })
                     .unwrap_or_default();
                 (region.part_id, addr)
             })
             .collect();
         result.sort_by_key(|(pid, _)| *pid);
+        Ok(result)
+    }
+
+    /// F099-N-c — like `all_partitions`, but also returns each partition's
+    /// `(start_key, end_key)` range so bench tools can generate keys that
+    /// actually land in each partition. Prior bench tools used a constant
+    /// prefix like "pc_{tid}_{seq}" / "bench_{tid}_{seq}" which lexically
+    /// always fell in ONE partition, making N>1 perf tests measure a single
+    /// partition with (N-1) rejecting load.
+    pub async fn all_partitions_with_range(
+        &mut self,
+    ) -> Result<Vec<(u64, String, Vec<u8>, Vec<u8>)>> {
+        if self.regions.is_empty() {
+            self.refresh_regions().await?;
+        }
+        let mut result: Vec<(u64, String, Vec<u8>, Vec<u8>)> = self
+            .regions
+            .iter()
+            .map(|(_, region)| {
+                let addr = self
+                    .part_addrs
+                    .get(&region.part_id)
+                    .cloned()
+                    .or_else(|| {
+                        self.ps_details
+                            .get(&region.ps_id)
+                            .map(|d| d.address.clone())
+                    })
+                    .unwrap_or_default();
+                let (start_key, end_key) = region
+                    .rg
+                    .as_ref()
+                    .map(|r| (r.start_key.clone(), r.end_key.clone()))
+                    .unwrap_or_default();
+                (region.part_id, addr, start_key, end_key)
+            })
+            .collect();
+        result.sort_by_key(|(pid, _, _, _)| *pid);
         Ok(result)
     }
 

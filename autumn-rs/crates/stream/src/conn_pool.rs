@@ -1,3 +1,17 @@
+//! Per-process connection pool for extent nodes (single-threaded compio).
+//!
+//! One `Rc<RpcClient>` per SocketAddr. Since autumn-rpc's `RpcClient`
+//! handles concurrent `call`/`call_vectored` via an internal
+//! `Mutex<WriteHalf>` (byte-level frame serialization) plus a background
+//! reader that dispatches responses by `req_id`, multiple tasks can
+//! drive appends against the same addr simultaneously — true TCP
+//! multiplex, not one-caller-at-a-time.
+//!
+//! Historical note: before R3, this pool used a take/put `RefCell<Option<RpcConn>>`
+//! pattern with an embedded sequential `RpcConn` struct. That prevented
+//! multiplex even though autumn-rpc supports it at the wire level. R3
+//! replaces the custom sequential conn with `Rc<RpcClient>` (shared).
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -5,133 +19,54 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use autumn_rpc::{Frame, FrameDecoder, RpcError};
+use autumn_rpc::client::RpcClient;
 use bytes::Bytes;
-use compio::io::{AsyncRead, AsyncWriteExt};
-use compio::net::TcpStream;
-use compio::BufResult;
 
-/// A single sequential RPC connection for single-threaded compio runtime.
-struct RpcConn {
-    reader: compio::net::OwnedReadHalf<TcpStream>,
-    writer: compio::net::OwnedWriteHalf<TcpStream>,
-    decoder: FrameDecoder,
-    next_id: u32,
-    read_buf: Vec<u8>,
-}
-
-impl RpcConn {
-    async fn connect(addr: SocketAddr) -> Result<Self> {
-        let stream = TcpStream::connect(addr).await?;
-        stream.set_nodelay(true)?;
-        set_tcp_buffer_sizes(&stream, 512 * 1024);
-        let (reader, writer) = stream.into_split();
-        Ok(Self {
-            reader,
-            writer,
-            decoder: FrameDecoder::new(),
-            next_id: 1,
-            read_buf: vec![0u8; 512 * 1024],
-        })
-    }
-
-    /// Send a request and read back the response (sequential, single owner).
-    async fn call(&mut self, msg_type: u8, payload: Bytes) -> Result<Bytes> {
-        let req_id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1).max(1);
-
-        let frame = Frame::request(req_id, msg_type, payload);
-        // Vectored write: header + payload without copying the payload.
-        let hdr = Bytes::copy_from_slice(&frame.encode_header());
-        let bufs = vec![hdr, frame.payload];
-        let BufResult(result, _) = self.writer.write_vectored_all(bufs).await;
-        result?;
-
-        self.read_response(req_id).await
-    }
-
-    /// Send a request whose payload is already split into parts (zero-copy).
-    async fn call_vectored(&mut self, msg_type: u8, payload_parts: Vec<Bytes>) -> Result<Bytes> {
-        let req_id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1).max(1);
-
-        let payload_len: u32 = payload_parts.iter().map(|p| p.len() as u32).sum();
-        let hdr = Frame::encode_request_header(req_id, msg_type, payload_len);
-
-        let mut bufs = Vec::with_capacity(1 + payload_parts.len());
-        bufs.push(Bytes::copy_from_slice(&hdr));
-        bufs.extend(payload_parts);
-        let BufResult(result, _) = self.writer.write_vectored_all(bufs).await;
-        result?;
-
-        self.read_response(req_id).await
-    }
-
-    async fn read_response(&mut self, req_id: u32) -> Result<Bytes> {
-
-        loop {
-            match self.decoder.try_decode().map_err(|e| anyhow!("{e}"))? {
-                Some(resp) if resp.req_id == req_id => {
-                    if resp.is_error() {
-                        let (code, message) = RpcError::decode_status(&resp.payload);
-                        return Err(anyhow!("rpc error ({:?}): {}", code, message));
-                    }
-                    return Ok(resp.payload);
-                }
-                Some(_) => continue,
-                None => {}
-            }
-
-            let BufResult(result, buf_back) =
-                self.reader.read(std::mem::take(&mut self.read_buf)).await;
-            self.read_buf = buf_back;
-            let n = result?;
-            if n == 0 {
-                return Err(anyhow!("connection closed"));
-            }
-            self.decoder.feed(&self.read_buf[..n]);
-        }
-    }
-}
-
-/// Per-process connection pool for extent nodes (single-threaded compio).
-///
-/// Keyed by `SocketAddr`: each address owns one sequential `RpcConn`. Uses
-/// take/put pattern on `RefCell<Option<RpcConn>>` to avoid holding borrow_mut
-/// across await points. If the pooled conn is already taken (another task is
-/// using it), we create a second connection for the same address on the fly.
-///
-/// F087-bulk-mux previously keyed by `(SocketAddr, PoolKind)` to keep large
-/// SSTable flushes off the socket used by small log_stream WAL batches. F088
-/// moved flush to a dedicated P-bulk OS thread with its own ConnPool, so the
-/// P-log SC now only carries WAL (+ rare compact writes) and PoolKind
-/// separation became unnecessary (F093 removal).
 pub struct ConnPool {
-    conns: RefCell<HashMap<SocketAddr, Rc<RefCell<Option<RpcConn>>>>>,
+    clients: RefCell<HashMap<SocketAddr, Rc<RpcClient>>>,
 }
 
 impl ConnPool {
     pub fn new() -> Self {
         Self {
-            conns: RefCell::new(HashMap::new()),
+            clients: RefCell::new(HashMap::new()),
         }
     }
 
-    /// Send an RPC to an extent node and return the response payload.
-    /// On error, the connection is discarded (not returned to pool) so
-    /// the next call creates a fresh connection.
+    /// Get or open an RpcClient for `addr`. Uses the existing pool entry
+    /// if present; otherwise connects and stashes. Connection is shared
+    /// across concurrent callers.
+    async fn get_client(&self, addr: SocketAddr) -> Result<Rc<RpcClient>> {
+        if let Some(client) = self.clients.borrow().get(&addr).cloned() {
+            return Ok(client);
+        }
+        let client = RpcClient::connect(addr)
+            .await
+            .map_err(|e| anyhow!("connect {}: {}", addr, e))?;
+        self.clients.borrow_mut().insert(addr, client.clone());
+        Ok(client)
+    }
+
+    /// Evict the pooled client for `addr` (next `get_client` reconnects).
+    fn evict(&self, addr: SocketAddr) {
+        self.clients.borrow_mut().remove(&addr);
+    }
+
+    /// Send an RPC and await the response. On error, evict the client so
+    /// the next call reconnects (matches R2 behavior semantically).
     pub async fn call(&self, addr: &str, msg_type: u8, payload: Bytes) -> Result<Bytes> {
         let sock = parse_addr(addr)?;
-        let mut conn = self.take_conn(sock).await?;
-        let result = conn.call(msg_type, payload).await;
-        if result.is_ok() {
-            self.put_conn(sock, conn);
+        let client = self.get_client(sock).await?;
+        match client.call(msg_type, payload).await {
+            Ok(bytes) => Ok(bytes),
+            Err(e) => {
+                self.evict(sock);
+                Err(anyhow!("{}", e))
+            }
         }
-        // On error: conn is dropped, pool entry stays None → next call reconnects.
-        result
     }
 
-    /// Send an RPC with a timeout.
+    /// Send an RPC with a timeout. Same error-eviction contract as `call`.
     pub async fn call_timeout(
         &self,
         addr: &str,
@@ -139,18 +74,18 @@ impl ConnPool {
         payload: Bytes,
         timeout: Duration,
     ) -> Result<Bytes> {
-        use futures::FutureExt;
-        let call_fut = self.call(addr, msg_type, payload);
-        let timer_fut = compio::time::sleep(timeout);
-        futures::pin_mut!(call_fut, timer_fut);
-        match futures::future::select(call_fut, timer_fut).await {
-            futures::future::Either::Left((result, _)) => result,
-            futures::future::Either::Right(_) => Err(anyhow!("RPC timed out after {:?}", timeout)),
+        let sock = parse_addr(addr)?;
+        let client = self.get_client(sock).await?;
+        match client.call_timeout(msg_type, payload, timeout).await {
+            Ok(bytes) => Ok(bytes),
+            Err(e) => {
+                self.evict(sock);
+                Err(anyhow!("{}", e))
+            }
         }
     }
 
-    /// Send an RPC with payload split into parts (zero-copy vectored write).
-    /// On error, the connection is discarded so next call reconnects.
+    /// Send an RPC with payload already split into parts (zero-copy).
     pub async fn call_vectored(
         &self,
         addr: &str,
@@ -158,40 +93,39 @@ impl ConnPool {
         payload_parts: Vec<Bytes>,
     ) -> Result<Bytes> {
         let sock = parse_addr(addr)?;
-        let mut conn = self.take_conn(sock).await?;
-        let result = conn.call_vectored(msg_type, payload_parts).await;
-        if result.is_ok() {
-            self.put_conn(sock, conn);
-        }
-        result
-    }
-
-    /// Take an RpcConn for the given address. If the pooled one is in use
-    /// (taken by another task), create a fresh connection.
-    async fn take_conn(&self, addr: SocketAddr) -> Result<RpcConn> {
-        if let Some(cell) = self.conns.borrow().get(&addr).cloned() {
-            if let Some(conn) = cell.borrow_mut().take() {
-                return Ok(conn);
+        let client = self.get_client(sock).await?;
+        match client.call_vectored(msg_type, payload_parts).await {
+            Ok(bytes) => Ok(bytes),
+            Err(e) => {
+                self.evict(sock);
+                Err(anyhow!("{}", e))
             }
         }
-        RpcConn::connect(addr).await
     }
 
-    /// Return an RpcConn to the pool for the given address.
-    fn put_conn(&self, addr: SocketAddr, conn: RpcConn) {
-        let mut conns = self.conns.borrow_mut();
-        let cell = conns
-            .entry(addr)
-            .or_insert_with(|| Rc::new(RefCell::new(None)));
-        *cell.borrow_mut() = Some(conn);
+    /// Send a vectored request and return the oneshot receiver for the
+    /// response, without awaiting. Enables R3 pipelining: StreamClient
+    /// fires 3 `send_vectored` calls under a short mutex, then awaits
+    /// all 3 receivers concurrently outside the mutex.
+    pub async fn send_vectored(
+        &self,
+        addr: &str,
+        msg_type: u8,
+        payload_parts: Vec<Bytes>,
+    ) -> Result<futures::channel::oneshot::Receiver<autumn_rpc::Frame>> {
+        let sock = parse_addr(addr)?;
+        let client = self.get_client(sock).await?;
+        client
+            .send_vectored(msg_type, payload_parts)
+            .await
+            .map_err(|e| anyhow!("{}", e))
     }
 
     pub fn is_healthy(&self, addr: &str) -> bool {
         let Ok(sock) = parse_addr(addr) else {
             return false;
         };
-        let conns = self.conns.borrow();
-        conns.contains_key(&sock)
+        self.clients.borrow().contains_key(&sock)
     }
 }
 
@@ -201,20 +135,26 @@ impl Default for ConnPool {
     }
 }
 
-/// Set TCP send/recv buffer sizes via setsockopt.
-fn set_tcp_buffer_sizes(stream: &compio::net::TcpStream, size: usize) {
-    use std::os::fd::AsRawFd;
-    let fd = stream.as_raw_fd();
-    let size = size as libc::c_int;
-    unsafe {
-        libc::setsockopt(
-            fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
-            &size as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-        libc::setsockopt(
-            fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
-            &size as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
+/// F099-M: route `extent_id` to the correct shard port.
+///
+/// If `shard_ports` is empty, returns `address` unchanged (legacy mode).
+/// Otherwise replaces the port in `address` with `shard_ports[extent_id % K]`
+/// and returns the resulting `host:port` string.
+pub fn shard_addr_for_extent(address: &str, shard_ports: &[u16], extent_id: u64) -> String {
+    if shard_ports.is_empty() {
+        return address.to_string();
+    }
+    let k = shard_ports.len();
+    let port = shard_ports[(extent_id as usize) % k];
+    // Replace port while preserving host. Address may be of the form
+    // "host:port" or "[ipv6]:port". Split at the last ':' before the port.
+    let addr_trimmed = address
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    if let Some(colon) = addr_trimmed.rfind(':') {
+        format!("{}:{}", &addr_trimmed[..colon], port)
+    } else {
+        format!("{address}:{port}")
     }
 }
 

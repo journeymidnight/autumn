@@ -6,35 +6,38 @@ An LSM-tree based KV store built on top of the stream layer. Each `PartitionServ
 
 ## Architecture
 
-### Thread Model
+### Thread Model (post F099-J/K/I, 2026-04-20)
 
 ```
-Main compio thread (control plane)
+Main compio thread (control plane + fd dispatcher)
 ├─ heartbeat_loop          ← periodic manager heartbeat
 ├─ region_sync_loop        ← discover/open/close partitions
-└─ dispatch loop           ← rx.next() → Dispatcher
+└─ fd-dispatch loop        ← rx.next() → partition handle.fd_tx
 
 Accept OS thread (blocking)
 └─ std::net::accept → tx   ← dedicated accept, sends to main via channel
 
-Dispatcher worker threads (N = CPU count, configurable via --conn-threads)
-├─ worker-0: handle_ps_connection × K
-├─ worker-1: handle_ps_connection × K
-└─ worker-N: handle_ps_connection × K
-
-Partition threads — 2 OS threads per partition (F088, PoolKind removed in F093):
-├─ part-N-log (P-log): write_loop, flush_dispatcher, compact_loop, gc_loop, dispatch_rpc
-│     • owns PartitionData (Rc<RefCell>), dedicated StreamClient + ConnPool
-│     • serves log_stream WAL appends + (rare) compact row_stream writes
-│     • all WAL appends + atomic tables/sst_readers swap run here
+Partition threads — 2 OS threads per partition:
+├─ part-N (P-log): OWNS
+│     • merged_partition_loop (request dispatch + group-commit SQ/CQ)
+│     • fd-drain task: fd_rx.next() → compio::TcpStream → spawn ps-conn task
+│     • ps-conn task × K (one per live client connection, all on this runtime)
+│     • background_flush_loop, background_compact_loop, background_gc_loop
+│     • PartitionData (Rc<RefCell>) shared across all tasks on this runtime
+│     • dedicated StreamClient + ConnPool for log_stream/meta_stream
+│     • F099-D: write loop inlined into merged_partition_loop (no spawn/oneshot)
+│     • F099-J: ps-conn tasks collocated here; per-request mpsc hop is now
+│       same-thread (no eventfd, no cross-thread futex).
 ├─ part-N-bulk (P-bulk): flush_worker_loop
-│     • own compio runtime, own io_uring, own ConnPool, own StreamClient
-│     • uses StreamClient::new_with_revision to inherit owner-lock fencing
+│     • own compio runtime + io_uring + ConnPool + StreamClient
 │     • runs build_sst_bytes + row_stream.append + save_table_locs_raw
 │
 P-log → P-bulk: mpsc::Sender<FlushReq> (capacity 1 → sequential flushes)
 P-bulk → P-log: oneshot::Sender<Result<(TableMeta, SstReader)>>
 ```
+
+**Thread count**: `1 main + 1 ps-accept + 2N partition` = `2N + 2` OS threads.
+At N=1 this is **4** OS threads total (vs pre-F099-J `3 + (CPU-count workers) + 2 = ~194`).
 
 **Why two OS threads per partition?** A 128 MB row_stream flush holds the P-log
 compio runtime for hundreds of ms (syscall + 3-replica fanout CQE wait), head-
@@ -43,16 +46,105 @@ F087-bulk-mux pool split separated the TCP sockets, but the runtime was still
 single-threaded. F088 gives flush its own runtime so WAL appends make forward
 progress concurrently with SST uploads.
 
-Workers communicate with partition threads via `PartitionRouter` (DashMap<part_id, mpsc::Sender>).
-Each connection is sequential: decode → route → await response → write. No Mutex writer.
+**How ps-conn handoff works (F099-J + F099-K)**:
+- Post F099-K, each partition OS thread binds its OWN `compio::net::TcpListener`
+  on a unique port (`base_port + ord`) and runs its own accept loop + ps-conn
+  tasks on the SAME compio runtime as `merged_partition_loop`. The main thread
+  does NOT forward fds across partitions; clients connect directly to the
+  owning partition's port (part_addr reported via `MSG_REGISTER_PARTITION_ADDR`
+  and served to clients via `GetRegions.part_addrs`).
+- Each ps-conn task runs `handle_ps_connection` on THIS runtime. Its
+  `req_tx.send(req).await` is a same-thread mpsc send; the matching
+  `req_rx.next().await` inside `merged_partition_loop` wakes via a local
+  Waker (Rc-based) — no eventfd, no cross-thread futex.
+
+**ps-conn handler — F099-I true SQ/CQ inner loop (commit f099i)**:
+`handle_ps_connection` mirrors the ExtentNode R4 4.2 v3 pattern
+(`stream::extent_node::handle_connection`, commit `1e7e456`):
+
+```
+┌─ handle_ps_connection (one task per TCP conn) ──────────────────┐
+│                                                                 │
+│  SQ side — persistent read future:                              │
+│    Option<LocalBoxFuture<'static, PsReadBurst>>                 │
+│    owns OwnedReadHalf + 64 KiB buf across iterations;           │
+│    NEVER dropped mid-flight (io_uring SQE stability)            │
+│                                                                 │
+│  CQ side — FuturesUnordered<LocalBoxFuture<'static, Bytes>>     │
+│    cap = AUTUMN_PS_CONN_INFLIGHT_CAP (default 64)               │
+│    each future: clone req_tx → send PartitionRequest →          │
+│                 await oneshot resp → encode Frame::response     │
+│                                                                 │
+│  Loop:                                                          │
+│    (A) drain ready completions via `.next().now_or_never()`     │
+│        → tx_bufs                                                │
+│    (B) flush tx_bufs with ONE `write_vectored_all` syscall      │
+│    (C) branch on (n_inflight, at_cap):                          │
+│       n_inflight == 0 → await read alone; then                  │
+│         d=1 FAST PATH: if the burst yielded exactly one          │
+│         complete frame AND inflight/tx_bufs are empty,           │
+│         run request→response→write inline via `write_all`       │
+│         (no FU, no Box::pin, no write_vectored). Restores       │
+│         pre-F099-I cost at pipeline-depth=1.                     │
+│       at_cap          → await completion alone (back-pressure)  │
+│       n_inflight == 1 → await completion (fast path: avoid      │
+│           5-10 µs per-iter select polling cost at d=1)          │
+│       n_inflight > 1  → select(read, inflight.next())           │
+│           Left wins  → process frames, restart read_fut         │
+│           Right wins → put read_fut back, extend tx_bufs        │
+│    (D) on EOF: drain remaining inflight + final flush + return  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+At `--pipeline-depth=1`: the d=1 fast path engages — after reading a
+single-frame burst with no earlier in-flight replies, the ps-conn task
+does `tx.send(req) → resp_rx.await → writer.write_all(bytes)` inline.
+No `Box::pin(async {...})` heap alloc, no `FuturesUnordered::push`, no
+`write_vectored_all([1_iov])` — strictly cheaper than the pre-F099-I
+baseline's `write_all(one_frame)` path.
+
+At `--pipeline-depth ≥ N`: one TCP read delivers N frames → all N futures
+in `inflight` concurrently → drain-all-ready collects up to N ready replies
+into `tx_bufs` → one `write_vectored_all` = one `tcp_sendmsg`. Targeted
+win against F099-H's measured 0.8 CPU cores of small-frame TCP kernel
+overhead (91 % of `tcp_sendmsg` at 32–63 B PutResp headers, 22 µs each,
+34 k/s → ~N× fewer kernel TCP traversals per Put).
+
+Back-pressure: if `inflight.len()` reaches the cap mid-push, the inner
+`push_frames_to_inflight` helper awaits one completion before pushing the
+next future. This caps memory usage per pathological client (e.g. a large
+pipeline-depth burst all targeting the same partition).
+
+Mis-routed frames (`part_id != owner_part`) synthesise an immediate
+`NotFound` error frame onto inflight — no mpsc hop. TODO(F099-K):
+forward to owning partition's req_tx instead.
+
+**N>1 behaviour (F099-K)**: with per-partition listeners, each
+`handle_ps_connection` serves only frames whose `part_id == owner_part`.
+The client (autumn-client `perf-check`) is F099-K-aware and opens one
+TCP connection to each partition's port, striping requests across them
+by partition id.
+
+**Trade-off measured**:
+- Pre-F099-J P-log CPU: ~57 % user / 43 % iouring-idle (F099-H §2.3).
+- Post-F099-J P-log CPU: ~100 % — ps-conn decode + dispatch + response
+  writes all run on this thread.
+- Post F099-K: load distributes across N partition threads, each with
+  its own listener + P-log.
+- Post F099-I: ~N× fewer `tcp_sendmsg` calls at pipeline-depth=N, which
+  at the 57 k N=1 × d=1 ceiling accounted for 0.8 CPU cores of pure
+  kernel TCP overhead.
 
 ```
 ┌─────────────────── PartitionServer ────────────────────┐
 │  Rc<RefCell<HashMap<part_id, PartitionHandle>>>         │
-│  Arc<PartitionRouter>  ← shared with worker threads     │
+│  (F099-J: no Arc<PartitionRouter> — ps-conn tasks run   │
+│           on the P-log runtime and use a same-thread    │
+│           PartitionRequest mpsc; no cross-thread wake)  │
 │                                                          │
 │  ┌──────── PartitionData (per partition thread) ───┐    │
-│  │  active: Memtable (SkipMap)                      │    │
+│  │  active: Memtable (RwLock<BTreeMap>, F099-C)     │    │
 │  │  imm: VecDeque<Arc<Memtable>>   ← frozen tables  │    │
 │  │  sst_readers: Vec<Arc<SstReader>>  ← oldest→new  │    │
 │  │  tables: Vec<TableMeta>          ← aligned        │    │
@@ -61,7 +153,8 @@ Each connection is sequential: decode → route → await response → write. No
 │  │  row_stream_id   ← SSTables                       │    │
 │  │  meta_stream_id  ← TableLocations checkpoint      │    │
 │  │                                                   │    │
-│  │  write_tx: mpsc::Sender<WriteRequest>              │    │
+│  │  (F099-D: no write_tx — writes come directly from │    │
+│  │   req_rx via merged_partition_loop)                │    │
 │  │  seq_number: monotonic MVCC counter               │    │
 │  │  has_overlap: AtomicU32                           │    │
 │  └───────────────────────────────────────────────────┘   │
@@ -78,31 +171,134 @@ The null byte (`0x00`) is a **separator** between the user key and the inverted 
 
 The **inverted** sequence ensures that for the same user key, newer writes (higher seq) sort **before** older writes in byte order. Lookup uses `seek_user_key` which seeks to `user_key ++ 0x00 ++ BE(0)` — the smallest possible internal key for this user key — then returns the first (newest) entry found.
 
-## Write Path: Put / Delete (Group Commit)
+## Write Path: Put / Delete (Group Commit, R4 4.4 SQ/CQ, F099-D merged, F099-I batched)
 
 ```
 Put(key, value, part_id, must_sync):
-  1. Thin RPC handler: send WriteRequest{Put{key, value}, must_sync} to write_tx channel
-  2. Await response on oneshot channel
+  1. ps-conn task (F099-I): decode frame from TCP read; push
+     `async { clone req_tx → send PartitionRequest → await oneshot resp →
+              encode Frame::response }` onto the per-conn inflight
+     FuturesUnordered. MULTIPLE frames from the same TCP read end up in
+     the inflight set concurrently.
+  2. Same-thread mpsc: PartitionRequest delivered into merged_partition_loop.
+  3. P-log merged_partition_loop: decode PutReq inline, push a
+     WriteRequest with a direct `WriteResponder::Put { outer: resp_tx, key }`
+     into the `pending` Vec. NO compio::spawn, NO inner oneshot.
+  4. ps-conn awaits the outer resp_tx via the inflight future — the SAME
+     oneshot that was sent into the request; Phase 3 fires its encoded
+     `PutResp` frame directly into it.
+  5. ps-conn loop top: drain-all-ready completions into `tx_bufs`; flush
+     `tx_bufs` via ONE `write_vectored_all` syscall — coalescing all Put
+     responses that became ready since the previous flush.
 
-background_write_loop (per partition):
-  1. Recv first WriteRequest (blocking)
-  2. Drain up to MAX_WRITE_BATCH (128) more non-blocking
-  3. Acquire partition write lock
-  4. Validate each key is in_range; error invalid ones
-  5. Assign seq_numbers, compute internal_keys
-  6. Encode all entries as WAL records: [op:1][key_len:4 LE][val_len:4 LE][expires_at:8 LE][key][value]
-  7. batch_must_sync = any(req.must_sync) — if ANY request needs fsync, whole batch syncs
-  8. stream_client.append_batch(log_stream_id, &blocks, batch_must_sync) — 1 RPC for entire batch
-     ALL entries (small and large) go to log_stream (no separate local WAL file)
-  9. Compute VP for large values (>4KB): VP points to record in logStream
-  10. Insert all into active Memtable
-  11. Update vp_extent_id / vp_offset to end of batch
-  12. maybe_rotate_locked() → flush if thresholds exceeded
-  13. Drop lock, reply Ok(key) to all requestors
+merged_partition_loop (per partition, F099-D fold-in of the old
+                       background_write_loop_r1):
+  OWNS:   FuturesUnordered<Pin<Box<dyn Future<Output = InflightCompletion>>>>
+  CAP:    AUTUMN_PS_INFLIGHT_CAP (default 8, range [1, 64])
+  GATE:   MIN_PIPELINE_BATCH = 256  (2nd+ batch requires pending >= 256)
+  RECV:   req_rx: mpsc<PartitionRequest> (WRITE_CHANNEL_CAP = 1024)
+          — the SAME channel that carries reads + writes from ps-conn
+
+  Loop (per iteration):
+    (A) drain ready completions via `inflight.next().now_or_never()`
+        → run Phase 3 (memtable insert + direct WriteResponder::send_ok) each
+    (B) if pending.non_empty && !at_cap && (n_inflight==0 || pending >= 256):
+          launch_new_batch:
+            Phase 1: validate, seq-assign, encode WAL records
+            Launch Phase 2: stream_client.append_batch future (NOT awaited)
+            Push (BatchData, Phase2Fut → InflightCompletion) into FU
+          continue
+    (C) if at_cap:
+          await inflight.next() (back-pressure) → run Phase 3
+          continue
+    (D) branch on n_inflight:
+          == 0:  await req_rx.next() alone (cold idle)
+          >  0:  select(req_rx.next, inflight.next()) — race SQ vs CQ
+                 Left  (SQ wins) → handle_incoming_req:
+                                   - PUT/DELETE/STREAM_PUT: decode + pending.push
+                                   - GET/HEAD/RANGE/SPLIT/MAINTENANCE: inline
+                                     via dispatch_partition_rpc (reads still
+                                     run inline on P-log)
+                 Right (CQ wins) → run Phase 3 on the completion
+    (E) non-blocking drain of any queued requests (still decode inline)
+
+  Shutdown (req_rx closed):
+    Drain all inflight via await-loop; run Phase 3 on each so clients
+    receive their final ack. Then flush any residual pending as one last
+    batch. Finally emit metrics.
+
+  Error handling:
+    LockedByOther on any completion  → set locked_by_other flag, drain
+      remaining inflight cleanly, return (partition self-evicts in the
+      enclosing loop).
+    Other append errors              → log + propagate Err(_) to each
+      client's oneshot. Loop continues.
 ```
 
+**Phase 1 / Phase 3 primitives** (`start_write_batch` / `finish_write_batch`
+in `background.rs`) are unchanged from R3; Phase 2 is wrapped into a boxed
+`InflightCompletion` future. Phase 3 runs at most once per loop iteration
+(single-threaded compio task), so the partition write lock is never held
+concurrently — `maybe_rotate_locked` remains correct.
+
 `Delete` sends `WriteOp::Delete{user_key}`, writes `op = 2` (tombstone).
+
+### Why a `MIN_PIPELINE_BATCH` gate?
+
+R3 Task 5b found that greedily splitting a naturally-full 256-op burst
+into multiple small batches regressed throughput because per-batch
+overhead (encode, 3-replica `send_vectored`, lease/ack state machine
+cycle) outweighs the concurrency gain of running two small batches in
+parallel. The gate says: a *second or later* batch launches only when
+pending has grown to the full burst size (256 — matches the
+`--threads 256` perf_check workload). The first batch after an idle
+period always launches (avoiding starvation on low-load streams).
+
+### Out-of-order completion is correct
+
+Phase 2 completions may arrive in a different order than launch order
+(e.g., batch B finishes before batch A if A had a larger payload and
+consequently higher write bandwidth). This is fine because:
+- **Seq numbers** were assigned in Phase 1 in batch-launch order, so A
+  always has lower seqs than B.
+- **Memtable MVCC keys** are `user_key ++ 0x00 ++ BE(u64::MAX - seq)`.
+  Byte-sort order is independent of insertion order.
+- **Client oneshot replies** are per-request, not per-batch-order.
+- **LogStream ordering** is preserved by the stream worker's
+  lease/ack cursor (step 4.3): both batches land at distinct contiguous
+  offsets regardless of Phase 2 completion order.
+
+### Cross-layer SQ/CQ stack (post-R4)
+
+```
+┌─ PS merged_partition_loop  (this crate, 4.4 + F099-D)        ┐
+│    FU<InflightCompletion>, cap 8                              │
+│    (was background_write_loop_r1 before F099-D; merged with   │
+│     the request-dispatch loop to remove the per-Put spawn +   │
+│     inner oneshot that cost ~30 % of P-log CPU at 256 × d=1)  │
+└─────────────┬─────────────────────────────────────────────────┘
+              ▼  stream_client.append_batch(log_stream_id, …)
+┌─ autumn-stream stream_worker_loop  (step 4.3)                 ┐
+│    FU<3-replica-join>, cap 32, per stream_id                  │
+└─────────────┬─────────────────────────────────────────────────┘
+              ▼  pool.send_vectored per replica
+┌─ autumn-rpc writer_task (step 4.1) — single SQ per conn       ┐
+└─────────────┬─────────────────────────────────────────────────┘
+              ▼  TCP
+┌─ autumn-stream handle_connection (step 4.2 v3, server side)   ┐
+│    FU<batch-io>, cap 64, persistent read future               │
+└───────────────────────────────────────────────────────────────┘
+```
+
+## P-bulk SQ/CQ (flush_worker_loop, R4 4.4)
+
+Same FuturesUnordered + select pattern on the bulk thread, cap = 2
+(default, env `AUTUMN_PS_BULK_INFLIGHT_CAP`, range [1, 16]). Each
+in-flight flush holds a 128 MB SST buffer, so the cap is deliberately
+small. The benefit is that while one SST is uploading via
+`row_stream.append`, the next flush can start its `build_sst_bytes`
+`spawn_blocking` — overlapping CPU (build) with network (upload) without
+ballooning peak memory.
 
 **Record format**: `[op:1][key_len:4 LE][val_len:4 LE][expires_at:8 LE][key][value]` (17-byte header)
 
@@ -268,7 +464,7 @@ After split, both child partitions will detect `has_overlap = true` on next open
 
 ## Fault Recovery: LockedByOther Self-Eviction
 
-If the `background_write_loop` receives a `CODE_LOCKED_BY_OTHER` error from the stream layer
+If the `merged_partition_loop` receives a `CODE_LOCKED_BY_OTHER` error from the stream layer
 (meaning a newer partition owner has taken the lock), it sets a `locked_by_other` flag.
 The main partition loop checks this flag on each request and exits if set.
 This prevents split-brain where two PS nodes serve the same partition.
@@ -349,10 +545,17 @@ Operates on **user keys only** (8-byte MVCC suffix stripped before hashing). 1% 
 
 5. **No local WAL file** — logStream is the sole WAL. All writes (small and large) go to logStream via `append_batch`. Recovery reads logStream from the VP head checkpoint in metaStream. If no checkpoint exists (tables is empty AND vp_eid == 0), recovery replays logStream from the very first extent, offset 0 — this covers partitions that accepted writes but were killed before their first flush. Unflushed imm tables that are in memory are also covered: logStream contains all records newer than the last SSTable flush.
 
-6. **Group commit batching** — the background_write_loop drains up to MAX_WRITE_BATCH (256) requests per RPC cycle. If ANY request in a batch has `must_sync=true`, the entire batch is synced. This allows `--nosync` clients to piggyback on sync requests from other clients without extra overhead.
+6. **Group commit batching** — the merged_partition_loop drains up to MAX_WRITE_BATCH (256) requests per RPC cycle. If ANY request in a batch has `must_sync=true`, the entire batch is synced. This allows `--nosync` clients to piggyback on sync requests from other clients without extra overhead.
 
 7. **Per-partition StreamClient** — each `PartitionData` holds its own `stream_client: Arc<StreamClient>` (no Mutex) created via `StreamClient::new_with_revision`. StreamClient is internally concurrent via per-stream locking (`DashMap<stream_id, Arc<Mutex<StreamAppendState>>>`). Different streams (log/row/meta) are fully concurrent; the same stream is serialized. The server-level `PartitionServer.stream_client` is used only in `split_part` for coordination RPCs.
 
-8. **`process_write_batch` lock scope** — the write lock is held only for seq number assignment and block encoding (Phase 1), then released before the `append_batch` network RPC (Phase 2), then re-acquired for memtable insert and VP head update (Phase 3). This prevents the partition write lock from blocking reads/flushes/compaction during network I/O.
+8. **`start_write_batch` / `finish_write_batch` lock scope** — the write lock is held only for seq number assignment and block encoding (Phase 1), then released before the `append_batch` network RPC (Phase 2), then re-acquired for memtable insert and VP head update (Phase 3). This prevents the partition write lock from blocking reads/flushes/compaction during network I/O.
 
 7. **`sst_readers` and `tables` are always aligned by index** — `tables[i]` and `sst_readers[i]` refer to the same SSTable. Operations on these must maintain alignment. Compaction's atomic swap replaces slices, not individual elements.
+
+9. **Memtable backing = `parking_lot::RwLock<BTreeMap>` (F099-C)** — the active memtable has exactly one writer (the P-log thread's `merged_partition_loop` Phase 3) and N readers (ps-conn `handle_get` call sites + P-log itself). Correctness properties:
+   - Writer holds the write lock for the duration of one `insert_batch` call (hot path, up to 256 entries), then releases. Subsequent readers take the read lock AFTER the writer releases → linearisable Put-then-Get.
+   - Rotation (`rotate_active`) replaces the whole `Memtable` struct via `std::mem::replace` on the owning `PartitionData`; this is safe because `rotate_active` runs exclusively on P-log inside a `RefCell::borrow_mut`.
+   - `imm: VecDeque<Arc<Memtable>>` — after rotation, frozen memtables are read-only from both P-log (during flush + GC + compaction) and P-bulk (during `build_sst_bytes`). Multiple readers acquire the read lock concurrently.
+   - Hot path uses `insert_batch(iter)` (one write lock per batch of 256 inserts, not 256 locks), and `for_each(closure)` (read lock held for the iteration — used by `build_sst_bytes` and `rotate_active`).
+   - The `bytes: AtomicU64` counter is not inside the lock, so `mem_bytes()` and `maybe_rotate` stay lock-free.

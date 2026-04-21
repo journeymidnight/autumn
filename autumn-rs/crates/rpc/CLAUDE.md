@@ -35,12 +35,41 @@ Error responses encode status as: `[status_code: u8][message bytes]`.
 
 ### `client.rs`
 - `RpcClient`: multiplexed client over one TCP connection
-  - `connect(addr)` → `Arc<RpcClient>`: connect + start background reader
+  - `connect(addr)` → `Rc<RpcClient>`: connect + start background reader + writer tasks
   - `call(msg_type, payload)` → `Bytes`: send request, await response
+  - `call_vectored(msg_type, parts)` → `Bytes`: vectored payload, zero-copy
   - `send_frame(frame)` → `oneshot::Receiver<Frame>`: low-level send
+  - `send_vectored(msg_type, parts)` → `oneshot::Receiver<Frame>`: pipelined submit
   - `send_oneshot(msg_type, payload)`: fire-and-forget (req_id=0)
-- Background reader task routes responses by req_id via `DashMap<u32, oneshot::Sender<Frame>>`
-- Writer serialized by `tokio::sync::Mutex` (runtime-agnostic)
+- **SQ/CQ architecture (R4 step 4.1, F098)**:
+  - **SQ**: callers push `SubmitMsg { Single | Vectored }` onto a bounded
+    `mpsc::channel(SUBMIT_CHANNEL_CAP=1024)`. A single `writer_task` owns
+    `WriteHalf` and drains the queue sequentially — no cross-caller mutex.
+    Back-pressure comes naturally from the bounded channel.
+  - **CQ**: `read_loop` task owns `ReadHalf`, decodes frames, dispatches to
+    the matching `oneshot::Sender<Frame>` in
+    `Rc<RefCell<HashMap<u32, oneshot::Sender<Frame>>>>`.
+- Invariants:
+  - pending-insert happens **before** submit_tx.send so the CQ can't race
+    in and find no entry.
+  - `pending.borrow_mut()` is always scoped tight — never held across await.
+  - `submit_tx` is cloned from a `RefCell` borrow (scoped), never borrowed
+    across `.send().await` — avoids RefCell-across-await panics.
+  - `next_req_id` skips `0` on wraparound (0 reserved for fire-and-forget).
+- **F099-I-fix writer_task instrumentation**: on any write error, the
+  writer_task logs `iov_count`, `total_bytes`, `errno.raw_os_error()`,
+  `kind`, and the error message at WARN before exiting. This makes the
+  previously opaque "submit error: connection closed" downstream cascade
+  (see `stream::client::launch_append`) self-explanatory — the FIRST
+  writer that encountered a kernel-level error in a stress run surfaces
+  with the exact shape of the offending SendMsg, eliminating guesswork.
+- **2-iov SendMsg shape is stable**: every `call_vectored` /
+  `send_vectored` produces a `SubmitMsg::Vectored { bufs: [hdr, part] }`
+  with exactly 2 iovecs — well under UIO_MAXIOV=1024. The writer_task
+  serialises submits so concurrent callers never combine their iovs in
+  one syscall. Stress-tested at 2048 concurrent futures sharing one
+  writer_task in `writer_task_handles_2048_concurrent_vectored` — no
+  EINVAL, no EAGAIN, all requests complete.
 
 ### `server.rs`
 - `RpcServer::new(handler)`: create server with async handler `Fn(u8, Bytes) -> Result<Bytes, (StatusCode, String)>`

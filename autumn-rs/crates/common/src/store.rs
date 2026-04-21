@@ -20,6 +20,10 @@ pub struct MetadataState {
     pub partitions: HashMap<u64, MgrPartitionMeta>,
     pub ps_nodes: HashMap<u64, String>,
     pub regions: BTreeMap<u64, MgrRegionInfo>,
+    /// F099-K — per-partition listener addresses reported by PS via
+    /// `RegisterPartitionAddr`. In-memory only; rebuilt when the PS
+    /// re-registers on restart. Keyed by `part_id`; value is `host:port`.
+    pub part_addrs: HashMap<u64, String>,
 }
 
 impl MetadataState {

@@ -1,0 +1,55 @@
+/*
+ * F099-H: latency + size histogram of kernel tcp_sendmsg / tcp_recvmsg /
+ * tcp_write_xmit / sock_def_readable per PID.
+ *
+ * Usage:  bpftrace -e "$(cat tcp_sendmsg.bt)" <PID>
+ *
+ * Kprobe-based; gives per-call kernel-side latency INCLUDING any
+ * schedule/block time (not just CPU-on-syscall time). This is what the
+ * user-space send() experiences as "kernel time".
+ */
+
+BEGIN {
+    printf("tcp_sendmsg: target PID = %d\n", $1);
+}
+
+kprobe:tcp_sendmsg / pid == $1 / { @start_send[tid] = nsecs; }
+kretprobe:tcp_sendmsg / @start_send[tid] / {
+    $l = nsecs - @start_send[tid];
+    @tcp_sendmsg_count = count();
+    @tcp_sendmsg_ns_total = sum($l);
+    @tcp_sendmsg_ns = hist($l);
+    if (retval > 0) { @tcp_sendmsg_retbytes = hist((uint64)retval); }
+    delete(@start_send[tid]);
+}
+
+kprobe:tcp_recvmsg / pid == $1 / { @start_recv[tid] = nsecs; }
+kretprobe:tcp_recvmsg / @start_recv[tid] / {
+    $l = nsecs - @start_recv[tid];
+    @tcp_recvmsg_count = count();
+    @tcp_recvmsg_ns_total = sum($l);
+    @tcp_recvmsg_ns = hist($l);
+    if (retval > 0) { @tcp_recvmsg_retbytes = hist((uint64)retval); }
+    delete(@start_recv[tid]);
+}
+
+kprobe:tcp_write_xmit / pid == $1 / { @tcp_write_xmit_calls = count(); }
+kprobe:__tcp_push_pending_frames / pid == $1 / { @tcp_push_calls = count(); }
+
+END {
+    clear(@start_send);
+    clear(@start_recv);
+    printf("\n=== tcp_sendmsg ===\n");
+    print(@tcp_sendmsg_count);
+    print(@tcp_sendmsg_ns_total);
+    print(@tcp_sendmsg_ns);
+    print(@tcp_sendmsg_retbytes);
+    printf("\n=== tcp_recvmsg ===\n");
+    print(@tcp_recvmsg_count);
+    print(@tcp_recvmsg_ns_total);
+    print(@tcp_recvmsg_ns);
+    print(@tcp_recvmsg_retbytes);
+    printf("\n=== tcp_write_xmit calls ===\n");
+    print(@tcp_write_xmit_calls);
+    print(@tcp_push_calls);
+}

@@ -696,6 +696,10 @@ impl AutumnManager {
             .collect();
         for part_id in stale {
             state.regions.remove(&part_id);
+            // F099-K: a dropped region implies the old per-partition
+            // listener address is also invalid; drop it so clients can't
+            // be handed back a dead addr via GetRegions.
+            state.part_addrs.remove(&part_id);
         }
 
         if state.ps_nodes.is_empty() {
@@ -845,12 +849,44 @@ impl AutumnManager {
 
     // ── Extent node RPC helpers ─────────────────────────────────────────
 
+    /// F099-M: look up `shard_ports` for a node by address, so we can
+    /// route extent RPCs to the owning shard. Returns empty Vec if the
+    /// node isn't found (shouldn't happen in practice but stays safe).
+    fn shard_ports_for_addr(&self, addr: &str) -> Vec<u16> {
+        let normalized = Self::normalize_endpoint(addr);
+        let s = self.store.inner.borrow();
+        for node in s.nodes.values() {
+            if Self::normalize_endpoint(&node.address) == normalized {
+                return node.shard_ports.clone();
+            }
+        }
+        Vec::new()
+    }
+
+    /// F099-M: route an address to the shard listening for `extent_id`.
+    /// If `shard_ports` is empty, returns `addr` unchanged (legacy mode).
+    fn shard_addr_for_extent(addr: &str, shard_ports: &[u16], extent_id: u64) -> String {
+        if shard_ports.is_empty() {
+            return addr.to_string();
+        }
+        let k = shard_ports.len();
+        let port = shard_ports[(extent_id as usize) % k];
+        let trimmed = Self::normalize_endpoint(addr);
+        if let Some(colon) = trimmed.rfind(':') {
+            format!("{}:{}", &trimmed[..colon], port)
+        } else {
+            format!("{trimmed}:{port}")
+        }
+    }
+
     async fn alloc_extent_on_node(&self, addr: &str, extent_id: u64) -> Result<u64, AppError> {
-        let addr = Self::normalize_endpoint(addr);
+        let base = Self::normalize_endpoint(addr);
+        let shard_ports = self.shard_ports_for_addr(&base);
+        let routed = Self::shard_addr_for_extent(&base, &shard_ports, extent_id);
         let payload = rkyv_encode(&ExtAllocExtentReq { extent_id });
         let resp = self
             .conn_pool
-            .call(&addr, EXT_MSG_ALLOC_EXTENT, payload)
+            .call(&routed, EXT_MSG_ALLOC_EXTENT, payload)
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
         let r: ExtAllocExtentResp =
@@ -865,21 +901,23 @@ impl AutumnManager {
     }
 
     async fn commit_length_on_node(&self, addr: &str, extent_id: u64) -> Result<u32, AppError> {
-        let addr = Self::normalize_endpoint(addr);
+        let base = Self::normalize_endpoint(addr);
+        let shard_ports = self.shard_ports_for_addr(&base);
+        let routed = Self::shard_addr_for_extent(&base, &shard_ports, extent_id);
         let req = ExtCommitLengthReq {
             extent_id,
             revision: 0,
         };
         let resp = self
             .conn_pool
-            .call(&addr, EXT_MSG_COMMIT_LENGTH, req.encode())
+            .call(&routed, EXT_MSG_COMMIT_LENGTH, req.encode())
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
         let r =
             ExtCommitLengthResp::decode(resp).map_err(|e| AppError::Internal(e.to_string()))?;
         if r.code != CODE_OK {
             return Err(AppError::Internal(format!(
-                "commit_length failed on {addr}: code {}",
+                "commit_length failed on {routed}: code {}",
                 r.code
             )));
         }
@@ -1077,6 +1115,7 @@ mod tests {
             let req = rkyv_encode(&RegisterNodeReq {
                 addr: "127.0.0.1:4001".to_string(),
                 disk_uuids: vec!["d1".to_string()],
+                shard_ports: vec![],
             });
             let resp = m.handle_register_node(req).await.unwrap();
             let r: RegisterNodeResp = rkyv_decode(&resp).unwrap();
@@ -1085,6 +1124,7 @@ mod tests {
             let req2 = rkyv_encode(&RegisterNodeReq {
                 addr: "127.0.0.1:4001".to_string(),
                 disk_uuids: vec!["d2".to_string()],
+                shard_ports: vec![],
             });
             let resp2 = m.handle_register_node(req2).await.unwrap();
             let r2: RegisterNodeResp = rkyv_decode(&resp2).unwrap();

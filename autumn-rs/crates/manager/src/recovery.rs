@@ -46,7 +46,13 @@ impl AutumnManager {
         }
 
         for candidate in &candidates {
-            let addr = Self::normalize_endpoint(&candidate.address);
+            let base = Self::normalize_endpoint(&candidate.address);
+            // F099-M: recovery targets a specific extent_id → route to owner shard.
+            let addr = Self::shard_addr_for_extent(
+                &base,
+                &candidate.shard_ports,
+                extent_id,
+            );
 
             let task = MgrRecoveryTask {
                 extent_id,
@@ -213,7 +219,13 @@ impl AutumnManager {
 
                     if (ex.avali & bit) == 0 {
                         if let Some(n) = node.clone() {
-                            let addr = Self::normalize_endpoint(&n.address);
+                            let base = Self::normalize_endpoint(&n.address);
+                            // F099-M: re_avali on specific extent → owner shard.
+                            let addr = Self::shard_addr_for_extent(
+                                &base,
+                                &n.shard_ports,
+                                ex.extent_id,
+                            );
                             let payload = rkyv_encode(&ExtReAvaliReq {
                                 extent_id: ex.extent_id,
                                 eversion: ex.eversion,
@@ -446,8 +458,27 @@ impl AutumnManager {
                     .borrow_mut()
                     .insert(extent_id);
 
-                let coordinator_addr = Self::normalize_endpoint(&target_addrs[0]);
-                let ec_target_addrs = target_addrs.clone();
+                // F099-M: coordinator is the shard that owns `extent_id` on
+                // the first replica. For convert_to_ec, the coordinator reads
+                // the full extent locally, then dispatches shards to targets.
+                let coordinator_base = Self::normalize_endpoint(&target_addrs[0]);
+                let coordinator_shard_ports = self.shard_ports_for_addr(&coordinator_base);
+                let coordinator_addr = Self::shard_addr_for_extent(
+                    &coordinator_base,
+                    &coordinator_shard_ports,
+                    extent_id,
+                );
+                // Rewrite target_addrs to each target node's owner shard for
+                // `extent_id` so the coordinator's WriteShard RPCs land on the
+                // correct shard on each peer.
+                let ec_target_addrs: Vec<String> = target_addrs
+                    .iter()
+                    .map(|a| {
+                        let b = Self::normalize_endpoint(a);
+                        let sp = self.shard_ports_for_addr(&b);
+                        Self::shard_addr_for_extent(&b, &sp, extent_id)
+                    })
+                    .collect();
                 let target_nodes_clone = target_nodes.clone();
                 let extra_disk_ids_clone = extra_disk_ids.clone();
                 let orig_replica_count = ex.replicates.len() as u32;

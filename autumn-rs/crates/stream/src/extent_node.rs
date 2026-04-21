@@ -29,7 +29,7 @@ use bytes::Bytes;
 use autumn_rpc::{Frame, FrameDecoder, HandlerResult, StatusCode};
 use compio::BufResult;
 use compio::fs::{File as CompioFile, OpenOptions};
-use compio::io::{AsyncReadAtExt, AsyncWriteAt, AsyncWriteAtExt};
+use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use compio::net::TcpListener;
 use compio::io::{AsyncRead, AsyncWriteExt};
 use dashmap::DashMap;
@@ -40,7 +40,7 @@ use std::rc::Rc;
 
 // ─── Per-node append metrics ─────────────────────────────────────────────────
 
-struct ExtentAppendMetrics {
+pub(crate) struct ExtentAppendMetrics {
     started_at: Instant,
     req_count: u64,
     bytes: u64,
@@ -51,7 +51,7 @@ impl ExtentAppendMetrics {
     fn new() -> Self {
         Self { started_at: Instant::now(), req_count: 0, bytes: 0, total_ns: 0 }
     }
-    fn record(&mut self, reqs: u64, bytes: u64, elapsed_ns: u64) {
+    pub(crate) fn record(&mut self, reqs: u64, bytes: u64, elapsed_ns: u64) {
         self.req_count += reqs;
         self.bytes += bytes;
         self.total_ns += elapsed_ns;
@@ -73,7 +73,7 @@ impl ExtentAppendMetrics {
 }
 
 thread_local! {
-    static EXTENT_APPEND_METRICS: RefCell<ExtentAppendMetrics> =
+    pub(crate) static EXTENT_APPEND_METRICS: RefCell<ExtentAppendMetrics> =
         RefCell::new(ExtentAppendMetrics::new());
 }
 
@@ -217,6 +217,18 @@ pub struct ExtentNodeConfig {
     disks: Vec<(PathBuf, Option<u64>)>,
     pub manager_endpoint: Option<String>,
     pub wal_dir: Option<PathBuf>,
+    /// F099-M: this shard's index (0..shard_count). Only extents where
+    /// `extent_id % shard_count == shard_idx` are owned by this instance.
+    pub shard_idx: u32,
+    /// F099-M: total shard count in the extent-node process. 1 = legacy
+    /// single-threaded mode; >1 enables per-shard filtering + routing.
+    pub shard_count: u32,
+    /// F099-M: sibling shards' local listener addresses on this process
+    /// (typically `127.0.0.1:<shard_ports[i]>`). Used by control-plane
+    /// RPC handlers (alloc, re_avali, convert_to_ec, copy_extent,
+    /// require_recovery) to forward a mismatched extent_id to the
+    /// owning sibling shard via localhost loopback.
+    pub sibling_addrs: Vec<String>,
 }
 
 impl ExtentNodeConfig {
@@ -226,6 +238,9 @@ impl ExtentNodeConfig {
             disks: vec![(data_dir, Some(disk_id))],
             manager_endpoint: None,
             wal_dir: None,
+            shard_idx: 0,
+            shard_count: 1,
+            sibling_addrs: Vec::new(),
         }
     }
 
@@ -236,6 +251,9 @@ impl ExtentNodeConfig {
             disks: data_dirs.into_iter().map(|d| (d, None)).collect(),
             manager_endpoint: None,
             wal_dir: None,
+            shard_idx: 0,
+            shard_count: 1,
+            sibling_addrs: Vec::new(),
         }
     }
 
@@ -248,19 +266,38 @@ impl ExtentNodeConfig {
         self.wal_dir = Some(wal_dir);
         self
     }
+
+    /// F099-M: mark this config as a shard of a multi-shard extent-node.
+    /// `shard_idx` must be < `shard_count`. `sibling_addrs[i]` is the
+    /// local address of shard `i` (normally `127.0.0.1:<shard_ports[i]>`).
+    pub fn with_shard(mut self, shard_idx: u32, shard_count: u32, sibling_addrs: Vec<String>) -> Self {
+        assert!(shard_count >= 1, "shard_count must be >= 1");
+        assert!(shard_idx < shard_count, "shard_idx must be < shard_count");
+        if shard_count > 1 {
+            assert_eq!(
+                sibling_addrs.len(),
+                shard_count as usize,
+                "sibling_addrs must have exactly shard_count entries"
+            );
+        }
+        self.shard_idx = shard_idx;
+        self.shard_count = shard_count;
+        self.sibling_addrs = sibling_addrs;
+        self
+    }
 }
 
 // ─── ExtentEntry ─────────────────────────────────────────────────────────────
 
-struct ExtentEntry {
-    file: std::cell::UnsafeCell<CompioFile>,
-    len: AtomicU64,
-    eversion: AtomicU64,
-    sealed_length: AtomicU64,
-    avali: AtomicU32,
-    last_revision: AtomicI64,
+pub(crate) struct ExtentEntry {
+    pub(crate) file: std::cell::UnsafeCell<CompioFile>,
+    pub(crate) len: AtomicU64,
+    pub(crate) eversion: AtomicU64,
+    pub(crate) sealed_length: AtomicU64,
+    pub(crate) avali: AtomicU32,
+    pub(crate) last_revision: AtomicI64,
     /// Which disk this extent lives on. Used to resolve file paths.
-    disk_id: u64,
+    pub(crate) disk_id: u64,
 }
 
 // ─── ExtentNode ───────────────────────────────────────────────────────────────
@@ -276,7 +313,15 @@ pub struct ExtentNode {
     recovery_inflight: Rc<DashMap<u64, crate::extent_rpc::RecoveryTask>>,
     /// WAL for small must_sync writes. None if WAL is disabled.
     /// Wrapped in Rc<RefCell<>> for interior mutability on single-threaded compio.
-    wal: Option<Rc<RefCell<Wal>>>,
+    pub(crate) wal: Option<Rc<RefCell<Wal>>>,
+    /// F099-M: shard_idx / shard_count for per-shard extent ownership.
+    /// Default is (0, 1) = legacy single-thread mode.
+    shard_idx: u32,
+    shard_count: u32,
+    /// F099-M: local sibling shard addresses for cross-shard control RPC
+    /// forwarding. `sibling_addrs[i]` is the address of shard `i` on this
+    /// host. Empty in single-thread mode.
+    sibling_addrs: Rc<Vec<String>>,
 }
 
 impl Clone for ExtentNode {
@@ -289,6 +334,9 @@ impl Clone for ExtentNode {
             recovery_done: self.recovery_done.clone(),
             recovery_inflight: self.recovery_inflight.clone(),
             wal: self.wal.clone(),
+            shard_idx: self.shard_idx,
+            shard_count: self.shard_count,
+            sibling_addrs: self.sibling_addrs.clone(),
         }
     }
 }
@@ -363,6 +411,537 @@ async fn file_pread(file: &std::cell::UnsafeCell<CompioFile>, offset: u64, len: 
     Ok(buf)
 }
 
+// ───── R4 step 4.2 — inline SQ/CQ pipeline helpers ──────────────────────────
+
+/// Outcome of the persistent read future used by `handle_connection`.
+///
+/// The future OWNS both the `OwnedReadHalf` and the read buffer across
+/// iterations — when it completes, these are returned here and the caller
+/// rebuilds a fresh future via `spawn_read` with the same reader and buf.
+/// Never dropping the read future mid-flight is critical: dropping it would
+/// cancel the pending io_uring SQE, which compio handles correctly but
+/// introduces SQE-resubmit oscillation that regressed perf in earlier
+/// attempts.
+enum ReadBurst {
+    /// A full read arrived. `n` bytes at `buf[..n]` are valid payload.
+    Data {
+        buf: Vec<u8>,
+        n: usize,
+        reader: compio::net::OwnedReadHalf<compio::net::TcpStream>,
+    },
+    /// read() returned 0 (peer closed).
+    Eof {
+        #[allow(dead_code)]
+        reader: compio::net::OwnedReadHalf<compio::net::TcpStream>,
+        #[allow(dead_code)]
+        buf: Vec<u8>,
+    },
+    /// read() errored.
+    Err {
+        e: std::io::Error,
+        #[allow(dead_code)]
+        reader: compio::net::OwnedReadHalf<compio::net::TcpStream>,
+        #[allow(dead_code)]
+        buf: Vec<u8>,
+    },
+}
+
+/// Build a `'static`-lifetime `LocalBoxFuture<ReadBurst>` that reads once
+/// into `buf` and returns ownership of both `reader` and `buf`.
+fn spawn_read(
+    mut reader: compio::net::OwnedReadHalf<compio::net::TcpStream>,
+    buf: Vec<u8>,
+) -> futures::future::LocalBoxFuture<'static, ReadBurst> {
+    use compio::io::AsyncRead;
+    use futures::FutureExt;
+    async move {
+        let BufResult(result, buf_back) = reader.read(buf).await;
+        match result {
+            Ok(0) => ReadBurst::Eof { reader, buf: buf_back },
+            Ok(n) => ReadBurst::Data { buf: buf_back, n, reader },
+            Err(e) => ReadBurst::Err { e, reader, buf: buf_back },
+        }
+    }
+    .boxed_local()
+}
+
+/// Inflight cap — how many I/O futures `handle_connection` drives at once.
+/// Configurable via AUTUMN_EXTENT_INFLIGHT_CAP. Default 64 matches the
+/// client-side pipelining depth where extent_bench peaks.
+fn extent_inflight_cap() -> usize {
+    std::env::var("AUTUMN_EXTENT_INFLIGHT_CAP")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(64)
+}
+
+/// Decode all complete frames from `decoder`, group consecutive same-extent
+/// APPEND/READ frames, and push one I/O future per group onto `inflight`.
+/// Control RPCs are dispatched inline (as an `async move` future) and also
+/// pushed onto `inflight`.
+///
+/// Back-pressure: if `inflight.len()` reaches `cap` mid-push, we await one
+/// completion before pushing more. Completions drained during back-pressure
+/// go into `tx_bufs` and are flushed by the caller after this returns.
+async fn process_frames_backpressured(
+    node: &ExtentNode,
+    decoder: &mut FrameDecoder,
+    inflight: &mut futures::stream::FuturesUnordered<
+        std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Bytes>>>>,
+    >,
+    tx_bufs: &mut Vec<Bytes>,
+    cap: usize,
+) -> Result<()> {
+    use futures::stream::StreamExt as _;
+    // Pull all complete frames out of the decoder.
+    let mut frames: Vec<Frame> = Vec::new();
+    loop {
+        match decoder.try_decode().map_err(|e| anyhow::anyhow!(e))? {
+            Some(frame) if frame.req_id != 0 => frames.push(frame),
+            Some(_) => continue, // req_id=0: fire-and-forget, no response needed
+            None => break,
+        }
+    }
+
+    // Back-pressure: before each push, if we're at/above cap, await one
+    // completion and accumulate its bytes into tx_bufs so the caller's
+    // final write_vectored_all includes them.
+    macro_rules! backpressure {
+        () => {
+            while inflight.len() >= cap {
+                if let Some(done) = inflight.next().await {
+                    tx_bufs.extend(done);
+                } else {
+                    break;
+                }
+            }
+        };
+    }
+
+    let mut i = 0;
+    while i < frames.len() {
+        let msg_type = frames[i].msg_type;
+
+        if msg_type == MSG_APPEND {
+            // Group consecutive same-extent APPEND frames.
+            let first_req = match AppendReq::decode(frames[i].payload.clone()) {
+                Ok(r) => r,
+                Err(e) => {
+                    let req_id = frames[i].req_id;
+                    let p = autumn_rpc::RpcError::encode_status(
+                        StatusCode::InvalidArgument, &e.to_string());
+                    let bytes = Frame::error(req_id, MSG_APPEND, p).encode();
+                    inflight.push(Box::pin(async move { vec![bytes] }));
+                    i += 1;
+                    continue;
+                }
+            };
+            let anchor_extent = first_req.extent_id;
+            let mut slots: Vec<AppendSlot> = Vec::with_capacity(8);
+            slots.push(AppendSlot { req: first_req, req_id: frames[i].req_id });
+            i += 1;
+            while i < frames.len() && frames[i].msg_type == MSG_APPEND {
+                match AppendReq::decode(frames[i].payload.clone()) {
+                    Ok(r) if r.extent_id == anchor_extent => {
+                        slots.push(AppendSlot { req: r, req_id: frames[i].req_id });
+                        i += 1;
+                    }
+                    Ok(_) => break,
+                    Err(e) => {
+                        let req_id = frames[i].req_id;
+                        let p = autumn_rpc::RpcError::encode_status(
+                            StatusCode::InvalidArgument, &e.to_string());
+                        let bytes = Frame::error(req_id, MSG_APPEND, p).encode();
+                        inflight.push(Box::pin(async move { vec![bytes] }));
+                        i += 1;
+                    }
+                }
+            }
+
+            // Resolve extent; on error, synthesise one error frame per slot.
+            let extent = match node.get_extent(anchor_extent).await {
+                Ok(e) => e,
+                Err((code, msg)) => {
+                    let p = autumn_rpc::RpcError::encode_status(code, &msg);
+                    let bytes_list: Vec<Bytes> = slots
+                        .iter()
+                        .map(|s| Frame::error(s.req_id, MSG_APPEND, p.clone()).encode())
+                        .collect();
+                    inflight.push(Box::pin(async move { bytes_list }));
+                    continue;
+                }
+            };
+
+            // Back-pressure BEFORE advancing ACL state (extent.len
+            // reservation) so a pushed batch never stalls waiting to drain.
+            backpressure!();
+
+            // Run ACL + build I/O future synchronously up to the pwritev
+            // await. Early rejection paths resolve immediately (no I/O).
+            let fut = build_append_future(node.clone(), extent, slots).await;
+            inflight.push(fut);
+        } else if msg_type == MSG_READ_BYTES {
+            let first_req = match ReadBytesReq::decode(frames[i].payload.clone()) {
+                Ok(r) => r,
+                Err(e) => {
+                    let req_id = frames[i].req_id;
+                    let p = autumn_rpc::RpcError::encode_status(
+                        StatusCode::InvalidArgument, &e.to_string());
+                    let bytes = Frame::error(req_id, MSG_READ_BYTES, p).encode();
+                    inflight.push(Box::pin(async move { vec![bytes] }));
+                    i += 1;
+                    continue;
+                }
+            };
+            let anchor_extent = first_req.extent_id;
+            let mut slots: Vec<ReadSlot> = Vec::with_capacity(8);
+            slots.push(ReadSlot { req: first_req, req_id: frames[i].req_id });
+            i += 1;
+            while i < frames.len() && frames[i].msg_type == MSG_READ_BYTES {
+                match ReadBytesReq::decode(frames[i].payload.clone()) {
+                    Ok(r) if r.extent_id == anchor_extent => {
+                        slots.push(ReadSlot { req: r, req_id: frames[i].req_id });
+                        i += 1;
+                    }
+                    Ok(_) => break,
+                    Err(e) => {
+                        let req_id = frames[i].req_id;
+                        let p = autumn_rpc::RpcError::encode_status(
+                            StatusCode::InvalidArgument, &e.to_string());
+                        let bytes = Frame::error(req_id, MSG_READ_BYTES, p).encode();
+                        inflight.push(Box::pin(async move { vec![bytes] }));
+                        i += 1;
+                    }
+                }
+            }
+
+            let extent = match node.get_extent(anchor_extent).await {
+                Ok(e) => e,
+                Err((code, msg)) => {
+                    let p = autumn_rpc::RpcError::encode_status(code, &msg);
+                    let bytes_list: Vec<Bytes> = slots
+                        .iter()
+                        .map(|s| Frame::error(s.req_id, MSG_READ_BYTES, p.clone()).encode())
+                        .collect();
+                    inflight.push(Box::pin(async move { bytes_list }));
+                    continue;
+                }
+            };
+            backpressure!();
+            inflight.push(build_read_future(extent, slots));
+        } else {
+            // Control RPC — no hot-path grouping. Build a future that
+            // dispatches and encodes one response frame.
+            backpressure!();
+            let req_id = frames[i].req_id;
+            let payload = frames[i].payload.clone();
+            let node_clone = node.clone();
+            inflight.push(Box::pin(async move {
+                let resp_frame = match node_clone.dispatch(msg_type, payload).await {
+                    Ok(p) => Frame::response(req_id, msg_type, p),
+                    Err((code, message)) => {
+                        let p = autumn_rpc::RpcError::encode_status(code, &message);
+                        Frame::error(req_id, msg_type, p)
+                    }
+                };
+                vec![resp_frame.encode()]
+            }));
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+/// One append request slot routed through `handle_connection`.
+struct AppendSlot {
+    req: AppendReq,
+    req_id: u32,
+}
+
+struct ReadSlot {
+    req: ReadBytesReq,
+    req_id: u32,
+}
+
+/// Error-encode a single append slot.
+fn err_bytes(req_id: u32, msg_type: u8, code: StatusCode, msg: &str) -> Bytes {
+    Frame::error(req_id, msg_type,
+        autumn_rpc::RpcError::encode_status(code, msg),
+    ).encode()
+}
+
+/// Build the async future that performs ACL + pwritev for a same-extent
+/// APPEND batch. ACL early rejections resolve the future as an immediate
+/// pre-encoded Vec<Bytes> with no I/O.
+///
+/// The returned future is polled inside `handle_connection`'s
+/// FuturesUnordered — multiple appends to DIFFERENT extents run concurrently;
+/// appends to the SAME extent are all pushed to FU in order, and since the
+/// ACL synchronously reserves `extent.len`, overlapping same-extent futures
+/// compute non-overlapping `file_start`s.
+///
+/// NOTE: reserves `extent.len` synchronously BEFORE returning the I/O future
+/// so a subsequent submit to the same extent sees the advanced len. The
+/// returned future then calls `write_vectored_at` with pwritev at the
+/// reserved offset.
+async fn build_append_future(
+    node: ExtentNode,
+    extent: std::rc::Rc<ExtentEntry>,
+    slots: Vec<AppendSlot>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Bytes>>>> {
+    use compio::io::AsyncWriteAt;
+
+    if slots.is_empty() {
+        return Box::pin(async move { Vec::new() });
+    }
+
+    // 1. Eversion refresh: if ANY req.eversion > local, refresh from manager.
+    let local_eversion = extent.eversion.load(Ordering::SeqCst);
+    let needs_refresh = slots.iter().any(|s| s.req.eversion > local_eversion);
+    if needs_refresh {
+        let extent_id = slots[0].req.extent_id;
+        match node.extent_info_from_manager(extent_id).await {
+            Ok(Some(ex)) => {
+                let sealed_changed = ExtentNode::apply_extent_meta_ref(&extent, &ex);
+                if sealed_changed {
+                    let _ = node.save_meta(extent_id, &extent).await;
+                }
+            }
+            Ok(None) | Err(_) => {
+                let msg = format!(
+                    "cannot verify extent {} version: manager unreachable",
+                    extent_id
+                );
+                let out: Vec<Bytes> = slots
+                    .into_iter()
+                    .map(|s| err_bytes(s.req_id, MSG_APPEND, StatusCode::Unavailable, &msg))
+                    .collect();
+                return Box::pin(async move { out });
+            }
+        }
+    }
+
+    // 2. Sealed / eversion check using CURRENT local atomics.
+    let local_eversion = extent.eversion.load(Ordering::SeqCst);
+    let sealed = extent.sealed_length.load(Ordering::SeqCst) > 0
+        || extent.avali.load(Ordering::SeqCst) > 0;
+    if sealed || slots.iter().any(|s| local_eversion > s.req.eversion) {
+        let resp_payload = AppendResp { code: CODE_PRECONDITION, offset: 0, end: 0 }.encode();
+        let out: Vec<Bytes> = slots
+            .into_iter()
+            .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
+            .collect();
+        return Box::pin(async move { out });
+    }
+
+    // 3. Revision fencing: the first request's revision governs the batch.
+    let first = &slots[0].req;
+    let last_revision = extent.last_revision.load(Ordering::SeqCst);
+    if first.revision < last_revision {
+        let resp_payload = AppendResp { code: CODE_LOCKED_BY_OTHER, offset: 0, end: 0 }.encode();
+        let out: Vec<Bytes> = slots
+            .into_iter()
+            .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
+            .collect();
+        return Box::pin(async move { out });
+    }
+    let revision_changed = first.revision > last_revision;
+    if revision_changed {
+        extent.last_revision.store(first.revision, Ordering::SeqCst);
+    }
+
+    // 4. Commit reconciliation.
+    let mut file_start = extent.len.load(Ordering::SeqCst);
+    if file_start < first.commit as u64 {
+        let resp_payload = AppendResp { code: CODE_PRECONDITION, offset: 0, end: 0 }.encode();
+        let out: Vec<Bytes> = slots
+            .into_iter()
+            .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
+            .collect();
+        return Box::pin(async move { out });
+    }
+    if file_start > first.commit as u64 {
+        if let Err(e) = node.truncate_to_commit_ref(&extent, first.commit).await {
+            let out: Vec<Bytes> = slots
+                .into_iter()
+                .map(|s| err_bytes(s.req_id, MSG_APPEND, StatusCode::Internal, &e))
+                .collect();
+            return Box::pin(async move { out });
+        }
+        file_start = extent.len.load(Ordering::SeqCst);
+    }
+
+    // 5. Compute per-request offsets + collect payload Bytes for pwritev.
+    let n = slots.len();
+    let mut offsets: Vec<u32> = Vec::with_capacity(n);
+    let mut bufs: Vec<Bytes> = Vec::with_capacity(n);
+    let mut req_ids: Vec<u32> = Vec::with_capacity(n);
+    let mut cursor = file_start;
+    let mut must_sync = false;
+    let mut total_payload: usize = 0;
+    for slot in &slots {
+        offsets.push(cursor as u32);
+        cursor += slot.req.payload.len() as u64;
+        total_payload += slot.req.payload.len();
+        bufs.push(slot.req.payload.clone());
+        req_ids.push(slot.req_id);
+        must_sync |= slot.req.must_sync;
+    }
+    let total_end = cursor;
+    let extent_id = slots[0].req.extent_id;
+
+    // 6. WAL batch.
+    let use_wal = must_sync && node.wal.is_some()
+        && crate::wal::should_use_wal(true, total_payload);
+    if use_wal {
+        let wal_records: Vec<crate::wal::WalRecord> = slots
+            .iter()
+            .enumerate()
+            .map(|(k, s)| crate::wal::WalRecord {
+                extent_id,
+                start: offsets[k],
+                revision: s.req.revision,
+                payload: s.req.payload.to_vec(),
+            })
+            .collect();
+        if let Err(e) = node
+            .wal
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .write_batch(&wal_records)
+        {
+            let msg = e.to_string();
+            let out: Vec<Bytes> = req_ids
+                .into_iter()
+                .map(|id| err_bytes(id, MSG_APPEND, StatusCode::Internal, &msg))
+                .collect();
+            return Box::pin(async move { out });
+        }
+    }
+
+    // 7. Reserve `extent.len` BEFORE returning the I/O future so overlapping
+    //    same-extent futures compute non-overlapping file_starts.
+    extent.len.store(total_end, Ordering::SeqCst);
+    drop(slots); // release original AppendReq payload handles (already cloned into bufs)
+
+    // 8. Return the I/O future. Must be 'static and own everything.
+    let extent_for_io = extent;
+    Box::pin(async move {
+        let write_t0 = Instant::now();
+        // SAFETY: overlapping same-extent futures have non-overlapping
+        // file_starts (reserved in step 7); compio is single-threaded so
+        // &mut aliasing inside this closure is serialised per-future.
+        let f = unsafe { &mut *extent_for_io.file.get() };
+        let BufResult(wr, _) = f.write_vectored_at(bufs, file_start).await;
+        if let Err(e) = wr {
+            node.mark_disk_offline_for_extent(extent_id);
+            let msg = e.to_string();
+            return req_ids
+                .into_iter()
+                .map(|id| err_bytes(id, MSG_APPEND, StatusCode::Internal, &msg))
+                .collect();
+        }
+
+        if must_sync && !use_wal {
+            let f_ref: &CompioFile = unsafe { &*extent_for_io.file.get() };
+            if let Err(e) = f_ref.sync_all().await {
+                node.mark_disk_offline_for_extent(extent_id);
+                let msg = e.to_string();
+                return req_ids
+                    .into_iter()
+                    .map(|id| err_bytes(id, MSG_APPEND, StatusCode::Internal, &msg))
+                    .collect();
+            }
+        }
+
+        let write_elapsed_ns = write_t0.elapsed().as_nanos() as u64;
+        EXTENT_APPEND_METRICS.with(|m| {
+            m.borrow_mut()
+                .record(n as u64, total_payload as u64, write_elapsed_ns);
+        });
+
+        if revision_changed {
+            let _ = node.save_meta(extent_id, &extent_for_io).await;
+        }
+
+        req_ids
+            .into_iter()
+            .enumerate()
+            .map(|(k, req_id)| {
+                let end = if k + 1 < n { offsets[k + 1] } else { total_end as u32 };
+                let resp = AppendResp { code: CODE_OK, offset: offsets[k], end };
+                Frame::response(req_id, MSG_APPEND, resp.encode()).encode()
+            })
+            .collect()
+    })
+}
+
+/// Build the async future that services a same-extent READ batch. Reads
+/// are processed sequentially inside ONE future — each pread is ~1µs and
+/// the responses are written back together.
+fn build_read_future(
+    extent: std::rc::Rc<ExtentEntry>,
+    slots: Vec<ReadSlot>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Bytes>>>> {
+    Box::pin(async move {
+        use compio::io::AsyncReadAtExt;
+
+        let mut out: Vec<Bytes> = Vec::with_capacity(slots.len());
+        for slot in slots {
+            let req = slot.req;
+            let ev = extent.eversion.load(Ordering::SeqCst);
+            if req.eversion > 0 && req.eversion < ev {
+                out.push(err_bytes(
+                    slot.req_id,
+                    MSG_READ_BYTES,
+                    StatusCode::FailedPrecondition,
+                    &format!(
+                        "extent {} eversion too low: got {}, expect >= {}",
+                        req.extent_id, req.eversion, ev
+                    ),
+                ));
+                continue;
+            }
+
+            let total_len = extent.len.load(Ordering::SeqCst);
+            let end = total_len as u32;
+            let read_offset = req.offset as u64;
+            let read_size = if req.length == 0 {
+                total_len.saturating_sub(read_offset)
+            } else {
+                (req.length as u64).min(total_len.saturating_sub(read_offset))
+            };
+
+            let f: &CompioFile = unsafe { &*extent.file.get() };
+            let buf = vec![0u8; read_size as usize];
+            let BufResult(result, buf) = f.read_exact_at(buf, read_offset).await;
+            let bytes = match result {
+                Ok(_) => Frame::response(
+                    slot.req_id,
+                    MSG_READ_BYTES,
+                    ReadBytesResp {
+                        code: CODE_OK,
+                        end,
+                        payload: Bytes::from(buf),
+                    }
+                    .encode(),
+                )
+                .encode(),
+                Err(e) => err_bytes(
+                    slot.req_id,
+                    MSG_READ_BYTES,
+                    StatusCode::Internal,
+                    &e.to_string(),
+                ),
+            };
+            out.push(bytes);
+        }
+        out
+    })
+}
+
 impl ExtentNode {
     const META_MAGIC: &'static [u8; 8] = b"EXTMETA\0";
     const META_SIZE: usize = 40;
@@ -381,9 +960,17 @@ impl ExtentNode {
             disk_map.insert(disk_id, Rc::new(disk));
         }
 
-        // Open WAL before loading extents so we can replay into freshly loaded files.
+        // F099-M: per-shard WAL subdir so fsync on one shard does not
+        // serialise with fsync on another (they live on separate compio
+        // runtimes and would otherwise block each other through a shared
+        // Wal record writer).
         let wal_result = if let Some(wal_dir) = config.wal_dir {
-            Some(Wal::open(wal_dir)?)
+            let resolved = if config.shard_count > 1 {
+                wal_dir.join(format!("shard_{}", config.shard_idx))
+            } else {
+                wal_dir
+            };
+            Some(Wal::open(resolved)?)
         } else {
             None
         };
@@ -396,12 +983,17 @@ impl ExtentNode {
             recovery_done: Rc::new(std::cell::RefCell::new(Vec::new())),
             recovery_inflight: Rc::new(DashMap::new()),
             wal: None, // set after replay
+            shard_idx: config.shard_idx,
+            shard_count: config.shard_count,
+            sibling_addrs: Rc::new(config.sibling_addrs),
         };
 
         // Load existing extents from all disks.
         node.load_extents().await?;
 
-        // Replay WAL records into extent files.
+        // Replay WAL records into extent files. Only this shard's WAL is
+        // replayed; cross-shard records live in sibling WAL dirs which
+        // the corresponding shard will replay on its own init.
         if let Some((mut wal, replay_files)) = wal_result {
             node.replay_wal(&replay_files).await;
             wal.cleanup_old_wals();
@@ -409,6 +1001,39 @@ impl ExtentNode {
         }
 
         Ok(node)
+    }
+
+    /// F099-M: does this shard own `extent_id`?
+    #[inline]
+    pub(crate) fn owns_extent(&self, extent_id: u64) -> bool {
+        self.shard_count <= 1 || (extent_id % self.shard_count as u64) as u32 == self.shard_idx
+    }
+
+    /// F099-M: return the local sibling address that owns `extent_id`
+    /// (this host's shard for the target extent). None in single-thread mode.
+    #[inline]
+    fn sibling_for_extent(&self, extent_id: u64) -> Option<&str> {
+        if self.shard_count <= 1 {
+            return None;
+        }
+        let owner = (extent_id % self.shard_count as u64) as usize;
+        self.sibling_addrs.get(owner).map(|s| s.as_str())
+    }
+
+    /// F099-M: forward a control-plane RPC to a sibling shard on the same
+    /// host. Used when an RPC arrives at a non-owner shard. Uses the
+    /// manager_pool as a general-purpose ConnPool (the sibling address is
+    /// a localhost loopback; per-shard reuse amortises the TCP cost).
+    async fn forward_rpc_to_sibling(
+        &self,
+        sibling_addr: &str,
+        msg_type: u8,
+        payload: Bytes,
+    ) -> HandlerResult {
+        self.manager_pool
+            .call(sibling_addr, msg_type, payload)
+            .await
+            .map_err(|e| (StatusCode::Unavailable, format!("forward to shard {sibling_addr}: {e}")))
     }
 
     /// Return the first online disk, or None if all are offline.
@@ -424,7 +1049,7 @@ impl ExtentNode {
     }
 
     /// Mark the disk hosting an extent as offline after an I/O error.
-    fn mark_disk_offline_for_extent(&self, extent_id: u64) {
+    pub(crate) fn mark_disk_offline_for_extent(&self, extent_id: u64) {
         if let Some(entry) = self.extents.get(&extent_id) {
             let disk_id = entry.disk_id;
             if let Some(disk) = self.disks.get(&disk_id) {
@@ -496,7 +1121,7 @@ impl ExtentNode {
         }
     }
 
-    async fn save_meta(&self, extent_id: u64, entry: &ExtentEntry) -> Result<(), String> {
+    pub(crate) async fn save_meta(&self, extent_id: u64, entry: &ExtentEntry) -> Result<(), String> {
         let sealed_length = entry.sealed_length.load(Ordering::SeqCst);
         let eversion = entry.eversion.load(Ordering::SeqCst);
         let last_revision = entry.last_revision.load(Ordering::SeqCst);
@@ -544,6 +1169,21 @@ impl ExtentNode {
             .await?;
 
             for extent_id in found {
+                // F099-M: only load extents this shard owns. Under normal
+                // operation the other shards will never have touched this
+                // extent file (disk hash-byte vs. extent_id-modulo are
+                // independent, so all extents with the same id collide on
+                // the same file and shard). A mis-owned extent here would
+                // indicate a prior run with a different shard_count.
+                if !self.owns_extent(extent_id) {
+                    tracing::debug!(
+                        extent_id,
+                        shard_idx = self.shard_idx,
+                        shard_count = self.shard_count,
+                        "skip load: extent does not belong to this shard"
+                    );
+                    continue;
+                }
                 let path = disk.extent_path(extent_id);
                 let file = match OpenOptions::new()
                     .create(true)
@@ -612,87 +1252,192 @@ impl ExtentNode {
         }
     }
 
-    /// Handle one TCP connection.
+
+    /// Handle one TCP connection (R4 step 4.2 v3 — **true SQ/CQ**).
     ///
-    /// Appends are processed sequentially to guarantee the `end` watermark:
-    /// returning end=N means all data in 0..N is written. Reads are spawned
-    /// for concurrent I/O (they don't affect the watermark).
+    /// **One compio task per TCP connection, inline `FuturesUnordered`,
+    ///  concurrent submission and completion via `select` race.**
+    ///
+    /// The v2 design (commit b1a92f7) used a *burst-structured* loop:
+    /// `reader.read().await` → push futures → drain ALL futures → flush →
+    /// loop. This kept the microbench at parity but violated SQ/CQ semantics:
+    /// fast ops in a burst were gated on the slowest op's completion, and no
+    /// pipelining crossed burst boundaries (TCP burst N+1 couldn't start
+    /// until burst N's drain finished).
+    ///
+    /// v3 restores true SQ/CQ:
+    ///   - A **persistent read future** lives in `read_fut: Option<LocalBoxFuture>`
+    ///     and owns the `OwnedReadHalf<TcpStream>` + read buffer until it
+    ///     resolves. It is NEVER dropped mid-flight (that would corrupt
+    ///     io_uring SQE state); on a completion-wins race it is put back
+    ///     into the `Option` for the next iteration.
+    ///   - A **single FuturesUnordered** holds in-flight batch I/O futures.
+    ///   - **Each iteration** (in order):
+    ///       1. Opportunistically drain any already-ready completions with
+    ///          `inflight.next().now_or_never()` — costs nothing if none
+    ///          are ready, and streams out responses immediately as they
+    ///          finish rather than waiting for a burst boundary.
+    ///       2. Flush accumulated `tx_bufs` with ONE `write_vectored_all`
+    ///          syscall (amortises writev across multiple ready completions).
+    ///       3. Decide what to wait on:
+    ///           - `!has_inflight`  → await the read future alone.
+    ///           - `at_cap`         → await completion alone (back-pressure:
+    ///             we MUST NOT have more than `cap` futures in FU).
+    ///           - Otherwise        → `select(read_fut, inflight.next())`.
+    ///             On Left (read wins): consume result, decode, push, then
+    ///             rebuild the read future. On Right (completion wins):
+    ///             put the read future back, extend tx_bufs, loop.
+    ///
+    /// ## Why a completion doesn't starve the reader (and vice versa)
+    ///
+    /// `futures::future::select` polls both futures each call. If the read
+    /// is always the slower of the two, the completion side naturally gets
+    /// progress. If the completion is slower, the read side does. On the
+    /// "many fast completions, no new reads" case the loop cycles through
+    /// step 1 drain + step 3 select-Right repeatedly with the read future
+    /// sitting pending.
+    ///
+    /// ## Buffer reuse
+    ///
+    /// The read buffer is moved INTO the read future and back OUT of it via
+    /// `ReadBurst`. No per-iteration allocation — the same 512 KiB Vec is
+    /// recycled.
     pub async fn handle_connection(
         stream: compio::net::TcpStream,
         node: ExtentNode,
     ) -> Result<()> {
-        let (mut reader, mut writer) = stream.into_split();
+        use futures::future::{select, Either, LocalBoxFuture};
+        use futures::FutureExt;
+        use futures::stream::{FuturesUnordered, StreamExt};
+
+        const READ_BUF_SIZE: usize = 512 * 1024;
+
+        let (reader, mut writer) = stream.into_split();
         let mut decoder = FrameDecoder::new();
-        let mut buf = vec![0u8; 512 * 1024];
+
+        let cap = extent_inflight_cap();
+        let mut inflight: FuturesUnordered<
+            std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Bytes>>>>,
+        > = FuturesUnordered::new();
+
+        // Response bytes from completions — flushed opportunistically each
+        // iteration. A completion arriving mid-burst is written out as soon
+        // as we swing past the top of the loop, not held until a burst
+        // boundary.
+        let mut tx_bufs: Vec<Bytes> = Vec::with_capacity(128);
+
+        // Persistent read future: owns the reader + buf across iterations.
+        // Rebuilt after it completes (ReadBurst returns reader + buf).
+        let buf = vec![0u8; READ_BUF_SIZE];
+        let mut read_fut: Option<LocalBoxFuture<'static, ReadBurst>> =
+            Some(spawn_read(reader, buf));
 
         loop {
-            let BufResult(result, buf_back) = reader.read(buf).await;
-            buf = buf_back;
-            let n = result?;
-            if n == 0 {
-                return Ok(());
+            // (1) Opportunistic drain of any already-ready completions.
+            //     `now_or_never` never awaits — if the next item is Pending
+            //     it returns None and we move on.
+            while let Some(Some(done)) = inflight.next().now_or_never() {
+                tx_bufs.extend(done);
             }
 
-            decoder.feed(&buf[..n]);
-
-            // Decode all frames from this TCP read.
-            let mut frames = Vec::new();
-            loop {
-                match decoder.try_decode().map_err(|e| anyhow::anyhow!(e))? {
-                    Some(frame) if frame.req_id != 0 => frames.push(frame),
-                    Some(_) => continue,
-                    None => break,
-                }
-            }
-
-            // Process all frames, collect ALL responses into one buffer.
-            // Then write everything with one write_vectored_all — one syscall per TCP read.
-            let mut all_responses: Vec<Bytes> = Vec::with_capacity(frames.len());
-
-            let mut i = 0;
-            while i < frames.len() {
-                let msg_type = frames[i].msg_type;
-
-                if msg_type == MSG_READ_BYTES {
-                    // Batch consecutive reads.
-                    let batch_start = i;
-                    while i < frames.len() && frames[i].msg_type == MSG_READ_BYTES {
-                        i += 1;
-                    }
-                    let responses = node.handle_read_batch(&frames[batch_start..i]).await;
-                    for f in responses {
-                        all_responses.push(f.encode());
-                    }
-                } else if msg_type == MSG_APPEND {
-                    // Batch consecutive appends → one vectored pwritev per extent.
-                    let batch_start = i;
-                    while i < frames.len() && frames[i].msg_type == MSG_APPEND {
-                        i += 1;
-                    }
-                    let responses = node.handle_append_batch(&frames[batch_start..i]).await;
-                    for f in responses {
-                        all_responses.push(f.encode());
-                    }
-                } else {
-                    // Control RPCs: one at a time.
-                    let req_id = frames[i].req_id;
-                    let payload = frames[i].payload.clone();
-                    let resp_frame = match node.dispatch(msg_type, payload).await {
-                        Ok(p) => Frame::response(req_id, msg_type, p),
-                        Err((code, message)) => {
-                            let p = autumn_rpc::RpcError::encode_status(code, &message);
-                            Frame::error(req_id, msg_type, p)
-                        }
-                    };
-                    all_responses.push(resp_frame.encode());
-                    i += 1;
-                }
-            }
-
-            // ONE write_vectored_all for all responses from this TCP read batch.
-            if !all_responses.is_empty() {
-                let BufResult(result, _) = writer.write_vectored_all(all_responses).await;
+            // (2) Flush accumulated responses with ONE vectored write.
+            if !tx_bufs.is_empty() {
+                let bufs = std::mem::take(&mut tx_bufs);
+                let BufResult(result, _) = writer.write_vectored_all(bufs).await;
                 result?;
+            }
+
+            // (3) Decide what to wait on.
+            let n_inflight = inflight.len();
+            let at_cap = n_inflight >= cap;
+
+            if n_inflight == 0 {
+                // Nothing in flight — just await the read.
+                let rfut = read_fut
+                    .take()
+                    .expect("read_fut invariant: always Some when no Left branch pending");
+                match rfut.await {
+                    ReadBurst::Eof { .. } => return Ok(()),
+                    ReadBurst::Err { e, .. } => return Err(e.into()),
+                    ReadBurst::Data { buf, n, reader } => {
+                        decoder.feed(&buf[..n]);
+                        process_frames_backpressured(
+                            &node, &mut decoder, &mut inflight, &mut tx_bufs, cap,
+                        )
+                        .await?;
+                        read_fut = Some(spawn_read(reader, buf));
+                    }
+                }
+                continue;
+            }
+
+            if at_cap {
+                // Back-pressure: only await a completion. The read future
+                // stays pinned in `read_fut` untouched.
+                if let Some(done) = inflight.next().await {
+                    tx_bufs.extend(done);
+                }
+                continue;
+            }
+
+            // (3c) Race read vs completion. Both futures are polled each
+            //      call to `select`; whichever resolves first wins. We
+            //      BORROW `inflight.next()` as the right-hand side — it's
+            //      a single-use wrapper, so we create a fresh one each
+            //      iteration. FU's internal completion state is preserved
+            //      regardless of whether the wrapper is dropped or awaited.
+            //
+            //      The hot microbench workload (sustained request-response
+            //      pipelining at depth=64 through one extent) produces a
+            //      single inflight future at a time; the client doesn't
+            //      send more until it drains responses. We detect this
+            //      single-inflight case and skip the select overhead —
+            //      the read future stays pinned, and we just await the
+            //      completion. This preserves SQ/CQ semantics in multi-
+            //      extent scenarios (n_inflight > 1) while regaining the
+            //      per-op overhead of the old single-task hot path.
+            if n_inflight == 1 {
+                if let Some(done) = inflight.next().await {
+                    tx_bufs.extend(done);
+                }
+                continue;
+            }
+
+            let rfut = read_fut.take().unwrap();
+            let cfut = inflight.next();
+            match select(rfut, Box::pin(cfut)).await {
+                Either::Left((read_result, _cfut_dropped)) => {
+                    match read_result {
+                        ReadBurst::Eof { .. } => {
+                            // Drain and flush remaining inflight before exiting.
+                            while let Some(done) = inflight.next().await {
+                                tx_bufs.extend(done);
+                            }
+                            if !tx_bufs.is_empty() {
+                                let bufs = std::mem::take(&mut tx_bufs);
+                                let _ = writer.write_vectored_all(bufs).await.0;
+                            }
+                            return Ok(());
+                        }
+                        ReadBurst::Err { e, .. } => return Err(e.into()),
+                        ReadBurst::Data { buf, n, reader } => {
+                            decoder.feed(&buf[..n]);
+                            process_frames_backpressured(
+                                &node, &mut decoder, &mut inflight, &mut tx_bufs, cap,
+                            )
+                            .await?;
+                            read_fut = Some(spawn_read(reader, buf));
+                        }
+                    }
+                }
+                Either::Right((maybe_done, rfut_back)) => {
+                    // Completion won; preserve the read future for next iter.
+                    read_fut = Some(rfut_back);
+                    if let Some(done) = maybe_done {
+                        tx_bufs.extend(done);
+                    }
+                    // Loop top will drain more + flush opportunistically.
+                }
             }
         }
     }
@@ -714,6 +1459,22 @@ impl ExtentNode {
     }
 
     async fn get_extent(&self, extent_id: u64) -> Result<Rc<ExtentEntry>, (StatusCode, String)> {
+        // F099-M: hot-path RPCs (append/read/commit_length) must hit the
+        // owning shard. A wrong-shard request signals a client routing
+        // bug — surface it as FailedPrecondition so the client logs it
+        // instead of silently succeeding on the wrong shard.
+        if !self.owns_extent(extent_id) {
+            return Err((
+                StatusCode::FailedPrecondition,
+                format!(
+                    "extent {} belongs to shard {} not shard {} (shard_count={})",
+                    extent_id,
+                    extent_id % self.shard_count as u64,
+                    self.shard_idx,
+                    self.shard_count,
+                ),
+            ));
+        }
         self.extents
             .get(&extent_id)
             .map(|v| Rc::clone(v.value()))
@@ -721,6 +1482,17 @@ impl ExtentNode {
     }
 
     async fn ensure_extent(&self, extent_id: u64) -> Result<Rc<ExtentEntry>, String> {
+        // F099-M: a non-owning shard should never `ensure_extent`. This is
+        // an invariant violation — log loudly and reject.
+        if !self.owns_extent(extent_id) {
+            return Err(format!(
+                "ensure_extent on wrong shard: extent {} → shard {}, this is shard {} (count={})",
+                extent_id,
+                extent_id % self.shard_count as u64,
+                self.shard_idx,
+                self.shard_count,
+            ));
+        }
         if let Some(v) = self.extents.get(&extent_id) {
             return Ok(Rc::clone(v.value()));
         }
@@ -774,6 +1546,11 @@ impl ExtentNode {
         old_sealed == 0 && ex.sealed_length > 0
     }
 
+    /// Crate-visible wrapper for `apply_extent_meta` used from extent_worker.rs.
+    pub(crate) fn apply_extent_meta_ref(extent: &ExtentEntry, ex: &ExtentInfo) -> bool {
+        Self::apply_extent_meta(extent, ex)
+    }
+
     async fn truncate_to_commit(extent: &Rc<ExtentEntry>, commit: u32) -> Result<(), String> {
         file_ref(&extent.file)
             .set_len(commit as u64)
@@ -781,6 +1558,15 @@ impl ExtentNode {
             .map_err(|e| e.to_string())?;
         extent.len.store(commit as u64, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Crate-visible wrapper for `truncate_to_commit` used from extent_worker.rs.
+    pub(crate) async fn truncate_to_commit_ref(
+        &self,
+        extent: &Rc<ExtentEntry>,
+        commit: u32,
+    ) -> Result<(), String> {
+        Self::truncate_to_commit(extent, commit).await
     }
 
     /// Copy the full extent data from a remote source node using autumn-rpc.
@@ -838,7 +1624,7 @@ impl ExtentNode {
         Err("no source replica available for copy".to_string())
     }
 
-    async fn extent_info_from_manager(&self, extent_id: u64) -> Result<Option<ExtentInfo>, String> {
+    pub(crate) async fn extent_info_from_manager(&self, extent_id: u64) -> Result<Option<ExtentInfo>, String> {
         let mgr = match &self.manager_endpoint {
             Some(ep) => crate::conn_pool::normalize_endpoint(ep),
             None => return Ok(None),
@@ -1190,242 +1976,6 @@ impl ExtentNode {
         .encode())
     }
 
-    /// Process a batch of MSG_APPEND frames in one vectored write per extent.
-    ///
-    /// Within the batch, requests are grouped by extent_id and validated in order.
-    /// Payloads for the same extent are written with a single `write_vectored_at`
-    /// call (pwritev) — zero extra copy, one syscall per extent.
-    ///
-    /// Returns one `Frame` per input frame, in order.
-    async fn handle_append_batch(&self, frames: &[autumn_rpc::Frame]) -> Vec<Frame> {
-        // Group consecutive frames by extent_id to maximize coalescing.
-        // We process them extent-by-extent while preserving per-frame order.
-        let mut out: Vec<Frame> = Vec::with_capacity(frames.len());
-
-        let mut i = 0;
-        while i < frames.len() {
-            // Decode the first request to get the extent_id for this sub-batch.
-            let first_req = match AppendReq::decode(frames[i].payload.clone()) {
-                Ok(r) => r,
-                Err(e) => {
-                    out.push(Frame::error(
-                        frames[i].req_id, MSG_APPEND,
-                        autumn_rpc::RpcError::encode_status(StatusCode::InvalidArgument, &e.to_string()),
-                    ));
-                    i += 1;
-                    continue;
-                }
-            };
-            let extent_id = first_req.extent_id;
-
-            // Find contiguous frames for the same extent_id.
-            let sub_start = i;
-            let mut sub_end = i + 1;
-            while sub_end < frames.len() {
-                // Peek at next req's extent_id without full decode.
-                match AppendReq::decode(frames[sub_end].payload.clone()) {
-                    Ok(r) if r.extent_id == extent_id => sub_end += 1,
-                    _ => break,
-                }
-            }
-
-            // Decode all requests in this sub-batch.
-            let mut reqs: Vec<AppendReq> = Vec::with_capacity(sub_end - sub_start);
-            let mut decode_err: Option<(usize, String)> = None;
-            reqs.push(first_req);
-            for k in (sub_start + 1)..sub_end {
-                match AppendReq::decode(frames[k].payload.clone()) {
-                    Ok(r) => reqs.push(r),
-                    Err(e) => {
-                        decode_err = Some((k - sub_start, e.to_string()));
-                        break;
-                    }
-                }
-            }
-            let valid_count = if let Some((idx, _)) = &decode_err { *idx } else { reqs.len() };
-
-            // Get extent (shared for all reqs in this sub-batch).
-            let extent = match self.get_extent(extent_id).await {
-                Ok(e) => e,
-                Err((code, msg)) => {
-                    let payload = autumn_rpc::RpcError::encode_status(code, &msg);
-                    for k in sub_start..sub_end {
-                        out.push(Frame::error(frames[k].req_id, MSG_APPEND, payload.clone()));
-                    }
-                    i = sub_end;
-                    continue;
-                }
-            };
-
-            // Validate eversion / sealed / revision for the first request.
-            // All requests in the batch share the same extent so these checks
-            // apply once (eversion and sealed are stable within a batch).
-            let first = &reqs[0];
-            let local_eversion = extent.eversion.load(Ordering::SeqCst);
-            if first.eversion > local_eversion {
-                // Eversion mismatch — fall back to per-request path for the whole sub-batch.
-                for k in 0..valid_count {
-                    let req_id = frames[sub_start + k].req_id;
-                    let resp = self.handle_append(frames[sub_start + k].payload.clone()).await;
-                    let frame = match resp {
-                        Ok(p) => Frame::response(req_id, MSG_APPEND, p),
-                        Err((code, msg)) => Frame::error(req_id, MSG_APPEND,
-                            autumn_rpc::RpcError::encode_status(code, &msg)),
-                    };
-                    out.push(frame);
-                }
-                i = sub_end;
-                continue;
-            }
-            if local_eversion > first.eversion
-                || extent.sealed_length.load(Ordering::SeqCst) > 0
-                || extent.avali.load(Ordering::SeqCst) > 0
-            {
-                let resp_payload = AppendResp { code: CODE_PRECONDITION, offset: 0, end: 0 }.encode();
-                for k in sub_start..sub_end {
-                    out.push(Frame::response(frames[k].req_id, MSG_APPEND, resp_payload.clone()));
-                }
-                i = sub_end;
-                continue;
-            }
-
-            // Revision fencing (first request sets the tone for the whole batch).
-            let last_revision = extent.last_revision.load(Ordering::SeqCst);
-            if first.revision < last_revision {
-                let resp_payload = AppendResp { code: CODE_LOCKED_BY_OTHER, offset: 0, end: 0 }.encode();
-                for k in sub_start..sub_end {
-                    out.push(Frame::response(frames[k].req_id, MSG_APPEND, resp_payload.clone()));
-                }
-                i = sub_end;
-                continue;
-            }
-            let revision_changed = first.revision > last_revision;
-            if revision_changed {
-                extent.last_revision.store(first.revision, Ordering::SeqCst);
-            }
-
-            // Commit reconciliation (only first request carries commit from client).
-            let mut file_start = extent.len.load(Ordering::SeqCst);
-            if file_start < first.commit as u64 {
-                let resp_payload = AppendResp { code: CODE_PRECONDITION, offset: 0, end: 0 }.encode();
-                for k in sub_start..sub_end {
-                    out.push(Frame::response(frames[k].req_id, MSG_APPEND, resp_payload.clone()));
-                }
-                i = sub_end;
-                continue;
-            }
-            if file_start > first.commit as u64 {
-                if let Err(e) = Self::truncate_to_commit(&extent, first.commit).await {
-                    let payload = autumn_rpc::RpcError::encode_status(StatusCode::Internal, &e);
-                    for k in sub_start..sub_end {
-                        out.push(Frame::error(frames[k].req_id, MSG_APPEND, payload.clone()));
-                    }
-                    i = sub_end;
-                    continue;
-                }
-                file_start = extent.len.load(Ordering::SeqCst);
-            }
-
-            // Compute per-request offsets and collect payloads for vectored write.
-            let mut offsets: Vec<u32> = Vec::with_capacity(valid_count);
-            let mut bufs: Vec<Bytes> = Vec::with_capacity(valid_count);
-            let mut cursor = file_start;
-            let must_sync = reqs[..valid_count].iter().any(|r| r.must_sync);
-
-            for req in &reqs[..valid_count] {
-                offsets.push(cursor as u32);
-                cursor += req.payload.len() as u64;
-                bufs.push(req.payload.clone());
-            }
-            let total_end = cursor;
-
-            // WAL batch: write all records in one batch + one fsync, skip extent sync.
-            let total_payload: usize = reqs[..valid_count].iter().map(|r| r.payload.len()).sum();
-            let use_wal = must_sync && self.wal.is_some()
-                && should_use_wal(true, total_payload);
-            if use_wal {
-                let wal_records: Vec<WalRecord> = reqs[..valid_count].iter().enumerate().map(|(k, req)| {
-                    WalRecord {
-                        extent_id,
-                        start: offsets[k],
-                        revision: req.revision,
-                        payload: req.payload.to_vec(),
-                    }
-                }).collect();
-                if let Err(e) = self.wal.as_ref().unwrap().borrow_mut().write_batch(&wal_records) {
-                    let payload = autumn_rpc::RpcError::encode_status(
-                        StatusCode::Internal, &e.to_string(),
-                    );
-                    for k in sub_start..sub_end {
-                        out.push(Frame::error(frames[k].req_id, MSG_APPEND, payload.clone()));
-                    }
-                    i = sub_end;
-                    continue;
-                }
-            }
-
-            // Single vectored write — one pwritev syscall, zero extra copies.
-            let write_t0 = Instant::now();
-            let f = unsafe { &mut *extent.file.get() };
-            let BufResult(wr, _) = f.write_vectored_at(bufs, file_start).await;
-            if let Err(e) = wr {
-                let payload = autumn_rpc::RpcError::encode_status(
-                    StatusCode::Internal, &e.to_string(),
-                );
-                for k in sub_start..sub_end {
-                    out.push(Frame::error(frames[k].req_id, MSG_APPEND, payload.clone()));
-                }
-                i = sub_end;
-                continue;
-            }
-
-            // If WAL was used, skip extent sync (WAL provides durability).
-            if must_sync && !use_wal {
-                if let Err(e) = file_ref(&extent.file).sync_all().await {
-                    let payload = autumn_rpc::RpcError::encode_status(
-                        StatusCode::Internal, &e.to_string(),
-                    );
-                    for k in sub_start..sub_end {
-                        out.push(Frame::error(frames[k].req_id, MSG_APPEND, payload.clone()));
-                    }
-                    i = sub_end;
-                    continue;
-                }
-            }
-            let write_elapsed_ns = write_t0.elapsed().as_nanos() as u64;
-            EXTENT_APPEND_METRICS.with(|m| {
-                m.borrow_mut().record(valid_count as u64, total_payload as u64, write_elapsed_ns);
-            });
-
-            extent.len.store(total_end, Ordering::SeqCst);
-
-            if revision_changed {
-                let _ = self.save_meta(extent_id, &extent).await;
-            }
-
-            // Emit per-request responses.
-            for k in 0..valid_count {
-                let end = if k + 1 < valid_count {
-                    offsets[k + 1]
-                } else {
-                    total_end as u32
-                };
-                let resp = AppendResp { code: CODE_OK, offset: offsets[k], end };
-                out.push(Frame::response(frames[sub_start + k].req_id, MSG_APPEND, resp.encode()));
-            }
-            // If there was a decode error partway through, emit error for that frame.
-            if let Some((idx, msg)) = decode_err {
-                let payload = autumn_rpc::RpcError::encode_status(
-                    StatusCode::InvalidArgument, &msg,
-                );
-                out.push(Frame::error(frames[sub_start + idx].req_id, MSG_APPEND, payload));
-            }
-
-            i = sub_end;
-        }
-
-        out
-    }
 
     async fn handle_read_bytes(&self, payload: Bytes) -> HandlerResult {
         let req = ReadBytesReq::decode(payload)
@@ -1471,25 +2021,23 @@ impl ExtentNode {
     /// Sequential preads are faster than N spawned tasks for page-cache hits:
     /// each pread completes in ~1µs, and responses are written back together,
     /// saving per-request TCP write overhead.
-    async fn handle_read_batch(&self, frames: &[autumn_rpc::Frame]) -> Vec<Frame> {
-        let mut out = Vec::with_capacity(frames.len());
-        for frame in frames {
-            let req_id = frame.req_id;
-            let resp_frame = match self.handle_read_bytes(frame.payload.clone()).await {
-                Ok(p) => Frame::response(req_id, MSG_READ_BYTES, p),
-                Err((code, msg)) => Frame::error(
-                    req_id, MSG_READ_BYTES,
-                    autumn_rpc::RpcError::encode_status(code, &msg),
-                ),
-            };
-            out.push(resp_frame);
-        }
-        out
-    }
-
     async fn handle_commit_length(&self, payload: Bytes) -> HandlerResult {
         let req = CommitLengthReq::decode(payload)
             .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
+
+        // F099-M: commit_length is a hot-path RPC; reject wrong-shard.
+        if !self.owns_extent(req.extent_id) {
+            return Err((
+                StatusCode::FailedPrecondition,
+                format!(
+                    "extent {} belongs to shard {} not shard {} (shard_count={})",
+                    req.extent_id,
+                    req.extent_id % self.shard_count as u64,
+                    self.shard_idx,
+                    self.shard_count,
+                ),
+            ));
+        }
 
         let entry = self
             .extents
@@ -1526,6 +2074,15 @@ impl ExtentNode {
     async fn handle_alloc_extent(&self, payload: Bytes) -> HandlerResult {
         let req: AllocExtentReq = rkyv_decode(&payload)
             .map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        // F099-M: forward to owner shard if we don't own this extent.
+        if !self.owns_extent(req.extent_id) {
+            if let Some(sibling) = self.sibling_for_extent(req.extent_id) {
+                return self
+                    .forward_rpc_to_sibling(sibling, MSG_ALLOC_EXTENT, payload)
+                    .await;
+            }
+        }
 
         let disk = self
             .choose_disk()
@@ -1645,6 +2202,15 @@ impl ExtentNode {
         let req: RequireRecoveryReq = rkyv_decode(&payload)
             .map_err(|e| (StatusCode::InvalidArgument, e))?;
 
+        // F099-M: forward to owner shard.
+        if !self.owns_extent(req.task.extent_id) {
+            if let Some(sibling) = self.sibling_for_extent(req.task.extent_id) {
+                return self
+                    .forward_rpc_to_sibling(sibling, MSG_REQUIRE_RECOVERY, payload)
+                    .await;
+            }
+        }
+
         let task = req.task;
 
         if self.manager_endpoint.is_none() {
@@ -1713,6 +2279,15 @@ impl ExtentNode {
     async fn handle_re_avali(&self, payload: Bytes) -> HandlerResult {
         let req: ReAvaliReq = rkyv_decode(&payload)
             .map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        // F099-M: forward to owner shard.
+        if !self.owns_extent(req.extent_id) {
+            if let Some(sibling) = self.sibling_for_extent(req.extent_id) {
+                return self
+                    .forward_rpc_to_sibling(sibling, MSG_RE_AVALI, payload)
+                    .await;
+            }
+        }
 
         let extent = match self.get_extent(req.extent_id).await {
             Ok(v) => v,
@@ -1804,8 +2379,17 @@ impl ExtentNode {
     }
 
     async fn handle_copy_extent(&self, payload: Bytes) -> HandlerResult {
-        let req = CopyExtentReq::decode(payload)
+        let req = CopyExtentReq::decode(payload.clone())
             .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
+
+        // F099-M: forward to owner shard.
+        if !self.owns_extent(req.extent_id) {
+            if let Some(sibling) = self.sibling_for_extent(req.extent_id) {
+                return self
+                    .forward_rpc_to_sibling(sibling, MSG_COPY_EXTENT, payload)
+                    .await;
+            }
+        }
 
         let extent = self.get_extent(req.extent_id).await?;
         let mut logical_len = extent.len.load(Ordering::SeqCst);
@@ -1877,6 +2461,15 @@ impl ExtentNode {
     async fn handle_convert_to_ec(&self, payload: Bytes) -> HandlerResult {
         let req: ConvertToEcReq = rkyv_decode(&payload)
             .map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        // F099-M: forward to owner shard.
+        if !self.owns_extent(req.extent_id) {
+            if let Some(sibling) = self.sibling_for_extent(req.extent_id) {
+                return self
+                    .forward_rpc_to_sibling(sibling, MSG_CONVERT_TO_EC, payload)
+                    .await;
+            }
+        }
 
         let extent_id = req.extent_id;
         let data_shards = req.data_shards as usize;
@@ -1975,8 +2568,17 @@ impl ExtentNode {
     }
 
     async fn handle_write_shard(&self, payload: Bytes) -> HandlerResult {
-        let req = WriteShardReq::decode(payload)
+        let req = WriteShardReq::decode(payload.clone())
             .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
+
+        // F099-M: forward to owner shard.
+        if !self.owns_extent(req.extent_id) {
+            if let Some(sibling) = self.sibling_for_extent(req.extent_id) {
+                return self
+                    .forward_rpc_to_sibling(sibling, MSG_WRITE_SHARD, payload)
+                    .await;
+            }
+        }
 
         self.write_shard_local(
             req.extent_id,

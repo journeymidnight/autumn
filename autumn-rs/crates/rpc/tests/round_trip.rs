@@ -178,3 +178,73 @@ fn stateful_handler() {
         }
     });
 }
+
+/// F099-I-fix stress test: 2048 concurrent `call_vectored` futures sharing a
+/// single `RpcClient` must ALL complete successfully. This mirrors the
+/// F099-I concern scenario where 256 ps-conn tasks × 8 inflight per-frame
+/// futures = 2048 concurrent `tx.send()` calls funneled into the PS→extent-
+/// node RpcConn writer_task. The original F099-I note speculated that the
+/// kernel might reject the resulting SendMsg op with EINVAL (e.g.
+/// UIO_MAXIOV overflow on the per-msg iovec list, mpsc reservation
+/// exhaustion, or io_uring SQ overflow).
+///
+/// This test nails down that the writer_task's `write_vectored_all` path
+/// does NOT intrinsically fail under 2048 concurrent 2-iov submissions on
+/// loopback TCP.  Each `call_vectored(msg_type, vec![part])` produces a
+/// `SubmitMsg::Vectored { bufs: [hdr, part] }` with exactly 2 iovecs —
+/// identical to the shape `StreamClient::launch_append` generates for
+/// each replica.  The writer_task serialises them (single writer), so
+/// iovlen per syscall stays at 2.
+///
+/// If the test passes, it confirms:
+///   * 2-iov SendMsg is never rejected by the kernel regardless of
+///     concurrent pressure on the submit channel.
+///   * `futures::channel::mpsc::bounded(1024)` handles 2048 simultaneous
+///     senders (each gets its guaranteed slot, so capacity is 1024 +
+///     num_senders = 3072 — ample for the load).
+///   * The compio io_uring SQ accommodates the sustained write rate
+///     without returning EAGAIN/EINVAL under this pattern.
+#[test]
+fn writer_task_handles_2048_concurrent_vectored() {
+    use futures::future::join_all;
+
+    let addr = start_echo_server();
+    rt().block_on(async move {
+        let client = RpcClient::connect(addr).await.unwrap();
+        const N: usize = 2048;
+
+        let mut futs = Vec::with_capacity(N);
+        for i in 0u32..N as u32 {
+            let c = client.clone();
+            futs.push(compio::runtime::spawn(async move {
+                // 2-iov vectored payload (header + 1 part) — matches the
+                // StreamClient launch_append shape.
+                let part = Bytes::from(i.to_le_bytes().to_vec());
+                let resp = c.call_vectored(1, vec![part.clone()]).await;
+                match resp {
+                    Ok(bytes) => {
+                        assert_eq!(bytes, part, "req {i} got wrong echo payload");
+                        Ok(i)
+                    }
+                    Err(e) => Err(format!("req {i} failed: {e}")),
+                }
+            }));
+        }
+
+        let results: Vec<Result<u32, String>> = join_all(futs)
+            .await
+            .into_iter()
+            .map(|h| h.unwrap())
+            .collect();
+
+        let errors: Vec<_> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+        assert!(
+            errors.is_empty(),
+            "{} of {} requests failed; first error: {:?}",
+            errors.len(),
+            N,
+            errors.first()
+        );
+        assert_eq!(results.len(), N);
+    });
+}

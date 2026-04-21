@@ -3,6 +3,7 @@ extern crate libc;
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -49,6 +50,32 @@ fn hex_split_ranges(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
         ranges.push((start_key, end_key));
     }
     ranges
+}
+
+/// F099-N-c — generate a bench key guaranteed to lie in the partition
+/// identified by `start_key`. Returns an ASCII string so it remains
+/// JSON-safe for wbench's result file.
+///
+/// Strategy: for empty `start_key` (first partition [""..X)), prefix with
+/// "!" (0x21, smaller than any hex digit '0'..'f' = 0x30..0x66). For any
+/// other partition, prefix the key with `start_key + "!"` — this is
+/// strictly >= start_key and strictly < the next partition's start_key
+/// (because `start_key + "!"` shares the full `start_key` prefix and then
+/// '!' = 0x21 is smaller than any trailing character of the next split).
+fn key_for_partition(start_key: &[u8], tag: &str, tid: usize, seq: u64) -> String {
+    let mut key = Vec::with_capacity(start_key.len() + tag.len() + 32);
+    if !start_key.is_empty() {
+        key.extend_from_slice(start_key);
+    }
+    key.push(b'!');
+    key.extend_from_slice(tag.as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(tid.to_string().as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(seq.to_string().as_bytes());
+    // SAFETY: all inputs are ASCII (start_key is hex digits, tag is ASCII,
+    // tid/seq are decimal digits, separators are '!' and '_').
+    String::from_utf8(key).expect("ASCII bench key")
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +128,10 @@ enum Command {
     RegisterNode {
         addr: String,
         disks: Vec<String>,
+        /// F099-M: per-shard listener ports on the extent-node process.
+        /// Empty = legacy single-thread extent-node (client routes all
+        /// extents to `addr`).
+        shard_ports: Vec<u16>,
     },
     Format {
         listen: String,
@@ -129,6 +160,8 @@ enum Command {
         baseline_file: String,
         threshold: f64,
         update_baseline: bool,
+        partitions: usize,
+        pipeline_depth: usize,
     },
     Info,
 }
@@ -160,7 +193,7 @@ fn usage() -> ! {
     eprintln!("                                    Write benchmark (--nosync skips fsync)");
     eprintln!("  rbench [--threads 40] [--duration 10] <RESULT_FILE>");
     eprintln!("                                    Read benchmark");
-    eprintln!("  perf-check [--threads 256] [--duration 10] [--size 4096] [--nosync] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline]");
+    eprintln!("  perf-check [--threads 256] [--duration 10] [--size 4096] [--nosync] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline] [--partitions N] [--pipeline-depth K]");
     eprintln!("                                    Quick write+read bench; warns if >threshold regression vs baseline");
     eprintln!("  info                              Show cluster info");
     std::process::exit(1);
@@ -363,10 +396,21 @@ fn parse_args() -> Args {
         "register-node" => {
             let mut addr = String::new();
             let mut disks: Vec<String> = Vec::new();
+            let mut shard_ports: Vec<u16> = Vec::new();
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--addr" => { i += 1; addr = raw[i].clone(); }
                     "--disk" => { i += 1; disks.push(raw[i].clone()); }
+                    "--shard-ports" => {
+                        i += 1;
+                        for part in raw[i].split(',') {
+                            let p = part.trim();
+                            if p.is_empty() { continue; }
+                            let port: u16 = p.parse()
+                                .expect("--shard-ports entries must be u16");
+                            shard_ports.push(port);
+                        }
+                    }
                     _ => {}
                 }
                 i += 1;
@@ -378,7 +422,7 @@ fn parse_args() -> Args {
             if disks.is_empty() {
                 disks.push("disk-default".to_string());
             }
-            Command::RegisterNode { addr, disks }
+            Command::RegisterNode { addr, disks, shard_ports }
         }
         "format" => {
             let mut listen = String::new();
@@ -499,6 +543,8 @@ fn parse_args() -> Args {
             let mut baseline_file = "perf_baseline.json".to_string();
             let mut threshold = 0.8f64;
             let mut update_baseline = false;
+            let mut partitions_meta_from_flag: usize = 1;
+            let mut pipeline_depth: usize = 1;
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--threads" | "-t" => {
@@ -527,6 +573,24 @@ fn parse_args() -> Args {
                     "--update-baseline" => {
                         update_baseline = true;
                     }
+                    "--partitions" => {
+                        i += 1;
+                        partitions_meta_from_flag = raw[i].parse().expect("--partitions must be a positive integer");
+                        if partitions_meta_from_flag == 0 {
+                            eprintln!("--partitions must be >= 1");
+                            usage();
+                        }
+                    }
+                    "--pipeline-depth" => {
+                        i += 1;
+                        pipeline_depth = raw[i]
+                            .parse()
+                            .expect("--pipeline-depth must be a positive integer");
+                        if pipeline_depth == 0 || pipeline_depth > 256 {
+                            eprintln!("--pipeline-depth must be in [1, 256]");
+                            usage();
+                        }
+                    }
                     other => {
                         eprintln!("unknown perf-check flag: {other}");
                         usage();
@@ -542,6 +606,8 @@ fn parse_args() -> Args {
                 baseline_file,
                 threshold,
                 update_baseline,
+                partitions: partitions_meta_from_flag,
+                pipeline_depth,
             }
         }
         "info" => Command::Info,
@@ -601,6 +667,10 @@ struct BenchConfig {
     report_interval_secs: u64,
     part_id: Option<u64>,
     reuse_value: bool,
+    #[serde(default)]
+    partition_count: usize,
+    #[serde(default)]
+    group_commit_cap: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -784,6 +854,8 @@ mod tests {
                 report_interval_secs: 1,
                 part_id: Some(7),
                 reuse_value: true,
+                partition_count: 1,
+                group_commit_cap: None,
             },
             summary: BenchSummaryRecord {
                 total_ops: 1,
@@ -1053,12 +1125,13 @@ async fn main() -> Result<()> {
             println!("forcegc triggered for partition {part_id}, extents={extent_ids:?}");
         }
 
-        Command::RegisterNode { addr, disks } => {
+        Command::RegisterNode { addr, disks, shard_ports } => {
             // Retry on CODE_NOT_LEADER: manager may still be completing etcd
             // leader election when cluster.sh fires the first register-node.
             let req_bytes = rkyv_encode(&RegisterNodeReq {
                 addr: addr.clone(),
                 disk_uuids: disks,
+                shard_ports: shard_ports.clone(),
             });
             let mut attempt = 0u32;
             let resp = loop {
@@ -1104,6 +1177,8 @@ async fn main() -> Result<()> {
                     rkyv_encode(&RegisterNodeReq {
                         addr: advertise.clone(),
                         disk_uuids: disk_uuids.clone(),
+                        // F099-M: format path always uses legacy single-shard mode.
+                        shard_ports: vec![],
                     }),
                 )
                 .await
@@ -1171,20 +1246,30 @@ async fn main() -> Result<()> {
                 }
             }
 
-            let partitions = if let Some(part_id) = part_id {
-                vec![(part_id, client.resolve_part_id(part_id).await?)]
-            } else {
-                client.all_partitions().await?
-            };
+            // F099-N-c: partition ranges for range-aware key generation.
+            let partitions: Vec<(u64, String, Vec<u8>, Vec<u8>)> =
+                if let Some(part_id) = part_id {
+                    // Single-partition mode — fetch its range from the full list.
+                    let all = client.all_partitions_with_range().await?;
+                    let entry = all
+                        .into_iter()
+                        .find(|(pid, _, _, _)| *pid == part_id)
+                        .ok_or_else(|| anyhow!("partition {} not found", part_id))?;
+                    vec![entry]
+                } else {
+                    client.all_partitions_with_range().await?
+                };
             if partitions.is_empty() {
                 bail!("no partitions found, run bootstrap first");
             }
 
             // Resolve PS addresses for each thread
-            let mut thread_targets: Vec<(u64, SocketAddr)> = Vec::with_capacity(threads);
+            let mut thread_targets: Vec<(u64, SocketAddr, Vec<u8>)> =
+                Vec::with_capacity(threads);
             for tid in 0..threads {
-                let (part_id, ps_addr) = &partitions[tid % partitions.len()];
-                thread_targets.push((*part_id, parse_addr(ps_addr)?));
+                let (part_id, ps_addr, start_key, _end_key) =
+                    &partitions[tid % partitions.len()];
+                thread_targets.push((*part_id, parse_addr(ps_addr)?, start_key.clone()));
             }
 
             let deadline =
@@ -1195,7 +1280,7 @@ async fn main() -> Result<()> {
             let ops_samples = Arc::new(Mutex::new(Vec::<BenchSample>::new()));
 
             let mut handles = Vec::new();
-            for (tid, (part_id, ps_addr)) in thread_targets.into_iter().enumerate() {
+            for (tid, (part_id, ps_addr, start_key)) in thread_targets.into_iter().enumerate() {
                 let deadline = Arc::clone(&deadline);
                 let total_ops = Arc::clone(&total_ops);
                 let total_errors = Arc::clone(&total_errors);
@@ -1218,7 +1303,8 @@ async fn main() -> Result<()> {
                             if std::time::SystemTime::now() >= *deadline {
                                 break;
                             }
-                            let key = format!("bench_{}_{}", tid, seq);
+                            // F099-N-c: range-aware key (falls in this partition).
+                            let key = key_for_partition(&start_key, "bench", tid, seq);
                             seq += 1;
 
                             let t0 = Instant::now();
@@ -1321,6 +1407,8 @@ async fn main() -> Result<()> {
                     report_interval_secs,
                     part_id,
                     reuse_value,
+                    partition_count: 1,
+                    group_commit_cap: None,
                 },
                 summary,
                 ops_samples: ops_samples.lock().unwrap().drain(..).collect(),
@@ -1485,19 +1573,40 @@ async fn main() -> Result<()> {
             baseline_file,
             threshold,
             update_baseline,
+            partitions: partitions_meta_from_flag,
+            pipeline_depth,
         } => {
+            let pipeline_depth = pipeline_depth.max(1);
             // ---- Write phase ----
-            println!("==> perf-check: write ({threads} threads, {duration_secs}s, {value_size}B)");
+            if pipeline_depth > 1 {
+                println!(
+                    "==> perf-check: write ({threads} threads, {duration_secs}s, {value_size}B, depth={pipeline_depth})"
+                );
+            } else {
+                println!(
+                    "==> perf-check: write ({threads} threads, {duration_secs}s, {value_size}B)"
+                );
+            }
 
-            let partitions = client.all_partitions().await?;
+            // F099-N-c: use `all_partitions_with_range` so each thread can
+            // generate keys that fall inside its assigned partition's range.
+            let partitions = client.all_partitions_with_range().await?;
             if partitions.is_empty() {
                 bail!("no partitions found, run bootstrap first");
             }
+            if partitions.len() != partitions_meta_from_flag {
+                eprintln!(
+                    "warning: --partitions={} but cluster has {} partitions; using cluster value",
+                    partitions_meta_from_flag, partitions.len()
+                );
+            }
 
-            let mut thread_targets: Vec<(u64, SocketAddr)> = Vec::with_capacity(threads);
+            let mut thread_targets: Vec<(u64, SocketAddr, Vec<u8>)> =
+                Vec::with_capacity(threads);
             for tid in 0..threads {
-                let (part_id, ps_addr) = &partitions[tid % partitions.len()];
-                thread_targets.push((*part_id, parse_addr(ps_addr)?));
+                let (part_id, ps_addr, start_key, _end_key) =
+                    &partitions[tid % partitions.len()];
+                thread_targets.push((*part_id, parse_addr(ps_addr)?, start_key.clone()));
             }
 
             let deadline =
@@ -1506,14 +1615,16 @@ async fn main() -> Result<()> {
             let bench_start = Instant::now();
 
             let mut write_handles = Vec::new();
-            for (tid, (part_id, ps_addr)) in thread_targets.into_iter().enumerate() {
+            for (tid, (part_id, ps_addr, start_key)) in thread_targets.into_iter().enumerate() {
                 let deadline = Arc::clone(&deadline);
                 let total_ops = Arc::clone(&total_ops);
                 let value_bytes =
                     (0..value_size).map(|i| (i % 256) as u8).collect::<Vec<u8>>();
 
+                let max_depth = pipeline_depth;
                 let handle = std::thread::spawn(move || {
                     compio::runtime::Runtime::new().unwrap().block_on(async {
+                        use futures::stream::{FuturesUnordered, StreamExt};
                         let ps = match RpcClient::connect(ps_addr).await {
                             Ok(c) => c,
                             Err(e) => {
@@ -1523,34 +1634,46 @@ async fn main() -> Result<()> {
                         };
                         let mut seq: u64 = 0;
                         let mut local_latencies: Vec<f64> = Vec::new();
-                        let mut local_keys: Vec<String> = Vec::new();
+                        let mut local_keyinfo: Vec<(String, u64, SocketAddr)> = Vec::new();
+                        let mut inflight = FuturesUnordered::new();
                         loop {
-                            if std::time::SystemTime::now() >= *deadline {
-                                break;
+                            // Refill pipeline up to max_depth while deadline not expired.
+                            while inflight.len() < max_depth
+                                && std::time::SystemTime::now() < *deadline
+                            {
+                                // F099-N-c: key must fall in this thread's
+                                // partition range or PS will reject it with
+                                // "key out of range".
+                                let key = key_for_partition(&start_key, "pc", tid, seq);
+                                seq += 1;
+                                let req_bytes = rkyv_encode(&PutReq {
+                                    part_id,
+                                    key: key.as_bytes().to_vec(),
+                                    value: value_bytes.clone(),
+                                    must_sync: !nosync,
+                                    expires_at: 0,
+                                });
+                                let ps_clone = ps.clone();
+                                let t0 = Instant::now();
+                                inflight.push(async move {
+                                    let res = ps_clone.call(MSG_PUT, req_bytes).await;
+                                    (res, key, t0.elapsed())
+                                });
                             }
-                            let key = format!("pc_{tid}_{seq}");
-                            seq += 1;
-                            let t0 = Instant::now();
-                            let res = ps
-                                .call(
-                                    MSG_PUT,
-                                    rkyv_encode(&PutReq {
-                                        part_id,
-                                        key: key.as_bytes().to_vec(),
-                                        value: value_bytes.clone(),
-                                        must_sync: !nosync,
-                                        expires_at: 0,
-                                    }),
-                                )
-                                .await;
-                            let elapsed = t0.elapsed();
-                            if res.is_ok() {
-                                total_ops.fetch_add(1, Ordering::Relaxed);
-                                local_latencies.push(elapsed.as_secs_f64() * 1000.0);
-                                local_keys.push(key);
+                            // Drain one completion. When deadline passes AND inflight is
+                            // empty, next() returns None and we exit.
+                            match inflight.next().await {
+                                Some((res, key, elapsed)) => {
+                                    if res.is_ok() {
+                                        total_ops.fetch_add(1, Ordering::Relaxed);
+                                        local_latencies.push(elapsed.as_secs_f64() * 1000.0);
+                                        local_keyinfo.push((key, part_id, ps_addr));
+                                    }
+                                }
+                                None => break,
                             }
                         }
-                        (local_latencies, local_keys)
+                        (local_latencies, local_keyinfo)
                     })
                 });
                 write_handles.push(handle);
@@ -1568,11 +1691,11 @@ async fn main() -> Result<()> {
             });
 
             let mut all_write_latencies: Vec<f64> = Vec::new();
-            let mut all_write_keys: Vec<String> = Vec::new();
+            let mut all_write_keyinfo: Vec<(String, u64, SocketAddr)> = Vec::new();
             for h in write_handles {
-                if let Ok((lats, keys)) = h.join() {
+                if let Ok((lats, keyinfo)) = h.join() {
                     all_write_latencies.extend(lats);
-                    all_write_keys.extend(keys);
+                    all_write_keyinfo.extend(keyinfo);
                 }
             }
             drop(progress_w);
@@ -1592,76 +1715,90 @@ async fn main() -> Result<()> {
                 &mut write_hist,
             );
 
-            if all_write_keys.is_empty() {
+            if all_write_keyinfo.is_empty() {
                 bail!("write phase produced no keys — is the cluster running?");
             }
 
             // ---- Read phase ----
-            println!("\n==> perf-check: read ({threads} threads, {duration_secs}s)");
+            if pipeline_depth > 1 {
+                println!(
+                    "\n==> perf-check: read ({threads} threads, {duration_secs}s, depth={pipeline_depth})"
+                );
+            } else {
+                println!("\n==> perf-check: read ({threads} threads, {duration_secs}s)");
+            }
 
-            let pc_keys = Arc::new(all_write_keys);
+            let pc_keyinfo = Arc::new(all_write_keyinfo);
             let manager_addr = Arc::new(args.manager.clone());
             let deadline =
                 Arc::new(std::time::SystemTime::now() + Duration::from_secs(duration_secs));
             let total_ops = Arc::new(AtomicU64::new(0));
             let bench_start = Instant::now();
-            let keys_per_thread = (pc_keys.len() + threads - 1) / threads;
+            let keys_per_thread = (pc_keyinfo.len() + threads - 1) / threads;
 
             let mut read_handles = Vec::new();
             for tid in 0..threads {
-                let pc_keys = Arc::clone(&pc_keys);
-                let manager_addr = Arc::clone(&manager_addr);
+                let pc_keyinfo = Arc::clone(&pc_keyinfo);
+                let _manager_addr = Arc::clone(&manager_addr); // kept for parity, unused now
                 let deadline = Arc::clone(&deadline);
                 let total_ops = Arc::clone(&total_ops);
 
+                let max_depth = pipeline_depth;
                 let handle = std::thread::spawn(move || {
                     compio::runtime::Runtime::new().unwrap().block_on(async {
-                        let mut cc = match ClusterClient::connect(&manager_addr).await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                eprintln!("thread {tid} connect error: {e}");
-                                return Vec::new();
-                            }
-                        };
+                        use futures::stream::{FuturesUnordered, StreamExt};
+                        // Per-thread RpcClient connection cache keyed by ps_addr.
+                        let mut conns: std::collections::HashMap<SocketAddr, Rc<RpcClient>> =
+                            std::collections::HashMap::new();
                         let start_idx = tid * keys_per_thread;
-                        let end_idx = (start_idx + keys_per_thread).min(pc_keys.len());
+                        let end_idx = (start_idx + keys_per_thread).min(pc_keyinfo.len());
                         if start_idx >= end_idx {
                             return Vec::new();
                         }
-                        let my_keys = &pc_keys[start_idx..end_idx];
+                        let my_slice = &pc_keyinfo[start_idx..end_idx];
                         let mut ki = 0usize;
                         let mut local_latencies: Vec<f64> = Vec::new();
+                        let mut inflight = FuturesUnordered::new();
 
                         loop {
-                            if std::time::SystemTime::now() >= *deadline {
-                                break;
+                            // Refill pipeline up to max_depth while deadline not expired.
+                            while inflight.len() < max_depth
+                                && std::time::SystemTime::now() < *deadline
+                            {
+                                let (key, part_id, ps_addr) = &my_slice[ki % my_slice.len()];
+                                ki += 1;
+                                let ps = match conns.get(ps_addr) {
+                                    Some(c) => c.clone(),
+                                    None => match RpcClient::connect(*ps_addr).await {
+                                        Ok(c) => {
+                                            conns.insert(*ps_addr, c.clone());
+                                            c
+                                        }
+                                        Err(_) => continue,
+                                    },
+                                };
+                                let req_bytes = rkyv_encode(&GetReq {
+                                    part_id: *part_id,
+                                    key: key.as_bytes().to_vec(),
+                                    offset: 0,
+                                    length: 0,
+                                });
+                                let t0 = Instant::now();
+                                inflight.push(async move {
+                                    let res = ps.call(MSG_GET, req_bytes).await;
+                                    (res, t0.elapsed())
+                                });
                             }
-                            let key = &my_keys[ki % my_keys.len()];
-                            ki += 1;
-                            let Ok((part_id, ps_addr)) =
-                                cc.resolve_key(key.as_bytes()).await
-                            else {
-                                continue;
-                            };
-                            let Ok(ps) = cc.get_ps_client(&ps_addr).await else {
-                                continue;
-                            };
-                            let t0 = Instant::now();
-                            let res = ps
-                                .call(
-                                    MSG_GET,
-                                    rkyv_encode(&GetReq {
-                                        part_id,
-                                        key: key.as_bytes().to_vec(),
-                                        offset: 0,
-                                        length: 0,
-                                    }),
-                                )
-                                .await;
-                            let elapsed = t0.elapsed();
-                            if res.is_ok() {
-                                total_ops.fetch_add(1, Ordering::Relaxed);
-                                local_latencies.push(elapsed.as_secs_f64() * 1000.0);
+                            // Drain one completion. When deadline passes AND inflight is
+                            // empty, next() returns None and we exit.
+                            match inflight.next().await {
+                                Some((res, elapsed)) => {
+                                    if res.is_ok() {
+                                        total_ops.fetch_add(1, Ordering::Relaxed);
+                                        local_latencies.push(elapsed.as_secs_f64() * 1000.0);
+                                    }
+                                }
+                                None => break,
                             }
                         }
                         local_latencies
@@ -1777,6 +1914,10 @@ async fn main() -> Result<()> {
                         report_interval_secs: 1,
                         part_id: None,
                         reuse_value: true,
+                        partition_count: partitions_meta_from_flag,
+                        group_commit_cap: std::env::var("AUTUMN_GROUP_COMMIT_CAP")
+                            .ok()
+                            .and_then(|s| s.parse::<usize>().ok()),
                     },
                     recorded_at: now_secs,
                 };

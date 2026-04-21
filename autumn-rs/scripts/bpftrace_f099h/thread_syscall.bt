@@ -1,0 +1,49 @@
+/*
+ * F099-H: thread-filtered syscall latency.
+ *
+ * Usage:  bpftrace -e "$(cat thread_syscall.bt)" <TID>
+ *
+ * Same as syscall_summary.bt but filters by TID not PID. Use to isolate the
+ * P-log thread (part-13) or a single ps-conn thread from the noise of a
+ * 256-thread process.
+ */
+
+BEGIN {
+    printf("thread_syscall: target TID = %d\n", $1);
+}
+
+tracepoint:syscalls:sys_enter_pwritev   / tid == $1 / { @start[tid, "pwritev"]   = nsecs; @size_bytes["pwritev"]   = hist(args->vlen); }
+tracepoint:syscalls:sys_enter_pwritev2  / tid == $1 / { @start[tid, "pwritev2"]  = nsecs; @size_bytes["pwritev2"]  = hist(args->vlen); }
+tracepoint:syscalls:sys_enter_preadv    / tid == $1 / { @start[tid, "preadv"]    = nsecs; }
+tracepoint:syscalls:sys_enter_writev    / tid == $1 / { @start[tid, "writev"]    = nsecs; @size_bytes["writev"]    = hist(args->vlen); }
+tracepoint:syscalls:sys_enter_readv     / tid == $1 / { @start[tid, "readv"]     = nsecs; @size_bytes["readv"]     = hist(args->vlen); }
+tracepoint:syscalls:sys_enter_write     / tid == $1 / { @start[tid, "write"]     = nsecs; @size_bytes["write"]     = hist(args->count); }
+tracepoint:syscalls:sys_enter_read      / tid == $1 / { @start[tid, "read"]      = nsecs; @size_bytes["read"]      = hist(args->count); }
+tracepoint:syscalls:sys_enter_sendto    / tid == $1 / { @start[tid, "sendto"]    = nsecs; @size_bytes["sendto"]    = hist(args->len); }
+tracepoint:syscalls:sys_enter_recvfrom  / tid == $1 / { @start[tid, "recvfrom"]  = nsecs; @size_bytes["recvfrom"]  = hist(args->size); }
+tracepoint:syscalls:sys_enter_sendmsg   / tid == $1 / { @start[tid, "sendmsg"]   = nsecs; }
+tracepoint:syscalls:sys_enter_recvmsg   / tid == $1 / { @start[tid, "recvmsg"]   = nsecs; }
+tracepoint:syscalls:sys_enter_io_uring_enter / tid == $1 / { @start[tid, "io_uring_enter"] = nsecs; }
+tracepoint:syscalls:sys_enter_futex     / tid == $1 / { @start[tid, "futex"]     = nsecs; }
+
+tracepoint:syscalls:sys_exit_pwritev   / @start[tid, "pwritev"]   / { $l = nsecs - @start[tid, "pwritev"];   @count["pwritev"]   = count(); @total_ns["pwritev"]   = sum($l); @lat_ns["pwritev"]   = hist($l); delete(@start[tid, "pwritev"]); }
+tracepoint:syscalls:sys_exit_pwritev2  / @start[tid, "pwritev2"]  / { $l = nsecs - @start[tid, "pwritev2"];  @count["pwritev2"]  = count(); @total_ns["pwritev2"]  = sum($l); @lat_ns["pwritev2"]  = hist($l); delete(@start[tid, "pwritev2"]); }
+tracepoint:syscalls:sys_exit_preadv    / @start[tid, "preadv"]    / { $l = nsecs - @start[tid, "preadv"];    @count["preadv"]    = count(); @total_ns["preadv"]    = sum($l); @lat_ns["preadv"]    = hist($l); delete(@start[tid, "preadv"]); }
+tracepoint:syscalls:sys_exit_writev    / @start[tid, "writev"]    / { $l = nsecs - @start[tid, "writev"];    @count["writev"]    = count(); @total_ns["writev"]    = sum($l); @lat_ns["writev"]    = hist($l); delete(@start[tid, "writev"]); }
+tracepoint:syscalls:sys_exit_readv     / @start[tid, "readv"]     / { $l = nsecs - @start[tid, "readv"];     @count["readv"]     = count(); @total_ns["readv"]     = sum($l); @lat_ns["readv"]     = hist($l); delete(@start[tid, "readv"]); }
+tracepoint:syscalls:sys_exit_write     / @start[tid, "write"]     / { $l = nsecs - @start[tid, "write"];     @count["write"]     = count(); @total_ns["write"]     = sum($l); @lat_ns["write"]     = hist($l); delete(@start[tid, "write"]); }
+tracepoint:syscalls:sys_exit_read      / @start[tid, "read"]      / { $l = nsecs - @start[tid, "read"];      @count["read"]      = count(); @total_ns["read"]      = sum($l); @lat_ns["read"]      = hist($l); delete(@start[tid, "read"]); }
+tracepoint:syscalls:sys_exit_sendto    / @start[tid, "sendto"]    / { $l = nsecs - @start[tid, "sendto"];    @count["sendto"]    = count(); @total_ns["sendto"]    = sum($l); @lat_ns["sendto"]    = hist($l); delete(@start[tid, "sendto"]); }
+tracepoint:syscalls:sys_exit_recvfrom  / @start[tid, "recvfrom"]  / { $l = nsecs - @start[tid, "recvfrom"];  @count["recvfrom"]  = count(); @total_ns["recvfrom"]  = sum($l); @lat_ns["recvfrom"]  = hist($l); delete(@start[tid, "recvfrom"]); }
+tracepoint:syscalls:sys_exit_sendmsg   / @start[tid, "sendmsg"]   / { $l = nsecs - @start[tid, "sendmsg"];   @count["sendmsg"]   = count(); @total_ns["sendmsg"]   = sum($l); @lat_ns["sendmsg"]   = hist($l); delete(@start[tid, "sendmsg"]); }
+tracepoint:syscalls:sys_exit_recvmsg   / @start[tid, "recvmsg"]   / { $l = nsecs - @start[tid, "recvmsg"];   @count["recvmsg"]   = count(); @total_ns["recvmsg"]   = sum($l); @lat_ns["recvmsg"]   = hist($l); delete(@start[tid, "recvmsg"]); }
+tracepoint:syscalls:sys_exit_io_uring_enter / @start[tid, "io_uring_enter"] / { $l = nsecs - @start[tid, "io_uring_enter"]; @count["io_uring_enter"] = count(); @total_ns["io_uring_enter"] = sum($l); @lat_ns["io_uring_enter"] = hist($l); delete(@start[tid, "io_uring_enter"]); }
+tracepoint:syscalls:sys_exit_futex     / @start[tid, "futex"]     / { $l = nsecs - @start[tid, "futex"];     @count["futex"]     = count(); @total_ns["futex"]     = sum($l); @lat_ns["futex"]     = hist($l); delete(@start[tid, "futex"]); }
+
+END {
+    clear(@start);
+    printf("\n--- COUNTS (tid=%d) ---\n", $1); print(@count);
+    printf("\n--- TOTAL NS ---\n"); print(@total_ns);
+    printf("\n--- LATENCY HIST ---\n"); print(@lat_ns);
+    printf("\n--- SIZE HIST ---\n"); print(@size_bytes);
+}

@@ -89,6 +89,32 @@ wait_port() {
 }
 
 # ---------------------------------------------------------------------------
+# disk helpers
+# ---------------------------------------------------------------------------
+
+# Return the --data argument for extent node $1 (1-indexed) given $CLUSTER_MODE.
+disk_args_for_node() {
+    local i="$1"
+    case "${CLUSTER_MODE:-default}" in
+        3disk)
+            case "$i" in
+                1) echo "/data03/autumn-rs/d1" ;;
+                2) echo "/data05/autumn-rs/d2" ;;
+                3) echo "/data08/autumn-rs/d3" ;;
+                *) die "--3disk supports exactly 3 nodes; got i=$i" ;;
+            esac
+            ;;
+        multidisk-1node)
+            [[ "$i" == "1" ]] || die "--multidisk-1node supports exactly 1 node"
+            echo "/data03/autumn-rs/d1,/data05/autumn-rs/d2,/data08/autumn-rs/d3"
+            ;;
+        *)
+            echo "$DATA_ROOT/d$i"
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # start
 # ---------------------------------------------------------------------------
 
@@ -104,10 +130,8 @@ do_start() {
     need_bin "$PS"
     need_bin "$AC"
 
-    # Create data dirs for all nodes (d1..dN)
-    local data_dirs=("$DATA_ROOT/etcd" "$DATA_ROOT/ps")
-    for (( i=1; i<=replicas; i++ )); do data_dirs+=("$DATA_ROOT/d$i"); done
-    mkdir -p "${data_dirs[@]}"
+    # Create data dirs for etcd and ps; node dirs are created per-node below.
+    mkdir -p "$DATA_ROOT/etcd" "$DATA_ROOT/ps"
 
     # etcd
     start_proc etcd \
@@ -129,20 +153,104 @@ do_start() {
         "$MANAGER" --port 9001 --etcd 127.0.0.1:2379
     wait_port 9001 manager
 
-    # extent node(s): node1=9101, node2=9102, ...
+    # Extent node(s): node1=9101, node2=9102, ...
+    # Pre-create all data directories so both single-disk and multi-disk paths can rely on them.
+    for (( i=1; i<=replicas; i++ )); do
+        local disk_arg
+        disk_arg=$(disk_args_for_node "$i")
+        mkdir -p $(echo "$disk_arg" | tr ',' ' ')
+    done
+
+    # In --multidisk-1node mode, `autumn-client format` must run BEFORE the
+    # extent-node starts. Format registers the node with the manager and
+    # writes the `disk_id` file in every data directory — ExtentNodeConfig::
+    # new_multi requires those files on open. The format call also replaces
+    # register-node for this mode.
+    if [[ "${CLUSTER_MODE:-default}" == "multidisk-1node" ]]; then
+        local disk_arg
+        disk_arg=$(disk_args_for_node 1)
+        # shellcheck disable=SC2086  # intentional word splitting for positional args
+        "$AC" --manager "$MANAGER_ADDR" format \
+            --listen ":9101" \
+            --advertise "127.0.0.1:9101" \
+            $(echo "$disk_arg" | tr ',' ' ')
+    fi
+
+    # F099-M: when AUTUMN_EXTENT_SHARDS is set, launch each extent-node
+    # with K shards. Each shard listens on port + shard_idx * shard_stride
+    # (stride 10 by default). cluster.sh passes --shards so the binary
+    # spawns K compio runtimes in one process; cluster.sh must also tell
+    # the manager about the shard_ports via `register-node --shard-ports`
+    # so the manager/PS can route each extent to the owning shard.
+    local shards="${AUTUMN_EXTENT_SHARDS:-1}"
+    [[ "$shards" =~ ^[0-9]+$ ]] && (( shards >= 1 )) || shards=1
+    local shard_stride="${AUTUMN_EXTENT_SHARD_STRIDE:-10}"
+    [[ "$shard_stride" =~ ^[0-9]+$ ]] && (( shard_stride >= 1 )) || shard_stride=10
+    if (( shards > 1 )); then
+        echo "[cluster] F099-M: extent-node shards=$shards stride=$shard_stride"
+    fi
+
+    # Launch extent-node processes.
     for (( i=1; i<=replicas; i++ )); do
         local port=$(( 9100 + i ))
-        start_proc "node$i" \
-            "$NODE" --port "$port" --disk-id "$i" --data "$DATA_ROOT/d$i" --manager "$MANAGER_ADDR"
+        local disk_arg
+        disk_arg=$(disk_args_for_node "$i")
+        # multidisk-1node sends multiple paths through --data and OMITS --disk-id
+        # (extent-node switches to multi-disk mode when --data has commas AND --disk-id is absent).
+        if [[ "$disk_arg" == *,* ]]; then
+            if (( shards > 1 )); then
+                start_proc "node$i" \
+                    "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR" \
+                    --shards "$shards" --shard-stride "$shard_stride"
+            else
+                start_proc "node$i" \
+                    "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR"
+            fi
+        else
+            if (( shards > 1 )); then
+                start_proc "node$i" \
+                    "$NODE" --port "$port" --disk-id "$i" --data "$disk_arg" --manager "$MANAGER_ADDR" \
+                    --shards "$shards" --shard-stride "$shard_stride"
+            else
+                start_proc "node$i" \
+                    "$NODE" --port "$port" --disk-id "$i" --data "$disk_arg" --manager "$MANAGER_ADDR"
+            fi
+        fi
+        # Wait for the primary (shard 0) port. Sibling shard ports come up
+        # around the same time from the same process.
         wait_port "$port" "node$i"
     done
 
-    # register extent node(s)
-    for (( i=1; i<=replicas; i++ )); do
-        local port=$(( 9100 + i ))
-        "$AC" --manager "$MANAGER_ADDR" register-node --addr "127.0.0.1:$port" --disk "disk-$i"
-    done
-    echo "[cluster] extent node(s) registered"
+    # register extent node(s) — skip for multidisk-1node (format already registered).
+    if [[ "${CLUSTER_MODE:-default}" != "multidisk-1node" ]]; then
+        for (( i=1; i<=replicas; i++ )); do
+            local port=$(( 9100 + i ))
+            if (( shards > 1 )); then
+                # Build comma-separated shard_ports: port, port+stride, port+2*stride, ...
+                local shard_ports_csv=""
+                for (( s=0; s<shards; s++ )); do
+                    local sp=$(( port + s * shard_stride ))
+                    if [[ -z "$shard_ports_csv" ]]; then
+                        shard_ports_csv="$sp"
+                    else
+                        shard_ports_csv="${shard_ports_csv},${sp}"
+                    fi
+                done
+                "$AC" --manager "$MANAGER_ADDR" register-node \
+                    --addr "127.0.0.1:$port" --disk "disk-$i" \
+                    --shard-ports "$shard_ports_csv"
+            else
+                "$AC" --manager "$MANAGER_ADDR" register-node --addr "127.0.0.1:$port" --disk "disk-$i"
+            fi
+        done
+        echo "[cluster] extent node(s) registered"
+    else
+        echo "[cluster] extent node registered via format (multidisk-1node)"
+    fi
+
+    if [[ -n "${AUTUMN_GROUP_COMMIT_CAP:-}" ]]; then
+        echo "[cluster] AUTUMN_GROUP_COMMIT_CAP=$AUTUMN_GROUP_COMMIT_CAP (forwarding to PS)"
+    fi
 
     # partition server
     start_proc ps \
@@ -150,24 +258,52 @@ do_start() {
         --psid 1 --port 9201 \
         --manager "$MANAGER_ADDR" \
         --advertise 127.0.0.1:9201
-    wait_port 9201 ps 60  # longer timeout: PS waits for manager leader election
+    # F099-K: no central PS listener — partitions bind their own ports
+    # AFTER they are opened. Don't wait for port 9201 here; bootstrap
+    # below creates partitions, and the per-partition listener (9201,
+    # 9202, ...) will come up as the PS opens each partition.
+    echo "[cluster] PS launched (F099-K: per-partition listeners bind on partition open)"
 
     # bootstrap (create streams + partitions) — only on a fresh data dir
     if [[ -f "$bootstrap_marker" ]]; then
         echo "[cluster] skipping bootstrap (already done — use 'restart' for a fresh cluster)"
+        # Give PS a moment to sync regions and re-bind listeners on restart.
+        wait_port 9201 ps 60
     else
         # Use 3+0 replication when >= 3 nodes, otherwise match node count
         local repl
         if (( replicas >= 3 )); then repl="3+0"; else repl="${replicas}+0"; fi
         sleep 2  # give PS a moment to register with manager
         # AUTUMN_BOOTSTRAP_PRESPLIT: e.g. "4:3fffffff,7ffffffe,bffffffd"
+        # The literal split points in the env var are documentation only;
+        # autumn-client's `--presplit N:hexstring` calls hex_split_ranges(N)
+        # internally and produces the same 0x3FFF.../0x7FFF.../0xBFFF... split
+        # points. Forward just the partition count with `hexstring` kind.
         if [[ -n "${AUTUMN_BOOTSTRAP_PRESPLIT:-}" ]]; then
-            "$AC" --manager "$MANAGER_ADDR" bootstrap --replication "$repl" --presplit "$AUTUMN_BOOTSTRAP_PRESPLIT"
+            local n_parts_arg="${AUTUMN_BOOTSTRAP_PRESPLIT%%:*}"
+            [[ "$n_parts_arg" =~ ^[0-9]+$ ]] || n_parts_arg=1
+            "$AC" --manager "$MANAGER_ADDR" bootstrap --replication "$repl" --presplit "${n_parts_arg}:hexstring"
         else
             "$AC" --manager "$MANAGER_ADDR" bootstrap --replication "$repl"
         fi
         touch "$bootstrap_marker"
-        sleep 1    # wait for PS to pick up the new partition
+        # Wait for PS to pick up the new partition(s) and finish opening them.
+        # Each partition's open() runs stream commit_length calls serially against
+        # the server-level stream_client, so total time scales with partition count.
+        # Budget ~3s per partition (empirically sufficient at bootstrap time).
+        local n_parts=1
+        if [[ -n "${AUTUMN_BOOTSTRAP_PRESPLIT:-}" ]]; then
+            n_parts="${AUTUMN_BOOTSTRAP_PRESPLIT%%:*}"
+            [[ "$n_parts" =~ ^[0-9]+$ ]] || n_parts=1
+        fi
+        local wait_secs=$(( 3 * n_parts ))
+        (( wait_secs < 3 )) && wait_secs=3
+        echo "[cluster] waiting ${wait_secs}s for PS to open ${n_parts} partition(s)..."
+        sleep "$wait_secs"
+        # F099-K: confirm the first partition's listener is actually up.
+        # Under F099-K the per-partition listener on :9201 only exists
+        # once partition 0 has been opened and registered with the mgr.
+        wait_port 9201 "partition 0 listener" 60
     fi
 
     echo ""
@@ -203,6 +339,9 @@ do_stop() {
     pkill -9 -f "$BIN/autumn-manager-server" 2>/dev/null || true
     pkill -9 -f "$BIN/autumn-extent-node" 2>/dev/null || true
     pkill -9 -f "$BIN/autumn-ps " 2>/dev/null || true
+    # Match stray etcd only when its --data-dir is inside an autumn-rs tree.
+    # Avoids killing unrelated etcd instances on the host.
+    pkill -9 -f 'etcd --data-dir [^ ]*autumn-rs' 2>/dev/null || true
     echo "[cluster] all processes stopped"
 }
 
@@ -213,6 +352,8 @@ do_stop() {
 do_clean() {
     do_stop
     rm -rf "$DATA_ROOT" "$LOG_DIR"
+    # Also wipe alternate-disk data if this run used --3disk or --multidisk-1node.
+    rm -rf /data03/autumn-rs /data05/autumn-rs /data08/autumn-rs 2>/dev/null || true
     echo "[cluster] data dirs wiped"
 }
 
@@ -262,7 +403,30 @@ do_logs() {
 # ---------------------------------------------------------------------------
 
 CMD="${1:-help}"
-REPLICAS="${2:-1}"
+shift || true
+
+REPLICAS=1
+MODE="default"  # default | 3disk | multidisk-1node
+if [[ "${1:-}" =~ ^[0-9]+$ ]]; then
+    REPLICAS="$1"
+    shift
+fi
+while (( $# > 0 )); do
+    case "$1" in
+        --3disk)             MODE="3disk" ;;
+        --multidisk-1node)   MODE="multidisk-1node" ;;
+        *) die "unknown cluster.sh flag: $1" ;;
+    esac
+    shift
+done
+
+# Mode validation
+if [[ "$MODE" == "3disk" ]]; then
+    (( REPLICAS == 3 )) || die "--3disk requires replicas=3 (got $REPLICAS)"
+elif [[ "$MODE" == "multidisk-1node" ]]; then
+    (( REPLICAS == 1 )) || die "--multidisk-1node requires replicas=1 (got $REPLICAS)"
+fi
+export CLUSTER_MODE="$MODE"
 
 case "$CMD" in
     start)   do_start "$REPLICAS" ;;
@@ -274,6 +438,7 @@ case "$CMD" in
     logs)    do_logs ;;
     *)
         echo "Usage: $0 {start [N] | stop | restart [N] | clean | reset [N] | status | logs}"
+        echo "  Optional mode flag: --3disk (replicas=3, nodes on /data03,/data05,/data08) | --multidisk-1node (replicas=1, one node spans all three NVMes)"
         exit 1
         ;;
 esac

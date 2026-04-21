@@ -21,20 +21,45 @@ AC="$SCRIPT_DIR/target/release/autumn-client"
 
 USE_SHM=0
 UPDATE_BASELINE=""
-for arg in "$@"; do
-    case "$arg" in
+PARTITIONS=1
+PIPELINE_DEPTH=1
+SKIP_CLUSTER=0
+while (( $# > 0 )); do
+    case "$1" in
         --shm)              USE_SHM=1 ;;
         --update-baseline)  UPDATE_BASELINE="--update-baseline" ;;
+        --skip-cluster)     SKIP_CLUSTER=1 ;;
+        --partitions)
+            shift
+            PARTITIONS="${1:-}"
+            [[ "$PARTITIONS" =~ ^[0-9]+$ ]] && (( PARTITIONS >= 1 )) \
+                || { echo "--partitions must be a positive integer" >&2; exit 1; }
+            ;;
+        --pipeline-depth)
+            shift
+            PIPELINE_DEPTH="${1:-}"
+            [[ "$PIPELINE_DEPTH" =~ ^[0-9]+$ ]] && (( PIPELINE_DEPTH >= 1 && PIPELINE_DEPTH <= 256 )) \
+                || { echo "--pipeline-depth must be an integer in [1, 256]" >&2; exit 1; }
+            ;;
         -h|--help)
             sed -n '2,11p' "$0"
             exit 0
             ;;
         *)
-            echo "unknown option: $arg" >&2
+            echo "unknown option: $1" >&2
             exit 1
             ;;
     esac
+    shift
 done
+
+# Emit AUTUMN_BOOTSTRAP_PRESPLIT=N:hexstring when N > 1.
+# The bootstrap handler expands "hexstring" into N uniform 8-char hex midpoints
+# via hex_split_ranges(); no need to compute midpoints explicitly here.
+if (( PARTITIONS > 1 )); then
+    export AUTUMN_BOOTSTRAP_PRESPLIT="${PARTITIONS}:hexstring"
+    echo "[perf-check] presplit: $AUTUMN_BOOTSTRAP_PRESPLIT"
+fi
 
 if (( USE_SHM )); then
     export AUTUMN_DATA_ROOT="/dev/shm/autumn-rs"
@@ -49,12 +74,16 @@ fi
 # Build release binaries
 echo "[perf-check] building release binaries..."
 cd "$SCRIPT_DIR"
-cargo build --workspace --release 2>&1 | grep -E "^(Compiling|Finished|error)" || true
+cargo build --workspace --release --exclude autumn-fuse 2>&1 | grep -E "^(Compiling|Finished|error)" || true
 
 # Fresh 3-replica cluster (data root => $AUTUMN_DATA_ROOT, picked up by cluster.sh)
-echo "[perf-check] clean + start 3-replica cluster on $STORAGE_LABEL..."
-bash "$SCRIPT_DIR/cluster.sh" clean
-bash "$SCRIPT_DIR/cluster.sh" start 3
+if (( SKIP_CLUSTER == 0 )); then
+    echo "[perf-check] clean + start 3-replica cluster on $STORAGE_LABEL..."
+    bash "$SCRIPT_DIR/cluster.sh" clean
+    bash "$SCRIPT_DIR/cluster.sh" start 3
+else
+    echo "[perf-check] --skip-cluster: assuming cluster is already running"
+fi
 
 # Run perf-check (baseline file lives next to this script)
 # Parameters match production-style load: 256 threads, 4KB values, nosync (group-commit path)
@@ -65,5 +94,7 @@ echo "[perf-check] running perf-check on $STORAGE_LABEL (baseline: $BASELINE)...
     --threads 256 \
     --duration 10 \
     --size 4096 \
+    --partitions "$PARTITIONS" \
+    --pipeline-depth "$PIPELINE_DEPTH" \
     --baseline "$BASELINE" \
     $UPDATE_BASELINE

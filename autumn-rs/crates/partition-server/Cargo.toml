@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true
-crossbeam-skiplist.workspace = true
 dashmap.workspace = true
 tracing.workspace = true
 autumn-common = { path = "../common" }
@@ -22,3 +21,7 @@ parking_lot.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+
+[[bench]]
+name = "ps_bench"
+harness = false

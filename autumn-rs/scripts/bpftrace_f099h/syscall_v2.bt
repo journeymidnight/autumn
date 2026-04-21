@@ -1,0 +1,95 @@
+/*
+ * F099-H v2: per-syscall count + total time + size histogram for a single PID.
+ *
+ * Rewritten to avoid string-indexed maps (kernel 6.1 BPF verifier rejected the
+ * v1 script with "misaligned stack access" on the (tid, "name") composite key).
+ * Each syscall has its own @s_<name>[tid] map. String-free.
+ *
+ * Usage:  bpftrace syscall_v2.bt <PID>
+ *         Script self-terminates via exit() at interval:s:30.
+ */
+
+BEGIN {
+    printf("syscall_v2: target PID = %d\n", $1);
+}
+
+/* pwritev */
+tracepoint:syscalls:sys_enter_pwritev /pid == $1/ { @s_pwritev[tid] = nsecs; @size_pwritev_vlen = hist(args->vlen); }
+tracepoint:syscalls:sys_exit_pwritev  /@s_pwritev[tid]/ { $d = nsecs - @s_pwritev[tid]; @c_pwritev = count(); @tot_pwritev = sum($d); @lat_pwritev = hist($d); delete(@s_pwritev[tid]); }
+
+/* pwritev2 */
+tracepoint:syscalls:sys_enter_pwritev2 /pid == $1/ { @s_pwritev2[tid] = nsecs; @size_pwritev2_vlen = hist(args->vlen); }
+tracepoint:syscalls:sys_exit_pwritev2  /@s_pwritev2[tid]/ { $d = nsecs - @s_pwritev2[tid]; @c_pwritev2 = count(); @tot_pwritev2 = sum($d); @lat_pwritev2 = hist($d); delete(@s_pwritev2[tid]); }
+
+/* writev */
+tracepoint:syscalls:sys_enter_writev /pid == $1/ { @s_writev[tid] = nsecs; @size_writev_vlen = hist(args->vlen); }
+tracepoint:syscalls:sys_exit_writev  /@s_writev[tid]/ { $d = nsecs - @s_writev[tid]; @c_writev = count(); @tot_writev = sum($d); @lat_writev = hist($d); if (args->ret > 0) { @ret_writev_bytes = hist((uint64)args->ret); } delete(@s_writev[tid]); }
+
+/* write */
+tracepoint:syscalls:sys_enter_write /pid == $1/ { @s_write[tid] = nsecs; @size_write_count = hist(args->count); }
+tracepoint:syscalls:sys_exit_write  /@s_write[tid]/ { $d = nsecs - @s_write[tid]; @c_write = count(); @tot_write = sum($d); @lat_write = hist($d); delete(@s_write[tid]); }
+
+/* read */
+tracepoint:syscalls:sys_enter_read /pid == $1/ { @s_read[tid] = nsecs; @size_read_count = hist(args->count); }
+tracepoint:syscalls:sys_exit_read  /@s_read[tid]/ { $d = nsecs - @s_read[tid]; @c_read = count(); @tot_read = sum($d); @lat_read = hist($d); if (args->ret > 0) { @ret_read_bytes = hist((uint64)args->ret); } delete(@s_read[tid]); }
+
+/* readv */
+tracepoint:syscalls:sys_enter_readv /pid == $1/ { @s_readv[tid] = nsecs; @size_readv_vlen = hist(args->vlen); }
+tracepoint:syscalls:sys_exit_readv  /@s_readv[tid]/ { $d = nsecs - @s_readv[tid]; @c_readv = count(); @tot_readv = sum($d); @lat_readv = hist($d); delete(@s_readv[tid]); }
+
+/* sendto */
+tracepoint:syscalls:sys_enter_sendto /pid == $1/ { @s_sendto[tid] = nsecs; @size_sendto_len = hist(args->len); }
+tracepoint:syscalls:sys_exit_sendto  /@s_sendto[tid]/ { $d = nsecs - @s_sendto[tid]; @c_sendto = count(); @tot_sendto = sum($d); @lat_sendto = hist($d); delete(@s_sendto[tid]); }
+
+/* recvfrom */
+tracepoint:syscalls:sys_enter_recvfrom /pid == $1/ { @s_recvfrom[tid] = nsecs; @size_recvfrom_size = hist(args->size); }
+tracepoint:syscalls:sys_exit_recvfrom  /@s_recvfrom[tid]/ { $d = nsecs - @s_recvfrom[tid]; @c_recvfrom = count(); @tot_recvfrom = sum($d); @lat_recvfrom = hist($d); if (args->ret > 0) { @ret_recvfrom_bytes = hist((uint64)args->ret); } delete(@s_recvfrom[tid]); }
+
+/* sendmsg */
+tracepoint:syscalls:sys_enter_sendmsg /pid == $1/ { @s_sendmsg[tid] = nsecs; }
+tracepoint:syscalls:sys_exit_sendmsg  /@s_sendmsg[tid]/ { $d = nsecs - @s_sendmsg[tid]; @c_sendmsg = count(); @tot_sendmsg = sum($d); @lat_sendmsg = hist($d); delete(@s_sendmsg[tid]); }
+
+/* recvmsg */
+tracepoint:syscalls:sys_enter_recvmsg /pid == $1/ { @s_recvmsg[tid] = nsecs; }
+tracepoint:syscalls:sys_exit_recvmsg  /@s_recvmsg[tid]/ { $d = nsecs - @s_recvmsg[tid]; @c_recvmsg = count(); @tot_recvmsg = sum($d); @lat_recvmsg = hist($d); delete(@s_recvmsg[tid]); }
+
+/* io_uring_enter */
+tracepoint:syscalls:sys_enter_io_uring_enter /pid == $1/ { @s_iouring[tid] = nsecs; }
+tracepoint:syscalls:sys_exit_io_uring_enter  /@s_iouring[tid]/ { $d = nsecs - @s_iouring[tid]; @c_iouring = count(); @tot_iouring = sum($d); @lat_iouring = hist($d); delete(@s_iouring[tid]); }
+
+/* futex */
+tracepoint:syscalls:sys_enter_futex /pid == $1/ { @s_futex[tid] = nsecs; }
+tracepoint:syscalls:sys_exit_futex  /@s_futex[tid]/ { $d = nsecs - @s_futex[tid]; @c_futex = count(); @tot_futex = sum($d); @lat_futex = hist($d); delete(@s_futex[tid]); }
+
+/* epoll_pwait */
+tracepoint:syscalls:sys_enter_epoll_pwait /pid == $1/ { @s_epoll[tid] = nsecs; }
+tracepoint:syscalls:sys_exit_epoll_pwait  /@s_epoll[tid]/ { $d = nsecs - @s_epoll[tid]; @c_epoll = count(); @tot_epoll = sum($d); @lat_epoll = hist($d); delete(@s_epoll[tid]); }
+
+/* fsync / fdatasync / sync_file_range */
+tracepoint:syscalls:sys_enter_fsync /pid == $1/ { @s_fsync[tid] = nsecs; }
+tracepoint:syscalls:sys_exit_fsync  /@s_fsync[tid]/ { $d = nsecs - @s_fsync[tid]; @c_fsync = count(); @tot_fsync = sum($d); @lat_fsync = hist($d); delete(@s_fsync[tid]); }
+
+tracepoint:syscalls:sys_enter_fdatasync /pid == $1/ { @s_fdatasync[tid] = nsecs; }
+tracepoint:syscalls:sys_exit_fdatasync  /@s_fdatasync[tid]/ { $d = nsecs - @s_fdatasync[tid]; @c_fdatasync = count(); @tot_fdatasync = sum($d); @lat_fdatasync = hist($d); delete(@s_fdatasync[tid]); }
+
+interval:s:30 {
+    printf("\n=== snapshot @ 30s ===\n");
+    printf("COUNTS:\n");
+    print(@c_iouring); print(@c_pwritev); print(@c_pwritev2); print(@c_writev); print(@c_write);
+    print(@c_read); print(@c_readv); print(@c_sendto); print(@c_recvfrom); print(@c_sendmsg); print(@c_recvmsg);
+    print(@c_futex); print(@c_epoll); print(@c_fsync); print(@c_fdatasync);
+    printf("TOTAL NS:\n");
+    print(@tot_iouring); print(@tot_pwritev); print(@tot_pwritev2); print(@tot_writev); print(@tot_write);
+    print(@tot_read); print(@tot_readv); print(@tot_sendto); print(@tot_recvfrom); print(@tot_sendmsg); print(@tot_recvmsg);
+    print(@tot_futex); print(@tot_epoll); print(@tot_fsync); print(@tot_fdatasync);
+    printf("LAT HIST (log2 ns):\n");
+    print(@lat_iouring); print(@lat_pwritev); print(@lat_pwritev2); print(@lat_writev); print(@lat_write);
+    print(@lat_read); print(@lat_readv); print(@lat_sendto); print(@lat_recvfrom); print(@lat_sendmsg); print(@lat_recvmsg);
+    print(@lat_futex); print(@lat_epoll); print(@lat_fsync); print(@lat_fdatasync);
+    printf("SIZE HIST:\n");
+    print(@size_pwritev_vlen); print(@size_pwritev2_vlen); print(@size_writev_vlen);
+    print(@size_write_count); print(@size_read_count); print(@size_readv_vlen);
+    print(@size_sendto_len); print(@size_recvfrom_size);
+    print(@ret_writev_bytes); print(@ret_read_bytes); print(@ret_recvfrom_bytes);
+    exit();
+}
