@@ -1,71 +1,97 @@
-Date: 2026-04-20
+Date: 2026-04-21
 TaskStatus: completed
-Task scope: F099-M — multi-thread ExtentNode (per-shard runtime + port)
+Task scope: F099-N-b — diagnose 60-65 k write plateau at N=4 / N=8 × d=8
+           (measurement only, no src change)
 
 Branch: perf-r1-partition-scale-out
 Worktree: /data/dongmao_dev/autumn-perf-r1
 Main worktree /data/dongmao_dev/autumn (branch compio) MUST NOT be touched.
 
-This session completed F099-M:
-  - Popped stash@{0} (17-file WIP from prior subagent run).
-  - Fixed shards=4 cluster bring-up bug: cluster.sh was not passing
-    `--shards` or `--shard-ports` to the extent-node or register-node.
-    Without shard_ports on the node entry, the manager routed ALL
-    extents to shard 0's port (9101/...), which rejected any extent
-    where `extent_id % 4 != 0` with FailedPrecondition, surfacing as
-    PS "rowStream commit_length failed ... available nodes 0 less
-    than required 1 for extent 10".
-  - Fix: cluster.sh now reads $AUTUMN_EXTENT_SHARDS (+stride) and
-    (1) spawns the extent-node with --shards/--shard-stride, and
-    (2) passes --shard-ports to `autumn-client register-node`.
-  - Added 4 planned F099-M integration tests in
-    crates/stream/tests/f099m_shards.rs:
-      * f099m_shards_serve_disjoint_extents
-      * f099m_register_node_reports_shard_ports
-      * f099m_client_routes_by_extent_id_modulo
-      * f099m_recovery_per_shard
-    All pass. 40/40 autumn-stream lib + 84/84 autumn-partition-server
-    lib + 4/4 new F099-M tests all green.
-  - Perf validated:
-      * N=4 × d=8 (3-rep): write 62-70 k ops/s (median 67 k).
-        Above 57 k pre-F099-M baseline (+17 %) but below 110 k gate.
-      * Fanout p50 1.6 ms (was 129.6 ms) — 80x reduction.
-        Architectural fix is working.
-      * Extent-node CPU ~20 % per process (no longer saturated).
-      * PS P-log threads now at 100 % CPU — the new binding, as
-        predicted in F099-K-diagnosis.
-      * N=1 × d=1 regression check: 42.4 k write / 50.5 k read
-        (≥ 41 k baseline — no regression at shards=1 legacy path).
-  - Verdict: DONE_WITH_CONCERNS — architecture works, throughput
-    partial. The extent-node is no longer the bottleneck. The 67→110 k
-    gap is a PS-side (P-log) follow-up (not in F099-M scope).
+This session completed F099-N-b with a BIG finding:
 
-Key files touched (from stash + this session):
+ROOT CAUSE of the 60-65 k plateau at N=4 / N=8 × d=8 is NOT in the storage
+stack at all. It is a workload-distribution bug in `autumn-client perf-check`:
+
+  * Keys are `format!("pc_{tid}_{seq}")` — prefix byte 'p' = 0x70.
+  * Partition ranges are hex-encoded; ASCII first bytes are 0x33 / 0x37 /
+    0x62 (at N=4) or finer at N=8.
+  * Every "pc_..." key falls into the LAST partition's range (part 34 at
+    N=4, part 62 at N=8).
+  * The client still stripes its 256 threads round-robin across all N
+    partition ports, setting part_id == owner_part so each PS accepts the
+    frame at the ps-conn decode layer. Then `start_write_batch.in_range()`
+    rejects with "key is out of range" on N-1 of N partitions.
+  * Reject P-log threads still burn 40-60 % CPU per core: decode → mpsc
+    send → merged_partition_loop pickup → validate → send_err → encode
+    error frame → io_uring write back to client.
+
+Evidence (measured):
+  * `autumn-client info` at end of N=4 × d=8 bench:
+       part-34 log-stream = 63 GB, row-stream = 66 GB
+       parts 13/20/27 log/row/meta = 0 B
+  * PS log `partition write summary part_id=X`: ONLY part_id=34 emits
+    records throughout the run (1.83 M ops on part-34, 0 on others).
+  * Per-thread `top -H`: 4 P-logs at 99-100 % CPU — but only part-34-bulk
+    runs (flush), other *-bulk threads are 0 %.
+  * bpftrace per-thread: part-34 does 85k iouring_enter / 30s + 142
+    eventfd writes + 67 futex (cross-thread coord). part-13 does 40k
+    iouring_enter / 30s + ZERO writes + ZERO futex — pure reject loop.
+  * Global tcp_sendmsg retbytes:
+       part-13/20/27: ~4.7 MB/s each (tiny error frames at ~50 B)
+       part-34:      648 MB/s (productive)
+       part-34-bulk: 6.8 GB/s (SST upload)
+  * PS kernel TCP CPU: 2.84 cores at N=4 vs 0.71 cores at N=1 for the
+    SAME productive throughput — 4× waste on reject path round-trips.
+  * Control: N=1 × d=8 gives 63.3 k write (single productive P-log).
+    N=4 × d=8 gives 62.5 k median write. Same ceiling — exactly what
+    "only one partition actually works" predicts.
+
+All 7 hypotheses ruled out as independent causes:
+  H1 client-side: 1-5 % per-thread CPU, no contention
+  H2 PS-side: only part-34 P-log does real work; other 3 burn reject CPU
+  H3 extent-node per-shard: 10-40 % CPU, plenty of headroom
+  H4 kernel TCP: 2.84 cores at N=4 is symptom of H2, not cause
+  H5 bootstrap extent distribution: all productive extents go to 1 stream
+  H6 manager: 142 recv/s idle heartbeats only
+  H7 combinatorial: only 9 PS→extent sockets total
+
+Recommended F099-N-c (<1 day, zero risk, bench-tool only):
+  * Fix key generation in crates/server/src/bin/autumn_client.rs for BOTH
+    perf-check (line 1603) and wbench (line 1270) so each thread emits
+    keys inside its assigned partition's range. Either expose the
+    partition range from the manager and prefix each key with a hex byte
+    in-range, or generate hex-prefixed keys derived from tid.
+  * After fix, re-measure N ∈ {1, 2, 4, 8} × d=8. Expected write throughput
+    rises from 62 k to 150-200 k at N=4 if each P-log keeps up. Any
+    remaining gap IS the real next bottleneck — worth a follow-up
+    diagnosis with the honest workload.
+
+Key files touched (this session):
   NEW:
-    - autumn-rs/crates/stream/tests/f099m_shards.rs
-  MODIFIED by stash:
-    - autumn-rs/crates/stream/src/extent_node.rs (+214)
-    - autumn-rs/crates/stream/src/client.rs (+18)
-    - autumn-rs/crates/stream/src/conn_pool.rs (+23: shard_addr_for_extent)
-    - autumn-rs/crates/stream/src/lib.rs (export shard_addr_for_extent)
-    - autumn-rs/crates/server/src/bin/extent_node.rs (+182)
-    - autumn-rs/crates/server/src/bin/autumn_client.rs (+18: --shard-ports)
-    - autumn-rs/crates/rpc/src/manager_rpc.rs (+10: shard_ports field)
-    - autumn-rs/crates/manager/src/lib.rs (+46: shard_ports_for_addr)
-    - autumn-rs/crates/manager/src/rpc_handlers.rs (stores shard_ports)
-    - autumn-rs/crates/manager/src/recovery.rs (shard-routed recovery)
-    - autumn-rs/crates/manager/tests/*.rs (shard_ports: vec![] fixtures)
-    - autumn-rs/crates/stream/tests/stream_sqcq.rs (shard_ports: vec![])
-  MODIFIED this session:
-    - autumn-rs/cluster.sh (+30: forward shards / shard_ports)
-    - feature_list.md (add F099-M entry)
+    - docs/superpowers/specs/2026-04-20-perf-f099-n-ceiling.md
+  MODIFIED:
+    - feature_list.md (added F099-N-a + F099-N-b entries with passes: true)
     - claude-progress.txt (this file)
 
-Next session can pick up from this baseline:
-  - Optional follow-up (F099-N?): close N=4 d=8 67 k → 110 k gap.
-    Bottleneck profile: PS 4× part-N threads at 100 % user CPU.
-    Candidates: group-commit batch accumulation tuning, bpftrace
-    attribution of the P-log hot loop (decode+dispatch vs apply),
-    lock-free memtable sentinel path.
-  - F099-M is architecturally complete; no further changes needed
-    to the extent-node side to unblock higher throughput.
+Raw artefacts (uncommitted, per scope):
+  /tmp/n_b/n4d8_run*.log  — bench outputs
+  /tmp/n_b/n4d8_*_top.txt — per-thread CPU snapshots (PS, client, nodes)
+  /tmp/n_b/ps_tcp.txt, /tmp/n_b/n1d8_ps_tcp.txt — PS tcp_sendmsg kprobe
+  /tmp/n_b/tcp_global.txt — global comm-keyed TCP counts (decisive H2)
+  /tmp/n_b/part34_plog.txt, /tmp/n_b/part13_plog.txt — P-log per-thread
+  /tmp/n_b/cluster_info.txt — stream size distribution
+
+Next session pick-up:
+  * Implement F099-N-c: fix perf-check + wbench key generation so keys
+    land in each thread's assigned partition. Rebuild perf_baseline_shm
+    after the fix.
+  * Once the workload is actually distributed, re-run the H2-H7 probes
+    (docs/superpowers/specs/2026-04-20-perf-f099-n-ceiling.md Appendix B
+    has the minimal cheat sheet). The FIRST check should be "does
+    partition write summary show non-zero ops on every partition?" — if
+    yes, proceed with throughput measurement; if no, there's still a
+    distribution bug.
+  * Expected outcome post F099-N-c: N=4 × d=8 ≥ 150 k; N=8 × d=8 ≥ 200 k.
+    Any gap from those targets reveals the real next bottleneck — most
+    likely merged_partition_loop user CPU at a single P-log, since the
+    N=1 × d=8 control already tops out at 63 k on one P-log.
