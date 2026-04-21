@@ -52,6 +52,32 @@ fn hex_split_ranges(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
     ranges
 }
 
+/// F099-N-c — generate a bench key guaranteed to lie in the partition
+/// identified by `start_key`. Returns an ASCII string so it remains
+/// JSON-safe for wbench's result file.
+///
+/// Strategy: for empty `start_key` (first partition [""..X)), prefix with
+/// "!" (0x21, smaller than any hex digit '0'..'f' = 0x30..0x66). For any
+/// other partition, prefix the key with `start_key + "!"` — this is
+/// strictly >= start_key and strictly < the next partition's start_key
+/// (because `start_key + "!"` shares the full `start_key` prefix and then
+/// '!' = 0x21 is smaller than any trailing character of the next split).
+fn key_for_partition(start_key: &[u8], tag: &str, tid: usize, seq: u64) -> String {
+    let mut key = Vec::with_capacity(start_key.len() + tag.len() + 32);
+    if !start_key.is_empty() {
+        key.extend_from_slice(start_key);
+    }
+    key.push(b'!');
+    key.extend_from_slice(tag.as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(tid.to_string().as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(seq.to_string().as_bytes());
+    // SAFETY: all inputs are ASCII (start_key is hex digits, tag is ASCII,
+    // tid/seq are decimal digits, separators are '!' and '_').
+    String::from_utf8(key).expect("ASCII bench key")
+}
+
 // ---------------------------------------------------------------------------
 // Command definitions
 // ---------------------------------------------------------------------------
@@ -1220,20 +1246,30 @@ async fn main() -> Result<()> {
                 }
             }
 
-            let partitions = if let Some(part_id) = part_id {
-                vec![(part_id, client.resolve_part_id(part_id).await?)]
-            } else {
-                client.all_partitions().await?
-            };
+            // F099-N-c: partition ranges for range-aware key generation.
+            let partitions: Vec<(u64, String, Vec<u8>, Vec<u8>)> =
+                if let Some(part_id) = part_id {
+                    // Single-partition mode — fetch its range from the full list.
+                    let all = client.all_partitions_with_range().await?;
+                    let entry = all
+                        .into_iter()
+                        .find(|(pid, _, _, _)| *pid == part_id)
+                        .ok_or_else(|| anyhow!("partition {} not found", part_id))?;
+                    vec![entry]
+                } else {
+                    client.all_partitions_with_range().await?
+                };
             if partitions.is_empty() {
                 bail!("no partitions found, run bootstrap first");
             }
 
             // Resolve PS addresses for each thread
-            let mut thread_targets: Vec<(u64, SocketAddr)> = Vec::with_capacity(threads);
+            let mut thread_targets: Vec<(u64, SocketAddr, Vec<u8>)> =
+                Vec::with_capacity(threads);
             for tid in 0..threads {
-                let (part_id, ps_addr) = &partitions[tid % partitions.len()];
-                thread_targets.push((*part_id, parse_addr(ps_addr)?));
+                let (part_id, ps_addr, start_key, _end_key) =
+                    &partitions[tid % partitions.len()];
+                thread_targets.push((*part_id, parse_addr(ps_addr)?, start_key.clone()));
             }
 
             let deadline =
@@ -1244,7 +1280,7 @@ async fn main() -> Result<()> {
             let ops_samples = Arc::new(Mutex::new(Vec::<BenchSample>::new()));
 
             let mut handles = Vec::new();
-            for (tid, (part_id, ps_addr)) in thread_targets.into_iter().enumerate() {
+            for (tid, (part_id, ps_addr, start_key)) in thread_targets.into_iter().enumerate() {
                 let deadline = Arc::clone(&deadline);
                 let total_ops = Arc::clone(&total_ops);
                 let total_errors = Arc::clone(&total_errors);
@@ -1267,7 +1303,8 @@ async fn main() -> Result<()> {
                             if std::time::SystemTime::now() >= *deadline {
                                 break;
                             }
-                            let key = format!("bench_{}_{}", tid, seq);
+                            // F099-N-c: range-aware key (falls in this partition).
+                            let key = key_for_partition(&start_key, "bench", tid, seq);
                             seq += 1;
 
                             let t0 = Instant::now();
@@ -1551,7 +1588,9 @@ async fn main() -> Result<()> {
                 );
             }
 
-            let partitions = client.all_partitions().await?;
+            // F099-N-c: use `all_partitions_with_range` so each thread can
+            // generate keys that fall inside its assigned partition's range.
+            let partitions = client.all_partitions_with_range().await?;
             if partitions.is_empty() {
                 bail!("no partitions found, run bootstrap first");
             }
@@ -1562,10 +1601,12 @@ async fn main() -> Result<()> {
                 );
             }
 
-            let mut thread_targets: Vec<(u64, SocketAddr)> = Vec::with_capacity(threads);
+            let mut thread_targets: Vec<(u64, SocketAddr, Vec<u8>)> =
+                Vec::with_capacity(threads);
             for tid in 0..threads {
-                let (part_id, ps_addr) = &partitions[tid % partitions.len()];
-                thread_targets.push((*part_id, parse_addr(ps_addr)?));
+                let (part_id, ps_addr, start_key, _end_key) =
+                    &partitions[tid % partitions.len()];
+                thread_targets.push((*part_id, parse_addr(ps_addr)?, start_key.clone()));
             }
 
             let deadline =
@@ -1574,7 +1615,7 @@ async fn main() -> Result<()> {
             let bench_start = Instant::now();
 
             let mut write_handles = Vec::new();
-            for (tid, (part_id, ps_addr)) in thread_targets.into_iter().enumerate() {
+            for (tid, (part_id, ps_addr, start_key)) in thread_targets.into_iter().enumerate() {
                 let deadline = Arc::clone(&deadline);
                 let total_ops = Arc::clone(&total_ops);
                 let value_bytes =
@@ -1600,7 +1641,10 @@ async fn main() -> Result<()> {
                             while inflight.len() < max_depth
                                 && std::time::SystemTime::now() < *deadline
                             {
-                                let key = format!("pc_{tid}_{seq}");
+                                // F099-N-c: key must fall in this thread's
+                                // partition range or PS will reject it with
+                                // "key out of range".
+                                let key = key_for_partition(&start_key, "pc", tid, seq);
                                 seq += 1;
                                 let req_bytes = rkyv_encode(&PutReq {
                                     part_id,

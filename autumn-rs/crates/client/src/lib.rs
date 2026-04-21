@@ -367,6 +367,44 @@ impl ClusterClient {
         Ok(result)
     }
 
+    /// F099-N-c — like `all_partitions`, but also returns each partition's
+    /// `(start_key, end_key)` range so bench tools can generate keys that
+    /// actually land in each partition. Prior bench tools used a constant
+    /// prefix like "pc_{tid}_{seq}" / "bench_{tid}_{seq}" which lexically
+    /// always fell in ONE partition, making N>1 perf tests measure a single
+    /// partition with (N-1) rejecting load.
+    pub async fn all_partitions_with_range(
+        &mut self,
+    ) -> Result<Vec<(u64, String, Vec<u8>, Vec<u8>)>> {
+        if self.regions.is_empty() {
+            self.refresh_regions().await?;
+        }
+        let mut result: Vec<(u64, String, Vec<u8>, Vec<u8>)> = self
+            .regions
+            .iter()
+            .map(|(_, region)| {
+                let addr = self
+                    .part_addrs
+                    .get(&region.part_id)
+                    .cloned()
+                    .or_else(|| {
+                        self.ps_details
+                            .get(&region.ps_id)
+                            .map(|d| d.address.clone())
+                    })
+                    .unwrap_or_default();
+                let (start_key, end_key) = region
+                    .rg
+                    .as_ref()
+                    .map(|r| (r.start_key.clone(), r.end_key.clone()))
+                    .unwrap_or_default();
+                (region.part_id, addr, start_key, end_key)
+            })
+            .collect();
+        result.sort_by_key(|(pid, _, _, _)| *pid);
+        Ok(result)
+    }
+
     // ── Internal: PS call with routing retry ─────────────────────────────────
 
     /// Resolve key to (part_id, ps_addr), call PS, retry once on failure with refresh.
